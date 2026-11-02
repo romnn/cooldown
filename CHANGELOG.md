@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **A literal package rule beats a glob in the same config file, whatever the table order.**
+  Two matching `[package."…"]` rules of one layer used to tie, and the tie went to whichever
+  pattern sorted first as text, so with `[package."@corp/*"] latest = true` beside
+  `[package."@corp/ui"] min-age = "30d"`, `@corp/ui` resolved to `latest` because `*` sorts before
+  `u`. Equally specific package and project rules are now ranked by their pattern: a literal beats
+  every glob, a longer literal prefix beats a shorter one (`@corp/ui*` beats `@corp/*`, and beats
+  `*-plugin` for `@corp/ui-plugin`), and only between equally long prefixes does the pattern that
+  sorts first win. Layer authority and selector specificity still come first, and each window
+  field and `max-major` is ranked on its own among the rules that set it. `@corp/ui` now waits its
+  30 days. A policy with overlapping package or project globs can resolve to a different window or
+  `max-major` ceiling than before, and pnpm `sync` can export or withhold a different set of
+  `minimumReleaseAgeExclude` entries; run `cooldown explain <package>` to see which rule now wins.
+
 - **npm attributes an aliased install to the package it actually installs.** An npm alias
   (`"foo": "npm:other@1.0.0"`, or an override to one) installs `other` at `node_modules/foo`, and
   `package-lock.json` records `name: "other"` there. cooldown read that entry as a release of

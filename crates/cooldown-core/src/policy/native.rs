@@ -6,7 +6,8 @@
 //! [`native_exemptions`] proves that per selector and withholds every selector it cannot prove.
 
 use super::model::{
-    ByKind, Origin, PatternGlob, PolicyLayer, ResolveKind, ResolveQuery, Rule, Selector, WindowSpec,
+    ByKind, Origin, PatternGlob, PolicyLayer, ResolveKind, ResolveQuery, Rule, RuleRank, Selector,
+    WindowSpec,
 };
 use super::resolve::resolve;
 use crate::model::{ToolId, UpdateKind};
@@ -63,10 +64,15 @@ pub struct NativeExemptions {
 /// - A literal selector is resolved with [`resolve`] once per kind and per registry context the
 ///   layers distinguish (none, plus each [`Selector::Registry`] they name), which is exact.
 /// - A glob selector is proven by dominance instead, since its packages cannot be enumerated.
-///   Every rule that may match one of its packages must resolve the same way as the rules that
-///   match all of them, and ties are assumed to go against the selector.
-///   For example, an earlier `@corp/*` rule wins a same-layer tie against a later `@corp/ui` rule
-///   in [`resolve`], yet the proof withholds `@corp/*` because the later rule could win.
+///   It ranks rules exactly as [`resolve`] does, by layer, selector specificity, and then how
+///   narrowly the pattern is spelled.
+///   Every rule that may match one of its packages and ranks at least as high as the best rule
+///   matching all of them must resolve the same way.
+///   For example, a `@corp/ui` rule with a 30-day window outranks a same-layer `@corp/*` `latest`
+///   rule, so the proof withholds `@corp/*`, while a `latest` on the narrower `@corp/ui*` can still
+///   be proven beside a broad `@corp/*` window.
+///   Rules of equal rank all count as possible winners, since the proof does not model which of
+///   several identical declarations comes first.
 ///   Two patterns built only from literals and single `*` wildcards are intersected exactly; any
 ///   other pattern is assumed to overlap every pattern but its own.
 ///
@@ -207,16 +213,10 @@ enum Coverage {
     Covers,
 }
 
-/// A rule's authority in [`resolve`]'s field picks: layer first, then selector specificity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Rank {
-    layer_index: usize,
-    specificity: u8,
-}
-
 /// A rule that may match one of the glob's packages.
 struct RelevantRule<'a> {
-    rank: Rank,
+    /// The rule's precedence, the same one [`resolve`] ranks it by.
+    rank: RuleRank<'a>,
     origin: &'a Origin,
     rule: &'a Rule,
     /// Whether the rule matches every package the glob matches.
@@ -247,10 +247,7 @@ fn glob_proven(context: PolicyContext<'_>, glob: &PatternGlob, target: ToolId) -
                 Coverage::Covers => true,
             };
             rules.push(RelevantRule {
-                rank: Rank {
-                    layer_index,
-                    specificity: rule.selector.specificity(),
-                },
+                rank: RuleRank::of(layer_index, &rule.selector),
                 origin: &layer.origin,
                 rule,
                 covers,
@@ -348,8 +345,10 @@ fn window_proven(rules: &[RelevantRule<'_>]) -> bool {
 ///
 /// A covering rule that sets the field matches every package, so each package's winner ranks at
 /// least as high as the highest such rule.
-/// The winner is then one of the relevant rules at or above that rank, and an equal rank counts
-/// as a possible winner because [`resolve`] keeps the first of tied rules, whichever that is.
+/// The winner is then one of the relevant rules at or above that rank, compared by the full rank
+/// [`resolve`] uses, including the direction of its raw-text tie-break.
+/// An equal rank counts as a possible winner: identical declarations tie, and [`resolve`] keeps
+/// the first of them, which the proof does not model.
 /// Without a covering rule, any relevant rule that sets the field may win, or none may.
 fn field_outcome(
     rules: &[RelevantRule<'_>],

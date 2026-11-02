@@ -2,6 +2,7 @@ use crate::duration::{duration_as_days, since};
 use crate::model::{ToolId, UpdateKind};
 use camino::Utf8Path;
 use jiff::{SignedDuration, Timestamp};
+use std::cmp::Reverse;
 use std::fmt;
 
 /// Where a policy value comes from, lowest → highest authority when compared by layer index in a
@@ -45,6 +46,9 @@ impl fmt::Display for Origin {
         f.write_str(&self.token())
     }
 }
+
+/// The characters that give a pattern glob syntax; a pattern without any of them is literal.
+const GLOB_SYNTAX: [char; 7] = ['*', '?', '[', ']', '{', '}', '\\'];
 
 /// A compiled glob with its original pattern preserved for display/equality.
 #[derive(Debug, Clone)]
@@ -98,7 +102,7 @@ impl PatternGlob {
     /// Whether the pattern has no glob syntax, so it matches only its own text.
     #[must_use]
     pub fn is_literal(&self) -> bool {
-        !self.raw.contains(['*', '?', '[', ']', '{', '}', '\\'])
+        !self.raw.contains(GLOB_SYNTAX)
     }
 
     /// Whether the pattern's only glob syntax is single `*` wildcards, each matching any run of
@@ -116,6 +120,38 @@ impl PatternGlob {
     pub fn raw(&self) -> &str {
         &self.raw
     }
+
+    /// The pattern's precedence over other patterns of an equally specific selector.
+    pub(crate) fn rank(&self) -> PatternRank<'_> {
+        PatternRank {
+            literal: self.is_literal(),
+            literal_prefix: self
+                .raw
+                .chars()
+                .take_while(|character| !GLOB_SYNTAX.contains(character))
+                .count(),
+            raw: Reverse(&self.raw),
+        }
+    }
+}
+
+/// How narrowly a pattern is spelled, ranking the rules of equally specific selectors.
+///
+/// A higher rank wins.
+/// A literal ranks above every glob, a glob with a longer literal prefix (counted in characters up
+/// to its first glob syntax) above one with a shorter prefix, and between equal prefixes the
+/// pattern whose text is smaller in plain code-point order wins.
+/// The rank depends only on the text, so it never depends on the order rules are declared in.
+///
+/// The rank is a precedence heuristic, not proof that one glob contains another: `@corp/ui*`
+/// outranks `*-plugin`, so a scope rule beats a suffix rule where both match, although neither
+/// glob contains the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PatternRank<'a> {
+    literal: bool,
+    literal_prefix: usize,
+    /// Reversed so that the smaller text ranks higher.
+    raw: Reverse<&'a str>,
 }
 
 impl PartialEq for PatternGlob {
@@ -151,6 +187,9 @@ pub enum Selector {
 
 impl Selector {
     /// Higher = more specific; breaks ties *within* a layer.
+    ///
+    /// Equally specific package or project rules are ordered by their pattern next, as
+    /// [`resolve`](crate::resolve) describes.
     #[must_use]
     pub fn specificity(&self) -> u8 {
         match self {
@@ -179,6 +218,14 @@ impl Selector {
         }
     }
 
+    /// The name or path pattern this selector matches, for the package and project selectors.
+    pub(crate) fn pattern(&self) -> Option<&PatternGlob> {
+        match self {
+            Selector::Package { glob, .. } | Selector::Project(glob) => Some(glob),
+            Selector::Default | Selector::Tool(_) | Selector::Registry(_) => None,
+        }
+    }
+
     /// The `<selector>` half of the `minAgeSource` string, e.g. `package=left-pad`.
     #[must_use]
     pub fn token(&self) -> Option<String> {
@@ -192,6 +239,33 @@ impl Selector {
                 tool: Some(tool),
             } => Some(format!("package={tool}:{}", glob.raw())),
             Selector::Package { glob, tool: None } => Some(format!("package={}", glob.raw())),
+        }
+    }
+}
+
+/// A rule's precedence in an authority-first field pick; a higher rank wins.
+///
+/// Layer authority comes first, then [`Selector::specificity`], then the [`PatternRank`] of a
+/// package or project pattern.
+/// Selectors of equal specificity are of one kind, so either both ranks carry a pattern or
+/// neither does.
+/// Two rules that match the same query tie only when their selectors are identical, and
+/// [`resolve`](crate::resolve) keeps the first of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct RuleRank<'a> {
+    /// The index of the rule's layer, low to high authority.
+    pub(crate) layer_index: usize,
+    specificity: u8,
+    pattern: Option<PatternRank<'a>>,
+}
+
+impl<'a> RuleRank<'a> {
+    /// The rank of a rule with `selector` in the layer at `layer_index`.
+    pub(crate) fn of(layer_index: usize, selector: &'a Selector) -> Self {
+        RuleRank {
+            layer_index,
+            specificity: selector.specificity(),
+            pattern: selector.pattern().map(PatternGlob::rank),
         }
     }
 }

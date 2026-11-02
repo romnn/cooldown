@@ -5,8 +5,11 @@
 //! each field has its own combine rule:
 //!
 //! - `min-age` / per-kind windows — **authority-first**: the highest layer that sets the field
-//!   wins; within a layer the most specific selector breaks the tie. Layer dominates selector.
-//! - `max-major` — **authority-first**, using the same layer and selector ordering as `min-age`.
+//!   wins; within a layer the most specific selector breaks the tie, and between equally specific
+//!   package or project rules the more narrowly spelled pattern wins (see [`resolve`]).
+//!   Layer dominates selector.
+//! - `max-major` — **authority-first**, using the same layer, selector, and pattern ordering as
+//!   `min-age`.
 //! - `floor` — **max-clamp**: the effective window clamps up to `max(floor)` over all layers.
 //! - `allow` — **accumulated union** that zeroes an ordinary window, but bypasses a floor only
 //!   per-floor: a floor is escaped only by an allow co-declared in that floor's own layer, or by an

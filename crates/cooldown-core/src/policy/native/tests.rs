@@ -9,6 +9,7 @@ use crate::{ByKind, Origin, PatternGlob, PolicyLayer, ResolveQuery, Rule, Select
 use camino::Utf8Path;
 use indoc::indoc;
 use jiff::{SignedDuration, Timestamp};
+use std::collections::BTreeMap;
 
 const PNPM: ToolId = ToolId("pnpm");
 const NPM: ToolId = ToolId("npm");
@@ -234,42 +235,94 @@ fn a_literal_is_proven_against_every_kind() {
     assert_eq!(exemptions(&layers), withheld(&["@corp/ui"]));
 }
 
-/// A same-layer tie of equal specificity goes to the first rule in `resolve`: the literal proof
-/// follows that winner in both orders.
+/// A literal outranks a same-layer glob in `resolve` whichever comes first, and the literal proof
+/// follows it: a literal `latest` is exported over a scope window in both orders.
 #[test]
-fn a_literal_follows_the_actual_tie_winner() {
-    let first = stack(vec![repo(vec![
-        latest(package("@corp/ui")),
-        min_age(package("@corp/*"), 30),
-    ])]);
-    assert_eq!(resolved_pin(&first, "@corp/ui"), WindowSpec::Latest);
-    assert_eq!(exemptions(&first), exempt(&["@corp/ui"]));
-
-    let second = stack(vec![repo(vec![
-        min_age(package("@corp/*"), 30),
-        latest(package("@corp/ui")),
-    ])]);
-    assert_eq!(resolved_pin(&second, "@corp/ui"), days(30));
-    assert_eq!(exemptions(&second), withheld(&["@corp/ui"]));
+fn a_literal_latest_beats_a_glob_window_in_both_orders() {
+    for rules in [
+        vec![latest(package("@corp/ui")), min_age(package("@corp/*"), 30)],
+        vec![min_age(package("@corp/*"), 30), latest(package("@corp/ui"))],
+    ] {
+        let layers = stack(vec![repo(rules)]);
+        assert_eq!(resolved_pin(&layers, "@corp/ui"), WindowSpec::Latest);
+        assert_eq!(exemptions(&layers), exempt(&["@corp/ui"]));
+    }
 }
 
-/// The glob proof withholds a selector a same-layer tie could go against in either order, even
-/// when `resolve` actually picks the selector's own rule: a known false negative.
+/// A literal window outranks a broad `latest` glob on the package it names, in both orders, so the
+/// glob is withheld although it decides every other package of the scope.
 #[test]
-fn a_glob_is_withheld_in_both_tie_orders() {
-    let first = stack(vec![repo(vec![
-        latest(package("@corp/*")),
-        min_age(package("@corp/ui"), 30),
-    ])]);
-    assert_eq!(resolved_pin(&first, "@corp/ui"), WindowSpec::Latest);
-    assert_eq!(exemptions(&first), withheld(&["@corp/*"]));
+fn a_literal_window_withholds_a_broad_latest_glob_in_both_orders() {
+    for rules in [
+        vec![latest(package("@corp/*")), min_age(package("@corp/ui"), 30)],
+        vec![min_age(package("@corp/ui"), 30), latest(package("@corp/*"))],
+    ] {
+        let layers = stack(vec![repo(rules)]);
+        assert_eq!(resolved_pin(&layers, "@corp/ui"), days(30));
+        assert_eq!(resolved_pin(&layers, "@corp/other"), WindowSpec::Latest);
+        assert_eq!(exemptions(&layers), withheld(&["@corp/*"]));
+    }
+}
 
-    let second = stack(vec![repo(vec![
-        min_age(package("@corp/ui"), 30),
+/// A narrow glob's `latest` is exported beside a lower-ranked broad window that overlaps it, while
+/// a broad `latest` beside a higher-ranked narrow window is withheld.
+#[test]
+fn a_narrower_glob_is_proven_over_a_broader_overlapping_window() {
+    for (exempting, gating) in [("@corp/ui*", "@corp/*"), ("@corp/ui*", "*-plugin")] {
+        for rules in [
+            vec![latest(package(exempting)), min_age(package(gating), 30)],
+            vec![min_age(package(gating), 30), latest(package(exempting))],
+        ] {
+            let layers = stack(vec![repo(rules)]);
+            assert_eq!(exemptions(&layers), exempt(&[exempting]), "{gating}");
+        }
+        for rules in [
+            vec![latest(package(gating)), min_age(package(exempting), 30)],
+            vec![min_age(package(exempting), 30), latest(package(gating))],
+        ] {
+            let layers = stack(vec![repo(rules)]);
+            assert_eq!(exemptions(&layers), withheld(&[gating]), "{exempting}");
+        }
+    }
+}
+
+/// Between equally long literal prefixes the smaller raw text outranks the other in the proof
+/// exactly as in `resolve`, so only the higher-ranked `latest` is exported.
+#[test]
+fn the_proof_follows_the_raw_text_tie_break() {
+    let layers = stack(vec![repo(vec![
+        min_age(package("@corp/*kit"), 30),
+        latest(package("@corp/*-kit")),
+    ])]);
+    assert_eq!(resolved_pin(&layers, "@corp/ui-kit"), WindowSpec::Latest);
+    assert_eq!(exemptions(&layers), exempt(&["@corp/*-kit"]));
+
+    let layers = stack(vec![repo(vec![
+        latest(package("@corp/*kit")),
+        min_age(package("@corp/*-kit"), 30),
+    ])]);
+    assert_eq!(resolved_pin(&layers, "@corp/ui-kit"), days(30));
+    assert_eq!(exemptions(&layers), withheld(&["@corp/*kit"]));
+}
+
+/// Identical declarations tie in rank and `resolve` keeps the first, which the proof does not
+/// model: a conflicting duplicate withholds the selector in both orders, even where the `latest`
+/// one actually wins.
+#[test]
+fn an_equally_ranked_conflicting_duplicate_withholds_in_both_orders() {
+    let latest_first = stack(vec![repo(vec![
+        latest(package("@corp/*")),
+        min_age(package("@corp/*"), 30),
+    ])]);
+    assert_eq!(resolved_pin(&latest_first, "@corp/ui"), WindowSpec::Latest);
+    assert_eq!(exemptions(&latest_first), withheld(&["@corp/*"]));
+
+    let window_first = stack(vec![repo(vec![
+        min_age(package("@corp/*"), 30),
         latest(package("@corp/*")),
     ])]);
-    assert_eq!(resolved_pin(&second, "@corp/ui"), days(30));
-    assert_eq!(exemptions(&second), withheld(&["@corp/*"]));
+    assert_eq!(resolved_pin(&window_first, "@corp/ui"), days(30));
+    assert_eq!(exemptions(&window_first), withheld(&["@corp/*"]));
 }
 
 /// A tool-qualified window outranks an unqualified exemption only for its own tool.
@@ -623,6 +676,34 @@ fn rule_pool() -> Vec<Rule> {
     ]
 }
 
+/// The building blocks of the generated comparison for pattern ranking: a duplicate of the
+/// `@corp/*` selector with conflicting values, a literal and a narrower prefix glob inside the
+/// scope, a suffix glob overlapping that prefix glob, and two globs that tie on their literal
+/// prefix and are ordered by their raw text, beside a per-kind default, a floor and a covering
+/// allow.
+fn pattern_rule_pool() -> Vec<Rule> {
+    vec![
+        latest(package("@corp/*")),
+        min_age(package("@corp/*"), 30),
+        min_age(package("@corp/ui"), 30),
+        latest(package("@corp/ui*")),
+        min_age(package("@corp/ui*"), 30),
+        latest(package("*-plugin")),
+        min_age(package("*-plugin"), 30),
+        latest(package("@corp/*-kit")),
+        min_age(package("@corp/*kit"), 30),
+        window(
+            Selector::Default,
+            ByKind {
+                major: Some(days(30)),
+                ..ByKind::default()
+            },
+        ),
+        floor(package("@corp/ui"), 3),
+        allow(package("*")),
+    ]
+}
+
 /// Every ordered selection of at most two rules from `pool`.
 fn selections(pool: &[Rule]) -> Vec<Vec<Rule>> {
     let mut selections = vec![Vec::new()];
@@ -641,50 +722,70 @@ fn selections(pool: &[Rule]) -> Vec<Vec<Rule>> {
 /// including an empty scope suffix and a name only the `@co*` rule matches.
 const NAMES: [&str; 6] = ["@corp/ui", "@corp/x", "@corp/", "@co", "@other/a", "zzz"];
 
-/// Whenever the glob proof exports a selector, `resolve` exempts every enumerated name it matches
-/// for every kind, registry and project.
+/// The names the pattern-ranking comparison checks, where the prefix, suffix, and raw-text-tied
+/// globs overlap and where each matches alone.
+const PATTERN_NAMES: [&str; 9] = [
+    "@corp/ui",
+    "@corp/ui-plugin",
+    "eslint-plugin",
+    "@corp/ui-kit",
+    "@corp/x-kit",
+    "@corp/xkit",
+    "@corp/kit",
+    "@corp/x",
+    "zzz",
+];
+
+/// The rule sets, globs and names one generated soundness comparison enumerates.
+struct SoundnessCase<'a> {
+    /// The rules the lower layer is built from, as every ordered pair.
+    lower_pool: &'a [Rule],
+    /// The single rules the higher layer may hold, beside an empty higher layer.
+    higher_rules: Vec<Rule>,
+    globs: &'a [&'a str],
+    names: &'a [&'a str],
+}
+
+/// How often the glob proof succeeded and failed for each glob.
+#[derive(Default)]
+struct ProofCounts<'a> {
+    proven: BTreeMap<&'a str, usize>,
+    unproven: BTreeMap<&'a str, usize>,
+}
+
+impl ProofCounts<'_> {
+    fn proven(&self, glob: &str) -> usize {
+        self.proven.get(glob).copied().unwrap_or_default()
+    }
+
+    fn unproven(&self, glob: &str) -> usize {
+        self.unproven.get(glob).copied().unwrap_or_default()
+    }
+}
+
+/// Asserts that whenever the glob proof exports a glob, `resolve` exempts every listed name it
+/// matches for every kind, registry and project.
 ///
 /// The stacks enumerate ordered rule pairs in a lower layer (so same-layer ties occur in both
 /// orders) under at most one rule in a higher layer, for two layer-origin pairs: a floor in a
 /// global layer that a repository allow cannot bypass, and one in a repository layer that a CLI
 /// allow can.
-#[test]
-fn the_glob_proof_is_sound_against_resolve() {
-    let pool = rule_pool();
-    let lower_selections = selections(&pool);
-    // A higher layer overrides the lower one; these rules each override in a different way.
+fn assert_glob_proof_sound<'a>(case: &SoundnessCase<'a>) -> ProofCounts<'a> {
+    let lower_selections = selections(case.lower_pool);
     let mut higher_selections = vec![Vec::new()];
-    higher_selections.extend(
-        [
-            latest(package("@corp/*")),
-            allow(package("*")),
-            min_age(package("@corp/ui"), 30),
-            min_age(qualified("@corp/*", PNPM), 30),
-            window(
-                Selector::Default,
-                ByKind {
-                    major: Some(days(30)),
-                    ..ByKind::default()
-                },
-            ),
-            floor(Selector::Default, 2),
-            min_age(Selector::Registry("r".into()), 30),
-            min_age(
-                Selector::Project(PatternGlob::new("sub/*").expect("glob")),
-                30,
-            ),
-        ]
-        .map(|rule| vec![rule]),
-    );
+    higher_selections.extend(case.higher_rules.iter().map(|rule| vec![rule.clone()]));
     let origins = [
         (Origin::Global, Origin::Repo("cooldown.toml".into())),
         (Origin::Repo("cooldown.toml".into()), Origin::Cli),
     ];
-    let globs = ["@corp/*", "*"].map(|glob| PatternGlob::new(glob).expect("glob"));
+    let globs: Vec<(&str, PatternGlob)> = case
+        .globs
+        .iter()
+        .map(|glob| (*glob, PatternGlob::new(glob).expect("glob")))
+        .collect();
     // A registry no rule names resolves like no registry at all.
     let registries = [None, Some("r")];
-    let mut proven = 0_usize;
-    let mut unproven = 0_usize;
+    let mut counts = ProofCounts::default();
     for (lower_origin, higher_origin) in &origins {
         for lower in &lower_selections {
             for higher in &higher_selections {
@@ -697,13 +798,13 @@ fn the_glob_proof_is_sound_against_resolve() {
                         layers: &layers,
                         project,
                     };
-                    for glob in &globs {
+                    for (raw, glob) in &globs {
                         if !glob_proven(context, glob, PNPM) {
-                            unproven += 1;
+                            *counts.unproven.entry(raw).or_default() += 1;
                             continue;
                         }
-                        proven += 1;
-                        for name in NAMES.iter().filter(|name| glob.is_match(name)) {
+                        *counts.proven.entry(raw).or_default() += 1;
+                        for name in case.names.iter().filter(|name| glob.is_match(name)) {
                             for registry in registries {
                                 for kind in KINDS {
                                     let query = ResolveQuery {
@@ -719,9 +820,8 @@ fn the_glob_proof_is_sound_against_resolve() {
                                     assert_eq!(
                                         spec,
                                         WindowSpec::Latest,
-                                        "{} proven, but {name} ({registry:?}, {kind:?}) in \
-                                         {project} resolves otherwise under {layers:#?}",
-                                        glob.raw()
+                                        "{raw} proven, but {name} ({registry:?}, {kind:?}) in \
+                                         {project} resolves otherwise under {layers:#?}"
                                     );
                                 }
                             }
@@ -731,7 +831,72 @@ fn the_glob_proof_is_sound_against_resolve() {
             }
         }
     }
+    counts
+}
+
+/// Whenever the glob proof exports a selector, `resolve` exempts every enumerated name it matches
+/// for every kind, registry and project.
+#[test]
+fn the_glob_proof_is_sound_against_resolve() {
+    let pool = rule_pool();
+    // A higher layer overrides the lower one; these rules each override in a different way.
+    let higher_rules = vec![
+        latest(package("@corp/*")),
+        allow(package("*")),
+        min_age(package("@corp/ui"), 30),
+        min_age(qualified("@corp/*", PNPM), 30),
+        window(
+            Selector::Default,
+            ByKind {
+                major: Some(days(30)),
+                ..ByKind::default()
+            },
+        ),
+        floor(Selector::Default, 2),
+        min_age(Selector::Registry("r".into()), 30),
+        min_age(
+            Selector::Project(PatternGlob::new("sub/*").expect("glob")),
+            30,
+        ),
+    ];
+    let globs = ["@corp/*", "*"];
+    let counts = assert_glob_proof_sound(&SoundnessCase {
+        lower_pool: &pool,
+        higher_rules,
+        globs: &globs,
+        names: &NAMES,
+    });
     // The enumeration exercises both outcomes, so the comparison is not vacuous.
+    let proven: usize = counts.proven.values().sum();
+    let unproven: usize = counts.unproven.values().sum();
     assert!(proven > 1_000, "only {proven} proofs succeeded");
     assert!(unproven > 1_000, "only {unproven} proofs failed");
+}
+
+/// The glob proof stays sound where pattern ranking decides the winner: prefix globs, suffix
+/// overlaps, raw-text ties, and identically ranked conflicting duplicates.
+#[test]
+fn the_glob_proof_is_sound_against_resolve_under_pattern_ranking() {
+    let pool = pattern_rule_pool();
+    let higher_rules = vec![
+        latest(package("@corp/*")),
+        min_age(package("@corp/ui*"), 30),
+        latest(package("@corp/*-kit")),
+        floor(Selector::Default, 2),
+    ];
+    let globs = ["@corp/*", "@corp/ui*", "*-plugin", "@corp/*-kit"];
+    let counts = assert_glob_proof_sound(&SoundnessCase {
+        lower_pool: &pool,
+        higher_rules,
+        globs: &globs,
+        names: &PATTERN_NAMES,
+    });
+    // Every glob is both exported and withheld somewhere, so the comparison cannot pass by
+    // withholding a glob everywhere.
+    for glob in globs {
+        let proven = counts.proven(glob);
+        let unproven = counts.unproven(glob);
+        assert!(proven > 100, "only {proven} proofs of {glob} succeeded");
+        assert!(unproven > 100, "only {unproven} proofs of {glob} failed");
+    }
 }

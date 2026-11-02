@@ -770,3 +770,332 @@ fn advisories_bad_tokens_are_config_errors() {
         );
     }
 }
+
+/// The repository stack of `toml` twice: once with its rules as parsed and once reversed.
+///
+/// Reversing the TOML text alone proves nothing about rule order, because the parser reads package
+/// and project tables from sorted maps; reversing the parsed rules is what puts the other rule
+/// first.
+fn rule_orders(toml: &str) -> [Vec<PolicyLayer>; 2] {
+    let parsed = repo(toml);
+    let mut reversed = parsed.clone();
+    reversed.rules.reverse();
+    [layers_from(vec![parsed]), layers_from(vec![reversed])]
+}
+
+fn win_in(layers: &[PolicyLayer], pkg: &str, project: &str, kind: ResolveKind) -> ResolvedWindow {
+    resolve(layers, &q(pkg, Utf8Path::new(project), kind), now()).window
+}
+
+fn effective_default_in(layers: &[PolicyLayer], project: &str) -> ResolvedWindow {
+    win_in(layers, "", project, ResolveKind::EffectiveDefault)
+}
+
+/// The issue's example: a literal package rule beats a scope glob in the same layer however the
+/// tables are written and however the rules are ordered, and the glob still decides its other
+/// packages.
+#[test]
+fn a_literal_package_rule_beats_a_same_layer_glob_in_every_order() {
+    use indoc::indoc;
+    let glob_first = indoc! {r#"
+        [package."@corp/*"]
+        latest = true
+
+        [package."@corp/ui"]
+        min-age = "30d"
+    "#};
+    let literal_first = indoc! {r#"
+        [package."@corp/ui"]
+        min-age = "30d"
+
+        [package."@corp/*"]
+        latest = true
+    "#};
+    for toml in [glob_first, literal_first] {
+        for layers in rule_orders(toml) {
+            let window = win(&layers, "@corp/ui", ResolveKind::CurrentPin);
+            assert_eq!(window.spec, WindowSpec::MinAge(days(30)));
+            assert_eq!(window.source(), "repo:cooldown.toml:package=@corp/ui");
+
+            let window = win(&layers, "@corp/other", ResolveKind::CurrentPin);
+            assert_eq!(window.spec, WindowSpec::Latest);
+            assert_eq!(window.source(), "repo:cooldown.toml:package=@corp/*");
+        }
+    }
+}
+
+/// A glob whose text sorts before the literal it shadows, as `@corp/a*` sorts before `@corp/api`,
+/// still loses to the literal.
+#[test]
+fn a_literal_beats_a_glob_that_sorts_before_it() {
+    use indoc::indoc;
+    let toml = indoc! {r#"
+        [package."@corp/a*"]
+        latest = true
+
+        [package."@corp/api"]
+        min-age = "30d"
+    "#};
+    for layers in rule_orders(toml) {
+        let window = win(&layers, "@corp/api", ResolveKind::CurrentPin);
+        assert_eq!(window.spec, WindowSpec::MinAge(days(30)));
+        assert_eq!(window.source(), "repo:cooldown.toml:package=@corp/api");
+        assert_eq!(
+            win(&layers, "@corp/app", ResolveKind::CurrentPin).spec,
+            WindowSpec::Latest
+        );
+    }
+}
+
+/// Between two globs, the longer literal prefix wins: a nested scope glob beats the whole scope,
+/// and a namespace prefix beats a suffix pattern.
+#[test]
+fn the_longer_literal_prefix_wins_between_globs() {
+    use indoc::indoc;
+    let nested = indoc! {r#"
+        [package."@corp/*"]
+        latest = true
+
+        [package."@corp/ui*"]
+        min-age = "30d"
+    "#};
+    for layers in rule_orders(nested) {
+        let window = win(&layers, "@corp/ui-kit", ResolveKind::CurrentPin);
+        assert_eq!(window.spec, WindowSpec::MinAge(days(30)));
+        assert_eq!(window.source(), "repo:cooldown.toml:package=@corp/ui*");
+    }
+
+    let suffix = indoc! {r#"
+        [package."*-plugin"]
+        latest = true
+
+        [package."@corp/ui*"]
+        min-age = "30d"
+    "#};
+    for layers in rule_orders(suffix) {
+        let window = win(&layers, "@corp/ui-plugin", ResolveKind::CurrentPin);
+        assert_eq!(window.spec, WindowSpec::MinAge(days(30)));
+        assert_eq!(window.source(), "repo:cooldown.toml:package=@corp/ui*");
+        // The suffix rule still decides a plugin outside the scope.
+        assert_eq!(
+            win(&layers, "eslint-plugin", ResolveKind::CurrentPin).spec,
+            WindowSpec::Latest
+        );
+    }
+}
+
+/// Two globs with equally long literal prefixes fall back to their raw text: the smaller one wins,
+/// whichever rule comes first.
+#[test]
+fn equal_prefixes_fall_back_to_the_smaller_raw_pattern() {
+    use indoc::indoc;
+    let toml = indoc! {r#"
+        [package."@corp/*kit"]
+        latest = true
+
+        [package."@corp/*-kit"]
+        min-age = "30d"
+    "#};
+    for layers in rule_orders(toml) {
+        let window = win(&layers, "@corp/ui-kit", ResolveKind::CurrentPin);
+        assert_eq!(window.spec, WindowSpec::MinAge(days(30)));
+        assert_eq!(window.source(), "repo:cooldown.toml:package=@corp/*-kit");
+    }
+}
+
+/// `max-major` follows the same order as the windows: a literal beats a glob in either rule order.
+#[test]
+fn a_literal_beats_a_glob_for_max_major() {
+    use indoc::indoc;
+    let toml = indoc! {r#"
+        [package."@corp/*"]
+        max-major = 3
+
+        [package."@corp/ui"]
+        max-major = 5
+    "#};
+    for layers in rule_orders(toml) {
+        let query = q("@corp/ui", Utf8Path::new("."), ResolveKind::CurrentPin);
+        let pick = resolve_max_major(&layers, &query).expect("ceiling");
+        assert_eq!(pick.limit, 5);
+        assert_eq!(pick.selector.token().as_deref(), Some("package=@corp/ui"));
+
+        let query = q("@corp/other", Utf8Path::new("."), ResolveKind::CurrentPin);
+        let pick = resolve_max_major(&layers, &query).expect("ceiling");
+        assert_eq!(pick.limit, 3);
+    }
+}
+
+/// Every per-kind window field is picked by the same order, each on its own.
+#[test]
+fn a_literal_beats_a_glob_for_every_window_field() {
+    use indoc::indoc;
+    let toml = indoc! {r#"
+        [package."@corp/*"]
+        min-age = { default = "1d", major = "2d", minor = "3d", patch = "4d" }
+
+        [package."@corp/ui"]
+        min-age = { default = "10d", major = "20d", minor = "30d", patch = "40d" }
+    "#};
+    for layers in rule_orders(toml) {
+        for (kind, expected) in [
+            (ResolveKind::CurrentPin, 10),
+            (ResolveKind::Candidate(UpdateKind::Major), 20),
+            (ResolveKind::Candidate(UpdateKind::Minor), 30),
+            (ResolveKind::Candidate(UpdateKind::Patch), 40),
+        ] {
+            let window = win(&layers, "@corp/ui", kind);
+            assert_eq!(window.spec, WindowSpec::MinAge(days(expected)), "{kind:?}");
+            assert_eq!(window.source(), "repo:cooldown.toml:package=@corp/ui");
+        }
+    }
+}
+
+/// The ranking chooses a winner per field among the rules that set it, so a literal's bare window
+/// does not erase a glob's explicit major window: the major kind is searched across every rule
+/// before falling through to the bare default.
+#[test]
+fn a_literal_scalar_window_keeps_a_globs_per_kind_window() {
+    use indoc::indoc;
+    let toml = indoc! {r#"
+        [package."@corp/*"]
+        min-age = { major = "30d" }
+
+        [package."@corp/ui"]
+        min-age = "10d"
+    "#};
+    for layers in rule_orders(toml) {
+        let major = win(
+            &layers,
+            "@corp/ui",
+            ResolveKind::Candidate(UpdateKind::Major),
+        );
+        assert_eq!(major.spec, WindowSpec::MinAge(days(30)));
+        assert_eq!(major.source(), "repo:cooldown.toml:package=@corp/*");
+
+        // No rule sets `minor`, so it falls through to the literal's bare window.
+        let minor = win(
+            &layers,
+            "@corp/ui",
+            ResolveKind::Candidate(UpdateKind::Minor),
+        );
+        assert_eq!(minor.spec, WindowSpec::MinAge(days(10)));
+        assert_eq!(minor.source(), "repo:cooldown.toml:package=@corp/ui");
+    }
+}
+
+/// Layer authority and selector specificity still come before the pattern: a higher layer's glob
+/// beats a lower layer's literal, and a tool-qualified glob beats an unqualified literal.
+#[test]
+fn layer_and_selector_specificity_outrank_the_pattern() {
+    use indoc::indoc;
+    let layers = layers_from(vec![
+        global(indoc! {r#"
+            [package."@corp/ui"]
+            min-age = "30d"
+            max-major = 5
+        "#}),
+        repo(indoc! {r#"
+            [package."@corp/*"]
+            latest = true
+            max-major = 3
+        "#}),
+    ]);
+    assert_eq!(
+        win(&layers, "@corp/ui", ResolveKind::CurrentPin).spec,
+        WindowSpec::Latest
+    );
+    let query = q("@corp/ui", Utf8Path::new("."), ResolveKind::CurrentPin);
+    assert_eq!(
+        resolve_max_major(&layers, &query).map(|pick| pick.limit),
+        Some(3)
+    );
+
+    let qualified = indoc! {r#"
+        [tool.go.package."@corp/*"]
+        min-age = "30d"
+        max-major = 3
+
+        [package."@corp/ui"]
+        min-age = "10d"
+        max-major = 5
+    "#};
+    for layers in rule_orders(qualified) {
+        let window = win(&layers, "@corp/ui", ResolveKind::CurrentPin);
+        assert_eq!(window.spec, WindowSpec::MinAge(days(30)));
+        assert_eq!(window.source(), "repo:cooldown.toml:package=go:@corp/*");
+        assert_eq!(
+            resolve_max_major(&layers, &query).map(|pick| pick.limit),
+            Some(3)
+        );
+    }
+}
+
+/// Project patterns are ranked like package patterns, including for the effective default.
+#[test]
+fn project_patterns_rank_like_package_patterns() {
+    use indoc::indoc;
+    let toml = indoc! {r#"
+        [project."apps/*"]
+        min-age = "30d"
+
+        [project."apps/web"]
+        min-age = "10d"
+
+        [project."apps/web/*"]
+        min-age = "20d"
+    "#};
+    for layers in rule_orders(toml) {
+        // A literal project beats the glob that also matches it.
+        let window = win_in(&layers, "x", "apps/web", ResolveKind::CurrentPin);
+        assert_eq!(window.spec, WindowSpec::MinAge(days(10)));
+        assert_eq!(window.source(), "repo:cooldown.toml:project=apps/web");
+        let window = effective_default_in(&layers, "apps/web");
+        assert_eq!(window.spec, WindowSpec::MinAge(days(10)));
+
+        // A nested project glob beats the broader one by its longer prefix.
+        let window = win_in(&layers, "x", "apps/web/admin", ResolveKind::CurrentPin);
+        assert_eq!(window.spec, WindowSpec::MinAge(days(20)));
+        assert_eq!(window.source(), "repo:cooldown.toml:project=apps/web/*");
+        let window = effective_default_in(&layers, "apps/web/admin");
+        assert_eq!(window.spec, WindowSpec::MinAge(days(20)));
+
+        // The broad glob still decides a sibling project.
+        assert_eq!(
+            effective_default_in(&layers, "apps/api").spec,
+            WindowSpec::MinAge(days(30))
+        );
+    }
+}
+
+/// Pattern ranking leaves the other combine rules alone: floors still max-clamp and `allow` is
+/// still a union, whichever rule is more specific.
+#[test]
+fn pattern_ranking_leaves_floor_and_allow_unchanged() {
+    use indoc::indoc;
+    let floors = indoc! {r#"
+        [package."@corp/*"]
+        floor = "10d"
+
+        [package."@corp/ui"]
+        min-age = "1d"
+        floor = "3d"
+    "#};
+    for layers in rule_orders(floors) {
+        let window = win(&layers, "@corp/ui", ResolveKind::CurrentPin);
+        assert_eq!(window.floor, Some(days(10)));
+        assert!((window.effective_min_age_days(now()) - 10.0).abs() < 1e-9);
+    }
+
+    let allows = indoc! {r#"
+        allow = ["@corp/*"]
+
+        [package."@corp/ui"]
+        min-age = "30d"
+    "#};
+    for layers in rule_orders(allows) {
+        let window = win(&layers, "@corp/ui", ResolveKind::CurrentPin);
+        assert!(window.exempt);
+        assert_eq!(window.spec, WindowSpec::Latest);
+    }
+}
