@@ -5366,10 +5366,16 @@ impl ToolWrite for RepoScopedFake {
         let path = repo_root.join("uv.toml");
         let mut written = self.already_written.lock().unwrap();
         if *written {
-            Ok(SyncReport::Unchanged { path })
+            Ok(SyncReport::Unchanged {
+                path,
+                warnings: Vec::new(),
+            })
         } else {
             *written = true;
-            Ok(SyncReport::Written { path })
+            Ok(SyncReport::Written {
+                path,
+                warnings: Vec::new(),
+            })
         }
     }
 }
@@ -5608,7 +5614,10 @@ impl ToolWrite for ProjectScopedFake {
     ) -> Result<SyncReport> {
         let path = project.root.join("project.toml");
         self.native_writes.lock().unwrap().push(path.to_string());
-        Ok(SyncReport::Written { path })
+        Ok(SyncReport::Written {
+            path,
+            warnings: Vec::new(),
+        })
     }
 }
 

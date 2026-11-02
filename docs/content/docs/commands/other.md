@@ -110,6 +110,27 @@ cooldown sync
 
 The same behavior is available as a global `--sync` flag on any command, which syncs before the command runs (a no-op under `--dry-run`). See [Supported ecosystems]({{< relref "../tools/_index.md" >}}) for which tools have a native cooldown that `sync` can write to.
 
+### pnpm
+
+For pnpm, `sync` writes the project's `pnpm-workspace.yaml`: the default window as
+`minimumReleaseAge` (in minutes), and every `latest` or `allow` package selector as a
+`minimumReleaseAgeExclude` entry, followed by the exact versions of young locked packages cooldown
+admits.
+
+pnpm matches those entries more simply than cooldown matches its selectors: only `*` is a wildcard
+(and crosses `/`), a leading `!` negates, and every other character is literal. So `sync` writes a
+selector only when pnpm reads it the same way: letters, digits, `.`, `_`, `~`, `-`, `/`, single `*`
+wildcards, and a leading `@` scope, as in `@types/*` or `*-plugin`. Any other selector, such as
+`@types/{node,react}`, `react-?om` or `[a-c]*`, is left out and reported as a `stricter_native`
+warning: cooldown still exempts the packages it matches, but pnpm's own age gate keeps applying to
+them. A selector containing `**` is left out too, since cooldown gives `**/` a recursive-directory
+meaning pnpm lacks. To exempt such packages natively as well, write them as separate selectors pnpm
+can read (`[package."@types/node"]` and `[package."@types/react"]`).
+
+When the policy has selectors but nothing can be written, `sync` keeps an explicit
+`minimumReleaseAgeExclude: []`, so pnpm does not fall back to exclusions inherited from user or
+global configuration. Without any selectors an empty list is removed.
+
 ### uv
 
 For uv, `sync` writes the repository-root `uv.toml`: the default window as `exclude-newer`, and

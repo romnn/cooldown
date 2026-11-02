@@ -14,8 +14,9 @@ use crate::lock::{
 };
 use crate::manifest;
 use crate::native::{
-    ConfigStringList, NativeAge, exact_exclusion, minimum_age_exclusions, set_yaml_block_list,
-    set_yaml_scalar, set_yaml_string_map, window_minutes,
+    ConfigStringList, EmptyList, NativeAge, NativeSelectors, exact_exclusion,
+    minimum_age_exclusions, set_yaml_block_list, set_yaml_scalar, set_yaml_string_map,
+    window_minutes,
 };
 use crate::nodecmd::NodeCmd;
 use crate::peers::{
@@ -2340,7 +2341,13 @@ impl<L: NodeLock> NpmTool<L> {
         match crate::exclusions::persisted_rules(native_age.exclusions, &exact_versions, &locked) {
             crate::exclusions::Persisted::Unchanged => {}
             crate::exclusions::Persisted::Rules(exclusions) => {
-                set_yaml_block_list(&path, "minimumReleaseAgeExclude", &exclusions, false)?;
+                set_yaml_block_list(
+                    &path,
+                    "minimumReleaseAgeExclude",
+                    &exclusions,
+                    EmptyList::Remove,
+                    false,
+                )?;
             }
             crate::exclusions::Persisted::ScalarSetting => {
                 return Err(CoreError::Config(format!(
@@ -3211,14 +3218,16 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
             return Ok(SyncReport::Unsupported); // npm/yarn/bun have no native cooldown knob
         };
         let path = project.root.join(file);
+        // Selectors pnpm would read differently stay out of the native list and are reported on
+        // every outcome, including the early return that writes nothing.
+        let selectors = NativeSelectors::partition(&policy.exempt_packages);
+        let warnings = omitted_selector_warnings(&selectors.omitted);
         let Some(minutes) = policy.default_window.as_ref().and_then(window_minutes) else {
             // pnpm's minimumReleaseAge is a rolling minute count; a freeze date or opt-out can't be
             // expressed, so leave the file untouched.
-            return Ok(SyncReport::Unchanged { path });
+            return Ok(SyncReport::Unchanged { path, warnings });
         };
         // Policy-exempt names and admitted young versions must also pass pnpm's rolling age gate.
-        // An empty list removes the key, so toggling a package back under the cooldown cleans up
-        // after itself.
         let exclusions = if let Some(admitted) = &policy.admitted_versions {
             let mut exact_versions = BTreeMap::<String, BTreeSet<String>>::new();
             for admitted in admitted {
@@ -3227,12 +3236,12 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
                     .or_default()
                     .insert(admitted.version.to_string());
             }
-            minimum_age_exclusions(&policy.exempt_packages, &exact_versions)?
+            minimum_age_exclusions(&selectors.written, &exact_versions)
         } else {
             // Without complete evidence, preserve exact entry strings even for missing pins.
             // Policy globs and the default window can still be synchronized safely.
             let existing = NativeAge::read(&path)?.exclusions.into_vec();
-            let mut exclusions = minimum_age_exclusions(&policy.exempt_packages, &BTreeMap::new())?;
+            let mut exclusions = minimum_age_exclusions(&selectors.written, &BTreeMap::new());
             exclusions.extend(
                 existing
                     .into_iter()
@@ -3240,15 +3249,49 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
             );
             exclusions
         };
+        // A policy without selectors removes an empty list, so toggling a package back under the
+        // cooldown cleans up after itself.
+        // A policy whose selectors were all omitted keeps an explicit empty list instead, which
+        // masks the exclusions pnpm would otherwise inherit from user or global configuration
+        // just as a non-empty list does.
+        let empty = if policy.exempt_packages.is_empty() {
+            EmptyList::Remove
+        } else {
+            EmptyList::Explicit
+        };
         let mut changed =
             set_yaml_scalar(&path, "minimumReleaseAge", &minutes.to_string(), dry_run)?;
-        changed |= set_yaml_block_list(&path, "minimumReleaseAgeExclude", &exclusions, dry_run)?;
+        changed |= set_yaml_block_list(
+            &path,
+            "minimumReleaseAgeExclude",
+            &exclusions,
+            empty,
+            dry_run,
+        )?;
         Ok(if changed {
-            SyncReport::Written { path }
+            SyncReport::Written { path, warnings }
         } else {
-            SyncReport::Unchanged { path }
+            SyncReport::Unchanged { path, warnings }
         })
     }
+}
+
+/// One [`DiagnosticKind::StricterNative`] warning per selector `sync` leaves out of pnpm's
+/// `minimumReleaseAgeExclude`, since pnpm's age gate then still governs the packages it exempts.
+fn omitted_selector_warnings(omitted: &[String]) -> Vec<Diagnostic> {
+    omitted
+        .iter()
+        .map(|selector| {
+            Diagnostic::new(
+                DiagnosticKind::StricterNative,
+                format!(
+                    "selector `{selector}` is left out of pnpm's minimumReleaseAgeExclude, which \
+                     would match it differently, so pnpm's minimumReleaseAge still gates the \
+                     packages it exempts"
+                ),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -3846,6 +3889,252 @@ packages:
             tool.write_native(&project, &policy, false).await?,
             SyncReport::Unchanged { .. }
         );
+        Ok(())
+    }
+
+    /// A pnpm project rooted at `root`, for the native sync tests.
+    fn pnpm_sync_project(root: &Utf8Path) -> Project {
+        Project {
+            root: root.to_owned(),
+            kind: Pnpm::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        }
+    }
+
+    /// A 14-day policy exempting `selectors`, with `admitted` as the evaluated admissions.
+    fn pnpm_sync_policy(selectors: &[&str], admitted: Option<&[(&str, &str)]>) -> ResolvedPolicy {
+        ResolvedPolicy {
+            default_window: Some(cooldown_core::WindowSpec::MinAge(
+                jiff::SignedDuration::from_hours(24 * 14),
+            )),
+            exempt_packages: selectors.iter().map(ToString::to_string).collect(),
+            package_windows: std::collections::BTreeMap::new(),
+            admitted_versions: admitted.map(|admitted| {
+                admitted
+                    .iter()
+                    .map(|(name, version)| cooldown_core::AdmittedVersion {
+                        name: (*name).to_string(),
+                        version: Version::new(*version),
+                    })
+                    .collect()
+            }),
+        }
+    }
+
+    /// The selectors a sync report's `StricterNative` warnings name, in report order.
+    fn omitted_selectors(report: &SyncReport) -> Vec<String> {
+        let warnings = match report {
+            SyncReport::Written { warnings, .. } | SyncReport::Unchanged { warnings, .. } => {
+                warnings.as_slice()
+            }
+            SyncReport::Deferred { .. } | SyncReport::Unsupported => &[],
+        };
+        warnings
+            .iter()
+            .inspect(|warning| assert_eq!(warning.kind, DiagnosticKind::StricterNative))
+            .filter_map(|warning| {
+                let (_, rest) = warning.message.split_once('`')?;
+                let (selector, _) = rest.split_once('`')?;
+                Some(selector.to_string())
+            })
+            .collect()
+    }
+
+    fn pnpm_sync_tool() -> eyre::Result<(tempfile::TempDir, NpmTool<Pnpm>)> {
+        let cache = tempfile::tempdir()?;
+        let tool = NpmTool::<Pnpm>::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        Ok((cache, tool))
+    }
+
+    /// With complete admission evidence, sync writes the selectors pnpm reads as cooldown does,
+    /// keeps an admitted exact union that only an omitted selector covers, and reports each
+    /// omitted selector, in a dry run as in a real one.
+    #[tokio::test]
+    async fn write_native_writes_only_selectors_pnpm_reads_identically() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        std::fs::write(&path, "packages: []\n")?;
+        let project = pnpm_sync_project(&root);
+        let policy = pnpm_sync_policy(
+            &[
+                "@types/{node,react}",
+                "*-plugin",
+                "react-?om",
+                "@types/*-utils",
+            ],
+            Some(&[
+                ("@types/node", "22.0.0"),
+                ("@types/react-utils", "1.0.0"),
+                ("react-dom", "19.0.0"),
+            ]),
+        );
+        let (_cache, tool) = pnpm_sync_tool()?;
+        let omitted = ["@types/{node,react}", "react-?om"];
+
+        // A dry run reports the write and the omissions without touching the file.
+        let dry = tool.write_native(&project, &policy, true).await?;
+        std::assert_matches!(dry, SyncReport::Written { .. });
+        assert_eq!(omitted_selectors(&dry), omitted);
+        assert_eq!(std::fs::read_to_string(&path)?, "packages: []\n");
+
+        // The safe selectors come first; `@types/react-utils` is covered by the written
+        // `@types/*-utils`, while `@types/node` and `react-dom` are covered only by omitted
+        // selectors and keep their exact unions.
+        let written = tool.write_native(&project, &policy, false).await?;
+        std::assert_matches!(written, SyncReport::Written { .. });
+        assert_eq!(omitted_selectors(&written), omitted);
+        assert_eq!(
+            NativeAge::read(&path)?.exclusions.into_vec(),
+            [
+                "*-plugin",
+                "@types/*-utils",
+                "@types/node@22.0.0",
+                "react-dom@19.0.0"
+            ]
+        );
+
+        // An unchanged second sync still reports the omissions.
+        let again = tool.write_native(&project, &policy, false).await?;
+        std::assert_matches!(again, SyncReport::Unchanged { .. });
+        assert_eq!(omitted_selectors(&again), omitted);
+        Ok(())
+    }
+
+    /// Without admission evidence, sync writes the safe selectors, keeps every existing exact
+    /// entry verbatim, and still reports the omitted selectors.
+    #[tokio::test]
+    async fn write_native_omits_unsafe_selectors_when_evaluation_fails() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                packages: []
+                minimumReleaseAgeExclude:
+                  - "@types/{node,react}"
+                  - "@types/node@22.0.0"
+            "#},
+        )?;
+        let project = pnpm_sync_project(&root);
+        let policy = pnpm_sync_policy(&["@types/{node,react}", "**", "*-plugin"], None);
+        let (_cache, tool) = pnpm_sync_tool()?;
+
+        let report = tool.write_native(&project, &policy, false).await?;
+        std::assert_matches!(report, SyncReport::Written { .. });
+        assert_eq!(omitted_selectors(&report), ["**", "@types/{node,react}"]);
+        assert_eq!(
+            NativeAge::read(&path)?.exclusions.into_vec(),
+            ["*-plugin", "@types/node@22.0.0"]
+        );
+        Ok(())
+    }
+
+    /// A policy whose selectors are all omitted keeps an explicit empty list, so the exclusions
+    /// pnpm inherits from user or global configuration stay masked; the list empties only once
+    /// nothing is left in it, and the key disappears again when the policy drops its selectors.
+    #[tokio::test]
+    async fn write_native_keeps_an_explicit_empty_list_for_omitted_selectors() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        let project = pnpm_sync_project(&root);
+        let (_cache, tool) = pnpm_sync_tool()?;
+        let explicit_empty = indoc! {"
+            packages: []
+            minimumReleaseAge: 20160
+            minimumReleaseAgeExclude: []
+        "};
+
+        // Creating the key
+        std::fs::write(&path, "packages: []\nminimumReleaseAge: 20160\n")?;
+        let omitted_only = pnpm_sync_policy(&["react-?om"], Some(&[]));
+        let created = tool.write_native(&project, &omitted_only, false).await?;
+        std::assert_matches!(created, SyncReport::Written { .. });
+        assert_eq!(omitted_selectors(&created), ["react-?om"]);
+        assert_eq!(std::fs::read_to_string(&path)?, explicit_empty);
+
+        // An unchanged second sync
+        let again = tool.write_native(&project, &omitted_only, false).await?;
+        std::assert_matches!(again, SyncReport::Unchanged { .. });
+        assert_eq!(omitted_selectors(&again), ["react-?om"]);
+
+        // Replacing an old list
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                packages: []
+                minimumReleaseAge: 20160
+                minimumReleaseAgeExclude:
+                  - "react-?om"
+                  - "react-dom@19.0.0"
+            "#},
+        )?;
+        tool.write_native(&project, &omitted_only, false).await?;
+        assert_eq!(std::fs::read_to_string(&path)?, explicit_empty);
+
+        // Preserved exact unions keep the list non-empty when evaluation fails.
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                packages: []
+                minimumReleaseAge: 20160
+                minimumReleaseAgeExclude:
+                  - "react-dom@19.0.0"
+            "#},
+        )?;
+        let unevaluated = pnpm_sync_policy(&["react-?om"], None);
+        std::assert_matches!(
+            tool.write_native(&project, &unevaluated, false).await?,
+            SyncReport::Unchanged { .. }
+        );
+        assert_eq!(
+            NativeAge::read(&path)?.exclusions.into_vec(),
+            ["react-dom@19.0.0"]
+        );
+
+        // Without selectors the empty list is removed, as before.
+        std::fs::write(&path, explicit_empty)?;
+        let no_selectors = pnpm_sync_policy(&[], Some(&[]));
+        let removed = tool.write_native(&project, &no_selectors, false).await?;
+        std::assert_matches!(removed, SyncReport::Written { .. });
+        assert_eq!(omitted_selectors(&removed), [] as [String; 0]);
+        assert_eq!(
+            std::fs::read_to_string(&path)?,
+            "packages: []\nminimumReleaseAge: 20160\n"
+        );
+        Ok(())
+    }
+
+    /// A window pnpm cannot express leaves the file untouched, yet the omitted selectors are
+    /// still reported.
+    #[tokio::test]
+    async fn write_native_reports_omitted_selectors_when_the_window_is_not_written()
+    -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        std::fs::write(&path, "packages: []\n")?;
+        let project = pnpm_sync_project(&root);
+        let mut policy = pnpm_sync_policy(&["[!a-c]*", "*-plugin"], Some(&[]));
+        policy.default_window = Some(cooldown_core::WindowSpec::Latest);
+        let (_cache, tool) = pnpm_sync_tool()?;
+
+        let report = tool.write_native(&project, &policy, false).await?;
+        std::assert_matches!(report, SyncReport::Unchanged { .. });
+        assert_eq!(omitted_selectors(&report), ["[!a-c]*"]);
+        assert_eq!(std::fs::read_to_string(&path)?, "packages: []\n");
         Ok(())
     }
 

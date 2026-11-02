@@ -234,12 +234,13 @@ fn resolve_advisory_floor(
 /// The `package` selector globs the policy marks fully exempt from the cooldown — a `latest = true`
 /// rule (a [`WindowSpec::Latest`] on any kind) or an `allow` entry.
 ///
-/// These map directly onto a native per-package exemption list (pnpm's `minimumReleaseAgeExclude`,
-/// which accepts the same glob patterns), so `sync` can bake the `cooldown.toml` `latest` packages
-/// into a tool's native config beside the default window — otherwise a `latest`-exempt package stays
-/// quarantined by the native rolling window even though cooldown's own policy exempts it. The raw glob
-/// is emitted verbatim (`@scope/*`, `@typescript/native-preview`), deduplicated and sorted for a
-/// deterministic, idempotent write. A `package` rule that sets a `min-age`/`freeze` (not `latest`) is
+/// These feed a native per-package exemption list (pnpm's `minimumReleaseAgeExclude`), so `sync` can
+/// bake the `cooldown.toml` `latest` packages into a tool's native config beside the default window —
+/// otherwise a `latest`-exempt package stays quarantined by the native rolling window even though
+/// cooldown's own policy exempts it. The raw glob is emitted verbatim (`@scope/*`,
+/// `@typescript/native-preview`), deduplicated and sorted for a deterministic, idempotent write.
+/// The native list may read glob syntax differently, so the adapter decides which globs it can
+/// write. A `package` rule that sets a `min-age`/`freeze` (not `latest`) is
 /// not exempt and is never listed.
 #[must_use]
 pub fn exempt_package_globs(layers: &[PolicyLayer], target: crate::model::ToolId) -> Vec<String> {

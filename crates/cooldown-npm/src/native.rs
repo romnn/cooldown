@@ -1,27 +1,53 @@
 //! pnpm native cooldown configuration parsing and text-preserving updates.
 
+use crate::exclusions::{is_pnpm_safe_selector, name_matches};
 use camino::Utf8Path;
 use cooldown_core::{CoreError, Result, WindowSpec};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Renders name globs before exact version unions, omitting versions a glob already covers.
+/// cooldown's package selectors split by whether `sync` can write them into pnpm's
+/// `minimumReleaseAgeExclude`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct NativeSelectors {
+    /// The selectors pnpm reads exactly as cooldown does ([`is_pnpm_safe_selector`]), sorted and
+    /// deduplicated.
+    pub(crate) written: Vec<String>,
+    /// The selectors pnpm would read differently, sorted and deduplicated.
+    ///
+    /// They are left out of the native list, so pnpm's age gate keeps governing the packages they
+    /// exempt: stricter than cooldown, never looser.
+    pub(crate) omitted: Vec<String>,
+}
+
+impl NativeSelectors {
+    pub(crate) fn partition(selectors: &[String]) -> Self {
+        let (written, omitted) = selectors
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .cloned()
+            .partition(|selector| is_pnpm_safe_selector(selector));
+        NativeSelectors { written, omitted }
+    }
+}
+
+/// Renders the written selectors before exact version unions, omitting the versions of a name a
+/// written selector already covers under pnpm's own matcher.
+///
+/// `selectors` must be pnpm-safe ([`NativeSelectors::written`]): such a selector carries no
+/// version and no negation, so it exempts every version of each name it matches and an exact
+/// union after it would never be reached.
 pub(crate) fn minimum_age_exclusions(
-    globs: &[String],
+    selectors: &[String],
     exact_versions: &BTreeMap<String, BTreeSet<String>>,
-) -> Result<Vec<String>> {
-    let globs: Vec<_> = globs
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let matchers = globs
-        .iter()
-        .map(|glob| cooldown_core::PatternGlob::new(glob))
-        .collect::<Result<Vec<_>>>()?;
-    let mut exclusions = globs;
+) -> Vec<String> {
+    let mut exclusions = selectors.to_vec();
     exclusions.extend(exact_versions.iter().filter_map(|(name, versions)| {
-        if versions.is_empty() || matchers.iter().any(|glob| glob.is_match(name)) {
+        if versions.is_empty()
+            || selectors
+                .iter()
+                .any(|selector| name_matches(selector, name))
+        {
             return None;
         }
         Some(format!(
@@ -33,7 +59,7 @@ pub(crate) fn minimum_age_exclusions(
                 .join("||")
         ))
     }));
-    Ok(exclusions)
+    exclusions
 }
 
 /// Recognizes cooldown-owned exact entries without claiming user-authored version ranges.
@@ -236,13 +262,25 @@ fn replace_top_level_block(
     found.then_some((out, existing))
 }
 
+/// How [`set_yaml_block_list`] writes an empty item list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmptyList {
+    /// The key and its block are removed.
+    Remove,
+    /// The key is kept as an explicit empty sequence (`key: []`).
+    ///
+    /// pnpm reads an explicit empty list as the setting itself, which masks a list inherited from
+    /// user or global configuration, while a removed key exposes it.
+    Explicit,
+}
+
 /// Sets one top-level YAML block sequence while preserving the rest of the document.
 ///
-/// An empty item list removes the key and its block so native configuration never retains an empty
-/// exemption list.
+/// An empty item list is written as `empty` says: [`EmptyList::Remove`] removes the key and its
+/// block, and [`EmptyList::Explicit`] writes `key: []`.
 /// Items are emitted as double-quoted scalars in caller-provided order, which safely preserves
 /// scoped names such as `@scope/pkg` and glob patterns such as `@scope/*`.
-/// A missing file is created only for a non-empty list and when `dry_run` is disabled.
+/// A missing file is created only when something is written and `dry_run` is disabled.
 ///
 /// # Errors
 ///
@@ -251,6 +289,7 @@ pub(crate) fn set_yaml_block_list(
     path: &Utf8Path,
     key: &str,
     items: &[String],
+    empty: EmptyList,
     dry_run: bool,
 ) -> Result<bool> {
     let content = match std::fs::read_to_string(path) {
@@ -258,9 +297,12 @@ pub(crate) fn set_yaml_block_list(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(CoreError::Filesystem(format!("{path}: {error}"))),
     };
-    // An empty desired block means the key should be absent.
+    // An empty desired block means the key should be absent; `key: []` keeps it explicitly empty.
     let desired: Vec<String> = if items.is_empty() {
-        Vec::new()
+        match empty {
+            EmptyList::Remove => Vec::new(),
+            EmptyList::Explicit => vec![format!("{key}: []")],
+        }
     } else {
         std::iter::once(format!("{key}:"))
             .chain(
@@ -378,7 +420,7 @@ mod tests {
     use indoc::indoc;
 
     #[test]
-    fn minimum_age_exclusions_render_globs_then_exact_version_unions() -> eyre::Result<()> {
+    fn minimum_age_exclusions_render_globs_then_exact_version_unions() {
         let globs = vec!["z-*".to_string(), "@scope/*".to_string(), "z-*".to_string()];
         let versions = BTreeMap::from([
             (
@@ -393,15 +435,67 @@ mod tests {
             ("b".to_string(), BTreeSet::from(["3.0.0".to_string()])),
             ("empty".to_string(), BTreeSet::new()),
         ]);
+        let selectors = NativeSelectors::partition(&globs);
         assert_eq!(
-            minimum_age_exclusions(&globs, &versions)?,
+            minimum_age_exclusions(&selectors.written, &versions),
             ["@scope/*", "z-*", "a@1.2.2||2.0.1", "b@3.0.0"]
         );
         assert_eq!(
-            minimum_age_exclusions(&[], &BTreeMap::new())?,
+            minimum_age_exclusions(&[], &BTreeMap::new()),
             [] as [String; 0]
         );
-        Ok(())
+    }
+
+    /// Only selectors pnpm reads exactly as cooldown does are written; the others are returned
+    /// for reporting, both sorted and deduplicated.
+    #[test]
+    fn native_selectors_split_written_from_omitted() {
+        let selectors = [
+            "@types/{node,react}",
+            "*-plugin",
+            "**",
+            "JSONStream",
+            "*-plugin",
+            "react-?om",
+        ]
+        .map(String::from);
+        assert_eq!(
+            NativeSelectors::partition(&selectors),
+            NativeSelectors {
+                written: vec!["*-plugin".to_string(), "JSONStream".to_string()],
+                omitted: vec![
+                    "**".to_string(),
+                    "@types/{node,react}".to_string(),
+                    "react-?om".to_string(),
+                ],
+            }
+        );
+    }
+
+    /// An admitted exact version stays in the list unless a *written* selector covers its name
+    /// under pnpm's matcher: an omitted brace selector cooldown matches it with covers nothing on
+    /// pnpm's side, so dropping the union would leave the admitted version gated.
+    #[test]
+    fn an_exact_union_survives_a_selector_pnpm_cannot_read() {
+        let selectors = NativeSelectors::partition(&["@types/{node,react}".to_string()]);
+        let versions = BTreeMap::from([(
+            "@types/node".to_string(),
+            BTreeSet::from(["22.0.0".to_string()]),
+        )]);
+        let exclusions = minimum_age_exclusions(&selectors.written, &versions);
+        assert_eq!(exclusions, ["@types/node@22.0.0"]);
+        assert!(crate::exclusions::exempts(
+            &exclusions,
+            "@types/node",
+            "22.0.0"
+        ));
+
+        // A written wildcard that pnpm matches the name with still makes the union redundant.
+        let selectors = NativeSelectors::partition(&["@types/*".to_string()]);
+        assert_eq!(
+            minimum_age_exclusions(&selectors.written, &versions),
+            ["@types/*"]
+        );
     }
 
     #[test]
@@ -502,6 +596,7 @@ mod tests {
             &path,
             "minimumReleaseAgeExclude",
             &items,
+            EmptyList::Remove,
             false
         )?);
         let after = std::fs::read_to_string(&path)?;
@@ -520,6 +615,7 @@ mod tests {
             &path,
             "minimumReleaseAgeExclude",
             &items,
+            EmptyList::Remove,
             false
         )?);
 
@@ -529,6 +625,7 @@ mod tests {
             &path,
             "minimumReleaseAgeExclude",
             &fewer,
+            EmptyList::Remove,
             false
         )?);
         let updated = std::fs::read_to_string(&path)?;
@@ -543,6 +640,7 @@ mod tests {
             &path,
             "minimumReleaseAgeExclude",
             &[],
+            EmptyList::Remove,
             false
         )?);
         let removed = std::fs::read_to_string(&path)?;
@@ -556,8 +654,93 @@ mod tests {
             &path,
             "minimumReleaseAgeExclude",
             &[],
+            EmptyList::Remove,
             false
         )?);
+        Ok(())
+    }
+
+    /// An explicit empty list is written as `key: []`: it creates the key, replaces an existing
+    /// block, is idempotent, and reports without writing under `dry_run`.
+    #[test]
+    fn set_yaml_block_list_writes_an_explicit_empty_list() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("pnpm-workspace.yaml"))
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let key = "minimumReleaseAgeExclude";
+        std::fs::write(&path, "minimumReleaseAge: 20160\n")?;
+
+        // Absent key, dry run: the change is reported and nothing is written.
+        assert!(set_yaml_block_list(
+            &path,
+            key,
+            &[],
+            EmptyList::Explicit,
+            true
+        )?);
+        assert_eq!(
+            std::fs::read_to_string(&path)?,
+            "minimumReleaseAge: 20160\n"
+        );
+
+        // Absent key: the explicit empty sequence is appended.
+        assert!(set_yaml_block_list(
+            &path,
+            key,
+            &[],
+            EmptyList::Explicit,
+            false
+        )?);
+        assert_eq!(
+            std::fs::read_to_string(&path)?,
+            "minimumReleaseAge: 20160\nminimumReleaseAgeExclude: []\n"
+        );
+        assert_eq!(
+            NativeAge::read(&path)?.exclusions.into_vec(),
+            [] as [String; 0]
+        );
+
+        // Present and already empty: nothing changes.
+        assert!(!set_yaml_block_list(
+            &path,
+            key,
+            &[],
+            EmptyList::Explicit,
+            false
+        )?);
+
+        // An existing block is replaced in place, and an empty list again empties it.
+        assert!(set_yaml_block_list(
+            &path,
+            key,
+            &["a".to_string()],
+            EmptyList::Explicit,
+            false
+        )?);
+        assert!(set_yaml_block_list(
+            &path,
+            key,
+            &[],
+            EmptyList::Explicit,
+            false
+        )?);
+        assert_eq!(
+            std::fs::read_to_string(&path)?,
+            "minimumReleaseAge: 20160\nminimumReleaseAgeExclude: []\n"
+        );
+
+        // Removal still deletes the explicit empty sequence.
+        assert!(set_yaml_block_list(
+            &path,
+            key,
+            &[],
+            EmptyList::Remove,
+            false
+        )?);
+        assert_eq!(
+            std::fs::read_to_string(&path)?,
+            "minimumReleaseAge: 20160\n"
+        );
         Ok(())
     }
 
@@ -588,6 +771,7 @@ mod tests {
             &path,
             "minimumReleaseAgeExclude",
             &["a".to_string()],
+            EmptyList::Remove,
             false
         )?);
         let after = std::fs::read_to_string(&path)?;
@@ -626,6 +810,7 @@ mod tests {
             &path,
             "minimumReleaseAgeExclude",
             &["a".to_string()],
+            EmptyList::Remove,
             false
         )?);
         let after = std::fs::read_to_string(&path)?;
@@ -664,6 +849,7 @@ mod tests {
             &path,
             "minimumReleaseAgeExclude",
             &["a".to_string()],
+            EmptyList::Remove,
             false
         )?);
 
@@ -671,6 +857,7 @@ mod tests {
             &path,
             "minimumReleaseAgeExclude",
             &["b".to_string()],
+            EmptyList::Remove,
             false
         )?);
         let after = std::fs::read_to_string(&path)?;
@@ -708,6 +895,7 @@ mod tests {
             &path,
             "minimumReleaseAgeExclude",
             &[],
+            EmptyList::Remove,
             false
         )?);
         assert_eq!(

@@ -1449,6 +1449,8 @@ pub struct ResolvedPolicy {
     /// Package selector globs the policy exempts from the cooldown (cooldown.toml `latest`/`allow`),
     /// to bake into a native per-package exemption list (pnpm's `minimumReleaseAgeExclude`). Empty for
     /// tools without such a native knob, which simply ignore it.
+    /// An adapter writes only the selectors its native list reads exactly as cooldown does and
+    /// reports each other one as a warning on its [`SyncReport`].
     pub exempt_packages: Vec<String>,
     /// The effective window of every package a literal `package` selector names (see
     /// [`package_windows`](crate::package_windows)), to bake into a native per-package cutoff
@@ -1471,11 +1473,17 @@ pub enum SyncReport {
     Written {
         /// Path of the native config file that was written.
         path: camino::Utf8PathBuf,
+        /// Non-fatal diagnostics about policy the native config cannot carry, such as a selector
+        /// the native exemption list would read differently.
+        /// The caller attributes them to the tool and project.
+        warnings: Vec<crate::Diagnostic>,
     },
     /// The native config at `path` already matched the policy; nothing was rewritten.
     Unchanged {
         /// Path of the native config file that was already in sync.
         path: camino::Utf8PathBuf,
+        /// Non-fatal diagnostics, as for [`SyncReport::Written`].
+        warnings: Vec<crate::Diagnostic>,
     },
     /// Writing was deferred to an external `tool` rather than performed in-process.
     Deferred {

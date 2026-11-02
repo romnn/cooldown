@@ -1765,6 +1765,7 @@ pub(crate) mod tests {
             if self.repo_sync {
                 Ok(cooldown_core::SyncReport::Written {
                     path: repo_root.join("native.toml"),
+                    warnings: Vec::new(),
                 })
             } else {
                 Ok(cooldown_core::SyncReport::Unsupported)

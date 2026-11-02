@@ -1863,6 +1863,74 @@ fn sync_writes_minimum_release_age_exclude_for_latest_packages() {
     );
 }
 
+/// `sync` writes only the selectors pnpm's `minimumReleaseAgeExclude` matcher reads exactly as
+/// cooldown does.
+/// A brace selector, which pnpm would read as literal text exempting nothing, is left out and
+/// reported as a `stricter_native` warning attributed to the project, in the JSON envelope and
+/// in the text report alike.
+#[test]
+fn sync_reports_selectors_pnpm_would_match_differently() {
+    skip_if_missing!("pnpm");
+    let fixture = Fixture::new().tag_independent();
+    fixture.write(
+        "package.json",
+        "{\n  \"name\": \"cooldown-sync-fixture\",\n  \"version\": \"0.1.0\",\n  \"private\": true\n}\n",
+    );
+    fixture.write("pnpm-workspace.yaml", "packages: []\n");
+    fixture.write("pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+    fixture.write(
+        "cooldown.toml",
+        indoc::indoc! {r#"
+            min-age = "14d"
+
+            [package."*-plugin"]
+            latest = true
+
+            [package."@types/{node,react}"]
+            latest = true
+        "#},
+    );
+
+    let report = fixture.cooldown_json(&["sync", "--tool", "pnpm"]);
+    assert!(report.ok(), "sync should succeed: {report:?}");
+    assert_eq!(
+        report.warning_kinds(),
+        std::collections::BTreeSet::from(["stricter_native".to_string()]),
+        "{report:?}"
+    );
+    assert!(
+        report
+            .warning_messages()
+            .iter()
+            .any(|message| message.contains("`@types/{node,react}`")),
+        "the warning names the omitted selector: {report:?}"
+    );
+    assert_eq!(
+        report.warning_projects(),
+        std::collections::BTreeSet::from([".".to_string()]),
+        "{report:?}"
+    );
+
+    let yaml = String::from_utf8(fixture.read_bytes("pnpm-workspace.yaml")).expect("utf8");
+    assert!(
+        yaml.contains("minimumReleaseAgeExclude:\n  - \"*-plugin\"\n"),
+        "the pnpm-safe selector is written: {yaml}"
+    );
+    assert!(
+        !yaml.contains("{node,react}"),
+        "the brace selector is left out: {yaml}"
+    );
+
+    // The unchanged second sync reports the omission in the text report too.
+    let text = fixture.cooldown(&["sync", "--tool", "pnpm"]);
+    let output = format!("{}{}", text.stdout_str(), text.stderr_str());
+    assert!(
+        output.contains("1 unchanged")
+            && output.contains("warning [stricter_native]: selector `@types/{node,react}`"),
+        "the text report carries the warning: {output}"
+    );
+}
+
 /// The peer-hold fixture: `eslint` on an open v8 range while `@typescript-eslint/eslint-plugin`
 /// is exact-pinned to `6.21.0`, whose peer range `eslint: ^7.0.0 || ^8.0.0` excludes eslint 9.
 /// At `FREEZE` the eslint 9.x line has long matured, so a `--major` upgrade plans the cross-major
