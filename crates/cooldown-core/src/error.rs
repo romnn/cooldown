@@ -422,12 +422,28 @@ diagnostic_kinds! {
     /// Distinct from [`Held`](DiagnosticKind::Held): nothing was held back, a copy was added.
     /// `[tool.pnpm] single-copy` and `--fail-on-new-duplicate` turn the addition into a refusal.
     DuplicateCopy = "duplicate_copy",
-    /// A dependency of a workspace member the run excludes moved anyway: pnpm re-resolves the
-    /// named package in every importer whose range admits a newer version, whatever the update's
-    /// filter, so the excluded importer's copy followed within its own range. The move is
-    /// committed and reported, never rolled back — refusing it would let the excluded subtree veto
-    /// every shared upgrade. Nothing was held, so this is not a [`Held`](DiagnosticKind::Held)
-    /// diagnostic either.
+    /// A dependency of a workspace member the run excludes moved anyway, under a declaration that
+    /// did not change, while its manifest stayed untouched.
+    ///
+    /// The diagnostic records the movement, not its cause.
+    /// The mechanism observed with pnpm is cooldown's override repair, which runs when pnpm's
+    /// native age gate rejects the starting lock or the targeted update leaves the lock
+    /// inconsistent.
+    /// The repair re-resolves the whole workspace under temporary overrides for the planned
+    /// targets, keyed by each target's major line.
+    /// pnpm applies such an override to every declaration whose range intersects that key, an
+    /// excluded member's included, so a matching declaration can move to the planned target.
+    /// The override-free settlement and the settled-lock guards still decide what is committed: a
+    /// version the declared range provably excludes is refused, not reported.
+    /// The target can be older than the newest version the member's range admits.
+    ///
+    /// The move is committed and reported, never rolled back: refusing it would let the excluded
+    /// subtree veto every shared upgrade.
+    /// The message claims the move stayed within the declared range only when cooldown can prove
+    /// it.
+    /// An excluded member's exact manifest pin is still protected, so a repair that would move one
+    /// is refused instead.
+    /// Nothing was held, so this is not a [`Held`](DiagnosticKind::Held) diagnostic either.
     ExcludedMoved = "excluded_moved",
     /// The advisory feed could not be reached or its response could not be parsed.
     ///

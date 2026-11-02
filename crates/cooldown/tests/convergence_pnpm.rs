@@ -1934,42 +1934,64 @@ fn importer_version(lock: &[u8], importer: &str, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// A workspace whose excluded member `pkgs/a` pins `chalk` exactly in `devDependencies` beside the
-/// caret pnpm records, while the managed member `pkgs/b` declares `chalk` and `ansi-regex` at
-/// carets with matured in-range moves.
-/// `pkgs/b` also locks a TypeScript published after [`FREEZE`], so the windowed update refuses
-/// the starting lock and cooldown repairs through workspace-wide overrides, which reach every
-/// importer's `chalk`, the excluded pin's included.
-fn excluded_pin_fixture() -> eyre::Result<Fixture> {
+/// The excluded member of [`excluded_pin_fixture`]: `chalk` pinned exactly in `devDependencies`
+/// beside the caret pnpm records.
+const EXCLUDED_PINNED_PACKAGE_JSON: &str = indoc::indoc! {r#"
+    {
+      "name": "@cooldown/pinned",
+      "version": "0.1.0",
+      "dependencies": { "chalk": "^4.1.0" },
+      "devDependencies": { "chalk": "4.1.0" }
+    }
+"#};
+
+/// An excluded member that declares `chalk` only at the caret the managed member shares, so
+/// nothing but its range constrains its copy.
+#[cfg(unix)]
+const EXCLUDED_RANGE_PACKAGE_JSON: &str = indoc::indoc! {r#"
+    {
+      "name": "@cooldown/ranged",
+      "version": "0.1.0",
+      "dependencies": { "chalk": "^4.1.0" }
+    }
+"#};
+
+/// A workspace whose excluded member `pkgs/a` has `excluded_manifest`, while the managed member
+/// `pkgs/b` declares `chalk` and `ansi-regex` at carets with matured in-range moves.
+/// Both members start on `chalk@4.1.0`, and every locked version predates [`FREEZE`], so pnpm's
+/// native age gate admits the starting lock.
+fn excluded_member_fixture(excluded_manifest: &str) -> Fixture {
     let fixture = Fixture::new().tag_independent();
     fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
     fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
     fixture.write(".npmrc", NPMRC);
-    fixture.write(
-        "pkgs/a/package.json",
-        indoc::indoc! {r#"
-            {
-              "name": "@cooldown/pinned",
-              "version": "0.1.0",
-              "dependencies": { "chalk": "^4.1.0" },
-              "devDependencies": { "chalk": "4.1.0" }
-            }
-        "#},
-    );
-    let managed = |extra: &str| {
-        indoc::formatdoc! {r#"
-            {{
-              "name": "@cooldown/managed",
-              "version": "0.1.0",
-              "dependencies": {{ "chalk": "^4.1.0", "ansi-regex": "^5.0.0"{extra} }}
-            }}
-        "#}
-    };
-    fixture.write("pkgs/b/package.json", &managed(""));
-    seed_lock(&fixture, HIDDEN_PIN_SEED);
+    fixture.write("pkgs/a/package.json", excluded_manifest);
     fixture.write(
         "pkgs/b/package.json",
-        &managed(r#", "typescript": "^5.0.0""#),
+        &excluded_fixture_managed_manifest(""),
+    );
+    seed_lock(&fixture, HIDDEN_PIN_SEED);
+    fixture
+}
+
+/// The managed member of [`excluded_member_fixture`], with `extra` appended to its dependencies.
+fn excluded_fixture_managed_manifest(extra: &str) -> String {
+    indoc::formatdoc! {r#"
+        {{
+          "name": "@cooldown/managed",
+          "version": "0.1.0",
+          "dependencies": {{ "chalk": "^4.1.0", "ansi-regex": "^5.0.0"{extra} }}
+        }}
+    "#}
+}
+
+/// Adds a TypeScript published after [`FREEZE`] to the managed member of
+/// [`excluded_member_fixture`] and locks it, so pnpm's native age gate refuses the windowed update
+/// and cooldown repairs through workspace-wide overrides.
+fn lock_a_fresh_typescript(fixture: &Fixture) -> eyre::Result<()> {
+    fixture.write(
+        "pkgs/b/package.json",
+        &excluded_fixture_managed_manifest(r#", "typescript": "^5.0.0""#),
     );
     let seed_minutes = minimum_release_age_minutes(FREEZE_LATER).to_string();
     fixture
@@ -1984,6 +2006,18 @@ fn excluded_pin_fixture() -> eyre::Result<Fixture> {
             &[],
         )?
         .require_success()?;
+    Ok(())
+}
+
+/// A workspace whose excluded member `pkgs/a` pins `chalk` exactly in `devDependencies` beside the
+/// caret pnpm records, while the managed member `pkgs/b` declares `chalk` and `ansi-regex` at
+/// carets with matured in-range moves.
+/// `pkgs/b` also locks a TypeScript published after [`FREEZE`], so the windowed update refuses
+/// the starting lock and cooldown repairs through workspace-wide overrides, which reach every
+/// importer's `chalk`, the excluded pin's included.
+fn excluded_pin_fixture() -> eyre::Result<Fixture> {
+    let fixture = excluded_member_fixture(EXCLUDED_PINNED_PACKAGE_JSON);
+    lock_a_fresh_typescript(&fixture)?;
     Ok(fixture)
 }
 
@@ -2051,6 +2085,312 @@ fn upgrade_refuses_a_resolve_that_moves_an_excluded_members_exact_pin() -> eyre:
         "the unrelated sibling lands"
     );
     assert_eq!(fixture.read_bytes("pkgs/a/package.json"), pinned_manifest);
+    Ok(())
+}
+
+/// A logging `pnpm` for `COOLDOWN_PNPM`: it records each invocation cooldown makes, then runs the
+/// real pnpm with the same arguments and hands back its output and exit code.
+///
+/// The record is what proves which path moved a copy: a final lock looks the same whether the
+/// filtered update or the override repair produced it.
+/// A pnpm killed by a signal comes back as the shell's numeric exit code (128 plus the signal), so
+/// the wrapper is no evidence for how cooldown classifies a terminated tool.
+#[cfg(unix)]
+struct LoggedPnpm {
+    dir: tempfile::TempDir,
+}
+
+/// One pnpm invocation as [`LoggedPnpm`] recorded it.
+#[cfg(unix)]
+#[derive(Debug)]
+struct Invocation {
+    args: String,
+    /// Whether `pnpm-workspace.yaml` carried an `overrides:` key when pnpm started.
+    overrides: bool,
+    /// Whether pnpm's output carried its minimum-release-age rejection code.
+    age_rejected: bool,
+    exit_code: i32,
+}
+
+#[cfg(unix)]
+impl Invocation {
+    fn succeeded(&self) -> bool {
+        self.exit_code == 0
+    }
+}
+
+/// The [`LoggedPnpm`] script.
+/// It buffers each invocation's output in fresh temp files, so concurrent invocations cannot
+/// interleave, and writes the log line once pnpm has exited.
+#[cfg(unix)]
+const LOGGED_PNPM_SCRIPT: &str = indoc::indoc! {r#"
+    #!/bin/sh
+    here=$(dirname "$0")
+    real=$(cat "$here/real-pnpm")
+    overrides=no
+    if grep -qs '^overrides:' pnpm-workspace.yaml; then overrides=yes; fi
+    out=$(mktemp)
+    err=$(mktemp)
+    "$real" "$@" >"$out" 2>"$err"
+    status=$?
+    age=no
+    if grep -qs 'ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION' "$out" "$err"; then age=yes; fi
+    cat "$out"
+    cat "$err" >&2
+    rm -f "$out" "$err"
+    printf '%s\t%s\t%s\t%s\n' "$overrides" "$age" "$status" "$*" >> "$here/invocations.log"
+    exit "$status"
+"#};
+
+#[cfg(unix)]
+impl LoggedPnpm {
+    fn new() -> eyre::Result<Self> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir()?;
+        let real = cooldown_adapter_util::resolve_program("pnpm");
+        // The script reads every path from beside itself rather than having one spliced into its
+        // source, so no character in a path can break its quoting.
+        std::fs::write(
+            dir.path().join("real-pnpm"),
+            real.as_os_str().as_encoded_bytes(),
+        )?;
+        let script = dir.path().join("pnpm");
+        std::fs::write(&script, LOGGED_PNPM_SCRIPT)?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        Ok(LoggedPnpm { dir })
+    }
+
+    fn path(&self) -> String {
+        self.dir.path().join("pnpm").display().to_string()
+    }
+
+    /// The recorded invocations in completion order, configuration queries left out.
+    fn invocations(&self) -> eyre::Result<Vec<Invocation>> {
+        let text = std::fs::read_to_string(self.dir.path().join("invocations.log"))?;
+        let invocations = text
+            .lines()
+            .map(|line| {
+                let mut fields = line.splitn(4, '\t');
+                let (Some(overrides), Some(age_rejected), Some(exit_code), Some(args)) =
+                    (fields.next(), fields.next(), fields.next(), fields.next())
+                else {
+                    eyre::bail!("malformed invocation record: {line}");
+                };
+                Ok(Invocation {
+                    args: args.to_string(),
+                    overrides: overrides == "yes",
+                    age_rejected: age_rejected == "yes",
+                    exit_code: exit_code.parse()?,
+                })
+            })
+            .collect::<eyre::Result<Vec<_>>>()?;
+        Ok(invocations
+            .into_iter()
+            .filter(|invocation| !invocation.args.starts_with("config "))
+            .collect())
+    }
+}
+
+/// The `upgrade` both excluded-move cases run: `chalk` only, with `pkgs/a` excluded.
+#[cfg(unix)]
+const EXCLUDED_CHALK_UPGRADE: &[&str] = &[
+    "upgrade",
+    "--exclude-folders",
+    "pkgs/a",
+    "--package",
+    "chalk",
+    "--freeze",
+    FREEZE,
+];
+
+/// The control for the repair case below: with an age-valid starting lock the filtered update
+/// succeeds, moves only the importer it selects, and no repair runs, so the excluded member's
+/// range-only copy stays at 4.1.0 and nothing reports an excluded move.
+///
+/// This pins down this fixture's behavior under the pinned pnpm, not a promise that a filtered
+/// update can never touch another importer's lock entries.
+#[cfg(unix)]
+#[test]
+fn a_filtered_update_leaves_an_excluded_members_range_only_copy_in_place() -> eyre::Result<()> {
+    skip_if_missing!("pnpm", Ok(()));
+    let fixture = excluded_member_fixture(EXCLUDED_RANGE_PACKAGE_JSON);
+    let pnpm = LoggedPnpm::new()?;
+    let excluded_manifest = fixture.read_bytes("pkgs/a/package.json");
+    let seed = fixture.read_bytes("pnpm-lock.yaml");
+    for importer in ["pkgs/a", "pkgs/b"] {
+        assert_eq!(
+            importer_version(&seed, importer, "chalk").as_deref(),
+            Some("4.1.0"),
+            "{importer} starts on 4.1.0"
+        );
+    }
+
+    let upgrade =
+        fixture.cooldown_json_env(EXCLUDED_CHALK_UPGRADE, &[("COOLDOWN_PNPM", &pnpm.path())]);
+
+    // The executed path: one successful update filtered to the managed member, and no repair.
+    let invocations = pnpm.invocations()?;
+    let updates: Vec<&Invocation> = invocations
+        .iter()
+        .filter(|invocation| invocation.args.contains(" update "))
+        .collect();
+    let [update] = updates.as_slice() else {
+        eyre::bail!("one filtered update: {invocations:#?}");
+    };
+    assert!(update.succeeded() && !update.age_rejected, "{update:?}");
+    assert!(update.args.contains("--filter ./pkgs/b"), "{update:?}");
+    assert!(!update.args.contains("pkgs/a"), "{update:?}");
+    assert!(
+        invocations
+            .iter()
+            .all(|invocation| !invocation.args.contains("--resolution-only")),
+        "{invocations:#?}"
+    );
+
+    // The managed member lands while the excluded copy keeps its version unreported.
+    assert!(upgrade.ok(), "{upgrade:#?}");
+    assert_eq!(
+        upgrade.applied_names(),
+        std::collections::BTreeSet::from(["chalk".to_string()]),
+        "{upgrade:#?}"
+    );
+    let Some(ChangeVersions { from, to: target }) = upgrade.applied_change_for("chalk") else {
+        eyre::bail!("chalk is applied with its versions: {upgrade:#?}");
+    };
+    assert_eq!(from, "4.1.0", "{upgrade:#?}");
+    let settled = fixture.read_bytes("pnpm-lock.yaml");
+    assert_eq!(
+        importer_version(&settled, "pkgs/b", "chalk"),
+        Some(target),
+        "the managed member takes the target"
+    );
+    assert_eq!(
+        importer_version(&settled, "pkgs/a", "chalk").as_deref(),
+        Some("4.1.0"),
+        "the excluded member keeps its copy"
+    );
+    assert!(
+        upgrade.warnings_of_kind("excluded_moved").is_empty(),
+        "{upgrade:#?}"
+    );
+    assert_eq!(fixture.read_bytes("pkgs/a/package.json"), excluded_manifest);
+    Ok(())
+}
+
+/// The path that moves an excluded member's copy is cooldown's override repair, not the filtered
+/// update.
+/// A too-fresh TypeScript makes pnpm's native age gate refuse the windowed update, so cooldown
+/// re-resolves the whole workspace under a temporary `chalk@^4.0.0` override that also matches the
+/// excluded member's `^4.1.0`.
+/// That range-only copy follows to the target under one `excluded_moved` warning naming it, with
+/// its manifest untouched, and a second run neither moves it again nor repeats the warning.
+#[cfg(unix)]
+#[test]
+fn the_override_repair_moves_an_excluded_members_range_only_copy_with_a_warning() -> eyre::Result<()>
+{
+    skip_if_missing!("pnpm", Ok(()));
+    let fixture = excluded_member_fixture(EXCLUDED_RANGE_PACKAGE_JSON);
+    lock_a_fresh_typescript(&fixture)?;
+    let pnpm = LoggedPnpm::new()?;
+    let excluded_manifest = fixture.read_bytes("pkgs/a/package.json");
+    let seed = fixture.read_bytes("pnpm-lock.yaml");
+    for importer in ["pkgs/a", "pkgs/b"] {
+        assert_eq!(
+            importer_version(&seed, importer, "chalk").as_deref(),
+            Some("4.1.0"),
+            "{importer} starts on 4.1.0"
+        );
+    }
+
+    let upgrade =
+        fixture.cooldown_json_env(EXCLUDED_CHALK_UPGRADE, &[("COOLDOWN_PNPM", &pnpm.path())]);
+
+    // The executed path: the filtered update is refused by the age gate, then the repair's
+    // resolution-only install runs under the temporary overrides and its settlement without them.
+    let invocations = pnpm.invocations()?;
+    let Some((update_at, update)) = invocations
+        .iter()
+        .enumerate()
+        .find(|(_, invocation)| invocation.args.contains(" update "))
+    else {
+        eyre::bail!("an update: {invocations:#?}");
+    };
+    let Some((repair_at, repair)) = invocations
+        .iter()
+        .enumerate()
+        .find(|(_, invocation)| invocation.args.contains("--resolution-only"))
+    else {
+        eyre::bail!("a resolution-only repair: {invocations:#?}");
+    };
+    let Some(settlement) = invocations.iter().skip(repair_at + 1).find(|invocation| {
+        invocation.args.starts_with("install ") && invocation.args.contains("--trust-lockfile")
+    }) else {
+        eyre::bail!("a settlement after the repair: {invocations:#?}");
+    };
+    assert!(update_at < repair_at, "{invocations:#?}");
+    assert!(update.args.contains("--filter ./pkgs/b"), "{update:?}");
+    assert!(!update.args.contains("pkgs/a"), "{update:?}");
+    assert!(
+        !update.succeeded() && update.age_rejected,
+        "the native age gate refuses the windowed update: {update:?}"
+    );
+    assert!(
+        repair.succeeded() && repair.overrides,
+        "the repair resolves under the temporary overrides: {repair:?}"
+    );
+    assert!(
+        settlement.succeeded() && !settlement.overrides,
+        "the settlement sees the restored configuration: {settlement:?}"
+    );
+
+    // Both copies land on the target, the excluded one reported once under its importer.
+    assert!(upgrade.ok(), "{upgrade:#?}");
+    assert_eq!(
+        upgrade.applied_names(),
+        std::collections::BTreeSet::from(["chalk".to_string()]),
+        "{upgrade:#?}"
+    );
+    let Some(ChangeVersions { from, to: target }) = upgrade.applied_change_for("chalk") else {
+        eyre::bail!("chalk is applied with its versions: {upgrade:#?}");
+    };
+    assert_eq!(from, "4.1.0", "{upgrade:#?}");
+    let settled = fixture.read_bytes("pnpm-lock.yaml");
+    for importer in ["pkgs/a", "pkgs/b"] {
+        assert_eq!(
+            importer_version(&settled, importer, "chalk"),
+            Some(target.clone()),
+            "{importer} takes the target"
+        );
+    }
+    let excluded_moves = upgrade.warnings_of_kind("excluded_moved");
+    let [moved] = excluded_moves.as_slice() else {
+        eyre::bail!("one excluded move: {upgrade:#?}");
+    };
+    assert_eq!(moved.package.as_deref(), Some("chalk"), "{moved:?}");
+    assert!(
+        moved
+            .message
+            .contains(&format!("chalk in pkgs/a (4.1.0 → {target})")),
+        "{moved:?}"
+    );
+
+    // The exclusion is honored where cooldown writes: no excluded manifest edit, and no temporary
+    // override left in the workspace configuration.
+    assert_eq!(fixture.read_bytes("pkgs/a/package.json"), excluded_manifest);
+    let workspace =
+        String::from_utf8_lossy(&fixture.read_bytes("pnpm-workspace.yaml")).into_owned();
+    assert!(!workspace.contains("overrides:"), "{workspace}");
+
+    // A second run finds nothing to move and leaves the lock byte-identical.
+    let again =
+        fixture.cooldown_json_env(EXCLUDED_CHALK_UPGRADE, &[("COOLDOWN_PNPM", &pnpm.path())]);
+    assert!(again.ok(), "{again:#?}");
+    assert!(again.applied_names().is_empty(), "{again:#?}");
+    assert!(
+        again.warnings_of_kind("excluded_moved").is_empty(),
+        "{again:#?}"
+    );
+    assert_eq!(fixture.read_bytes("pnpm-lock.yaml"), settled);
     Ok(())
 }
 
