@@ -254,11 +254,20 @@ When `upgrade` holds a cross-major update back, it explains the required action:
   the moving package) never moves in a run, and cooldown never rewrites its published contract, so
   editing its own `peerDependencies` range is what lifts that hold. Such a hold applies to
   same-major moves too, since a narrow author-written bound can exclude a patch bump. There is
-  deliberately no flag to force the break. A `peer_held` run does not fall back to the newest in-range release in the
-  same pass; a run without `--major` picks that up.
+  deliberately no flag to force the break.
 
 Only a matured release beyond the hold is reported. A fresh release still in cooldown does not
 produce an action that cannot yet be taken. Suppress command tips with `--no-suggestions`.
+
+On the npm family, a held cross-major target does not cost the move on the current line. When the
+planned major is held or rejected (`peer_held`, `multi_version_held`, a resolver conflict, a
+transitive it would drag into cooldown), `upgrade --major` still tries the newest matured release
+on the current major line in the same run, the release `--no-major` would take. That move is
+reported as its own applied row beside the held major row, which keeps its reason, and
+`outdated --major` reports the major `blocked`. A package held as `not_eligible` has no editable
+requirement to move, so it is not retried. The retry is bounded and best effort: one attempt with
+every such in-line move on top of what already landed, then one per package when there are
+several. Nothing that already landed is traded away for it.
 
 ## Projects that resolve against each other
 

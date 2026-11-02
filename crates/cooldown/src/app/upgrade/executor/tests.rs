@@ -1,5 +1,6 @@
 use super::planning::{
-    effective_hold, lower_adoptable_targets, plan_baseline_violations, target_package,
+    current_line_target, effective_hold, lower_adoptable_targets, plan_baseline_violations,
+    target_package,
 };
 use super::{
     BatchOutcome, CommittedBatch, PlanMode, TrialRollback, candidate_scope, collapse_applied_legs,
@@ -19,6 +20,7 @@ use cooldown_core::{
 use std::collections::HashSet;
 
 mod cargo_trials;
+mod node_trials;
 
 #[test]
 fn upgrade_walks_the_graph_unless_transitive_hidden() {
@@ -313,6 +315,91 @@ fn fallback_targets_are_adoptable_on_the_selected_line_and_bounded() -> eyre::Re
     // A target with no lower candidate on its own line has no fallback.
     let targets = lower_adoptable_targets(&releases, &verdict, &Version::new("3.0.0"));
     assert!(targets.is_empty());
+    Ok(())
+}
+
+/// The current-line alternative is the highest adoptable or exempt release on the current
+/// version's line, and exists only for a target on another line.
+#[test]
+fn current_line_target_is_the_highest_adoptable_release_on_the_current_line() -> eyre::Result<()> {
+    let dependency = dep("runtime", "1.0.0");
+    let mut releases = vec![
+        rel("1.0.0", 0),
+        rel("1.1.0", 1),
+        rel("1.2.0", 2),
+        rel("1.3.0", 3),
+        rel("2.0.0", 4),
+        rel("2.1.0", 5),
+    ];
+    for release in &mut releases {
+        release.major = MajorKey(release.major_number.unwrap_or_default().to_string());
+        release.kind_from_current = Some(UpdateKind::Minor);
+        release.published_at = Some("2026-09-01T00:00:00Z".parse()?);
+        // The newest in-line release is still cooling and 1.2.0's age is unknown, so neither
+        // is adoptable.
+        if release.version.as_str() == "1.3.0" {
+            release.published_at = Some("2026-10-08T00:00:00Z".parse()?);
+        }
+        if release.version.as_str() == "1.2.0" {
+            release.published_at = None;
+        }
+    }
+    let evaluate = |releases: &[Release]| -> eyre::Result<cooldown_core::Verdict> {
+        Ok(cooldown_core::evaluate(
+            &dependency,
+            releases,
+            &[cooldown_core::config::builtin_default_layer()],
+            &cooldown_core::ResolveContext {
+                tool: ToolId("mock"),
+                project: camino::Utf8Path::new("."),
+                allow_major: true,
+                honor_declared_bounds: false,
+                honor_latest_tag: false,
+            },
+            "2026-10-09T00:00:00Z".parse()?,
+        ))
+    };
+    let verdict = evaluate(&releases)?;
+    let target_of = |from: &str, target: &str| {
+        current_line_target(
+            &releases,
+            &verdict,
+            &Version::new(from),
+            &Version::new(target),
+        )
+        .map(|candidate| candidate.version.as_str().to_string())
+    };
+
+    // A cross-major target falls back to the highest matured 1.x release, past cooling and
+    // unknown-age ones.
+    assert_eq!(target_of("1.0.0", "2.1.0").as_deref(), Some("1.1.0"));
+    // A same-line target has none, since lower targets are the lower-line strategy's concern.
+    assert_eq!(target_of("1.0.0", "1.1.0"), None);
+    // Unknown endpoints cannot prove which line they sit on.
+    assert_eq!(target_of("1.0.0", "missing"), None);
+    assert_eq!(target_of("0.1.0", "2.1.0"), None);
+
+    // No matured in-line release leaves the cross-major target without an alternative.
+    releases.retain(|release| release.version.as_str() != "1.1.0");
+    let verdict = evaluate(&releases)?;
+    assert!(
+        current_line_target(
+            &releases,
+            &verdict,
+            &Version::new("1.0.0"),
+            &Version::new("2.1.0"),
+        )
+        .is_none()
+    );
+    // The lower-line strategy is unaffected: it still walks down the selected 2.x line.
+    let lower = lower_adoptable_targets(&releases, &verdict, &Version::new("2.1.0"));
+    assert_eq!(
+        lower
+            .iter()
+            .map(|candidate| candidate.version.as_str())
+            .collect::<Vec<_>>(),
+        ["2.0.0"]
+    );
     Ok(())
 }
 

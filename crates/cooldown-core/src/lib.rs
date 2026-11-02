@@ -45,6 +45,6 @@ pub use ports::{
     Capabilities, Clock, IsolatedMutation, IsolatedMutationProject, IsolatedMutationStrategy,
     MutationExecution, MutationRecovery, NativePolicyLayer, NativeRule, PackageRegistry,
     PreparedMutation, RawArtifact, RawRelease, RawWindow, RecoveryDisposition, ReleaseFetcher,
-    ResolveInputs, ResolvedPolicy, SyncReport, SyncScope, Tool, ToolRead, ToolWrite,
-    debug_assert_sorted, normalize_native,
+    ResolveInputs, ResolvedPolicy, SyncReport, SyncScope, TargetFallback, Tool, ToolRead,
+    ToolWrite, debug_assert_sorted, normalize_native,
 };

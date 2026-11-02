@@ -9,8 +9,9 @@ use self::batch::{
 };
 pub(crate) use self::planning::target_package_for;
 use self::planning::{
-    EffectiveHold, candidate_scope, dep_resolve_ctx, effective_hold, fix_change, is_downgrade,
-    lower_adoptable_targets, plan_baseline_violations, sort_planned_changes,
+    EffectiveHold, candidate_scope, current_line_target, dep_resolve_ctx, effective_hold,
+    fix_change, is_downgrade, lower_adoptable_targets, plan_baseline_violations,
+    sort_planned_changes,
 };
 use self::report::{collapse_applied_legs, combine_lock_status, conflict_skip_message, plan_item};
 use self::transitive_gate::{
@@ -32,8 +33,8 @@ use cooldown_core::{
     ApplyReport, BaselineViolation, CeilingReason, Change, DepScope, Dependency, Diagnostic,
     DiagnosticKind, FixVerdict, LockStatus, MemberRef, PackageId, Plan, ProjectMutationJournal,
     ProjectMutationState, Release, ResolveContext, RewriteMode, SkipReason, Skipped, Status,
-    UpdateKind, Version, check_pin_advised, evaluate_advised, evaluate_ceiling_hold_advised,
-    evaluate_fix_advised,
+    TargetFallback, UpdateKind, Version, check_pin_advised, evaluate_advised,
+    evaluate_ceiling_hold_advised, evaluate_fix_advised,
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
@@ -356,7 +357,13 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     /// copies of one package can converge on the same target while an advisory affects only one
     /// copy's current version, and only that copy's row is security-relevant.
     security_by_change: HashMap<ChangeProvenanceKey, crate::app::SecurityInfo>,
-    /// Older targets reuse the original planning evidence across isolation and replay trials.
+    /// The alternative targets of each planned change, in retry order, as the writer's
+    /// [`TargetFallback`] selects them.
+    ///
+    /// Alternatives reuse the original planning evidence across isolation and replay trials.
+    /// Current-line alternatives are only ever read from here: they come from the pre-lock graph
+    /// (the planner's, or [`prepare_current_line_fallbacks`](Self::prepare_current_line_fallbacks)
+    /// for preselected targets), never from a trial that already moved the graph.
     fallback_changes: HashMap<ChangeProvenanceKey, Vec<Change>>,
     /// The advisory relevance of locked pins, keyed by `(name, version, registry)`, captured on
     /// every residual-gate pass ([`graph_violations`](Self::graph_violations)).
@@ -884,6 +891,16 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         lock_changes: Vec<Change>,
         state: &mut TrialState,
     ) -> MutationFlow {
+        // Only a `--major` run plans a cross-major target, so only one can have a current-line
+        // alternative to prepare.
+        if self.ctx.writer.target_fallback() == TargetFallback::CurrentLine
+            && self.ctx.opts.allow_major
+            && let Err(error) = self.prepare_current_line_fallbacks(&lock_changes).await
+        {
+            let mut outcome = BatchOutcome::default();
+            outcome.errors.push(*error);
+            return self.merge_batch_outcome(outcome);
+        }
         let baseline_before_lock = state.clone();
         let mut rollback = TrialRollback::default();
         let initial = self
@@ -989,8 +1006,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             })
             .cloned()
             .collect();
-        if self.ctx.writer.supports_target_fallback() && !held.is_empty() {
-            let rejected = held
+        let fallback = self.ctx.writer.target_fallback();
+        if fallback != TargetFallback::None && !held.is_empty() {
+            let rejected: Vec<_> = held
                 .into_iter()
                 .map(|change| RejectedUpgrade {
                     skipped: held_upgrade_info(&change, &outcomes),
@@ -998,6 +1016,17 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     residual: Vec::new(),
                 })
                 .collect();
+            // Without a current-line alternative to try, the settled trial already is the
+            // outcome: committing it unchanged keeps every row, strict verdict, and resolver run
+            // exactly as a writer without fallback would produce them.
+            if fallback == TargetFallback::CurrentLine
+                && self.current_line_alternatives(&rejected).is_empty()
+            {
+                self.ctx.progress.candidates_decided(&lock_changes);
+                let flow = self.merge_batch_outcomes(outcomes);
+                self.collapse_collateral(&baseline.baseline_violations);
+                return flow;
+            }
             let mut outcome = BatchOutcome::default();
             if !self.restore_upgrade_trial(rollback, baseline, state, &mut outcome) {
                 return self.merge_batch_outcome(outcome);
@@ -1183,6 +1212,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// replay normally settles too. A replay that blocks or loses an accepted target (the registry
     /// moved between trials) fails closed: the baseline is restored and the accepted candidates report as held rather
     /// than committing a lock no trial verified.
+    ///
+    /// A rejected candidate is reported held only while its own target stays unlanded: one the
+    /// committed replay verifiably moved onto that target, from the same version and in every
+    /// member that declares it, reports only its applied row (see [`landed_as_collateral`]).
     async fn replay_selected_upgrade_changes(
         &mut self,
         accepted: Vec<Change>,
@@ -1221,6 +1254,15 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     return ControlFlow::Continue(());
                 }
                 self.ctx.progress.candidates_decided(&accepted);
+                // A retried sibling can float a rejected candidate onto its own target as
+                // collateral; the replay's committed rows then report it applied, and a held row
+                // for the same move would contradict them.
+                let rejected: Vec<_> = rejected
+                    .into_iter()
+                    .filter(|item| {
+                        !landed_as_collateral(&item.change, &outcomes, &self.last_gate_graph)
+                    })
+                    .collect();
                 if let ControlFlow::Break(conflict) = self.merge_batch_outcomes(outcomes) {
                     return ControlFlow::Break(conflict);
                 }
@@ -1268,7 +1310,33 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .await
     }
 
+    /// Retries the rejected candidates' alternative targets on top of the accepted set, as the
+    /// writer's [`TargetFallback`] selects them.
+    ///
+    /// Every trial starts from the restored pre-lock baseline and keeps every accepted target,
+    /// so a fallback can only add to what lands.
     async fn select_upgrade_fallbacks(
+        &mut self,
+        accepted: Vec<Change>,
+        rejected: Vec<RejectedUpgrade>,
+        baseline: &TrialState,
+        state: &mut TrialState,
+        rollback: &mut TrialRollback,
+    ) -> UpgradeSelectionResult {
+        match self.ctx.writer.target_fallback() {
+            TargetFallback::None => UpgradeSelectionResult::Selected { accepted, rejected },
+            TargetFallback::LowerOnSelectedLine => {
+                self.select_lower_line_fallbacks(accepted, rejected, baseline, state, rollback)
+                    .await
+            }
+            TargetFallback::CurrentLine => {
+                self.select_current_line_fallbacks(accepted, rejected, baseline, state, rollback)
+                    .await
+            }
+        }
+    }
+
+    async fn select_lower_line_fallbacks(
         &mut self,
         mut accepted: Vec<Change>,
         mut rejected: Vec<RejectedUpgrade>,
@@ -1276,7 +1344,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         state: &mut TrialState,
         rollback: &mut TrialRollback,
     ) -> UpgradeSelectionResult {
-        if !self.ctx.writer.supports_target_fallback() || rejected.is_empty() {
+        if rejected.is_empty() {
             return UpgradeSelectionResult::Selected { accepted, rejected };
         }
         let candidates = match self
@@ -1378,6 +1446,111 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         UpgradeSelectionResult::Selected { accepted, rejected }
     }
 
+    /// Retries the current-line alternatives of rejected cross-major candidates on top of the
+    /// accepted set: once jointly, so coupled in-line moves land together, then each alone when
+    /// there are several, so one that cannot land does not sink the rest.
+    ///
+    /// That bounds the selection at `1 + R` trials for `R` rejected candidates with an
+    /// alternative; the final replay of the accepted set is one more.
+    /// A rejected original stays in `rejected` even when its alternative lands, so the report
+    /// keeps the major target held with its original reason beside the applied in-line row.
+    /// A rejected candidate without an alternative is never re-pushed: retrying a target the
+    /// resolver already refused could only fail the trial its siblings depend on.
+    async fn select_current_line_fallbacks(
+        &mut self,
+        mut accepted: Vec<Change>,
+        rejected: Vec<RejectedUpgrade>,
+        baseline: &TrialState,
+        state: &mut TrialState,
+        rollback: &mut TrialRollback,
+    ) -> UpgradeSelectionResult {
+        let alternatives = self.current_line_alternatives(&rejected);
+        let passes = std::iter::once(None).chain(
+            (alternatives.len() > 1)
+                .then_some(0..alternatives.len())
+                .into_iter()
+                .flatten()
+                .map(Some),
+        );
+        for individual in passes {
+            let mut retry = accepted.clone();
+            retry.extend(
+                alternatives
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| individual.is_none_or(|selected| selected == *index))
+                    .map(|(_, alternative)| alternative)
+                    .filter(|alternative| !contains_upgrade(&accepted, alternative))
+                    .cloned(),
+            );
+            if retry.len() == accepted.len() {
+                continue;
+            }
+            let result = self
+                .try_upgrade_group_once(
+                    retry.clone(),
+                    &baseline.baseline_violations,
+                    state,
+                    rollback,
+                )
+                .await;
+            let mut improved = None;
+            match result {
+                UpgradeTrialResult::Settled(outcomes) => {
+                    let landed = landed_upgrade_changes(&retry, &outcomes, &self.last_gate_graph);
+                    if accepted
+                        .iter()
+                        .all(|change| contains_upgrade(&landed, change))
+                        && landed.len() > accepted.len()
+                    {
+                        improved = Some(landed);
+                    }
+                }
+                UpgradeTrialResult::PolicyBlocked(_) => {}
+                UpgradeTrialResult::Aborted(outcomes) => {
+                    let outcome = self.settle_aborted_trial(rollback, baseline, state, outcomes);
+                    return UpgradeSelectionResult::Aborted { outcome, rejected };
+                }
+            }
+            let mut outcome = BatchOutcome::default();
+            if !self.restore_upgrade_trial(rollback, baseline, state, &mut outcome) {
+                return UpgradeSelectionResult::Aborted { outcome, rejected };
+            }
+            if let Some(landed) = improved {
+                accepted = landed;
+            }
+            if alternatives
+                .iter()
+                .all(|alternative| contains_upgrade(&accepted, alternative))
+            {
+                break;
+            }
+        }
+        UpgradeSelectionResult::Selected { accepted, rejected }
+    }
+
+    /// The current-line alternative of each rejected candidate that has one, from the baseline
+    /// evidence cached before the first trial.
+    ///
+    /// A candidate held as not eligible has none: the missing editable requirement (a catalog
+    /// pin, a transitive-only dependency) holds every target alike.
+    fn current_line_alternatives(&self, rejected: &[RejectedUpgrade]) -> Vec<Change> {
+        rejected
+            .iter()
+            .filter(|item| {
+                item.skipped
+                    .as_ref()
+                    .is_none_or(|skipped| skipped.reason != SkipReason::NotEligible)
+            })
+            .filter_map(|item| {
+                self.fallback_changes
+                    .get(&change_provenance_key(&item.change))
+                    .and_then(|alternatives| alternatives.first())
+            })
+            .cloned()
+            .collect()
+    }
+
     async fn fallback_candidates(
         &mut self,
         changes: Vec<Change>,
@@ -1473,25 +1646,103 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             return Ok(Vec::new());
         };
         let releases = fetched.result?;
-        let advisories = self.advisories.clone();
-        let advised = advisories
+        let verdict = self.fallback_verdict(&dep, &releases);
+        self.remember_upgrade_fallbacks(change, &releases, &verdict);
+        Ok(self.fallback_changes.get(&key).cloned().unwrap_or_default())
+    }
+
+    /// Caches the current-line alternatives of preselected targets the forward planner never
+    /// evaluated, before the first trial moves the graph.
+    ///
+    /// A trial can move a held candidate collaterally, so evidence read after it would no longer
+    /// find the version the candidate moves from; reading the pre-lock graph here keeps a policy
+    /// preview selecting exactly the alternatives a planned run does.
+    /// Changes the planner already evaluated are served from the cache without any read.
+    async fn prepare_current_line_fallbacks(
+        &mut self,
+        changes: &[Change],
+    ) -> Result<(), Box<Diagnostic>> {
+        let pending: Vec<&Change> = changes
+            .iter()
+            .filter(|change| {
+                !self
+                    .fallback_changes
+                    .contains_key(&change_provenance_key(change))
+            })
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let deps = self
+            .read_reconcile_deps()
+            .await
+            .map_err(|err| Box::new(self.project_diag(&err, None)))?;
+        let mut evaluated: Vec<Dependency> = Vec::new();
+        for change in &pending {
+            let Some(dep) = deps
+                .iter()
+                .find(|dep| dep.package == change.package && dep.current == change.from)
+            else {
+                self.fallback_changes
+                    .insert(change_provenance_key(change), Vec::new());
+                continue;
+            };
+            if !evaluated
+                .iter()
+                .any(|seen| seen.package == dep.package && seen.current == dep.current)
+            {
+                evaluated.push(dep.clone());
+            }
+        }
+        let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
+        let fetched = self
+            .ws
+            .fetch_candidate_releases(
+                self.ctx.reader,
+                evaluated,
+                &fctx,
+                self.ctx.opts.candidate_scope(),
+                self.ctx.progress,
+                self.ctx.opts.fanout(),
+            )
+            .await;
+        for FetchedRelease {
+            dependency: dep,
+            result,
+        } in fetched
+        {
+            let releases =
+                result.map_err(|err| Box::new(self.project_diag(&err, Some(&dep.package.name))))?;
+            let verdict = self.fallback_verdict(&dep, &releases);
+            for change in &pending {
+                if change.package == dep.package && change.from == dep.current {
+                    self.remember_upgrade_fallbacks(change, &releases, &verdict);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Judges `dep`'s candidates exactly as the forward planner does, with the run's advisory
+    /// snapshot, so a fallback alternative is a target planning would have admitted.
+    fn fallback_verdict(&self, dep: &Dependency, releases: &[Release]) -> cooldown_core::Verdict {
+        let advised = self
+            .advisories
             .as_ref()
-            .and_then(|project| project.classify(self.ctx.reader, &dep, &releases));
+            .and_then(|project| project.classify(self.ctx.reader, dep, releases));
         let advisory_ctx = advised.as_ref().map(ClassifiedAdvisories::context);
         let rctx = ResolveContext {
             honor_declared_bounds: self.ctx.opts.rewrite == RewriteMode::Auto,
             ..Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts)
         };
-        let verdict = evaluate_advised(
-            &dep,
-            &releases,
+        evaluate_advised(
+            dep,
+            releases,
             advisory_ctx.as_ref(),
             &self.ctx.pctx.policy.layers,
-            &dep_resolve_ctx(&rctx, &dep),
+            &dep_resolve_ctx(&rctx, dep),
             self.ws.now(),
-        );
-        self.remember_upgrade_fallbacks(change, &releases, &verdict);
-        Ok(self.fallback_changes.get(&key).cloned().unwrap_or_default())
+        )
     }
 
     fn remember_upgrade_fallbacks(
@@ -1500,7 +1751,18 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         releases: &[Release],
         verdict: &cooldown_core::Verdict,
     ) {
-        let alternatives = lower_adoptable_targets(releases, verdict, &change.to)
+        let candidates = match self.ctx.writer.target_fallback() {
+            TargetFallback::None => return,
+            TargetFallback::LowerOnSelectedLine => {
+                lower_adoptable_targets(releases, verdict, &change.to)
+            }
+            TargetFallback::CurrentLine => {
+                current_line_target(releases, verdict, &change.from, &change.to)
+                    .into_iter()
+                    .collect()
+            }
+        };
+        let alternatives = candidates
             .into_iter()
             .map(|candidate| {
                 let alternative = Change {
@@ -1606,18 +1868,18 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
     }
 
+    /// Reports each rejected candidate as held, with the same strict verdict its skip row would
+    /// carry from a committed batch (see [`conservative_hold`]).
     fn record_rejected_upgrade_changes(&mut self, rejected: Vec<RejectedUpgrade>) {
-        self.acc.strict_incomplete |= !rejected.is_empty();
         for rejected_upgrade in rejected {
             if rejected_upgrade.residual.is_empty() {
-                self.record_change_skip(
-                    &rejected_upgrade.change,
-                    Some(rejected_upgrade.skipped.unwrap_or_else(|| SkippedInfo {
-                        reason: SkipReason::ResolverConflict,
-                        message: SkipReason::ResolverConflict.message().to_string(),
-                        offending: None,
-                    })),
-                );
+                let skipped = rejected_upgrade.skipped.unwrap_or_else(|| SkippedInfo {
+                    reason: SkipReason::ResolverConflict,
+                    message: SkipReason::ResolverConflict.message().to_string(),
+                    offending: None,
+                });
+                self.acc.strict_incomplete |= !conservative_hold(skipped.reason, self.mode);
+                self.record_change_skip(&rejected_upgrade.change, Some(skipped));
                 continue;
             }
             self.record_unreconciled_skips(
@@ -2905,25 +3167,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .offending
                 .filter(|package| *package != skipped.change.package)
                 .map(|package| package_label(&package));
-            // Deliberate policy holds are conservative-correct, not failed upgrades.
-            let conservative_hold = matches!(
-                skipped.reason,
-                SkipReason::NeedsMajor
-                    | SkipReason::DeclaredBoundHeld
-                    | SkipReason::MaxMajorHeld
-                    | SkipReason::DistTagHeld
-                    | SkipReason::MultiVersionHeld
-            )
-            // `NotEligible` says cooldown has no editable requirement to act on (a transitive-only
-            // or path/git dep, an unscopable override, a pnpm catalog-managed pin). Under forward
-            // `upgrade` the dep merely stays on its already-matured older version — conservative-
-            // correct, and permanently so: failing `--strict` would make e.g. a catalog-using repo
-            // unable to ever pass, with no cooldown-side remedy. Under `fix` the same hold leaves a
-            // live cooldown violation in the graph, so it still fails strict, consistent with fix's
-            // other unfixable-hold paths (graph-held, no matured older release).
-            || (skipped.reason == SkipReason::NotEligible
-                && matches!(self.mode, PlanMode::Upgrade { .. }));
-            if !conservative_hold {
+            if !conservative_hold(skipped.reason, self.mode) {
                 outcome.strict_incomplete = true;
             }
             let change = skipped.change;
@@ -3461,6 +3705,35 @@ fn held_upgrade_info(change: &Change, outcomes: &[BatchOutcome]) -> Option<Skipp
         })
 }
 
+/// Whether a hold for `reason` is conservative-correct under `mode` rather than a failed move,
+/// so it never makes a `--strict` run incomplete.
+fn conservative_hold(reason: SkipReason, mode: PlanMode) -> bool {
+    // Deliberate policy holds are conservative-correct, not failed upgrades.
+    matches!(
+        reason,
+        SkipReason::NeedsMajor
+            | SkipReason::DeclaredBoundHeld
+            | SkipReason::MaxMajorHeld
+            | SkipReason::DistTagHeld
+            | SkipReason::MultiVersionHeld
+    )
+    // `NotEligible` says cooldown has no editable requirement to act on (a transitive-only
+    // or path/git dep, an unscopable override, a pnpm catalog-managed pin). Under forward
+    // `upgrade` the dep merely stays on its already-matured older version — conservative-
+    // correct, and permanently so: failing `--strict` would make e.g. a catalog-using repo
+    // unable to ever pass, with no cooldown-side remedy. Under `fix` the same hold leaves a
+    // live cooldown violation in the graph, so it still fails strict, consistent with fix's
+    // other unfixable-hold paths (graph-held, no matured older release).
+    || (reason == SkipReason::NotEligible && matches!(mode, PlanMode::Upgrade { .. }))
+}
+
+/// Whether `changes` holds `change` itself: the same target from the same version.
+fn contains_upgrade(changes: &[Change], change: &Change) -> bool {
+    changes.iter().any(|item| {
+        change_target_key(item) == change_target_key(change) && item.from == change.from
+    })
+}
+
 fn same_upgrade_candidate(change: &Change, original: &Change) -> bool {
     change.package == original.package
         && change.from == original.from
@@ -3500,6 +3773,41 @@ fn landed_upgrade_changes(
         })
         .cloned()
         .collect()
+}
+
+/// Whether committed `outcomes` moved `change`'s package from its source version onto its target
+/// and the final `graph` holds that target for every member `change` declares.
+///
+/// Unlike [`landed_upgrade_changes`], the committed row is matched member-blind: an adapter
+/// reports collateral movement as a transitive row (`direct: false`, members filled in later
+/// from the graph), whose target key never carries the members a direct change's key does.
+/// The member requirement is proven against the graph instead, so a move that left one declaring
+/// member behind keeps its hold.
+fn landed_as_collateral(change: &Change, outcomes: &[BatchOutcome], graph: &[Dependency]) -> bool {
+    let target = change_target_key_parts(
+        &change.package.name,
+        change.package.registry.as_deref(),
+        change.to.as_str(),
+        false,
+        &[],
+    );
+    target_reached(graph, change)
+        && outcomes
+            .iter()
+            .filter(|outcome| outcome.is_committed())
+            .flat_map(|outcome| &outcome.items)
+            .any(|item| {
+                item.applied
+                    && item.edge.is_none()
+                    && item.from == change.from.as_str()
+                    && change_target_key_parts(
+                        &item.name,
+                        item.registry.as_deref(),
+                        &item.to,
+                        false,
+                        &[],
+                    ) == target
+            })
 }
 
 /// Splits `changes` in two and pushes the halves so the left half is processed first (LIFO).

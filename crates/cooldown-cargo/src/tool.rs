@@ -40,8 +40,9 @@ use cooldown_core::{
     FetchContext, GeneratedMembers, LockStatus, LockVerifyReport, MemberRef, MutationExecution,
     NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation, Project,
     ProjectMutationFile, ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder,
-    ReleaseQuality, ResolveInputs, Result, RewriteMode, SkipReason, Skipped, ToolId, ToolRead,
-    ToolTermination, ToolWrite, UpdateKind, VerifyReport, Version, fs::RecoveryAuthority,
+    ReleaseQuality, ResolveInputs, Result, RewriteMode, SkipReason, Skipped, TargetFallback,
+    ToolId, ToolRead, ToolTermination, ToolWrite, UpdateKind, VerifyReport, Version,
+    fs::RecoveryAuthority,
 };
 use cooldown_registry::SharedHttp;
 use sha2::{Digest as _, Sha256};
@@ -3239,8 +3240,8 @@ impl ToolWrite for CargoTool {
         true
     }
 
-    fn supports_target_fallback(&self) -> bool {
-        true
+    fn target_fallback(&self) -> TargetFallback {
+        TargetFallback::LowerOnSelectedLine
     }
 
     fn resolve_inputs(&self) -> ResolveInputs {
