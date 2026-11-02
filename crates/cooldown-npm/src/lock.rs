@@ -2913,15 +2913,23 @@ fn parse_yarn(content: &str) -> Vec<NameVersion> {
 
 /// Parses `bun.lock`: a JSONC document whose `packages` map values are arrays of the form
 /// `["name@version", registry, {...}, integrity]`.
+///
+/// Only registry identities are returned.
+///
+/// A source in place of a version, such as a git or tarball URL, a `file:`, `link:`, or
+/// `workspace:` protocol, or a repository path, names no registry release and is left out.
 fn parse_bun(content: &str) -> Result<Vec<NameVersion>> {
     let doc = decode_bun(content)?;
     let mut out = Vec::new();
     if let Some(packages) = doc.get("packages").and_then(|v| v.as_object()) {
         for val in packages.values() {
-            if let Some(spec) = val.get(0).and_then(|v| v.as_str())
-                && let Some(entry) = split_name_version(spec)
+            // Split with `BunIdentity` rather than `split_name_version`: the latter takes the
+            // last `@`, which a git source's own `@` would make the separator.
+            if let Some(BunIdentity { name, reference }) =
+                bun_identity(Some(val)).and_then(BunIdentity::parse)
+                && is_registry_reference(reference)
             {
-                out.push(entry);
+                out.push(NameVersion::new(name, reference));
             }
         }
     }
@@ -4295,6 +4303,37 @@ mod tests {
                 NameVersion::new("@babel/core", "7.1.0"),
             ])
         );
+    }
+
+    /// A mixed `bun.lock` yields exactly its registry packages: a git identity's inner `@`
+    /// must not move the name's split, and every protocol or repository source is left out.
+    #[test]
+    fn bun_text_lock_keeps_only_registry_identities() -> Result<()> {
+        let lock = indoc! {r#"
+            {
+                "lockfileVersion": 1,
+                "packages": {
+                    "lodash": ["lodash@4.17.21", "", {}, "sha512-a"],
+                    "chalk": ["chalk@5.0.0+build.1", "", {}, "sha512-b"],
+                    "@babel/core": ["@babel/core@7.1.0", "", {}, "sha512-c"],
+                    "pkg": ["pkg@git+ssh://git@github.com/x/pkg.git#abc123", {}],
+                    "@scope/pkg": ["@scope/pkg@git+ssh://git@github.com/x/pkg.git#abc123", {}],
+                    "y": ["y@github:x/y#sha", {}],
+                    "local": ["local@file:../local", {}],
+                    "pkg-a": ["pkg-a@workspace:packages/a"],
+                    "tarball": ["tarball@https://example.com/tarball.tgz", {}],
+                    "pkg-c": ["pkg-c@x/y#sha", {}],
+                },
+            }"#};
+        assert_eq!(
+            sorted(parse_bun(lock)?),
+            sorted(vec![
+                NameVersion::new("lodash", "4.17.21"),
+                NameVersion::new("chalk", "5.0.0+build.1"),
+                NameVersion::new("@babel/core", "7.1.0"),
+            ])
+        );
+        Ok(())
     }
 
     #[test]
