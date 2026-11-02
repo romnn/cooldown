@@ -123,7 +123,7 @@ selector only when pnpm reads it the same way: letters, digits, `.`, `_`, `~`, `
 wildcards, and a leading `@` scope, as in `@types/*` or `*-plugin`. Any other selector, such as
 `@types/{node,react}`, `react-?om` or `[a-c]*`, is left out and reported as a `stricter_native`
 warning: cooldown still exempts the packages it matches, but pnpm's own age gate keeps applying to
-them. A selector containing `**` is left out too, since cooldown gives `**/` a recursive-directory
+them unless another written selector covers them. A selector containing `**` is left out too, since cooldown gives `**/` a recursive-directory
 meaning pnpm lacks. To exempt such packages natively as well, write them as separate selectors pnpm
 can read (`[package."@types/node"]` and `[package."@types/react"]`).
 

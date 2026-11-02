@@ -3285,9 +3285,9 @@ fn omitted_selector_warnings(omitted: &[String]) -> Vec<Diagnostic> {
             Diagnostic::new(
                 DiagnosticKind::StricterNative,
                 format!(
-                    "selector `{selector}` is left out of pnpm's minimumReleaseAgeExclude, which \
-                     would match it differently, so pnpm's minimumReleaseAge still gates the \
-                     packages it exempts"
+                    "selector `{selector}` uses syntax sync does not write to pnpm's \
+                     minimumReleaseAgeExclude, so pnpm's minimumReleaseAge applies to its packages \
+                     unless another written rule exempts them"
                 ),
             )
         })
