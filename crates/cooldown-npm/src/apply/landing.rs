@@ -45,27 +45,6 @@ pub(crate) fn restore_after_owned_step(
     journal.restore_if_unchanged(postimage)
 }
 
-/// Chooses the lock-only driver command for one change, when the package manager supports one.
-///
-/// In `Auto` mode, an in-range target should move only the lock and preserve the author's range.
-/// The range check happens before the command because a native lock-only pin need not validate that
-/// the requested version still satisfies `package.json`.
-pub(crate) fn lockonly_command<L: NodeLock>(
-    project: &Project,
-    change: &Change,
-    mode: RewriteMode,
-) -> Result<Option<Vec<String>>> {
-    let name = &change.package.name;
-    let version = change.to.as_str();
-    if mode == RewriteMode::Auto
-        && let Some(lockonly) = L::lockonly_update_args(name, version)
-        && target_in_declared_range(project, change)?
-    {
-        return Ok(Some(lockonly));
-    }
-    Ok(None)
-}
-
 /// The transaction that lands one candidate after cooldown captures its authorized manifest edits.
 pub(crate) enum CandidateLanding {
     /// The command preserves manifests itself.
@@ -153,12 +132,6 @@ pub(crate) fn candidate_landing<L: NodeLock>(
             detail: exact_pin_hold_detail(&pin, change),
         });
     }
-    if let Some(args) = lockonly_command::<L>(project, change, mode)? {
-        return Ok(LandingPlan::Land(CandidateLanding::Direct {
-            command: args,
-            authorized_manifests: manifest_snapshot(project, change)?,
-        }));
-    }
     let declarations =
         manifest::declarations(&project.root, &change.members, &change.package.name)?;
     if declarations.absent() {
@@ -182,10 +155,7 @@ pub(crate) fn candidate_landing<L: NodeLock>(
     if mode == RewriteMode::Auto
         && rewrite.modified.is_empty()
         && declarations.has_install()
-        && matches!(
-            &preserving_pin,
-            Some(crate::lock::PreservingPin::PinRestoreResync { .. })
-        )
+        && preserving_pin.is_some()
     {
         // npm's resync can select the old lock again when every install range remains compatible.
         // Shift those ranges only when no declaration needed widening.
@@ -199,27 +169,18 @@ pub(crate) fn candidate_landing<L: NodeLock>(
         )?;
     }
     let authorized_manifests = manifest_snapshot(project, change)?;
-    let landing = match preserving_pin {
-        Some(crate::lock::PreservingPin::Direct(command)) => CandidateLanding::Direct {
-            command,
+    let landing = if let Some(crate::lock::PreservingPin { pin, resync }) = preserving_pin {
+        CandidateLanding::PinRestoreResync {
+            pin,
             authorized_manifests,
-        },
-        Some(crate::lock::PreservingPin::PinRestoreResync { pin, resync }) => {
-            CandidateLanding::PinRestoreResync {
-                pin,
-                authorized_manifests,
-                resync,
-            }
+            resync,
         }
-        None => {
-            let before = absolute_cutoff_from_project(
-                project.exclude_newer.as_deref(),
-                jiff::Timestamp::now(),
-            );
-            CandidateLanding::Direct {
-                command: L::relock_args(before.as_deref()),
-                authorized_manifests,
-            }
+    } else {
+        let before =
+            absolute_cutoff_from_project(project.exclude_newer.as_deref(), jiff::Timestamp::now());
+        CandidateLanding::Direct {
+            command: L::relock_args(before.as_deref()),
+            authorized_manifests,
         }
     };
     Ok(LandingPlan::Land(landing))
@@ -738,42 +699,6 @@ mod tests {
     }
 
     #[test]
-    fn pnpm_uses_lock_only_only_for_in_range_auto() -> eyre::Result<()> {
-        let DeclaredProject {
-            guard: _guard,
-            project,
-        } = project_declaring("^3.0.0")?;
-
-        // In-range minor under Auto → lock-only `pnpm update --no-save` (the declared range stands).
-        let in_range = change("nanoid", "3.1.0", "3.3.0");
-        let args = lockonly_command::<crate::lock::Pnpm>(&project, &in_range, RewriteMode::Auto)?;
-        assert_eq!(
-            args,
-            Some(vec![
-                "update".to_string(),
-                "nanoid@3.3.0".to_string(),
-                "--lockfile-only".to_string(),
-                "--no-save".to_string()
-            ])
-        );
-
-        // Out-of-range and `--rewrite` both take the manifest-rewrite + relock path.
-        let major = change("nanoid", "3.1.0", "5.0.0");
-        assert!(
-            lockonly_command::<crate::lock::Pnpm>(&project, &major, RewriteMode::Auto)?.is_none()
-        );
-        assert!(
-            lockonly_command::<crate::lock::Pnpm>(&project, &in_range, RewriteMode::Always)?
-                .is_none()
-        );
-        assert_eq!(
-            crate::lock::Pnpm::relock_args(None),
-            ["install", "--lockfile-only"]
-        );
-        Ok(())
-    }
-
-    #[test]
     fn relock_commands_refresh_locks_without_adding_dependencies() {
         assert_eq!(
             crate::lock::Npm::relock_args(None),
@@ -1001,40 +926,31 @@ mod tests {
         // plain resync recopies metadata from the restored manifest.
         let pin = preserving_pin::<Npm>(&project, &change, &[])
             .ok_or_else(|| eyre::eyre!("npm did not provide an exact pin"))?;
-        match pin {
-            crate::lock::PreservingPin::PinRestoreResync { pin, resync } => {
-                assert_eq!(
-                    pin,
-                    [
-                        "install",
-                        "chalk@5.6.2",
-                        "--package-lock-only",
-                        "--no-audit",
-                        "--no-fund"
-                    ],
-                    "the pin is target-directed, not a range-maximum update"
-                );
-                assert_eq!(
-                    resync,
-                    ["install", "--package-lock-only", "--no-audit", "--no-fund"],
-                    "the resync recopies restored manifest metadata without retargeting the lock"
-                );
-            }
-            crate::lock::PreservingPin::Direct(args) => {
-                eyre::bail!("npm's exact pin unexpectedly preserved the range directly: {args:?}")
-            }
-        }
-
-        // pnpm needs no bracketing: its exact pin already skips the manifest.
-        std::assert_matches!(
-            preserving_pin::<crate::lock::Pnpm>(&project, &change, &[]),
-            Some(crate::lock::PreservingPin::Direct(_))
+        let crate::lock::PreservingPin { pin, resync } = pin;
+        assert_eq!(
+            pin,
+            [
+                "install",
+                "chalk@5.6.2",
+                "--package-lock-only",
+                "--no-audit",
+                "--no-fund"
+            ],
+            "the pin is target-directed, not a range-maximum update"
         );
+        assert_eq!(
+            resync,
+            ["install", "--package-lock-only", "--no-audit", "--no-fund"],
+            "the resync recopies restored manifest metadata without retargeting the lock"
+        );
+
+        // pnpm lands every candidate through its joint resolve, never one at a time.
+        assert!(preserving_pin::<crate::lock::Pnpm>(&project, &change, &[]).is_none());
         Ok(())
     }
 
     #[test]
-    fn pnpm_lock_only_requires_all_declaring_manifests_to_accept_target() -> eyre::Result<()> {
+    fn a_target_is_in_range_only_when_every_declaring_manifest_admits_it() -> eyre::Result<()> {
         let dir = tempfile::tempdir()?;
         let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
             .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
@@ -1069,20 +985,8 @@ mod tests {
             },
         ];
 
-        let args = lockonly_command::<crate::lock::Pnpm>(&project, &change, RewriteMode::Auto)?;
-
-        assert!(args.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn npm_has_no_direct_lock_only_command() -> eyre::Result<()> {
-        let DeclaredProject {
-            guard: _guard,
-            project,
-        } = project_declaring("^3.0.0")?;
-        let in_range = change("nanoid", "3.1.0", "3.3.0");
-        assert!(lockonly_command::<Npm>(&project, &in_range, RewriteMode::Auto)?.is_none());
+        // `apps/b` declares `^2.0.0`, which excludes 3.3.0 although `apps/a` admits it.
+        assert!(!target_in_declared_range(&project, &change)?);
         Ok(())
     }
 
