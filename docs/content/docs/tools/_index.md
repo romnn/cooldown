@@ -19,7 +19,7 @@ bookCollapseSection: false
 | Python (pixi) | `pixi` | anaconda.org (+ PyPI) | `pixi.lock` |
 | npm | `npm` | npm registry | `package.json` / `package-lock.json` |
 | pnpm | `pnpm` | npm registry | `pnpm-lock.yaml` |
-| Yarn | `yarn` | npm registry | `yarn.lock` |
+| Yarn (Classic v1) | `yarn` | npm registry | `yarn.lock` |
 | Bun | `bun` | npm registry | `bun.lock` |
 | Deno | `deno` | npm + JSR | `deno.json` / `deno.lock` |
 | Ruby | `bundler` | rubygems.org | `Gemfile` / `Gemfile.lock` |
