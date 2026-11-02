@@ -340,8 +340,9 @@ pub struct Dependency {
     /// The dependency's package identity.
     pub package: PackageId,
     /// The package's identity in the tool's advisory-database ecosystem
-    /// ([`Capabilities::advisory_ecosystem`]), in the database's canonical spelling — or `None`
-    /// when the dependency's resolved source cannot be proven to belong to that ecosystem.
+    /// ([`Capabilities::advisory_ecosystem`](crate::Capabilities::advisory_ecosystem)),
+    /// in the database's canonical spelling — or `None` when the dependency's
+    /// resolved source cannot be proven to belong to that ecosystem.
     ///
     /// The feed query is case- and separator-sensitive, so the spelling must be the database's
     /// canonical form (the Python tools normalize to PEP 503, Swift lowercases its

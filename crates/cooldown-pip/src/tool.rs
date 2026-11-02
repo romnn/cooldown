@@ -1,7 +1,8 @@
-//! The generic PyPI-backed [`Tool`] for non-uv Python projects, parameterised by a [`PyLayout`]
-//! (pip or Poetry). Both resolve from PyPI and share the PEP 440 version model — reused wholesale
-//! from [`cooldown_uv`] — and differ only in which files they read and how their CLI re-pins a
-//! dependency.
+//! The generic PyPI-backed [`Tool`](cooldown_core::Tool) for non-uv
+//! Python projects, parameterised by a [`PyLayout`] (pip or Poetry).
+//! Both resolve from PyPI and share the PEP 440 version model —
+//! reused wholesale from [`cooldown_uv`] — and differ only in
+//! which files they read and how their CLI re-pins a dependency.
 
 use crate::lock;
 use async_trait::async_trait;
@@ -148,7 +149,7 @@ impl PyLayout for Poetry {
 
     /// Poetry takes resolution sources from the manifest alone; declaring any
     /// `[[tool.poetry.source]]` withdraws the lock's per-package origin claims (see
-    /// [`crate::ambient::poetry_declares_sources`]).
+    /// `crate::ambient::poetry_declares_sources`).
     fn ambient_origin_intact(project: &Project) -> bool {
         !crate::ambient::poetry_declares_sources(&project.manifest)
     }
@@ -156,7 +157,8 @@ impl PyLayout for Poetry {
     const CONFIRMS_WITH_DRIVER: bool = false;
 }
 
-/// The PyPI-backed implementation of the [`Tool`] port, generic over a [`PyLayout`].
+/// The PyPI-backed implementation of the
+/// [`Tool`](cooldown_core::Tool) port, generic over a [`PyLayout`].
 pub struct PyTool<L> {
     pypi: PyPi,
     driver: Driver,

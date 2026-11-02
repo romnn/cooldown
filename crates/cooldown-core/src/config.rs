@@ -1,4 +1,4 @@
-//! The TOML config schema and its conversion into [`PolicyLayer`]s.
+//! The TOML config schema and its conversion into [`PolicyLayer`](crate::PolicyLayer)s.
 //!
 //! One schema is used everywhere (the global file and every `cooldown.toml`). `min-age` is either a
 //! duration scalar or a per-kind table — never both in one selector. Within any single selector,

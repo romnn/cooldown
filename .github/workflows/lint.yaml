@@ -48,6 +48,8 @@ jobs:
         run: task unused-dependencies
       - name: Lint (all feature combinations × targets)
         run: task lint:fc
+      - name: Rustdoc (warnings denied)
+        run: task lint:doc
 
   spellcheck:
     runs-on: ubuntu-24.04

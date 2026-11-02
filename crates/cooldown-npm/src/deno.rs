@@ -1,8 +1,10 @@
-//! The Deno [`Tool`]: detection by `deno.lock`, the resolved graph read from that lock, and
-//! publish times routed per dependency to the registry that owns it. Unlike npm/pnpm/yarn/bun, a
-//! Deno project mixes two registries — `jsr:` specifiers resolve from [`JsrRegistry`] and `npm:`
-//! specifiers from [`NpmRegistry`] — so this adapter carries both clients and dispatches on each
-//! dependency's recorded registry. Both registries speak `SemVer`, so the version model is shared.
+//! The Deno [`Tool`](cooldown_core::Tool): detection by
+//! `deno.lock`, the resolved graph read from that lock, and publish
+//! times routed per dependency to the registry that owns it.
+//! Unlike npm/pnpm/yarn/bun, a Deno project mixes two registries — `jsr:` specifiers
+//! resolve from [`JsrRegistry`] and `npm:` specifiers from [`NpmRegistry`] — so this
+//! adapter carries both clients and dispatches on each dependency's recorded registry.
+//! Both registries speak `SemVer`, so the version model is shared.
 
 use crate::jsr::{JSR, JsrRegistry};
 use crate::lock::{NameVersion, split_name_version};
@@ -27,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 /// The [`ToolId`] for the Deno adapter (`"deno"`).
 pub const DENO_ID: ToolId = ToolId("deno");
 
-/// The Deno implementation of the [`Tool`] port.
+/// The Deno implementation of the [`Tool`](cooldown_core::Tool) port.
 ///
 /// It reads `deno.lock` (the `workspace.dependencies` list for the direct set, the `jsr`/`npm`
 /// maps for the resolved graph) and resolves each dependency's releases from the registry named on

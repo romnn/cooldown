@@ -31,9 +31,10 @@ pub fn parse(v: &str) -> Option<Version> {
 ///
 /// npm and the Rust `semver` parser disagree on bare tokens: npm reads a bare full version as an
 /// *equality* (`1.2.3` ⇔ `=1.2.3`) and a bare partial as an *X-range* (`1.2` ⇔ `1.2.x`), while the
-/// Rust parser would assume an implicit caret for both. [`normalized_requirement`] translates each
-/// clause accordingly before parsing; operator-led partials need no translation (the parser's
-/// `>I.J`-style desugarings already match node-semver's X-range rules).
+/// Rust parser would assume an implicit caret for both.
+/// `normalized_requirement` translates each clause accordingly before parsing;
+/// operator-led partials need no translation (the parser's `>I.J`-style desugarings
+/// already match node-semver's X-range rules).
 /// A whole exact pin is read in every spelling node-semver accepts (`v1.2.3`, `=v1.2.3`,
 /// `= v1.2.3`), the `v` prefix nowhere else.
 ///

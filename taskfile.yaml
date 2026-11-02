@@ -223,6 +223,13 @@ tasks:
     cmds:
       - cargo test --doc --workspace {{.CLI_ARGS}}
 
+  lint:doc:
+    desc: "build rustdoc with warnings denied (checks intra-doc links)"
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    cmds:
+      - cargo doc --no-deps --workspace --all-features {{.CLI_ARGS}}
+
   lint:ast-grep:
     desc: "lint with ast-grep rules"
     cmds:

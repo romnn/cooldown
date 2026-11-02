@@ -1,7 +1,9 @@
-//! The generic conda-world [`Tool`], parameterised by a [`CondaLayout`] (conda-lock or pixi). Both
-//! lockfiles pin a mix of conda-channel and PyPI packages, so — like the Deno adapter — this tool
-//! carries two registry clients and dispatches each dependency's publish-time lookup to the one
-//! named on its [`PackageId`]. Versions use the PEP 440 model reused from [`cooldown_uv`] (a close
+//! The generic conda-world [`Tool`](cooldown_core::Tool),
+//! parameterised by a [`CondaLayout`] (conda-lock or pixi).
+//! Both lockfiles pin a mix of conda-channel and PyPI packages, so — like the
+//! Deno adapter — this tool carries two registry clients and dispatches each
+//! dependency's publish-time lookup to the one named on its [`PackageId`].
+//! Versions use the PEP 440 model reused from [`cooldown_uv`] (a close
 //! approximation of conda's own ordering for the common `X.Y.Z` shapes).
 
 use crate::lock::{self, CondaDep};
@@ -138,7 +140,8 @@ impl CondaLayout for Pixi {
     }
 }
 
-/// The conda-world implementation of the [`Tool`] port, generic over a [`CondaLayout`].
+/// The conda-world implementation of the [`Tool`](cooldown_core::Tool)
+/// port, generic over a [`CondaLayout`].
 pub struct CondaEnvTool<L> {
     conda: Conda,
     pypi: PyPi,

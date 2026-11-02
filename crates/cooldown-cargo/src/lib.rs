@@ -36,7 +36,7 @@ pub const CARGO_MANIFEST: &str = "Cargo.toml";
 ///
 /// A `Cargo.toml` marks a workspace root: `cargo metadata` there already covers every member, so
 /// nested manifests below it are not separate projects — except those no root above them owns,
-/// which [`ownership`] recognizes and the orchestrator turns back into projects.
+/// which `ownership` recognizes and the orchestrator turns back into projects.
 pub const PROJECT_MARKER: cooldown_core::ProjectMarker = cooldown_core::ProjectMarker {
     marker: CARGO_MANIFEST,
     manifest: CARGO_MANIFEST,

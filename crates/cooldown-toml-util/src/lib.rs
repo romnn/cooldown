@@ -11,8 +11,8 @@ use serde::de::DeserializeOwned;
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::Filesystem`](cooldown_core::CoreError::Filesystem) when the file exists
-/// but cannot be read, or [`CoreError::Config`](cooldown_core::CoreError::Config) when its
+/// Returns [`CoreError::Filesystem`] when the file exists
+/// but cannot be read, or [`CoreError::Config`] when its
 /// contents are not valid TOML for `T`.
 pub fn read_toml_file<T>(path: &Utf8Path, doc_name: &str) -> Result<Option<T>, CoreError>
 where
@@ -35,8 +35,8 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::Filesystem`](cooldown_core::CoreError::Filesystem) when the file exists but
-/// cannot be read, or [`CoreError::Config`](cooldown_core::CoreError::Config) when it is not valid
+/// Returns [`CoreError::Filesystem`] when the file exists but
+/// cannot be read, or [`CoreError::Config`] when it is not valid
 /// TOML.
 pub fn parse_document(path: &Utf8Path) -> Result<Option<toml_edit::DocumentMut>, CoreError> {
     let content = match std::fs::read_to_string(path) {
@@ -54,7 +54,7 @@ pub fn parse_document(path: &Utf8Path) -> Result<Option<toml_edit::DocumentMut>,
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::Filesystem`](cooldown_core::CoreError::Filesystem) if the file cannot be
+/// Returns [`CoreError::Filesystem`] if the file cannot be
 /// written.
 pub fn write_document(path: &Utf8Path, doc: &toml_edit::DocumentMut) -> Result<(), CoreError> {
     std::fs::write(path, doc.to_string()).map_err(|e| CoreError::Filesystem(format!("{path}: {e}")))
@@ -89,8 +89,8 @@ pub fn replace_value(item: &mut toml_edit::Item, value: impl Into<toml_edit::Val
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::Filesystem`](cooldown_core::CoreError::Filesystem) if the file cannot be
-/// read or written, or [`CoreError::Config`](cooldown_core::CoreError::Config) if it is not valid
+/// Returns [`CoreError::Filesystem`] if the file cannot be
+/// read or written, or [`CoreError::Config`] if it is not valid
 /// TOML, the key path is empty, or an intermediate key exists but is not a table.
 pub fn set_toml_string(
     path: &Utf8Path,
@@ -113,8 +113,8 @@ pub fn set_toml_string(
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::Filesystem`](cooldown_core::CoreError::Filesystem) if the file cannot be
-/// read or written, or [`CoreError::Config`](cooldown_core::CoreError::Config) if it is not valid
+/// Returns [`CoreError::Filesystem`] if the file cannot be
+/// read or written, or [`CoreError::Config`] if it is not valid
 /// TOML, the key path is empty, or an intermediate key exists but is not a table.
 pub fn set_toml_value(
     path: &Utf8Path,

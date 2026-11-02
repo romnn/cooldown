@@ -1,6 +1,7 @@
-//! The Swift Package Manager [`Tool`]: detection by `Package.resolved`, the resolved graph from
-//! that pin file, and GitHub Releases publish times. The core owns the verdict; `swift` is driven
-//! only to apply.
+//! The Swift Package Manager [`Tool`](cooldown_core::Tool):
+//! detection by `Package.resolved`, the resolved graph from
+//! that pin file, and GitHub Releases publish times.
+//! The core owns the verdict; `swift` is driven only to apply.
 
 use crate::lock;
 use crate::registry::{GITHUB, GitHubReleases};
@@ -23,7 +24,7 @@ use cooldown_registry::SharedHttp;
 /// The [`ToolId`] for the Swift Package Manager adapter (`"swift"`).
 pub const SWIFT_ID: ToolId = ToolId("swift");
 
-/// The Swift Package Manager implementation of the [`Tool`] port.
+/// The Swift Package Manager implementation of the [`Tool`](cooldown_core::Tool) port.
 pub struct SwiftTool {
     registry: GitHubReleases,
     swift: Driver,

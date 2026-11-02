@@ -1,6 +1,7 @@
-//! The Python/uv [`Tool`]: detection, the resolved graph + per-file upload times from
-//! `uv.lock`, `PyPI` as the publish-time fallback, native `[tool.uv]` cooldown config, and
-//! `uv`-driven resolution/apply. The core owns the verdict; uv only resolves/applies a window.
+//! The Python/uv [`Tool`](cooldown_core::Tool): detection, the resolved graph +
+//! per-file upload times from `uv.lock`, `PyPI` as the publish-time fallback,
+//! native `[tool.uv]` cooldown config, and `uv`-driven resolution/apply.
+//! The core owns the verdict; uv only resolves/applies a window.
 
 use crate::artifact::published_at_for_artifacts;
 use crate::cutoff::{Cutoffs, package_cutoffs};
@@ -28,7 +29,7 @@ use cooldown_registry::SharedHttp;
 /// The [`ToolId`] for the Python/uv adapter (`"uv"`).
 pub const UV_ID: ToolId = ToolId("uv");
 
-/// The Python/uv implementation of the [`Tool`] port.
+/// The Python/uv implementation of the [`Tool`](cooldown_core::Tool) port.
 ///
 /// It detects `uv.lock` projects, reads the resolved graph and per-file upload
 /// times from the lock (falling back to [`PyPi`] for the publish instant), parses

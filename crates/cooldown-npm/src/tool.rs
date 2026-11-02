@@ -1,8 +1,10 @@
-//! The generic JavaScript/TypeScript [`Tool`]: detection, the resolved graph from a lockfile, npm
-//! registry publish times, and driver-backed re-resolution/apply. The lockfile format and driver
-//! binary are supplied by a [`NodeLock`] type parameter, so npm, pnpm, yarn, and bun are all the
-//! same adapter specialised over their lock format — they share the npm registry and version model
-//! and differ only in how their lock is parsed and how their CLI re-pins a dependency.
+//! The generic JavaScript/TypeScript [`Tool`](cooldown_core::Tool):
+//! detection, the resolved graph from a lockfile, npm registry
+//! publish times, and driver-backed re-resolution/apply.
+//! The lockfile format and driver binary are supplied by a [`NodeLock`] type
+//! parameter, so npm, pnpm, yarn, and bun are all the same adapter specialised
+//! over their lock format — they share the npm registry and version model and
+//! differ only in how their lock is parsed and how their CLI re-pins a dependency.
 
 use crate::apply::landing::{
     CandidateLanding, LandingPlan, OwnedStep, absolute_cutoff_from_project, candidate_landing,
@@ -142,7 +144,8 @@ fn pnpm_location_filter(path: &str) -> String {
     }
 }
 
-/// The JavaScript/TypeScript implementation of the [`Tool`] port, generic over a [`NodeLock`].
+/// The JavaScript/TypeScript implementation of the
+/// [`Tool`](cooldown_core::Tool) port, generic over a [`NodeLock`].
 ///
 /// It detects projects by their lockfile, reads the resolved graph from that lock, recovers
 /// direct/transitive classification from lock importer data or the root `package.json`, and resolves

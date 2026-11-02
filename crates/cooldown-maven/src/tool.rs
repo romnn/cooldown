@@ -1,6 +1,8 @@
-//! The generic Java [`Tool`], parameterised by a [`JavaLayout`] (Maven or Gradle). Both resolve
-//! from Maven Central and share the Maven version model; they differ only in which files they read
-//! (`pom.xml` vs `gradle.lockfile` + `build.gradle`) and how their CLI re-pins a dependency.
+//! The generic Java [`Tool`](cooldown_core::Tool),
+//! parameterised by a [`JavaLayout`] (Maven or Gradle).
+//! Both resolve from Maven Central and share the Maven version model; they
+//! differ only in which files they read (`pom.xml` vs `gradle.lockfile` +
+//! `build.gradle`) and how their CLI re-pins a dependency.
 
 use crate::lock;
 use crate::registry::{MAVEN_CENTRAL, MavenCentral};
@@ -125,7 +127,8 @@ impl JavaLayout for Gradle {
     }
 }
 
-/// The Java implementation of the [`Tool`] port, generic over a [`JavaLayout`].
+/// The Java implementation of the [`Tool`](cooldown_core::Tool)
+/// port, generic over a [`JavaLayout`].
 pub struct JavaTool<L> {
     registry: MavenCentral,
     driver: Driver,

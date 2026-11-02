@@ -228,10 +228,11 @@ pub struct RunOpts {
     /// `--why` (outdated): print each blocked row's reason — the one the upgrade resolve gives —
     /// below the table. Display-only; `blockedReason` is always in the JSON.
     pub why: bool,
-    /// `--rewrite` (upgrade): how to treat the manifest's version constraint. By default,
-    /// [`RewriteMode::Auto`] preserves an in-range constraint where the adapter supports lock-only
-    /// updates, widens implicit ceilings when required, and holds explicit upper bounds.
-    /// `--rewrite` selects [`RewriteMode::Always`].
+    /// `--rewrite` (upgrade): how to treat the manifest's version constraint.
+    /// By default, [`RewriteMode::Auto`](cooldown_core::RewriteMode::Auto) preserves
+    /// an in-range constraint where the adapter supports lock-only updates, widens
+    /// implicit ceilings when required, and holds explicit upper bounds.
+    /// `--rewrite` selects [`RewriteMode::Always`](cooldown_core::RewriteMode::Always).
     pub rewrite: cooldown_core::RewriteMode,
     /// `outdated --transitive`: include transitive (indirect) deps in the report.
     pub transitive: bool,
@@ -418,9 +419,7 @@ impl MemberExcludes {
 /// member is out of scope.
 /// A row no member claims stays under any selection, since no member can vouch for it either
 /// way and dropping it would let a transitive dependency slip past the gate.
-/// Project detection applies the same rule to the walk (see [`WalkPolicy`]).
-///
-/// [`WalkPolicy`]: crate::scan::WalkPolicy
+/// Project detection applies the same rule to the walk (see `WalkPolicy`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunScope {
     scan_root: Utf8PathBuf,

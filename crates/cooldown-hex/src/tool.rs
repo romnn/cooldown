@@ -1,6 +1,6 @@
-//! The Elixir/Hex [`Tool`]: detection by `mix.lock`, the resolved graph from that lock, the direct
-//! split from `mix.exs`, and hex.pm publish times. The core owns the verdict; `mix` is driven only
-//! to apply.
+//! The Elixir/Hex [`Tool`](cooldown_core::Tool): detection by `mix.lock`, the resolved
+//! graph from that lock, the direct split from `mix.exs`, and hex.pm publish times.
+//! The core owns the verdict; `mix` is driven only to apply.
 
 use crate::lock;
 use crate::registry::{HEXPM, Hex};
@@ -23,7 +23,7 @@ use cooldown_registry::SharedHttp;
 /// The [`ToolId`] for the Elixir/Hex adapter (`"hex"`).
 pub const HEX_ID: ToolId = ToolId("hex");
 
-/// The Elixir/Hex implementation of the [`Tool`] port.
+/// The Elixir/Hex implementation of the [`Tool`](cooldown_core::Tool) port.
 pub struct HexTool {
     registry: Hex,
     mix: Driver,
