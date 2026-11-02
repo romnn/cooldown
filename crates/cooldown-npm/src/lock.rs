@@ -4,9 +4,9 @@
 //! generic adapter can serve all of them.
 //!
 //! Every parser returns the flat list of resolved [`NameVersion`] pairs the lock pins.
-//! Where the lock records importer/member declarations (npm v2/v3, pnpm), the adapter uses that same
-//! data for both direct/transitive classification and source attribution; older formats fall back to
-//! the root manifest's declared dependency names.
+//! Where the lock records importer/member declarations (npm v2/v3, pnpm, bun's text lock), the
+//! adapter uses that same data for both direct/transitive classification and source attribution;
+//! older formats fall back to the root manifest's declared dependency names.
 
 use crate::version::{CeilingHold, is_exact_npm_specifier};
 use cooldown_core::{CoreError, Result, ToolId};
@@ -41,6 +41,16 @@ pub trait NodeLock: Send + Sync + 'static {
     /// (yarn classic, bun), whose identities never survive the feed.
     const EFFECTIVE_REGISTRY: EffectiveRegistryQuery = EffectiveRegistryQuery::Unavailable;
 
+    /// Whether the peer gate can tell which copy a member's peer contract binds to.
+    ///
+    /// The gate reads that copy from the install tree ([`NodeLock::install_paths`]) when the lock
+    /// records one, and otherwise from the member's own declaration, which is pnpm's isolated
+    /// layout.
+    /// A manager that hoists without recording its tree, or resolves peers by version rather than
+    /// through the member's declaration, proves neither, so its peer evidence stays unavailable
+    /// rather than borrowing pnpm's rule: yarn classic and bun.
+    const PEER_CONTEXTS_MODELED: bool = true;
+
     /// Parses the lockfile body into the flat list of resolved [`NameVersion`] pairs.
     ///
     /// # Errors
@@ -50,8 +60,8 @@ pub trait NodeLock: Send + Sync + 'static {
 
     /// The workspace member package(s) that declare each dependency, for attributing a dependency
     /// to its source package(s) in reports.
-    /// Empty for yarn classic and bun, which record no per-member data in their locks, so their
-    /// `members` column stays blank.
+    /// Empty for yarn classic, which records no per-member data in its lock, and for a `bun.lock`
+    /// whose members [`Bun`] cannot attribute, so their `members` column stays blank.
     #[must_use]
     fn member_sources(content: &str) -> MemberIndex {
         Self::member_sources_excluding(content, &HashSet::new())
@@ -121,8 +131,8 @@ pub trait NodeLock: Send + Sync + 'static {
     /// `importers:` keys, npm's non-`node_modules` `packages` keys (the root as `.`). A member
     /// that declares no dependencies appears nowhere in [`member_sources`](NodeLock::member_sources)
     /// yet still owns a `package.json` whose `peerDependencies` bind, so peer evidence enumerates
-    /// members from here rather than from what they declare. Default: empty (yarn classic and bun
-    /// record no member data).
+    /// members from here rather than from what they declare. Default: empty (yarn classic records
+    /// no member data).
     #[must_use]
     fn member_paths(_content: &str) -> HashSet<String> {
         HashSet::new()
@@ -143,8 +153,8 @@ pub trait NodeLock: Send + Sync + 'static {
     /// How the lock attributes a resolved version to each workspace member declaring it, the
     /// evidence the exact-pin guard judges a member's manifest pins against.
     ///
-    /// Default: [`MemberAttribution::Unknown`], since yarn classic and bun record no per-member
-    /// resolution, so their exact manifest pins are not protected from a sibling's resolve.
+    /// Default: [`MemberAttribution::Unknown`], since yarn classic records no per-member
+    /// resolution, so its exact manifest pins are not protected from a sibling's resolve.
     #[must_use]
     fn member_attribution(_content: &str) -> MemberAttribution {
         MemberAttribution::Unknown
@@ -402,10 +412,15 @@ impl SplitHold {
 /// pnpm records the resolved version per importer, so its entries are keyed exactly by
 /// `(name, version)`. npm records only version ranges per member, not the resolved version, so its
 /// entries are keyed by name and apply to every resolved version of that name.
+/// Bun keys a registry binding by version like pnpm, and a declaration whose binding the lock
+/// leaves undetermined by the one copy its package key records, as a declared copy.
 #[derive(Debug, Default)]
 pub struct MemberIndex {
     by_version: HashMap<(String, String), Vec<String>>,
     by_name: HashMap<String, Vec<String>>,
+    /// The members each copy is recorded for without proof that the member binds it (Bun's peer
+    /// declarations): they count as declaring that copy, but no member resolves to it.
+    declared_copies: HashMap<(String, String), Vec<String>>,
     /// `(name, version)` pairs every declaring importer pins exactly (pnpm).
     exact_version: HashSet<(String, String)>,
     /// Names pinned exactly by every declaring member manifest (npm, which records ranges per name).
@@ -494,6 +509,7 @@ impl MemberIndex {
             .values()
             .flatten()
             .chain(self.by_name.values().flatten())
+            .chain(self.declared_copies.values().flatten())
             .cloned()
             .collect()
     }
@@ -629,6 +645,7 @@ impl MemberIndex {
             .keys()
             .cloned()
             .chain(self.by_version.keys().map(|(name, _)| name.clone()))
+            .chain(self.declared_copies.keys().map(|(name, _)| name.clone()))
             // An `npm:` alias records the alias under the dependency name and the real package
             // inside the resolved version (`"foo": "npm:bar@^1"` → `("foo", "bar@1.2.3")`). The
             // real name is importer-declared too: a graph-wide override on it would drag the
@@ -666,19 +683,26 @@ impl MemberIndex {
     /// a move, no matter how it is physically bound.
     #[must_use]
     pub fn declares(&self, name: &str) -> bool {
-        self.by_name.contains_key(name) || self.by_version.keys().any(|(entry, _)| entry == name)
+        self.by_name.contains_key(name)
+            || self
+                .by_version
+                .keys()
+                .chain(self.declared_copies.keys())
+                .any(|(entry, _)| entry == name)
     }
 
     /// The member packages declaring `name` at `version`, sorted and deduplicated. Empty when the
     /// lock carries no per-member attribution for this dependency.
     #[must_use]
     pub fn members_for(&self, name: &str, version: &str) -> Vec<String> {
+        let key = (name.to_string(), version.to_string());
         let mut members: Vec<String> = self
             .by_version
-            .get(&(name.to_string(), version.to_string()))
+            .get(&key)
             .into_iter()
             .flatten()
             .chain(self.by_name.get(name).into_iter().flatten())
+            .chain(self.declared_copies.get(&key).into_iter().flatten())
             .cloned()
             .collect();
         members.sort();
@@ -1153,7 +1177,11 @@ pub enum MemberAttribution {
     Importers(ImporterBindings),
     /// The lock records the physical install tree a member's lookup walks (npm v2/v3).
     InstallTree(InstallPaths),
-    /// The lock records no per-member resolution (yarn classic, bun, npm v1).
+    /// The lock records each member's declarations and the package keys Bun binds them through
+    /// (`bun.lock`).
+    PackageKeys(BunBindings),
+    /// The lock records no per-member resolution (yarn classic, npm v1, an unsupported
+    /// `bun.lock`).
     Unknown,
 }
 
@@ -1164,8 +1192,9 @@ pub enum MemberResolution<'a> {
     Resolved(&'a str),
     /// The lock attributes resolutions per member and records none for this one.
     Missing,
-    /// No answer is known: the lock attributes nothing per member, or the member's binding is no
-    /// registry version of the name (a local reference, or an alias to another package).
+    /// No answer is known: the lock attributes nothing per member, the member's binding is no
+    /// registry version of the name (a local reference, or an alias to another package), or the
+    /// lock does not establish which copy the member binds.
     Unknown,
 }
 
@@ -1180,6 +1209,7 @@ impl MemberAttribution {
                 InstallLookup::Missing => MemberResolution::Missing,
                 InstallLookup::Unknown => MemberResolution::Unknown,
             },
+            MemberAttribution::PackageKeys(bindings) => bindings.resolution(member, name),
             MemberAttribution::Unknown => MemberResolution::Unknown,
         }
     }
@@ -1665,6 +1695,11 @@ pub struct Pnpm;
 /// The Yarn (classic, v1) package manager: `yarn.lock` backed by the npm registry.
 pub struct Yarn;
 /// The Bun package manager: `bun.lock` (text lockfile) backed by the npm registry.
+///
+/// Member attribution follows Bun's own loader ([`BunBindings`]) and covers lock versions 1
+/// through 3; any other lock attributes nothing per member.
+/// Current Bun binds peers by version and hoists without recording its tree, so the peer gate
+/// stays out of its locks ([`NodeLock::PEER_CONTEXTS_MODELED`]).
 pub struct Bun;
 
 impl NodeLock for Npm {
@@ -1924,6 +1959,7 @@ impl NodeLock for Yarn {
     const ID: ToolId = ToolId("yarn");
     const LOCKFILE: &'static str = "yarn.lock";
     const BIN: &'static str = "yarn";
+    const PEER_CONTEXTS_MODELED: bool = false;
 
     fn parse(content: &str) -> Result<Vec<NameVersion>> {
         // A Berry lock shares the file name but none of the Classic grammar, so the Classic
@@ -1994,8 +2030,27 @@ impl NodeLock for Bun {
     const LOCKFILE: &'static str = "bun.lock";
     const BIN: &'static str = "bun";
 
+    const PEER_CONTEXTS_MODELED: bool = false;
+
     fn parse(content: &str) -> Result<Vec<NameVersion>> {
         parse_bun(content)
+    }
+
+    fn member_sources_excluding(content: &str, excluded: &HashSet<String>) -> MemberIndex {
+        BunBindings::read(content)
+            .map(|bindings| bindings.member_index(excluded))
+            .unwrap_or_default()
+    }
+
+    fn member_paths(content: &str) -> HashSet<String> {
+        BunBindings::read(content)
+            .map(|bindings| bindings.members.into_keys().collect())
+            .unwrap_or_default()
+    }
+
+    fn member_attribution(content: &str) -> MemberAttribution {
+        BunBindings::read(content)
+            .map_or(MemberAttribution::Unknown, MemberAttribution::PackageKeys)
     }
 
     fn relock_args(_before: Option<&str>) -> Vec<String> {
@@ -2857,12 +2912,9 @@ fn parse_yarn(content: &str) -> Vec<NameVersion> {
 }
 
 /// Parses `bun.lock`: a JSONC document whose `packages` map values are arrays of the form
-/// `["name@version", registry, {...}, integrity]`. Bun writes trailing commas (valid JSONC but not
-/// JSON), so the body is normalised before handing it to the JSON parser.
+/// `["name@version", registry, {...}, integrity]`.
 fn parse_bun(content: &str) -> Result<Vec<NameVersion>> {
-    let normalised = strip_trailing_commas(content);
-    let doc: serde_json::Value = serde_json::from_str(&normalised)
-        .map_err(|e| CoreError::Parse(format!("bun.lock: {e}")))?;
+    let doc = decode_bun(content)?;
     let mut out = Vec::new();
     if let Some(packages) = doc.get("packages").and_then(|v| v.as_object()) {
         for val in packages.values() {
@@ -2874,6 +2926,474 @@ fn parse_bun(content: &str) -> Result<Vec<NameVersion>> {
         }
     }
     Ok(out)
+}
+
+/// Decodes the `bun.lock` body, the one decoding every Bun reader shares.
+///
+/// Bun writes trailing commas, valid JSONC but not JSON, so the body is normalised before the JSON
+/// parser sees it.
+fn decode_bun(content: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(&strip_trailing_commas(content))
+        .map_err(|err| CoreError::Parse(format!("bun.lock: {err}")))
+}
+
+/// The `bun.lock` `lockfileVersion`s whose member lookups [`BunBindings`] models.
+///
+/// From version 1 on, Bun's loader binds a member's direct dependency to the package key
+/// `<workspace-name>/<dependency>`, else to the root key `<dependency>`, in Bun 1.3.0 and current
+/// Bun alike; version 2 only tightened parsing and version 3 only added scoped overrides.
+/// Version 0 resolved member dependencies through the workspace's own package row instead, and a
+/// newer version is unproven, so both stay unattributed.
+const BUN_KEYED_LOCK_VERSIONS: std::ops::RangeInclusive<u64> = 1..=3;
+
+/// What a `bun.lock` binds each workspace member's direct dependencies to, read the way Bun's own
+/// loader binds them.
+///
+/// The root resolves a dependency through the package key of the dependency's name.
+/// Another member resolves it through `<workspace-name>/<dependency>` before that root key, where
+/// the workspace name is the member's package `name`, never its directory, and scoped names stay
+/// whole (`@acme/ui/@types/node`).
+/// The selected entry's first array element names the package that key holds.
+/// Package keys are Bun's own lookup paths, not npm install paths, so nothing else is read from
+/// them.
+///
+/// Only a lock of version 1 through 3 (`BUN_KEYED_LOCK_VERSIONS`) with a root workspace is read.
+/// A member is unsupported when the lock does not prove its key prefix: its name's root key must
+/// hold the member itself, `name@workspace:<path>`, and no other member may carry its name.
+/// When a root dependency of the same name holds that key, current Bun's loader reads the member's
+/// keys under `./<name>`, while Bun 1.3.0's reads them under `<name>`, where that root
+/// dependency's own nested copies live, so the lock alone cannot say which applies.
+pub struct BunBindings {
+    /// Member path (the root as `.`) → what the lock records for it; a member path that could
+    /// address a manifest outside the workspace is dropped.
+    members: BTreeMap<String, BunMember>,
+}
+
+/// One workspace member of a [`BunBindings`].
+enum BunMember {
+    /// The member's dependencies resolve through package keys the reader models, by name.
+    Keyed(BTreeMap<String, BunDependency>),
+    /// The lock does not prove which keys the member's dependencies resolve through.
+    Unsupported,
+}
+
+/// One dependency a member's lock entry declares, in every field that declares it.
+struct BunDependency {
+    /// The declarations in [`DIRECT_GROUPS`] order.
+    declarations: Vec<BunDeclaration>,
+    binding: BunBinding,
+}
+
+/// One field's declaration of a dependency, as the member's lock entry copies it.
+struct BunDeclaration {
+    field: &'static str,
+    /// The verbatim specifier, `None` when the entry records no string.
+    specifier: Option<String>,
+}
+
+impl BunDeclaration {
+    /// Whether the declaration pins one exact version.
+    fn is_exact(&self) -> bool {
+        self.specifier
+            .as_deref()
+            .is_some_and(is_exact_npm_specifier)
+    }
+}
+
+/// Whether `copy` provably satisfies at least one of `declarations`, peer ranges included.
+///
+/// A range the matcher cannot judge proves nothing, so it never makes a copy the member's.
+fn satisfies_a_declaration(declarations: &[BunDeclaration], copy: &str) -> bool {
+    declarations.iter().any(|declaration| {
+        declaration
+            .specifier
+            .as_deref()
+            .is_some_and(|range| crate::version::version_in_range(range, copy))
+    })
+}
+
+/// What a member's declared dependency binds to.
+enum BunBinding {
+    /// A registry copy of the dependency itself, at this version.
+    Registry(String),
+    /// No key holds the dependency, which Bun leaves unresolved only for an optional one.
+    Unresolved,
+    /// The key holds something other than a registry copy of the name: an alias to another
+    /// package, a workspace or other local package, or a git or tarball source.
+    Foreign,
+    /// The member declares the name itself, but the lock does not establish which copy it binds:
+    /// a peer, which current Bun binds by version rather than by key, or an entry no loader would
+    /// accept.
+    Uncertain {
+        /// The registry copy of the name the member's package key holds, when it holds one.
+        recorded: Option<String>,
+    },
+}
+
+impl BunBindings {
+    /// Reads the bindings from a `bun.lock` body, or `None` when the body does not decode or is no
+    /// lock [`BunBindings`] can read.
+    fn read(content: &str) -> Option<Self> {
+        let doc = decode_bun(content).ok()?;
+        let version = doc.get("lockfileVersion")?.as_u64()?;
+        if !BUN_KEYED_LOCK_VERSIONS.contains(&version) {
+            return None;
+        }
+        let workspaces = doc.get("workspaces")?.as_object()?;
+        // Bun always records the root, so a lock without it is no complete record of what any
+        // member declares.
+        workspaces.get("")?;
+        let no_packages = serde_json::Map::new();
+        let packages = match doc.get("packages") {
+            Some(packages) => packages.as_object()?,
+            None => &no_packages,
+        };
+        // Two members of one name share every key, so neither member's keys are its own.
+        let mut named: HashMap<&str, usize> = HashMap::new();
+        for (key, workspace) in workspaces {
+            if let Some(name) = workspace.get("name").and_then(serde_json::Value::as_str)
+                && !key.is_empty()
+            {
+                *named.entry(name).or_default() += 1;
+            }
+        }
+        let shared: HashSet<&str> = named
+            .into_iter()
+            .filter_map(|(name, count)| (count > 1).then_some(name))
+            .collect();
+        let members = workspaces
+            .iter()
+            .filter_map(|(key, workspace)| {
+                let path = if key.is_empty() { "." } else { key.as_str() };
+                // Member paths are joined onto the project root, so a crafted or stale key that
+                // could address a manifest outside the workspace is rejected here.
+                is_workspace_relative(path).then(|| {
+                    (
+                        path.to_string(),
+                        bun_member(key, workspace, packages, &shared),
+                    )
+                })
+            })
+            .collect();
+        Some(BunBindings { members })
+    }
+
+    /// What member `member` binds `name` to.
+    ///
+    /// [`MemberResolution::Missing`] means the member's lock entry declares no such dependency, or
+    /// declares it only as an optional dependency no key holds.
+    /// A member the lock does not list, an unsupported member, a peer declaration (which Bun binds
+    /// by version rather than by key), and every binding that is no registry copy of `name` are
+    /// [`MemberResolution::Unknown`]; [`Self::is_uncertain`] tells the cases apart.
+    #[must_use]
+    pub fn resolution(&self, member: &str, name: &str) -> MemberResolution<'_> {
+        let Some(BunMember::Keyed(dependencies)) = self.members.get(member) else {
+            return MemberResolution::Unknown;
+        };
+        match dependencies.get(name).map(|dependency| &dependency.binding) {
+            None | Some(BunBinding::Unresolved) => MemberResolution::Missing,
+            Some(BunBinding::Registry(version)) => MemberResolution::Resolved(version),
+            Some(BunBinding::Foreign | BunBinding::Uncertain { .. }) => MemberResolution::Unknown,
+        }
+    }
+
+    /// Whether member `member` declares `name` itself while the lock leaves which copy it binds
+    /// undetermined, such as a name it also declares as a peer.
+    ///
+    /// Such a member's [`MemberResolution::Unknown`] is the only one that some copy of `name`
+    /// could answer; every other unknown binding is proven to be no registry copy of the name, or
+    /// belongs to a member the lock does not attribute.
+    #[must_use]
+    pub fn is_uncertain(&self, member: &str, name: &str) -> bool {
+        let Some(BunMember::Keyed(dependencies)) = self.members.get(member) else {
+            return false;
+        };
+        dependencies
+            .get(name)
+            .is_some_and(|dependency| matches!(dependency.binding, BunBinding::Uncertain { .. }))
+    }
+
+    /// The [`MemberIndex`] of every member's declarations, the members at `excluded` paths left
+    /// out.
+    ///
+    /// A registry binding is attributed by its exact version.
+    /// An uncertain binding is attributed to the one copy its package key records, as a declared
+    /// copy no member resolves to, so the declaration still makes the dependency direct: what the
+    /// lock leaves uncertain is which copy the member finally binds, never that it declares the
+    /// name.
+    /// A foreign, local, or unresolved binding owns no registry copy of the name at all.
+    ///
+    /// A lock with an unsupported member yields the empty, non-authoritative index: an index
+    /// without that member's declarations would classify its dependencies as transitive.
+    fn member_index(&self, excluded: &HashSet<String>) -> MemberIndex {
+        if self
+            .members
+            .values()
+            .any(|member| matches!(member, BunMember::Unsupported))
+        {
+            return MemberIndex::default();
+        }
+        let mut by_version: HashMap<(String, String), Vec<String>> = HashMap::new();
+        let mut declared_copies: HashMap<(String, String), Vec<String>> = HashMap::new();
+        let mut declared: HashMap<(String, String), usize> = HashMap::new();
+        let mut exact: HashMap<(String, String), usize> = HashMap::new();
+        let mut loose: HashSet<String> = HashSet::new();
+        let mut specifiers: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut entries: HashMap<String, BTreeMap<String, ImporterEntry>> = HashMap::new();
+        for (path, member) in &self.members {
+            let BunMember::Keyed(dependencies) = member else {
+                continue;
+            };
+            if excluded.contains(path) {
+                continue;
+            }
+            for (name, dependency) in dependencies {
+                let BunDependency {
+                    declarations,
+                    binding,
+                } = dependency;
+                // The first field's specifier speaks for the member, as pnpm's one specifier per
+                // importer does, so a lone member never splits itself.
+                let specifier = declarations
+                    .first()
+                    .and_then(|declaration| declaration.specifier.clone());
+                // A semver range never contains `:`, so the test drops every protocol and alias.
+                if let Some(range) = specifier
+                    .as_deref()
+                    .filter(|range| !range.is_empty() && !range.contains(':'))
+                {
+                    specifiers
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(range.to_string());
+                }
+                let version = match binding {
+                    BunBinding::Registry(version) => version,
+                    // The member still declares the name itself, so the copy its key records keeps
+                    // the dependency direct and its declared bound applies.
+                    // That key is the evidence a registry binding rests on too; only which copy a
+                    // peer finally binds is uncertain, so the member owns that one copy and no
+                    // other, and only when it provably satisfies one of the member's own
+                    // declarations.
+                    BunBinding::Uncertain { recorded } => {
+                        if let Some(copy) = recorded
+                            .as_deref()
+                            .filter(|copy| satisfies_a_declaration(declarations, copy))
+                        {
+                            declared_copies
+                                .entry((name.clone(), copy.to_string()))
+                                .or_default()
+                                .push(path.clone());
+                        }
+                        // A range whose copy is unknown could hold any copy of the name, so none
+                        // is pinned by its exact declarations alone.
+                        if !declarations.iter().all(BunDeclaration::is_exact) {
+                            loose.insert(name.clone());
+                        }
+                        continue;
+                    }
+                    // A foreign or local binding is proven to be no registry copy of the name, and
+                    // an unresolved one is proven absent, so the member owns none of the name's
+                    // registry copies; its manifest still shows the declaration.
+                    BunBinding::Foreign | BunBinding::Unresolved => continue,
+                };
+                let key = (name.clone(), version.clone());
+                by_version
+                    .entry(key.clone())
+                    .or_default()
+                    .push(path.clone());
+                for declaration in declarations {
+                    *declared.entry(key.clone()).or_default() += 1;
+                    if declaration.is_exact() {
+                        *exact.entry(key.clone()).or_default() += 1;
+                    }
+                }
+                entries.entry(path.clone()).or_default().insert(
+                    name.clone(),
+                    ImporterEntry {
+                        specifier,
+                        version: version.clone(),
+                    },
+                );
+            }
+        }
+        // A copy is exact-pinned only when every declaration binding it is exact, since any
+        // range among them could still move it.
+        let exact_version = declared
+            .into_iter()
+            .filter(|(key, count)| exact.get(key) == Some(count))
+            .filter(|((name, _), _)| !loose.contains(name))
+            .map(|(key, _)| key)
+            .collect();
+        MemberIndex {
+            by_version,
+            declared_copies,
+            exact_version,
+            declared_specifiers: specifiers,
+            importer_entries: entries,
+            authoritative: true,
+            ..MemberIndex::default()
+        }
+    }
+}
+
+/// Reads one `workspaces` entry of a `bun.lock`, keyed `key` (the root's is empty), against the
+/// lock's `packages`, where `shared` lists the names several members carry.
+fn bun_member(
+    key: &str,
+    workspace: &serde_json::Value,
+    packages: &serde_json::Map<String, serde_json::Value>,
+    shared: &HashSet<&str>,
+) -> BunMember {
+    let Some(workspace) = workspace.as_object() else {
+        return BunMember::Unsupported;
+    };
+    // The root's dependencies resolve through bare keys; another member's go through its name.
+    let prefix = if key.is_empty() {
+        None
+    } else {
+        let Some(name) = workspace
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty() && !shared.contains(name))
+        else {
+            return BunMember::Unsupported;
+        };
+        let linked = format!("{name}@workspace:{key}");
+        if bun_identity(packages.get(name)) != Some(linked.as_str()) {
+            return BunMember::Unsupported;
+        }
+        Some(name)
+    };
+    let mut declared: BTreeMap<String, Vec<BunDeclaration>> = BTreeMap::new();
+    for field in DIRECT_GROUPS {
+        let Some(section) = workspace.get(field) else {
+            continue;
+        };
+        let Some(section) = section.as_object() else {
+            return BunMember::Unsupported;
+        };
+        for (name, specifier) in section {
+            if name.is_empty() {
+                continue;
+            }
+            declared
+                .entry(name.clone())
+                .or_default()
+                .push(BunDeclaration {
+                    field,
+                    specifier: specifier.as_str().map(str::to_string),
+                });
+        }
+    }
+    let dependencies = declared
+        .into_iter()
+        .map(|(name, declarations)| {
+            let binding = bun_binding(prefix, &name, &declarations, packages);
+            let dependency = BunDependency {
+                declarations,
+                binding,
+            };
+            (name, dependency)
+        })
+        .collect();
+    BunMember::Keyed(dependencies)
+}
+
+/// What a member whose keys start with `prefix` (its workspace name, `None` for the root) binds
+/// its declared dependency `name` to.
+fn bun_binding(
+    prefix: Option<&str>,
+    name: &str,
+    declarations: &[BunDeclaration],
+    packages: &serde_json::Map<String, serde_json::Value>,
+) -> BunBinding {
+    // A declaration without a string specifier is no entry Bun would load.
+    if declarations
+        .iter()
+        .any(|declaration| declaration.specifier.is_none())
+    {
+        return BunBinding::Uncertain { recorded: None };
+    }
+    let nested = prefix.map(|workspace| format!("{workspace}/{name}"));
+    let entry = nested
+        .as_deref()
+        .and_then(|nested| packages.get(nested))
+        .or_else(|| packages.get(name));
+    let Some(entry) = entry else {
+        // Bun refuses to load a lock that leaves a required dependency unresolved, so only an
+        // optional one is genuinely absent.
+        let optional = declarations
+            .iter()
+            .all(|declaration| declaration.field == "optionalDependencies");
+        return if optional {
+            BunBinding::Unresolved
+        } else {
+            BunBinding::Uncertain { recorded: None }
+        };
+    };
+    let Some(BunIdentity {
+        name: resolved,
+        reference,
+    }) = bun_identity(Some(entry)).and_then(BunIdentity::parse)
+    else {
+        return BunBinding::Uncertain { recorded: None };
+    };
+    if resolved != name || !is_registry_reference(reference) {
+        return BunBinding::Foreign;
+    }
+    // Current Bun binds a peer by a version scan over every copy of the name, so the copy the key
+    // holds need not be the one the member sees.
+    if declarations
+        .iter()
+        .any(|declaration| declaration.field == "peerDependencies")
+    {
+        return BunBinding::Uncertain {
+            recorded: Some(reference.to_string()),
+        };
+    }
+    BunBinding::Registry(reference.to_string())
+}
+
+/// The identity a `packages` entry holds: its value's first array element, `name@reference`.
+fn bun_identity(entry: Option<&serde_json::Value>) -> Option<&str> {
+    entry?.as_array()?.first()?.as_str()
+}
+
+/// The two halves of a package identity, `name@reference`.
+struct BunIdentity<'a> {
+    /// The package the key holds, a scope's leading `@` kept.
+    name: &'a str,
+    /// A registry version, or a protocol reference (`workspace:`, `file:`, `link:`, `root:`, a git
+    /// or tarball source).
+    reference: &'a str,
+}
+
+impl<'a> BunIdentity<'a> {
+    /// Splits `identity` at the first `@` after a scope's leading one, since a git reference can
+    /// itself contain an `@` (`pkg@git+ssh://git@github.com/…`).
+    fn parse(identity: &'a str) -> Option<Self> {
+        let at = identity.get(1..)?.find('@')? + 1;
+        let (name, reference) = identity.split_at_checked(at)?;
+        let reference = reference.strip_prefix('@')?;
+        Some(BunIdentity { name, reference })
+    }
+}
+
+/// Whether an identity's `reference` is a registry version rather than a protocol reference.
+fn is_registry_reference(reference: &str) -> bool {
+    !reference.is_empty() && !is_url_resolution(reference)
+}
+
+/// The registry version of `name` a package identity records, or `None` for another package or a
+/// protocol reference.
+#[cfg(test)]
+fn bun_registry_version<'a>(name: &str, identity: &'a str) -> Option<&'a str> {
+    let BunIdentity {
+        name: resolved,
+        reference,
+    } = BunIdentity::parse(identity)?;
+    (resolved == name && is_registry_reference(reference)).then_some(reference)
 }
 
 /// Removes JSON-invalid trailing commas (a comma whose next non-whitespace character closes an
@@ -2932,6 +3452,330 @@ fn strip_trailing_commas(s: &str) -> String {
     }
     flush(&mut out, &mut pending_comma, &mut pending_ws);
     out
+}
+
+/// Real `bun.lock` files the Bun readers' tests share.
+///
+/// Each was written by `bun install --lockfile-only` (Bun 1.4.4) in a scratch workspace whose
+/// manifests the `workspaces` entries copy verbatim; only the integrity hashes are elided.
+#[cfg(test)]
+pub(crate) mod bun_fixtures {
+    use indoc::indoc;
+
+    /// A root and three members, two of them pinning `chalk` at their own versions.
+    ///
+    /// `pkg-a` and `@acme/scoped` keep nested copies under their workspace names, while `pkg-b`
+    /// falls back to the root's copy, aliases `is-number` as `isnum`, and links `pkg-a`.
+    /// The root key `@types/node` is `@acme/scoped`'s hoisted copy, which the root itself does not
+    /// declare.
+    pub(crate) const WORKSPACES: &str = indoc! {r#"
+        {
+          "lockfileVersion": 2,
+          "configVersion": 1,
+          "workspaces": {
+            "": {
+              "name": "root",
+              "dependencies": {
+                "chalk": "4.1.2",
+                "is-number": "^7.0.0",
+              },
+            },
+            "packages/a": {
+              "name": "pkg-a",
+              "dependencies": {
+                "@types/node": "20.0.0",
+                "chalk": "4.1.0",
+              },
+            },
+            "packages/b": {
+              "name": "pkg-b",
+              "dependencies": {
+                "chalk": "4.1.2",
+                "isnum": "npm:is-number@6.0.0",
+                "pkg-a": "workspace:*",
+              },
+            },
+            "packages/scoped": {
+              "name": "@acme/scoped",
+              "devDependencies": {
+                "@types/node": "20.1.0",
+                "chalk": "5.3.0",
+              },
+            },
+          },
+          "packages": {
+            "@acme/scoped": ["@acme/scoped@workspace:packages/scoped"],
+
+            "@types/node": ["@types/node@20.1.0", "", {}, "sha512-x"],
+
+            "ansi-styles": ["ansi-styles@4.3.0", "", { "dependencies": { "color-convert": "^2.0.1" } }, "sha512-x"],
+
+            "chalk": ["chalk@4.1.2", "", { "dependencies": { "ansi-styles": "^4.1.0", "supports-color": "^7.1.0" } }, "sha512-x"],
+
+            "color-convert": ["color-convert@2.0.1", "", { "dependencies": { "color-name": "~1.1.4" } }, "sha512-x"],
+
+            "color-name": ["color-name@1.1.4", "", {}, "sha512-x"],
+
+            "has-flag": ["has-flag@4.0.0", "", {}, "sha512-x"],
+
+            "is-number": ["is-number@7.0.0", "", {}, "sha512-x"],
+
+            "isnum": ["is-number@6.0.0", "", {}, "sha512-x"],
+
+            "pkg-a": ["pkg-a@workspace:packages/a"],
+
+            "pkg-b": ["pkg-b@workspace:packages/b"],
+
+            "supports-color": ["supports-color@7.2.0", "", { "dependencies": { "has-flag": "^4.0.0" } }, "sha512-x"],
+
+            "@acme/scoped/chalk": ["chalk@5.3.0", "", {}, "sha512-x"],
+
+            "pkg-a/@types/node": ["@types/node@20.0.0", "", {}, "sha512-x"],
+
+            "pkg-a/chalk": ["chalk@4.1.0", "", { "dependencies": { "ansi-styles": "^4.1.0", "supports-color": "^7.1.0" } }, "sha512-x"],
+          }
+        }
+    "#};
+
+    /// A library member declaring `chalk` both as an exact dev pin and as a peer range, beside a
+    /// member declaring it only as an optional dependency.
+    pub(crate) const PEER_AND_OPTIONAL: &str = indoc! {r#"
+        {
+          "lockfileVersion": 2,
+          "configVersion": 1,
+          "workspaces": {
+            "": {
+              "name": "root",
+              "dependencies": {
+                "chalk": "4.1.2",
+              },
+            },
+            "packages/a": {
+              "name": "pkg-a",
+              "devDependencies": {
+                "chalk": "4.1.0",
+              },
+              "peerDependencies": {
+                "chalk": "^4.0.0",
+              },
+            },
+            "packages/b": {
+              "name": "pkg-b",
+              "optionalDependencies": {
+                "chalk": "4.1.1",
+              },
+            },
+          },
+          "packages": {
+            "ansi-styles": ["ansi-styles@4.3.0", "", { "dependencies": { "color-convert": "^2.0.1" } }, "sha512-x"],
+
+            "chalk": ["chalk@4.1.2", "", { "dependencies": { "ansi-styles": "^4.1.0", "supports-color": "^7.1.0" } }, "sha512-x"],
+
+            "color-convert": ["color-convert@2.0.1", "", { "dependencies": { "color-name": "~1.1.4" } }, "sha512-x"],
+
+            "color-name": ["color-name@1.1.4", "", {}, "sha512-x"],
+
+            "has-flag": ["has-flag@4.0.0", "", {}, "sha512-x"],
+
+            "pkg-a": ["pkg-a@workspace:packages/a"],
+
+            "pkg-b": ["pkg-b@workspace:packages/b"],
+
+            "supports-color": ["supports-color@7.2.0", "", { "dependencies": { "has-flag": "^4.0.0" } }, "sha512-x"],
+
+            "pkg-a/chalk": ["chalk@4.1.0", "", { "dependencies": { "ansi-styles": "^4.1.0", "supports-color": "^7.1.0" } }, "sha512-x"],
+
+            "pkg-b/chalk": ["chalk@4.1.1", "", { "dependencies": { "ansi-styles": "^4.1.0", "supports-color": "^7.1.0" } }, "sha512-x"],
+          }
+        }
+    "#};
+
+    /// A root and a library member that each declare `chalk` both as a dev dependency and as a peer
+    /// range with an explicit upper bound, the member's dev pin kept at its nested key.
+    pub(crate) const ROOT_PEER_AND_DEV: &str = indoc! {r#"
+        {
+          "lockfileVersion": 2,
+          "configVersion": 1,
+          "workspaces": {
+            "": {
+              "name": "root",
+              "devDependencies": {
+                "chalk": ">=4.1.0 <4.2.0",
+              },
+              "peerDependencies": {
+                "chalk": "^4.0.0",
+              },
+            },
+            "packages/a": {
+              "name": "pkg-a",
+              "devDependencies": {
+                "chalk": "4.1.0",
+              },
+              "peerDependencies": {
+                "chalk": ">=4.0.0 <5.0.0",
+              },
+            },
+          },
+          "packages": {
+            "ansi-styles": ["ansi-styles@4.3.0", "", { "dependencies": { "color-convert": "^2.0.1" } }, "sha512-x"],
+
+            "chalk": ["chalk@4.1.2", "", { "dependencies": { "ansi-styles": "^4.1.0", "supports-color": "^7.1.0" } }, "sha512-x"],
+
+            "color-convert": ["color-convert@2.0.1", "", { "dependencies": { "color-name": "~1.1.4" } }, "sha512-x"],
+
+            "color-name": ["color-name@1.1.4", "", {}, "sha512-x"],
+
+            "has-flag": ["has-flag@4.0.0", "", {}, "sha512-x"],
+
+            "pkg-a": ["pkg-a@workspace:packages/a"],
+
+            "supports-color": ["supports-color@7.2.0", "", { "dependencies": { "has-flag": "^4.0.0" } }, "sha512-x"],
+
+            "pkg-a/chalk": ["chalk@4.1.0", "", { "dependencies": { "ansi-styles": "^4.1.0", "supports-color": "^7.1.0" } }, "sha512-x"],
+          }
+        }
+    "#};
+
+    /// A member aliasing `chalk` to `is-number@6.0.0`, whose alias holds the root key `chalk`,
+    /// beside the root's `log-symbols`, whose own registry `chalk@4.1.2` Bun nests under it.
+    pub(crate) const ALIAS_BESIDE_TRANSITIVE: &str = indoc! {r#"
+        {
+          "lockfileVersion": 2,
+          "configVersion": 1,
+          "workspaces": {
+            "": {
+              "name": "root",
+              "dependencies": {
+                "log-symbols": "4.1.0",
+              },
+            },
+            "packages/b": {
+              "name": "pkg-b",
+              "dependencies": {
+                "chalk": "npm:is-number@6.0.0",
+              },
+            },
+          },
+          "packages": {
+            "ansi-styles": ["ansi-styles@4.3.0", "", { "dependencies": { "color-convert": "^2.0.1" } }, "sha512-x"],
+
+            "chalk": ["is-number@6.0.0", "", {}, "sha512-x"],
+
+            "color-convert": ["color-convert@2.0.1", "", { "dependencies": { "color-name": "~1.1.4" } }, "sha512-x"],
+
+            "color-name": ["color-name@1.1.4", "", {}, "sha512-x"],
+
+            "has-flag": ["has-flag@4.0.0", "", {}, "sha512-x"],
+
+            "is-unicode-supported": ["is-unicode-supported@0.1.0", "", {}, "sha512-x"],
+
+            "log-symbols": ["log-symbols@4.1.0", "", { "dependencies": { "chalk": "^4.1.0", "is-unicode-supported": "^0.1.0" } }, "sha512-x"],
+
+            "pkg-b": ["pkg-b@workspace:packages/b"],
+
+            "supports-color": ["supports-color@7.2.0", "", { "dependencies": { "has-flag": "^4.0.0" } }, "sha512-x"],
+
+            "log-symbols/chalk": ["chalk@4.1.2", "", { "dependencies": { "ansi-styles": "^4.1.0", "supports-color": "^7.1.0" } }, "sha512-x"],
+          }
+        }
+    "#};
+
+    /// A member declaring `chalk` as a bounded dev range and as a peer, whose copy `chalk@4.1.0`
+    /// holds the root key, beside the root's `log-symbols`, whose `chalk@5.6.2` Bun nests under it.
+    pub(crate) const PEER_BESIDE_TRANSITIVE: &str = indoc! {r#"
+        {
+          "lockfileVersion": 2,
+          "configVersion": 1,
+          "workspaces": {
+            "": {
+              "name": "root",
+              "dependencies": {
+                "log-symbols": "6.0.0",
+              },
+            },
+            "packages/b": {
+              "name": "pkg-b",
+              "devDependencies": {
+                "chalk": ">=4.1.0 <4.1.1",
+              },
+              "peerDependencies": {
+                "chalk": "^4.0.0",
+              },
+            },
+          },
+          "packages": {
+            "ansi-styles": ["ansi-styles@4.3.0", "", { "dependencies": { "color-convert": "^2.0.1" } }, "sha512-x"],
+
+            "chalk": ["chalk@4.1.0", "", { "dependencies": { "ansi-styles": "^4.1.0", "supports-color": "^7.1.0" } }, "sha512-x"],
+
+            "color-convert": ["color-convert@2.0.1", "", { "dependencies": { "color-name": "~1.1.4" } }, "sha512-x"],
+
+            "color-name": ["color-name@1.1.4", "", {}, "sha512-x"],
+
+            "has-flag": ["has-flag@4.0.0", "", {}, "sha512-x"],
+
+            "is-unicode-supported": ["is-unicode-supported@1.3.0", "", {}, "sha512-x"],
+
+            "log-symbols": ["log-symbols@6.0.0", "", { "dependencies": { "chalk": "^5.3.0", "is-unicode-supported": "^1.3.0" } }, "sha512-x"],
+
+            "pkg-b": ["pkg-b@workspace:packages/b"],
+
+            "supports-color": ["supports-color@7.2.0", "", { "dependencies": { "has-flag": "^4.0.0" } }, "sha512-x"],
+
+            "log-symbols/chalk": ["chalk@5.6.2", "", {}, "sha512-x"],
+          }
+        }
+    "#};
+
+    /// A member named `is-number` beside the root's registry `is-number@7.0.0`, which holds the
+    /// member's name key, so current Bun files the member's `chalk` under `./is-number/chalk`.
+    pub(crate) const COLLIDING_MEMBER: &str = indoc! {r#"
+        {
+          "lockfileVersion": 2,
+          "configVersion": 1,
+          "workspaces": {
+            "": {
+              "name": "root",
+              "dependencies": {
+                "chalk": "4.1.2",
+                "is-number": "7.0.0",
+              },
+            },
+            "packages/a": {
+              "name": "is-number",
+              "version": "1.0.0",
+              "dependencies": {
+                "chalk": "4.1.0",
+              },
+            },
+            "packages/b": {
+              "name": "pkg-b",
+              "dependencies": {
+                "chalk": "4.1.2",
+              },
+            },
+          },
+          "packages": {
+            "ansi-styles": ["ansi-styles@4.3.0", "", { "dependencies": { "color-convert": "^2.0.1" } }, "sha512-x"],
+
+            "chalk": ["chalk@4.1.2", "", { "dependencies": { "ansi-styles": "^4.1.0", "supports-color": "^7.1.0" } }, "sha512-x"],
+
+            "color-convert": ["color-convert@2.0.1", "", { "dependencies": { "color-name": "~1.1.4" } }, "sha512-x"],
+
+            "color-name": ["color-name@1.1.4", "", {}, "sha512-x"],
+
+            "has-flag": ["has-flag@4.0.0", "", {}, "sha512-x"],
+
+            "is-number": ["is-number@7.0.0", "", {}, "sha512-x"],
+
+            "pkg-b": ["pkg-b@workspace:packages/b"],
+
+            "supports-color": ["supports-color@7.2.0", "", { "dependencies": { "has-flag": "^4.0.0" } }, "sha512-x"],
+
+            "./is-number/chalk": ["chalk@4.1.0", "", { "dependencies": { "ansi-styles": "^4.1.0", "supports-color": "^7.1.0" } }, "sha512-x"],
+          }
+        }
+    "#};
 }
 
 #[cfg(test)]
@@ -4165,7 +5009,8 @@ packages:
 
     #[test]
     fn member_index_is_empty_by_default() {
-        // yarn/bun and the unparsable case: no attribution, so the column stays blank.
+        // Yarn, an unsupported bun.lock, and the unparsable case: no attribution, so the column
+        // stays blank.
         let index = MemberIndex::default();
         assert_eq!(index.members_for("anything", "1.0.0"), [] as [String; 0]);
     }
@@ -5080,5 +5925,379 @@ packages:
                 },
             ]
         );
+    }
+
+    /// The expected member list of a copy no member binds.
+    const NO_MEMBERS: [String; 0] = [];
+
+    /// The member paths a Bun lock yields, sorted.
+    fn bun_member_paths(lock: &str) -> Vec<String> {
+        let mut paths: Vec<String> = Bun::member_paths(lock).into_iter().collect();
+        paths.sort();
+        paths
+    }
+
+    /// Every member binds its own copy: the root through its dependency's key, another member
+    /// through `<workspace-name>/<dependency>` first and the root key after it, scoped names
+    /// whole on both sides.
+    #[test]
+    fn bun_attributes_each_member_its_own_copy() {
+        use bun_fixtures::WORKSPACES;
+        let attribution = Bun::member_attribution(WORKSPACES);
+
+        // Two members pinning one name at different versions each resolve their own copy.
+        assert_eq!(
+            attribution.resolution(".", "chalk"),
+            MemberResolution::Resolved("4.1.2")
+        );
+        assert_eq!(
+            attribution.resolution("packages/a", "chalk"),
+            MemberResolution::Resolved("4.1.0")
+        );
+        assert_eq!(
+            attribution.resolution("packages/scoped", "chalk"),
+            MemberResolution::Resolved("5.3.0")
+        );
+
+        // Without a nested key, the member falls back to the root's copy.
+        assert_eq!(
+            attribution.resolution("packages/b", "chalk"),
+            MemberResolution::Resolved("4.1.2")
+        );
+        assert_eq!(
+            attribution.resolution("packages/scoped", "@types/node"),
+            MemberResolution::Resolved("20.1.0")
+        );
+
+        // A scoped dependency nests under the workspace name, not its directory.
+        assert_eq!(
+            attribution.resolution("packages/a", "@types/node"),
+            MemberResolution::Resolved("20.0.0")
+        );
+
+        // A root key the member does not declare binds nothing for it.
+        assert_eq!(
+            attribution.resolution(".", "@types/node"),
+            MemberResolution::Missing
+        );
+
+        // A foreign alias and a linked workspace are no registry copy of their name.
+        assert_eq!(
+            attribution.resolution("packages/b", "isnum"),
+            MemberResolution::Unknown
+        );
+        assert_eq!(
+            attribution.resolution("packages/b", "pkg-a"),
+            MemberResolution::Unknown
+        );
+
+        // The index attributes each copy to its declaring members only.
+        let index = Bun::member_sources(WORKSPACES);
+        assert!(index.is_authoritative());
+        assert_eq!(index.members_for("chalk", "4.1.2"), [".", "packages/b"]);
+        assert_eq!(index.members_for("chalk", "4.1.0"), ["packages/a"]);
+        assert_eq!(index.members_for("chalk", "5.3.0"), ["packages/scoped"]);
+        assert_eq!(index.members_for("@types/node", "20.0.0"), ["packages/a"]);
+        assert_eq!(
+            index.members_for("@types/node", "20.1.0"),
+            ["packages/scoped"]
+        );
+        assert_eq!(index.members_for("is-number", "6.0.0"), NO_MEMBERS);
+        assert_eq!(index.resolved_version("packages/b", "chalk"), Some("4.1.2"));
+        assert_eq!(
+            index.resolved_versions_of("chalk"),
+            ["4.1.0", "4.1.2", "5.3.0"]
+        );
+        assert_eq!(
+            bun_member_paths(WORKSPACES),
+            [".", "packages/a", "packages/b", "packages/scoped"]
+        );
+    }
+
+    /// Each member's exact registry declarations pin their own copy, its first field's specifier
+    /// is its recorded entry, and an excluded member contributes nothing.
+    #[test]
+    fn bun_index_records_exact_pins_and_entries_per_member() {
+        use bun_fixtures::WORKSPACES;
+        let index = Bun::member_sources(WORKSPACES);
+        assert!(index.is_exact_pinned("chalk", "4.1.0"));
+        assert!(index.is_exact_pinned("chalk", "4.1.2"));
+        assert!(!index.is_exact_pinned("is-number", "7.0.0"));
+        assert_eq!(
+            index.entries_of("packages/scoped").get("chalk"),
+            Some(&&ImporterEntry {
+                specifier: Some("5.3.0".into()),
+                version: "5.3.0".into(),
+            })
+        );
+        assert_eq!(
+            index.declared_specifiers_of("chalk"),
+            ["4.1.0", "4.1.2", "5.3.0"]
+        );
+        assert!(!index.entries_of("packages/b").contains_key("isnum"));
+
+        let excluded = HashSet::from(["packages/a".to_string()]);
+        let index = Bun::member_sources_excluding(WORKSPACES, &excluded);
+        assert_eq!(index.members_for("chalk", "4.1.0"), NO_MEMBERS);
+        assert_eq!(index.declared_specifiers_of("chalk"), ["4.1.2", "5.3.0"]);
+    }
+
+    /// A peer declaration is bound by Bun's version scan rather than the member's key, so even an
+    /// exact dev pin beside it is unknown, while an optional dependency resolves through its key.
+    /// The unknown binding keeps its declaration: the member owns the one copy its key records,
+    /// though it resolves to none, and no copy is pinned for it.
+    #[test]
+    fn bun_peer_declarations_are_unknown_and_optional_ones_resolve() {
+        use bun_fixtures::PEER_AND_OPTIONAL;
+        let attribution = Bun::member_attribution(PEER_AND_OPTIONAL);
+        assert_eq!(
+            attribution.resolution("packages/a", "chalk"),
+            MemberResolution::Unknown
+        );
+        assert_eq!(
+            attribution.resolution("packages/b", "chalk"),
+            MemberResolution::Resolved("4.1.1")
+        );
+        let index = Bun::member_sources(PEER_AND_OPTIONAL);
+        assert!(index.is_authoritative());
+        assert!(index.declares("chalk"));
+        assert_eq!(index.members_for("chalk", "4.1.0"), ["packages/a"]);
+        assert_eq!(index.members_for("chalk", "4.1.1"), ["packages/b"]);
+        assert_eq!(index.members_for("chalk", "4.1.2"), ["."]);
+        assert_eq!(index.resolved_version("packages/a", "chalk"), None);
+        assert!(!index.is_exact_pinned("chalk", "4.1.0"));
+        assert_eq!(
+            index.declared_specifiers_of("chalk"),
+            ["4.1.0", "4.1.1", "4.1.2"]
+        );
+    }
+
+    /// A root that declares a name both as a dev dependency and as a peer keeps it declared through
+    /// the copy its key records, so the dependency stays direct even though the lock leaves which
+    /// copy it binds unknown.
+    #[test]
+    fn bun_root_peer_and_dev_declaration_stays_declared() {
+        use bun_fixtures::ROOT_PEER_AND_DEV;
+        let attribution = Bun::member_attribution(ROOT_PEER_AND_DEV);
+        for member in [".", "packages/a"] {
+            assert_eq!(
+                attribution.resolution(member, "chalk"),
+                MemberResolution::Unknown,
+                "{member}"
+            );
+        }
+        let index = Bun::member_sources(ROOT_PEER_AND_DEV);
+        assert!(index.is_authoritative());
+        assert_eq!(index.members_for("chalk", "4.1.2"), ["."]);
+        assert_eq!(index.members_for("chalk", "4.1.0"), ["packages/a"]);
+        assert_eq!(index.resolved_version(".", "chalk"), None);
+        assert!(!index.is_exact_pinned("chalk", "4.1.0"));
+    }
+
+    /// A member whose binding is uncertain owns only the copy its key records, and only when that
+    /// copy satisfies one of its own declarations, never another line of the name.
+    #[test]
+    fn bun_uncertain_member_owns_only_its_recorded_copy() {
+        use bun_fixtures::PEER_BESIDE_TRANSITIVE;
+        let index = Bun::member_sources(PEER_BESIDE_TRANSITIVE);
+        assert_eq!(index.members_for("chalk", "4.1.0"), ["packages/b"]);
+        assert_eq!(index.members_for("chalk", "5.6.2"), NO_MEMBERS);
+
+        // A recorded copy outside every declaration proves no ownership.
+        let outside = PEER_BESIDE_TRANSITIVE.replace(r#"">=4.1.0 <4.1.1""#, r#""4.1.1""#);
+        let outside = outside.replace(r#""^4.0.0""#, r#""4.1.1""#);
+        assert_eq!(
+            Bun::member_sources(&outside).members_for("chalk", "4.1.0"),
+            NO_MEMBERS
+        );
+    }
+
+    /// A foreign alias and a workspace link are proven to bind no registry copy of their name, so
+    /// they own none, unlike a declaration whose copy is merely undetermined.
+    #[test]
+    fn bun_foreign_and_local_declarations_own_no_registry_copy() {
+        use bun_fixtures::{PEER_AND_OPTIONAL, WORKSPACES};
+        let bindings = BunBindings::read(WORKSPACES);
+        for name in ["isnum", "pkg-a"] {
+            assert!(
+                bindings
+                    .as_ref()
+                    .is_some_and(|bindings| !bindings.is_uncertain("packages/b", name)),
+                "{name}"
+            );
+        }
+        let index = Bun::member_sources(WORKSPACES);
+        assert!(!index.declares("isnum"));
+        assert!(!index.declares("pkg-a"));
+        assert_eq!(index.members_for("isnum", "6.0.0"), NO_MEMBERS);
+
+        // A peer declaration of the name itself is the uncertain case.
+        assert!(
+            BunBindings::read(PEER_AND_OPTIONAL)
+                .is_some_and(|bindings| bindings.is_uncertain("packages/a", "chalk"))
+        );
+    }
+
+    /// A member whose name the root's registry dependency holds files its keys under `./<name>`
+    /// in current Bun and under `<name>` in Bun 1.3.0, so its bindings are unknown, its siblings'
+    /// stay readable, and the index is not authoritative.
+    #[test]
+    fn bun_member_colliding_with_a_root_dependency_is_unknown() {
+        use bun_fixtures::COLLIDING_MEMBER;
+        let attribution = Bun::member_attribution(COLLIDING_MEMBER);
+        assert_eq!(
+            attribution.resolution("packages/a", "chalk"),
+            MemberResolution::Unknown
+        );
+        assert_eq!(
+            attribution.resolution("packages/b", "chalk"),
+            MemberResolution::Resolved("4.1.2")
+        );
+        assert_eq!(
+            attribution.resolution(".", "is-number"),
+            MemberResolution::Resolved("7.0.0")
+        );
+        let index = Bun::member_sources(COLLIDING_MEMBER);
+        assert!(!index.is_authoritative());
+        assert!(index.all_paths().is_empty());
+        assert_eq!(
+            bun_member_paths(COLLIDING_MEMBER),
+            [".", "packages/a", "packages/b"]
+        );
+    }
+
+    /// A lock outside the supported schema attributes nothing: no member, no index, no binding.
+    #[test]
+    fn bun_unsupported_schemas_attribute_nothing() {
+        let lock = |version: &str, root: &str| {
+            formatdoc! {r#"
+                {{
+                  "lockfileVersion": {version},
+                  "workspaces": {{
+                    "{root}": {{ "dependencies": {{ "chalk": "4.1.0" }} }},
+                  }},
+                  "packages": {{ "chalk": ["chalk@4.1.0", "", {{}}, "sha512-x"] }},
+                }}
+            "#}
+        };
+        // Supported baseline
+        assert_eq!(
+            Bun::member_attribution(&lock("1", "")).resolution(".", "chalk"),
+            MemberResolution::Resolved("4.1.0")
+        );
+
+        // Version 0, an unreleased version, a non-numeric version, no root, and no JSON at all
+        for lock in [
+            lock("0", ""),
+            lock("4", ""),
+            lock(r#""1""#, ""),
+            lock("1", "packages/a"),
+            "{ not json".to_string(),
+        ] {
+            assert!(
+                matches!(Bun::member_attribution(&lock), MemberAttribution::Unknown),
+                "{lock}"
+            );
+            assert!(!Bun::member_sources(&lock).is_authoritative(), "{lock}");
+            assert!(Bun::member_paths(&lock).is_empty(), "{lock}");
+        }
+    }
+
+    /// Every binding the lock does not establish is unknown, never missing: only a dependency the
+    /// member's entry does not declare, or an optional one no key holds, is genuinely absent.
+    #[test]
+    fn bun_uncertain_bindings_are_unknown_not_missing() {
+        let lock = indoc! {r#"
+            {
+              "lockfileVersion": 1,
+              "workspaces": {
+                "": {
+                  "dependencies": {
+                    "absent": "1.0.0",
+                    "garbled": "1.0.0",
+                    "git": "github:acme/git",
+                    "unread": 1,
+                  },
+                  "optionalDependencies": { "fsevents": "2.3.3" },
+                },
+                "../outside": { "name": "outside", "dependencies": { "chalk": "4.1.0" } },
+                "packages/moved": { "name": "moved", "dependencies": { "chalk": "4.1.0" } },
+                "packages/twin-a": { "name": "twin", "dependencies": { "chalk": "4.1.0" } },
+                "packages/twin-b": { "name": "twin", "dependencies": { "chalk": "4.1.0" } },
+                "packages/broken": { "name": "broken", "dependencies": ["chalk"] },
+              },
+              "packages": {
+                "chalk": ["chalk@4.1.0", "", {}, "sha512-x"],
+                "garbled": "garbled@1.0.0",
+                "git": ["git@git+ssh://git@github.com/acme/git.git#abc", {}, "abc"],
+                "moved": ["moved@workspace:packages/elsewhere"],
+                "twin": ["twin@workspace:packages/twin-a"],
+                "broken": ["broken@workspace:packages/broken"],
+              },
+            }
+        "#};
+        let attribution = Bun::member_attribution(lock);
+        let resolution = |member: &str, name: &str| attribution.resolution(member, name);
+
+        // Genuine absence
+        assert_eq!(resolution(".", "chalk"), MemberResolution::Missing);
+        assert_eq!(resolution(".", "fsevents"), MemberResolution::Missing);
+
+        // A required dependency no key holds, a malformed entry, a git source, an unread
+        // specifier
+        for name in ["absent", "garbled", "git", "unread"] {
+            assert_eq!(resolution(".", name), MemberResolution::Unknown, "{name}");
+        }
+
+        // An unsafe member path, a name whose key holds another path, a name two members share,
+        // and a malformed entry
+        for member in [
+            "../outside",
+            "packages/moved",
+            "packages/twin-a",
+            "packages/twin-b",
+            "packages/broken",
+        ] {
+            assert_eq!(
+                resolution(member, "chalk"),
+                MemberResolution::Unknown,
+                "{member}"
+            );
+        }
+        assert_eq!(
+            bun_member_paths(lock),
+            [
+                ".",
+                "packages/broken",
+                "packages/moved",
+                "packages/twin-a",
+                "packages/twin-b"
+            ]
+        );
+    }
+
+    /// A package identity splits at the first `@` after a scope, so neither a scoped name nor a
+    /// git reference containing `@` misreads as a version.
+    #[test]
+    fn bun_registry_versions_split_at_the_name() {
+        assert_eq!(
+            bun_registry_version("@types/node", "@types/node@20.0.0"),
+            Some("20.0.0")
+        );
+        assert_eq!(
+            bun_registry_version("chalk", "chalk@5.0.0+build.1"),
+            Some("5.0.0+build.1")
+        );
+        assert_eq!(bun_registry_version("isnum", "is-number@6.0.0"), None);
+        assert_eq!(
+            bun_registry_version("git", "git@git+ssh://git@github.com/acme/git.git#abc"),
+            None
+        );
+        assert_eq!(
+            bun_registry_version("pkg-a", "pkg-a@workspace:packages/a"),
+            None
+        );
+        assert_eq!(bun_registry_version("root", "root@root:"), None);
+        assert_eq!(bun_registry_version("chalk", "chalk"), None);
     }
 }

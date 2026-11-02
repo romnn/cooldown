@@ -11,11 +11,13 @@
 //! A settled lock that newly violates one is refused, and the caller's recovery isolates the
 //! candidate whose resolve did it.
 //!
-//! Only locks that attribute a resolution to each member can be judged: pnpm's importers and npm's
-//! v2/v3 install tree.
-//! Yarn classic, bun, and npm v1 locks attribute nothing per member, so their pins are reported
+//! Only locks that attribute a resolution to each member can be judged: pnpm's importers, npm's
+//! v2/v3 install tree, and the package keys of a `bun.lock` its reader supports.
+//! Yarn classic and npm v1 locks attribute nothing per member, so their pins are reported
 //! [`Observed::Unknown`] and protected by nothing here; the name's newest copy is never a stand-in,
 //! since a transitive duplicate beside an unchanged member copy would read as a moved pin.
+//! Neither is a Bun member whose keys the lock does not prove, nor a Bun peer declaration, which
+//! Bun binds by version rather than by key.
 //! Within an npm install tree, an alias occupying the owner's slot (`"foo": "npm:other@1.0.0"`)
 //! installs another package, so it is unknown too rather than a version of the pinned name.
 

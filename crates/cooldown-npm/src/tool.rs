@@ -10,7 +10,8 @@ use crate::apply::landing::{
     target_in_declared_range, window_minutes_from_cutoff,
 };
 use crate::lock::{
-    EffectiveRegistryQuery, MemberIndex, NameVersion, NodeLock, SplitHold, SplitVerdict,
+    EffectiveRegistryQuery, MemberAttribution, MemberIndex, MemberResolution, NameVersion,
+    NodeLock, SplitHold, SplitVerdict,
 };
 use crate::manifest;
 use crate::native::{
@@ -709,9 +710,10 @@ fn candidate_moved(
 }
 
 /// Whether the re-locked graph resolves `change` at exactly its target, judged per declaring
-/// member when the lock carries member-scoped entries, per the member's physical install-tree
-/// instance when the lock records layout (npm), and by the name's newest copy only as the last
-/// resort, for a change without declaring members or a lock without either record.
+/// member on its package-key binding (bun), on its member-scoped entry (pnpm), or on its physical
+/// install-tree instance when the lock records layout (npm), and by the name's newest copy only as
+/// the last resort, for a change without declaring members, a lock without any such record, or a
+/// bun member that declares the name itself while the lock leaves its copy undetermined.
 ///
 /// A recorded install tree is authoritative for every declaring member: each must resolve a copy
 /// of the name itself at the target.
@@ -726,10 +728,29 @@ fn exact_target_reached<L: NodeLock>(project: &Project, change: &Change) -> Resu
     let content = read_lock::<L>(project)?;
     let newest = locked_versions::<L>(&content)?;
     let target = change.to.as_str();
+    let newest_reached = newest
+        .get(&change.package.name)
+        .is_some_and(|version| version == target);
     if change.members.is_empty() {
-        return Ok(newest
-            .get(&change.package.name)
-            .is_some_and(|version| version == target));
+        return Ok(newest_reached);
+    }
+    // Bun's attribution judges every member with a known binding on that binding, so another
+    // member's newer copy never stands in for it.
+    // Only a member that declares the name itself while the lock leaves its copy undetermined,
+    // such as one that also declares the name as a peer, falls back to the name's newest copy, the
+    // one evidence there is for it.
+    // A foreign or local binding is no copy of the name, so no copy elsewhere lands it.
+    if let MemberAttribution::PackageKeys(bindings) = L::member_attribution(&content) {
+        let name = change.package.name.as_str();
+        return Ok(change.members.iter().all(|member| {
+            match bindings.resolution(&member.path, name) {
+                MemberResolution::Resolved(version) => version == target,
+                MemberResolution::Missing => false,
+                MemberResolution::Unknown => {
+                    newest_reached && bindings.is_uncertain(&member.path, name)
+                }
+            }
+        }));
     }
     let members = L::member_sources(&content);
     let member_versions: Vec<Option<&str>> = change
@@ -755,9 +776,7 @@ fn exact_target_reached<L: NodeLock>(project: &Project, change: &Change) -> Resu
                 .is_some_and(|instance| instance.version == target)
         }));
     }
-    Ok(newest
-        .get(&change.package.name)
-        .is_some_and(|version| version == target))
+    Ok(newest_reached)
 }
 
 /// A net version change `apply` derived from the before/after lock diff for a package the plan did not
@@ -6966,6 +6985,607 @@ packages:
         assert!(
             declared.contains(r#""devDependencies": { "own": "1.0.0", "pinned": "1.0.0" }"#),
             "{declared}"
+        );
+        Ok(())
+    }
+
+    /// A Bun workspace whose root declares `first`, `second`, and `pinned` at carets and whose
+    /// excluded-to-be member `packages/a` (`pkg-a`) pins `pinned` exactly, kept at the member's
+    /// nested key below the root's newer copy, driven by a scripted `bun install` that lands each
+    /// widened root caret at 1.1.0.
+    /// Landing `second` also drops the member's nested `pinned`, the way Bun dedupes a nested key
+    /// onto the root copy, so the member's binding falls back to `pinned@1.1.0`.
+    #[cfg(unix)]
+    fn bun_sibling_pin_fixture(root: &Utf8Path) -> eyre::Result<NpmTool<Bun>> {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(
+            root.join("package.json"),
+            indoc! {r#"
+                {
+                  "name": "app",
+                  "workspaces": ["packages/*"],
+                  "dependencies": { "first": "^1.0.0", "second": "^1.0.0", "pinned": "^1.0.0" }
+                }
+            "#},
+        )?;
+        std::fs::create_dir_all(root.join("packages/a"))?;
+        std::fs::write(
+            root.join("packages/a/package.json"),
+            r#"{ "name": "pkg-a", "dependencies": { "pinned": "1.0.0" } }"#,
+        )?;
+        std::fs::write(
+            root.join("bun.lock"),
+            indoc! {r#"
+                {
+                  "lockfileVersion": 1,
+                  "workspaces": {
+                    "": {
+                      "name": "app",
+                      "dependencies": {
+                        "first": "^1.0.0",
+                        "pinned": "^1.0.0",
+                        "second": "^1.0.0",
+                      },
+                    },
+                    "packages/a": {
+                      "name": "pkg-a",
+                      "dependencies": {
+                        "pinned": "1.0.0",
+                      },
+                    },
+                  },
+                  "packages": {
+                    "first": ["first@1.0.0", "", {}, "sha512-x"],
+
+                    "pinned": ["pinned@1.1.0", "", {}, "sha512-x"],
+
+                    "pkg-a": ["pkg-a@workspace:packages/a"],
+
+                    "second": ["second@1.0.0", "", {}, "sha512-x"],
+
+                    "pkg-a/pinned": ["pinned@1.0.0", "", {}, "sha512-x"],
+                  }
+                }
+            "#},
+        )?;
+        let script = root.join("fake-bun.sh");
+        std::fs::write(
+            &script,
+            indoc! {r#"
+                #!/bin/sh
+                echo "$*" >> legs.log
+                land() {
+                    sed -e "s|\"$1\": \[\"$1@1.0.0\"|\"$1\": [\"$1@1.1.0\"|" \
+                        -e "s|\"$1\": \"^1.0.0\"|\"$1\": \"^1.1.0\"|" \
+                      bun.lock > bun.next && mv bun.next bun.lock
+                }
+                case "$*" in
+                  install)
+                    if grep -q '"first": "^1.1.0"' package.json; then land first; fi
+                    if grep -q '"second": "^1.1.0"' package.json; then
+                      land second
+                      grep -v '"pkg-a/pinned"' bun.lock > bun.next && mv bun.next bun.lock
+                    fi
+                    exit 0 ;;
+                esac
+                echo "unexpected args: $*" >&2; exit 1
+            "#},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let cache = tempfile::tempdir()?;
+        let mut tool = NpmTool::<Bun>::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        tool.cmd = crate::nodecmd::NodeCmd::with_bin(script.as_str());
+        Ok(tool)
+    }
+
+    fn bun_project(root: &Utf8Path) -> Project {
+        Project {
+            root: root.to_owned(),
+            kind: Bun::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        }
+    }
+
+    /// A Bun change declared by `members`, given as `(name, path)`.
+    fn bun_change(name: &str, from: &str, to: &str, members: &[(&str, &str)]) -> Change {
+        Change {
+            package: PackageId::new(Bun::ID, name, Some(NPM.to_string())),
+            members: members
+                .iter()
+                .map(|(name, path)| MemberRef {
+                    name: (*name).to_string(),
+                    path: (*path).to_string(),
+                })
+                .collect(),
+            ..change(name, from, to)
+        }
+    }
+
+    /// Bun lands candidates one at a time, judging each against the state the earlier landings
+    /// left: the first lands, while the second's install moves an excluded member's exact pin and
+    /// alone is rolled back, so the lock keeps exactly the first candidate's result.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bun_rolls_back_only_the_candidate_that_moves_an_excluded_members_pin()
+    -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let tool = bun_sibling_pin_fixture(&root)?;
+        let baseline = std::fs::read_to_string(root.join("bun.lock"))?;
+        let plan = Plan {
+            changes: vec![
+                bun_change("first", "1.0.0", "1.1.0", &[("app", ".")]),
+                bun_change("second", "1.0.0", "1.1.0", &[("app", ".")]),
+            ],
+            excluded_members: vec![MemberRef {
+                name: "pkg-a".to_string(),
+                path: "packages/a".to_string(),
+            }],
+            ..Plan::default()
+        };
+
+        let mutation = PreparedMutation::prepare(&tool, &bun_project(&root), &plan).await?;
+        let report = tool.apply(&mutation).await?;
+
+        // The accepted candidate stays applied.
+        assert_eq!(
+            report
+                .applied
+                .iter()
+                .map(|change| format!("{}@{}", change.package.name, change.to))
+                .collect::<Vec<_>>(),
+            ["first@1.1.0"]
+        );
+
+        // The later candidate is refused on the excluded member's pin, which it alone moved.
+        let [skip] = report.skipped.as_slice() else {
+            eyre::bail!("one rolled-back candidate: {:?}", report.skipped)
+        };
+        assert_eq!(skip.change.package.name, "second");
+        assert_eq!(skip.reason, SkipReason::ResolverConflict);
+        assert_eq!(
+            skip.detail.as_deref(),
+            Some(
+                "the resolve moved an exact pin it was not asked to rewrite: pinned resolves to \
+                 1.1.0 for packages/a/package.json, whose dependencies pins 1.0.0"
+            )
+        );
+
+        // The lock and manifests are the first candidate's post-state, the member's nested copy
+        // and the second caret restored.
+        let first_landed = baseline
+            .replace(r#""first@1.0.0""#, r#""first@1.1.0""#)
+            .replace(r#""first": "^1.0.0""#, r#""first": "^1.1.0""#);
+        assert_eq!(
+            std::fs::read_to_string(root.join("bun.lock"))?,
+            first_landed
+        );
+        let declared = std::fs::read_to_string(root.join("package.json"))?;
+        assert!(declared.contains(r#""first": "^1.1.0""#), "{declared}");
+        assert!(declared.contains(r#""second": "^1.0.0""#), "{declared}");
+        Ok(())
+    }
+
+    /// Bun's landing is judged at each declaring member's own binding: a newer copy another member
+    /// binds never stands in for the member's own, an alias is never landed by a copy of the name
+    /// elsewhere, and only a member whose own copy the lock leaves undetermined falls back to the
+    /// name's newest copy.
+    #[test]
+    fn bun_landing_is_verified_at_each_declaring_member() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let project = bun_project(&root);
+        let lock = |member: &str, nested: &str| {
+            indoc::formatdoc! {r#"
+                {{
+                  "lockfileVersion": 2,
+                  "workspaces": {{
+                    "": {{ "name": "app", "dependencies": {{ "chalk": "^4.1.0" }} }},
+                    "packages/b": {{ "name": "pkg-b", "dependencies": {{ "chalk": "{member}" }} }},
+                  }},
+                  "packages": {{
+                    "chalk": ["chalk@4.1.2", "", {{}}, "sha512-x"],
+                    "pkg-b": ["pkg-b@workspace:packages/b"],
+                    {nested}
+                  }},
+                }}
+            "#}
+        };
+        let to = |version: &str| bun_change("chalk", "4.1.0", version, &[("pkg-b", "packages/b")]);
+
+        // The member keeps its nested copy below the root's newer one.
+        let nested = r#""pkg-b/chalk": ["chalk@4.1.0", "", {}, "sha512-x"],"#;
+        std::fs::write(root.join("bun.lock"), lock("4.1.0", nested))?;
+        assert!(!exact_target_reached::<Bun>(&project, &to("4.1.2"))?);
+        assert!(exact_target_reached::<Bun>(&project, &to("4.1.0"))?);
+
+        // The member binds the root copy once its nested one is gone.
+        std::fs::write(root.join("bun.lock"), lock("^4.1.0", ""))?;
+        assert!(exact_target_reached::<Bun>(&project, &to("4.1.2"))?);
+
+        // An alias is no copy of the name, so the root's copy at the target never lands it.
+        let aliased = r#""pkg-b/chalk": ["other@4.1.0", "", {}, "sha512-x"],"#;
+        std::fs::write(root.join("bun.lock"), lock("npm:other@4.1.0", aliased))?;
+        assert!(!exact_target_reached::<Bun>(&project, &to("4.1.2"))?);
+        assert!(!exact_target_reached::<Bun>(&project, &to("4.1.0"))?);
+
+        // A member that also declares the name as a peer binds a copy the lock leaves
+        // undetermined, so the name's newest copy is the evidence, as before Bun members were
+        // attributed.
+        let peer = lock("^4.1.0", "").replace(
+            r#""dependencies": { "chalk": "^4.1.0" } },"#,
+            r#""dependencies": { "chalk": "^4.1.0" }, "peerDependencies": { "chalk": "^4.0.0" } },"#,
+        );
+        assert!(peer.contains("peerDependencies"), "{peer}");
+        std::fs::write(root.join("bun.lock"), &peer)?;
+        assert!(exact_target_reached::<Bun>(&project, &to("4.1.2"))?);
+        assert!(!exact_target_reached::<Bun>(&project, &to("4.1.0"))?);
+
+        // A member with a known binding beside it is still judged on its own copy.
+        let both = Change {
+            members: vec![
+                MemberRef {
+                    name: "pkg-b".to_string(),
+                    path: "packages/b".to_string(),
+                },
+                MemberRef {
+                    name: "pkg-c".to_string(),
+                    path: "packages/c".to_string(),
+                },
+            ],
+            ..to("4.1.2")
+        };
+        let mixed = peer.replace(
+            r#""pkg-b": ["pkg-b@workspace:packages/b"],"#,
+            indoc! {r#"
+                "pkg-b": ["pkg-b@workspace:packages/b"],
+                "pkg-c": ["pkg-c@workspace:packages/c"],
+                "pkg-c/chalk": ["chalk@4.1.0", "", {}, "sha512-x"],
+            "#},
+        );
+        let mixed = mixed.replace(
+            r#""packages/b": {"#,
+            r#""packages/c": { "name": "pkg-c", "dependencies": { "chalk": "4.1.0" } }, "packages/b": {"#,
+        );
+        std::fs::write(root.join("bun.lock"), &mixed)?;
+        assert_eq!(
+            Bun::member_attribution(&mixed).resolution("packages/c", "chalk"),
+            MemberResolution::Resolved("4.1.0")
+        );
+        assert!(!exact_target_reached::<Bun>(&project, &both)?);
+        Ok(())
+    }
+
+    /// The Bun inventory attributes each resolved copy to the members binding it, so a version
+    /// only an alias installs is no member's, and an exact copy every declaration pins is held.
+    #[tokio::test]
+    async fn bun_inventory_attributes_each_member_its_own_copy() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(root.join("bun.lock"), crate::lock::bun_fixtures::WORKSPACES)?;
+        // The manifests the fixture's workspace entries copy.
+        for (path, manifest) in [
+            (
+                "",
+                r#"{ "name": "root", "workspaces": ["packages/*"], "dependencies": { "chalk": "4.1.2", "is-number": "^7.0.0" } }"#,
+            ),
+            (
+                "packages/a",
+                r#"{ "name": "pkg-a", "dependencies": { "chalk": "4.1.0", "@types/node": "20.0.0" } }"#,
+            ),
+            (
+                "packages/b",
+                r#"{ "name": "pkg-b", "dependencies": { "chalk": "4.1.2", "pkg-a": "workspace:*", "isnum": "npm:is-number@6.0.0" } }"#,
+            ),
+            (
+                "packages/scoped",
+                r#"{ "name": "@acme/scoped", "devDependencies": { "chalk": "5.3.0", "@types/node": "20.1.0" } }"#,
+            ),
+        ] {
+            std::fs::create_dir_all(root.join(path))?;
+            std::fs::write(root.join(path).join("package.json"), manifest)?;
+        }
+        let tool = NpmTool::<Bun>::from_http(SharedHttp::new(
+            dir.path().join("cache").as_path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+
+        let deps = tool
+            .dependencies(&bun_project(&root), DepScope::Graph)
+            .await?;
+        let mut rows: Vec<String> = deps
+            .iter()
+            .filter(|dep| dep.direct)
+            .map(|dep| {
+                let members = dep
+                    .members
+                    .iter()
+                    .map(|member| member.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let pinned = if dep.pinned { " pinned" } else { "" };
+                format!("{}@{} [{members}]{pinned}", dep.package.name, dep.current)
+            })
+            .collect();
+        rows.sort();
+
+        // Each copy belongs to its own members; the alias's target and every transitive are no
+        // member's.
+        assert_eq!(
+            rows,
+            [
+                "@types/node@20.0.0 [pkg-a] pinned",
+                "@types/node@20.1.0 [@acme/scoped] pinned",
+                "chalk@4.1.0 [pkg-a] pinned",
+                "chalk@4.1.2 [root,pkg-b] pinned",
+                "chalk@5.3.0 [@acme/scoped] pinned",
+                "is-number@7.0.0 [root]",
+            ]
+        );
+        assert!(
+            deps.iter().any(|dep| dep.package.name == "is-number"
+                && dep.current.as_str() == "6.0.0"
+                && !dep.direct),
+            "{deps:?}"
+        );
+        Ok(())
+    }
+
+    /// A name the root and a member each declare both as a dev dependency and as a peer stays
+    /// direct, each copy attributed to the member whose key records it and bounded by its
+    /// declarations, though the lock leaves which copy each finally binds unknown.
+    #[tokio::test]
+    async fn bun_peer_and_dev_declarations_stay_direct() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            root.join("bun.lock"),
+            crate::lock::bun_fixtures::ROOT_PEER_AND_DEV,
+        )?;
+        // The manifests the fixture's workspace entries copy.
+        for (path, manifest) in [
+            (
+                "",
+                r#"{ "name": "root", "workspaces": ["packages/*"], "devDependencies": { "chalk": ">=4.1.0 <4.2.0" }, "peerDependencies": { "chalk": "^4.0.0" } }"#,
+            ),
+            (
+                "packages/a",
+                r#"{ "name": "pkg-a", "devDependencies": { "chalk": "4.1.0" }, "peerDependencies": { "chalk": ">=4.0.0 <5.0.0" } }"#,
+            ),
+        ] {
+            std::fs::create_dir_all(root.join(path))?;
+            std::fs::write(root.join(path).join("package.json"), manifest)?;
+        }
+        let tool = NpmTool::<Bun>::from_http(SharedHttp::new(
+            dir.path().join("cache").as_path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        let project = bun_project(&root);
+        let rows = |deps: &[Dependency]| {
+            let mut rows: Vec<String> = deps
+                .iter()
+                .filter(|dep| dep.package.name == "chalk")
+                .map(|dep| {
+                    let members = dep
+                        .members
+                        .iter()
+                        .map(|member| member.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let bound = if dep.declared_bound.is_some() {
+                        " bounded"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "chalk@{} direct={} [{members}]{bound}",
+                        dep.current, dep.direct
+                    )
+                })
+                .collect();
+            rows.sort();
+            rows
+        };
+        // Each member owns the copy its own key records; the member's exact dev pin is no upper
+        // bound, while the root's range is.
+        let expected = [
+            "chalk@4.1.0 direct=true [pkg-a]",
+            "chalk@4.1.2 direct=true [root] bounded",
+        ];
+
+        // Both copies are direct rows of the upgrade inventory.
+        let direct = tool.dependencies(&project, DepScope::Direct).await?;
+        assert_eq!(rows(&direct), expected);
+
+        // The graph inventory classifies them direct too, beside a transitive that stays one.
+        let graph = tool.dependencies(&project, DepScope::Graph).await?;
+        assert_eq!(rows(&graph), expected);
+        assert!(
+            graph
+                .iter()
+                .any(|dep| dep.package.name == "ansi-styles" && !dep.direct),
+            "{graph:?}"
+        );
+        Ok(())
+    }
+
+    /// A project on the [`ALIAS_BESIDE_TRANSITIVE`](crate::lock::bun_fixtures::ALIAS_BESIDE_TRANSITIVE)
+    /// lock with the manifests its workspace entries copy, the cache under `root`.
+    fn bun_alias_project(root: &Utf8Path) -> eyre::Result<NpmTool<Bun>> {
+        std::fs::write(
+            root.join("bun.lock"),
+            crate::lock::bun_fixtures::ALIAS_BESIDE_TRANSITIVE,
+        )?;
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "root", "workspaces": ["packages/*"], "dependencies": { "log-symbols": "4.1.0" } }"#,
+        )?;
+        std::fs::create_dir_all(root.join("packages/b"))?;
+        std::fs::write(
+            root.join("packages/b/package.json"),
+            r#"{ "name": "pkg-b", "dependencies": { "chalk": "npm:is-number@6.0.0" } }"#,
+        )?;
+        Ok(NpmTool::<Bun>::from_http(SharedHttp::new(
+            root.join(".cache").as_std_path(),
+            cooldown_registry::HttpOptions::default(),
+        )?))
+    }
+
+    /// A member aliasing a name to another package owns none of the name's registry copies, so the
+    /// root's transitive copy stays a memberless transitive row, which excluding the member cannot
+    /// prune, while the member's declaration is still shown.
+    #[tokio::test]
+    async fn bun_alias_owns_no_registry_copy_of_its_name() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let tool = bun_alias_project(&root)?;
+        let project = bun_project(&root);
+
+        // The transitive copy is no member's, whether or not the member is excluded.
+        let graph = tool.dependencies(&project, DepScope::Graph).await?;
+        let Some(chalk) = graph
+            .iter()
+            .find(|dep| dep.package.name == "chalk" && dep.current.as_str() == "4.1.2")
+        else {
+            eyre::bail!("the transitive chalk row is missing: {graph:?}")
+        };
+        assert!(!chalk.direct, "{chalk:?}");
+        assert_eq!(chalk.members, []);
+        let excluded = HashSet::from(["packages/b".to_string()]);
+        let content = std::fs::read_to_string(root.join("bun.lock"))?;
+        assert_eq!(
+            Bun::member_sources_excluding(&content, &excluded).members_for("chalk", "4.1.2"),
+            Bun::member_sources(&content).members_for("chalk", "4.1.2"),
+        );
+
+        // The member's own declaration is still shown, bound to no registry version.
+        let declarations = tool.declarations(&project, "chalk").await?;
+        let [declaration] = declarations.as_slice() else {
+            eyre::bail!("one declaration: {declarations:?}")
+        };
+        assert_eq!(declaration.member.path, "packages/b");
+        assert_eq!(declaration.range.as_deref(), Some("npm:is-number@6.0.0"));
+        assert_eq!(declaration.resolved, None);
+        Ok(())
+    }
+
+    /// An install that changes nothing never lands a candidate whose only declaring member aliases
+    /// the name, even though a registry copy of the name elsewhere already sits at the target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bun_alias_is_not_landed_by_an_unrelated_copy() -> eyre::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let mut tool = bun_alias_project(&root)?;
+        let script = root.join("fake-bun.sh");
+        std::fs::write(
+            &script,
+            indoc! {r#"
+                #!/bin/sh
+                echo "$*" >> legs.log
+                [ "$*" = install ] && exit 0
+                echo "unexpected args: $*" >&2; exit 1
+            "#},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        tool.cmd = crate::nodecmd::NodeCmd::with_bin(script.as_str());
+        let lock = std::fs::read_to_string(root.join("bun.lock"))?;
+        let plan = Plan {
+            changes: vec![bun_change(
+                "chalk",
+                "4.1.0",
+                "4.1.2",
+                &[("pkg-b", "packages/b")],
+            )],
+            ..Plan::default()
+        };
+
+        let mutation = PreparedMutation::prepare(&tool, &bun_project(&root), &plan).await?;
+        let report = tool.apply(&mutation).await?;
+
+        // The no-op install ran, yet nothing is reported applied.
+        assert!(std::fs::read_to_string(root.join("legs.log"))?.contains("install"));
+        assert_eq!(report.applied, []);
+        let [skip] = report.skipped.as_slice() else {
+            eyre::bail!("one held candidate: {:?}", report.skipped)
+        };
+        assert_eq!(skip.change.package.name, "chalk");
+        assert_eq!(std::fs::read_to_string(root.join("bun.lock"))?, lock);
+        Ok(())
+    }
+
+    /// A member declaring a name as a dev range and a peer owns only the copy its key records, so
+    /// the root's transitive copy of another line stays a memberless transitive row that excluding
+    /// the member cannot prune, while the member's own copy stays direct with its bound.
+    #[tokio::test]
+    async fn bun_uncertain_member_owns_no_transitive_line() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let lock = crate::lock::bun_fixtures::PEER_BESIDE_TRANSITIVE;
+        std::fs::write(root.join("bun.lock"), lock)?;
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "root", "workspaces": ["packages/*"], "dependencies": { "log-symbols": "6.0.0" } }"#,
+        )?;
+        std::fs::create_dir_all(root.join("packages/b"))?;
+        std::fs::write(
+            root.join("packages/b/package.json"),
+            r#"{ "name": "pkg-b", "devDependencies": { "chalk": ">=4.1.0 <4.1.1" }, "peerDependencies": { "chalk": "^4.0.0" } }"#,
+        )?;
+        let tool = NpmTool::<Bun>::from_http(SharedHttp::new(
+            root.join(".cache").as_std_path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+
+        let graph = tool
+            .dependencies(&bun_project(&root), DepScope::Graph)
+            .await?;
+        let row = |version: &str| {
+            graph
+                .iter()
+                .find(|dep| dep.package.name == "chalk" && dep.current.as_str() == version)
+        };
+
+        // The transitive line is no member's, so no exclusion can prune it.
+        let Some(transitive) = row("5.6.2") else {
+            eyre::bail!("the transitive chalk row is missing: {graph:?}")
+        };
+        assert!(!transitive.direct, "{transitive:?}");
+        assert_eq!(transitive.members, []);
+
+        // The member's own copy is direct, attributed to it, and bounded by its range.
+        let Some(own) = row("4.1.0") else {
+            eyre::bail!("the member's chalk row is missing: {graph:?}")
+        };
+        assert!(own.direct, "{own:?}");
+        assert_eq!(
+            own.members
+                .iter()
+                .map(|member| member.path.as_str())
+                .collect::<Vec<_>>(),
+            ["packages/b"]
+        );
+        assert_eq!(own.declared_bound.as_deref(), Some(">=4.1.0 <4.1.1"));
+
+        // Excluding the member leaves the transitive line untouched.
+        let excluded = HashSet::from(["packages/b".to_string()]);
+        assert_eq!(
+            Bun::member_sources_excluding(lock, &excluded).members_for("chalk", "5.6.2"),
+            Bun::member_sources(lock).members_for("chalk", "5.6.2"),
         );
         Ok(())
     }

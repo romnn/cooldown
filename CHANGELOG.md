@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Bun workspace members are attributed their own copies, and their exact pins are protected.**
+  cooldown read a `bun.lock` without its workspace members, so every dependency was the root
+  manifest's, a member's own declaration was not upgradeable, and an exact pin in a member
+  manifest was not checked after a sibling candidate's `bun install`. cooldown now reads each
+  member's declarations from the lock's `workspaces` and binds them through the package keys the
+  way Bun's own loader does: `<member-name>/<dependency>` first, then the root key. `outdated`
+  and `upgrade` show and land each member's own copy, `exclude` applies to Bun members, a package
+  every declaration pins exactly is held at planning (`pinned`), and a candidate whose install
+  moves any member's exact pin, an excluded member's included, is rolled back as
+  `resolver_conflict` naming the pin while the rest of the batch lands. This covers text lock
+  versions 1 to 3; a version 0 lock and a member whose name a root dependency also carries stay
+  unattributed and unprotected as before. A dependency a member also declares in
+  `peerDependencies`, which Bun binds by version rather than by key, stays direct for that member
+  but its pin is not protected and its landing is judged by the name's newest copy. The binary
+  `bun.lockb` is still not read. Yarn locks still record no per-member
+  resolution, so their exact pins are judged only before the install.
+
 - **A Yarn Berry `yarn.lock` is refused instead of read as an empty graph.** cooldown reads only
   Yarn Classic (v1) lockfiles. A Berry (v2+) lock, which opens with a `__metadata:` entry,
   matched none of the Classic grammar, so `outdated` reported nothing and `upgrade` found nothing

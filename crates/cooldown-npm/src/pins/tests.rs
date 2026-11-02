@@ -508,17 +508,19 @@ fn unattributed_locks_protect_nothing() -> eyre::Result<()> {
             .get(&key(".", "devDependencies", "chalk")),
         &Observed::Unknown
     );
-    let bun = |version: &str| {
+    // A version 0 bun.lock resolves member dependencies through the workspace's package row, which
+    // the reader does not model, so it attributes nothing either.
+    let bun_v0 = |version: &str| {
         formatdoc! {r#"
             {{
-              "lockfileVersion": 1,
+              "lockfileVersion": 0,
               "workspaces": {{ "": {{ "devDependencies": {{ "chalk": "4.1.0" }} }} }},
               "packages": {{ "chalk": ["chalk@{version}", "", {{}}, "sha512-x"] }}
             }}
         "#}
     };
     assert_eq!(
-        violated::<Bun>(&pins, Some(&bun("4.1.0")), &bun("4.1.2"), &none),
+        violated::<Bun>(&pins, Some(&bun_v0("4.1.0")), &bun_v0("4.1.2"), &none),
         NO_VIOLATIONS
     );
     let npm_v1 = |version: &str| {
@@ -528,6 +530,187 @@ fn unattributed_locks_protect_nothing() -> eyre::Result<()> {
     };
     assert_eq!(
         violated::<Npm>(&pins, Some(&npm_v1("4.1.0")), &npm_v1("4.1.2"), &none),
+        NO_VIOLATIONS
+    );
+    Ok(())
+}
+
+/// A `bun.lock` whose root declares `chalk` at a caret and whose member `packages/a` (named
+/// `pkg-a`) declares it in `field` at `specifier`, the root key holding `root` and the member's
+/// nested key holding `nested` when given.
+fn bun_lock(field: &str, specifier: &str, root: Option<&str>, nested: Option<&str>) -> String {
+    let entry = |key: &str, version: Option<&str>| {
+        version.map_or(String::new(), |version| {
+            format!(r#""{key}": ["chalk@{version}", "", {{}}, "sha512-x"],"#)
+        })
+    };
+    let root = entry("chalk", root);
+    let nested = entry("pkg-a/chalk", nested);
+    formatdoc! {r#"
+        {{
+          "lockfileVersion": 2,
+          "workspaces": {{
+            "": {{ "name": "root", "dependencies": {{ "chalk": "^4.1.0" }} }},
+            "packages/a": {{ "name": "pkg-a", "{field}": {{ "chalk": "{specifier}" }} }},
+          }},
+          "packages": {{
+            {root}
+            "pkg-a": ["pkg-a@workspace:packages/a"],
+            {nested}
+          }},
+        }}
+    "#}
+}
+
+/// Bun judges each member at the copy its own package key binds: a member's nested copy holds its
+/// pin beside a newer root copy, while the root copy it falls back to moving off the pin is a
+/// violation.
+#[test]
+fn bun_judges_the_copy_each_member_binds() -> eyre::Result<()> {
+    let pins = protected(&[(
+        "packages/a",
+        r#"{ "devDependencies": { "chalk": "4.1.0" } }"#,
+    )])?;
+    let none = AuthorizedPins::default();
+    let lock =
+        |root: &str, nested: Option<&str>| bun_lock("devDependencies", "4.1.0", Some(root), nested);
+    let baseline = lock("4.1.0", None);
+    assert_eq!(
+        pins.observe::<Bun>(Some(&baseline))
+            .get(&key("packages/a", "devDependencies", "chalk")),
+        &Observed::Resolved("4.1.0".to_string())
+    );
+
+    // The root moves while the member keeps its own nested copy, so the newest copy is not the
+    // evidence.
+    assert_eq!(
+        violated::<Bun>(&pins, Some(&baseline), &lock("4.1.2", Some("4.1.0")), &none),
+        NO_VIOLATIONS
+    );
+
+    // The member's binding follows the moved root copy.
+    assert_eq!(
+        violated::<Bun>(&pins, Some(&baseline), &lock("4.1.2", None), &none),
+        ["packages/a devDependencies chalk"]
+    );
+
+    // A nested copy that moves off the pin is a violation even with the root copy in place.
+    assert_eq!(
+        violated::<Bun>(&pins, Some(&baseline), &lock("4.1.0", Some("4.1.1")), &none),
+        ["packages/a devDependencies chalk"]
+    );
+    Ok(())
+}
+
+/// The grandfathering and authorization rules apply to Bun bindings as they do to pnpm's: an
+/// unchanged old violation stays, a moved one is new, and an authorized rewrite is judged against
+/// its replacement.
+#[test]
+fn bun_pins_follow_grandfathering_and_authorization() -> eyre::Result<()> {
+    let pins = protected(&[(
+        "packages/a",
+        r#"{ "devDependencies": { "chalk": "4.1.0" } }"#,
+    )])?;
+    let none = AuthorizedPins::default();
+    let lock = |root: &str| bun_lock("devDependencies", "4.1.0", Some(root), None);
+
+    // Grandfathered
+    assert_eq!(
+        violated::<Bun>(&pins, Some(&lock("4.1.2")), &lock("4.1.2"), &none),
+        NO_VIOLATIONS
+    );
+    assert_eq!(
+        violated::<Bun>(&pins, Some(&lock("4.1.2")), &lock("4.1.3"), &none),
+        ["packages/a devDependencies chalk"]
+    );
+
+    // Authorized
+    let mut authorized = AuthorizedPins::default();
+    authorized.record(
+        &change("chalk", true, false),
+        RewriteMode::Always,
+        false,
+        &rewrite_of(key("packages/a", "devDependencies", "chalk"), "4.1.2"),
+    );
+    assert_eq!(
+        violated::<Bun>(&pins, Some(&lock("4.1.0")), &lock("4.1.2"), &authorized),
+        NO_VIOLATIONS
+    );
+    assert_eq!(
+        violated::<Bun>(&pins, Some(&lock("4.1.0")), &lock("4.1.1"), &authorized),
+        ["packages/a devDependencies chalk"]
+    );
+    Ok(())
+}
+
+/// Only a dependency the member's lock entry stops declaring, or an optional one no key holds, is
+/// missing.
+/// A required one no key holds is a lock Bun refuses to load, and a peer is bound by version, so
+/// both are unknown.
+#[test]
+fn bun_absence_is_missing_only_where_the_lock_proves_it() -> eyre::Result<()> {
+    let required = protected(&[(
+        "packages/a",
+        r#"{ "devDependencies": { "chalk": "4.1.0" } }"#,
+    )])?;
+    let optional = protected(&[(
+        "packages/a",
+        r#"{ "optionalDependencies": { "chalk": "4.1.0" } }"#,
+    )])?;
+    let none = AuthorizedPins::default();
+    let observed = |pins: &ProtectedPins, field: &'static str, lock: &str| {
+        pins.observe::<Bun>(Some(lock))
+            .get(&key("packages/a", field, "chalk"))
+            .clone()
+    };
+    let bound = bun_lock("devDependencies", "4.1.0", Some("4.1.0"), None);
+
+    // A required dependency without a key
+    let unkeyed = bun_lock("devDependencies", "4.1.0", None, None);
+    assert_eq!(
+        observed(&required, "devDependencies", &unkeyed),
+        Observed::Unknown
+    );
+    assert_eq!(
+        violated::<Bun>(&required, Some(&bound), &unkeyed, &none),
+        NO_VIOLATIONS
+    );
+
+    // An optional dependency without a key
+    let unresolved = bun_lock("optionalDependencies", "4.1.0", None, None);
+    assert_eq!(
+        observed(&optional, "optionalDependencies", &unresolved),
+        Observed::Missing
+    );
+    let installed = bun_lock("optionalDependencies", "4.1.0", Some("4.1.0"), None);
+    assert_eq!(
+        violated::<Bun>(&optional, Some(&installed), &unresolved, &none),
+        NO_VIOLATIONS
+    );
+
+    // A dropped declaration
+    let dropped = bound.replace(
+        r#""devDependencies": { "chalk": "4.1.0" }"#,
+        r#""devDependencies": { "other": "1.0.0" }"#,
+    );
+    assert_ne!(dropped, bound);
+    assert_eq!(
+        observed(&required, "devDependencies", &dropped),
+        Observed::Missing
+    );
+    assert_eq!(
+        violated::<Bun>(&required, Some(&bound), &dropped, &none),
+        ["packages/a devDependencies chalk"]
+    );
+
+    // A peer declaration of the pinned name binds by version, not by key
+    let peer = bun_lock("peerDependencies", "^4.0.0", Some("4.1.2"), None);
+    assert_eq!(
+        observed(&required, "devDependencies", &peer),
+        Observed::Unknown
+    );
+    assert_eq!(
+        violated::<Bun>(&required, Some(&bound), &peer, &none),
         NO_VIOLATIONS
     );
     Ok(())
