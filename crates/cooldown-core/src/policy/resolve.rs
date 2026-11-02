@@ -1,54 +1,85 @@
 use super::model::{
-    ByKind, Origin, PolicyLayer, Resolution, ResolveKind, ResolveQuery, ResolvedWindow, Selector,
-    TraceStep, WindowSpec,
+    ByKind, Origin, PolicyLayer, Resolution, ResolveKind, ResolveQuery, ResolvedWindow, Rule,
+    RuleRank, Selector, TraceStep, WindowSpec,
 };
 use crate::duration::duration_as_days;
 use jiff::{SignedDuration, Timestamp};
 
+/// Where a rule sits in the stack, which identifies it even among duplicate declarations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RulePosition {
+    layer_index: usize,
+    rule_index: usize,
+}
+
+/// The authority-first winner among the matching rules that set one field.
+struct RankedPick<'a, T> {
+    position: RulePosition,
+    rank: RuleRank<'a>,
+    origin: &'a Origin,
+    selector: &'a Selector,
+    value: T,
+}
+
+/// Finds the authority-first winner among the rules that match `query` and set the field `extract`
+/// reads: the highest [`RuleRank`], keeping the first of identically ranked rules.
+///
+/// Only rules that set the field compete, so each field is decided on its own.
+fn pick_ranked<'a, T>(
+    layers: &'a [PolicyLayer],
+    query: &ResolveQuery<'_>,
+    extract: impl Fn(&'a Rule) -> Option<T>,
+) -> Option<RankedPick<'a, T>> {
+    let mut best: Option<RankedPick<'a, T>> = None;
+    for (layer_index, layer) in layers.iter().enumerate() {
+        for (rule_index, rule) in layer.rules.iter().enumerate() {
+            if !rule.selector.matches(query) {
+                continue;
+            }
+            let Some(value) = extract(rule) else {
+                continue;
+            };
+            let rank = RuleRank::of(layer_index, &rule.selector);
+            if best.as_ref().is_none_or(|best| rank > best.rank) {
+                best = Some(RankedPick {
+                    position: RulePosition {
+                        layer_index,
+                        rule_index,
+                    },
+                    rank,
+                    origin: &layer.origin,
+                    selector: &rule.selector,
+                    value,
+                });
+            }
+        }
+    }
+    best
+}
+
 /// A field pick: which rule won for one window field.
 struct FieldPick {
-    layer_index: usize,
-    specificity: u8,
+    /// The winning rule, or `None` for the built-in safety net no rule declares.
+    position: Option<RulePosition>,
     origin: Origin,
     selector: Selector,
     spec: WindowSpec,
 }
 
 /// Find the authority-first winner for a single window field: the highest layer with a matching
-/// rule that sets it, tie-broken within the layer by selector specificity.
+/// rule that sets it, tie-broken within the layer by selector specificity and then by how narrowly
+/// the selector's pattern is spelled.
 fn pick_field(
     layers: &[PolicyLayer],
     query: &ResolveQuery<'_>,
     extract: impl Fn(&ByKind) -> Option<&WindowSpec>,
 ) -> Option<FieldPick> {
-    let mut best: Option<FieldPick> = None;
-    for (layer_index, layer) in layers.iter().enumerate() {
-        for rule in &layer.rules {
-            if !rule.selector.matches(query) {
-                continue;
-            }
-            let Some(spec) = extract(&rule.window) else {
-                continue;
-            };
-            let specificity = rule.selector.specificity();
-            let better = match &best {
-                None => true,
-                Some(best_pick) => {
-                    (layer_index, specificity) > (best_pick.layer_index, best_pick.specificity)
-                }
-            };
-            if better {
-                best = Some(FieldPick {
-                    layer_index,
-                    specificity,
-                    origin: layer.origin.clone(),
-                    selector: rule.selector.clone(),
-                    spec: spec.clone(),
-                });
-            }
-        }
-    }
-    best
+    pick_ranked(layers, query, |rule| extract(&rule.window)).map(|pick| FieldPick {
+        position: Some(pick.position),
+        origin: pick.origin.clone(),
+        selector: pick.selector.clone(),
+        spec: pick.value.clone(),
+    })
 }
 
 fn field_for_kind(kind: ResolveKind) -> fn(&ByKind) -> Option<&WindowSpec> {
@@ -83,11 +114,24 @@ fn min_age_days_of(spec: &WindowSpec, now: Timestamp) -> f64 {
 ///
 /// Each field is combined by its own rule: `min-age` (and the per-kind windows) is
 /// **authority-first** — the highest layer that sets it wins, tie-broken within the layer by
-/// selector specificity, with a per-kind fall-through to the bare `default`; `max-major` uses the
-/// same authority-first ordering; `floor` is **max-clamped** across layers; and `allow` is a
-/// floor-aware **union** that zeroes an ordinary window but bypasses a floor only when it is
-/// co-declared in that floor's layer or is an audited env/CLI override. The returned
-/// [`Resolution::trace`] records every rule considered and which one applied.
+/// selector specificity and then by the selector's pattern, with a per-kind fall-through to the
+/// bare `default`; `max-major` uses the same authority-first ordering; `floor` is **max-clamped**
+/// across layers; and `allow` is a floor-aware **union** that zeroes an ordinary window but
+/// bypasses a floor only when it is co-declared in that floor's layer or is an audited env/CLI
+/// override.
+/// The returned [`Resolution::trace`] records every rule considered and marks the one that
+/// applied.
+///
+/// Within a layer, equally specific package or project rules are ordered by their pattern: a
+/// literal beats any glob, a glob with a longer literal prefix (the characters before its first
+/// `*`, `?`, `[`, `]`, `{`, `}` or `\`) beats one with a shorter prefix, and between equal prefixes
+/// the pattern whose text is smaller in plain code-point order wins.
+/// So `@corp/ui` beats `@corp/ui*`, which beats `@corp/*`, and for `@corp/ui-plugin` the scope
+/// rule `@corp/ui*` also beats the suffix rule `*-plugin`.
+/// The order depends only on the selectors, never on the order rules are declared in, and the
+/// first of several identical selectors wins.
+/// Each authority-first field is ranked among only the matching rules that set it, so a winner
+/// for one field decides nothing about another.
 ///
 /// `layers` are expected low → high authority. If no layer sets the resolved field (e.g. the
 /// caller omitted the built-in `Default` layer), a 7-day `min-age` safety net is used.
@@ -295,43 +339,22 @@ pub struct MaxMajorPick {
 #[derive(Debug, Clone)]
 struct IndexedMaxMajorPick {
     pick: MaxMajorPick,
-    layer_index: usize,
-    rule_index: usize,
-    specificity: u8,
+    position: RulePosition,
 }
 
 fn pick_max_major(layers: &[PolicyLayer], query: &ResolveQuery<'_>) -> Option<IndexedMaxMajorPick> {
-    let mut best: Option<IndexedMaxMajorPick> = None;
-    for (layer_index, layer) in layers.iter().enumerate() {
-        for (rule_index, rule) in layer.rules.iter().enumerate() {
-            let Some(limit) = rule.max_major else {
-                continue;
-            };
-            if !rule.selector.matches(query) {
-                continue;
-            }
-            let specificity = rule.selector.specificity();
-            let better = best.as_ref().is_none_or(|best| {
-                (layer_index, specificity) > (best.layer_index, best.specificity)
-            });
-            if better {
-                best = Some(IndexedMaxMajorPick {
-                    pick: MaxMajorPick {
-                        limit,
-                        origin: layer.origin.clone(),
-                        selector: rule.selector.clone(),
-                    },
-                    layer_index,
-                    rule_index,
-                    specificity,
-                });
-            }
-        }
-    }
-    best
+    pick_ranked(layers, query, |rule| rule.max_major).map(|pick| IndexedMaxMajorPick {
+        pick: MaxMajorPick {
+            limit: pick.value,
+            origin: pick.origin.clone(),
+            selector: pick.selector.clone(),
+        },
+        position: pick.position,
+    })
 }
 
-/// Resolves the inclusive package `max-major` ceiling by layer authority, then specificity.
+/// Resolves the inclusive package `max-major` ceiling by layer authority, then specificity, then
+/// pattern, exactly as [`resolve`] orders the window fields.
 #[must_use]
 pub fn resolve_max_major(layers: &[PolicyLayer], query: &ResolveQuery<'_>) -> Option<MaxMajorPick> {
     pick_max_major(layers, query).map(|pick| pick.pick)
@@ -347,9 +370,13 @@ fn trace_max_major(layers: &[PolicyLayer], query: &ResolveQuery<'_>, trace: &mut
             if !rule.selector.matches(query) {
                 continue;
             }
-            let applied = winner.as_ref().is_some_and(|winner| {
-                winner.layer_index == layer_index && winner.rule_index == rule_index
-            });
+            let position = RulePosition {
+                layer_index,
+                rule_index,
+            };
+            let applied = winner
+                .as_ref()
+                .is_some_and(|winner| winner.position == position);
             trace.push(TraceStep {
                 layer: layer.origin.clone(),
                 field: "max-major".to_string(),
@@ -369,9 +396,12 @@ fn trace_max_major(layers: &[PolicyLayer], query: &ResolveQuery<'_>, trace: &mut
 /// Picks the authority-first window field for `query` and traces every rule considered.
 ///
 /// `min-age` (and the per-kind windows) is authority-first: the highest layer that sets it wins,
-/// tie-broken within the layer by selector specificity, with a per-kind fall-through to the bare
-/// `default`. The built-in `Default` layer always sets `default = 7d`, so a pick effectively always
-/// exists; if a caller omits that layer, a 7-day safety net is used.
+/// tie-broken within the layer by selector specificity and then by the selector's pattern, with a
+/// per-kind fall-through to the bare `default`.
+/// The requested kind is searched across every layer before the fall-through, so a rule that sets
+/// only the bare window never hides another rule's per-kind window.
+/// The built-in `Default` layer always sets `default = 7d`, so a pick effectively always exists;
+/// if a caller omits that layer, a 7-day safety net is used.
 fn pick_window(
     layers: &[PolicyLayer],
     query: &ResolveQuery<'_>,
@@ -387,28 +417,30 @@ fn pick_window(
     let pick = kind_pick
         .or_else(|| pick_field(layers, query, |by_kind| by_kind.default.as_ref()))
         .unwrap_or(FieldPick {
-            layer_index: 0,
-            specificity: 0,
+            position: None,
             origin: Origin::Default,
             selector: Selector::Default,
             spec: WindowSpec::MinAge(SignedDuration::from_hours(24 * 7)),
         });
 
-    // Trace every rule that set the resolved field, marking the winner.
+    // Trace every rule that set the resolved field, marking the winner by its position so that one
+    // of several identical declarations is marked, not all of them.
     let resolved_field = if used_fallthrough {
         ResolveKind::CurrentPin
     } else {
         query.kind
     };
-    for layer in layers {
-        for rule in &layer.rules {
+    for (layer_index, layer) in layers.iter().enumerate() {
+        for (rule_index, rule) in layer.rules.iter().enumerate() {
             if !rule.selector.matches(query) {
                 continue;
             }
             if let Some(spec) = field_for_kind(resolved_field)(&rule.window) {
-                let is_winner = layer.origin == pick.origin
-                    && rule.selector == pick.selector
-                    && *spec == pick.spec;
+                let is_winner = pick.position
+                    == Some(RulePosition {
+                        layer_index,
+                        rule_index,
+                    });
                 trace.push(TraceStep {
                     layer: layer.origin.clone(),
                     field: field_name(resolved_field).to_string(),
@@ -416,7 +448,7 @@ fn pick_window(
                     min_age_days: Some(min_age_days_of(spec, now)),
                     applied: is_winner,
                     note: if is_winner {
-                        "selected (highest layer, most specific selector)".into()
+                        "selected (highest layer, then most specific selector and pattern)".into()
                     } else {
                         "considered".into()
                     },

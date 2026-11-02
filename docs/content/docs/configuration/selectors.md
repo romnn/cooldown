@@ -12,7 +12,7 @@ to*. From least to most specific:
 default  <  tool  <  project  <  registry  <  package  <  tool-qualified package
 ```
 
-Within a layer, the most specific selector that matches wins — see [Precedence]({{< relref "precedence.md" >}}).
+Within a layer, the most specific selector that matches wins. Between two matching rules of the same level, such as two package rules, the more narrowly spelled pattern wins: a literal beats a glob, and a longer literal prefix beats a shorter one — see [Precedence]({{< relref "precedence.md" >}}).
 
 ## Top level — the default
 
@@ -182,6 +182,28 @@ min-age = "14d"
 `[tool.uv.package.glob]` applies only to the PyPI package named `glob`; it cannot accidentally
 change the Cargo crate or npm package with the same name. A tool-qualified package rule is more
 specific than an unqualified `[package.glob]` rule in the same config layer.
+
+When several package rules of one layer match the same name, the most narrowly spelled pattern
+wins, whatever order the tables are written in:
+
+```toml
+[package."@corp/*"]
+latest = true
+
+[package."@corp/ui*"]
+min-age = "14d"
+
+[package."@corp/ui"]
+min-age = "30d"
+```
+
+`@corp/ui` waits 30 days, because a literal beats every glob. `@corp/ui-kit` waits 14 days,
+because `@corp/ui*` has the longer literal prefix (`@corp/ui` against `@corp/`). Every other
+`@corp/` package is exempt. A namespace prefix also beats a suffix pattern: for
+`@corp/ui-plugin`, `@corp/ui*` beats `*-plugin`. Two globs with equally long prefixes fall back to
+their text, the one that sorts first by code point winning. The ranking is per field, and
+`[project."…"]` patterns rank the same way; [Precedence]({{< relref "precedence.md" >}}) has the
+complete order.
 
 `max-major` is available only on package rules and is an integer. It is an absolute ceiling:
 within-major updates remain eligible, but even `upgrade --major --rewrite` will not cross it. For

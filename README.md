@@ -208,7 +208,9 @@ env → CLI flags. **Selectors** (most → least specific): `tool-qualified pack
 `registry` > `project` > `tool` > default.
 
 Resolution is per field: `min-age` and package-only `max-major` are **authority-first** (highest
-layer wins; within a layer the most specific selector breaks the tie); `floor` is **max-clamped**
+layer wins; within a layer the most specific selector breaks the tie, and between equally specific
+package or project rules a literal beats a glob and a longer literal prefix beats a shorter one,
+whatever the rule order); `floor` is **max-clamped**
 across layers (only ratchets stricter); `allow` is an **accumulated union** that can bypass a floor
 only when co-declared with it (or via an audited `--latest`/`--allow`). `cooldown explain <pkg>`
 prints the field-by-field derivation.
