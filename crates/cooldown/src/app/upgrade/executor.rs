@@ -1214,8 +1214,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// than committing a lock no trial verified.
     ///
     /// A rejected candidate is reported held only while its own target stays unlanded: one the
-    /// committed replay verifiably moved onto that target (from the same version, for the same
-    /// members) reports only its applied row.
+    /// committed replay verifiably moved onto that target, from the same version and in every
+    /// member that declares it, reports only its applied row (see [`landed_as_collateral`]).
     async fn replay_selected_upgrade_changes(
         &mut self,
         accepted: Vec<Change>,
@@ -1260,12 +1260,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 let rejected: Vec<_> = rejected
                     .into_iter()
                     .filter(|item| {
-                        landed_upgrade_changes(
-                            std::slice::from_ref(&item.change),
-                            &outcomes,
-                            &self.last_gate_graph,
-                        )
-                        .is_empty()
+                        !landed_as_collateral(&item.change, &outcomes, &self.last_gate_graph)
                     })
                     .collect();
                 if let ControlFlow::Break(conflict) = self.merge_batch_outcomes(outcomes) {
@@ -3793,6 +3788,41 @@ fn landed_upgrade_changes(
         })
         .cloned()
         .collect()
+}
+
+/// Whether committed `outcomes` moved `change`'s package from its source version onto its target
+/// and the final `graph` holds that target for every member `change` declares.
+///
+/// Unlike [`landed_upgrade_changes`], the committed row is matched member-blind: an adapter
+/// reports collateral movement as a transitive row (`direct: false`, members filled in later
+/// from the graph), whose target key never carries the members a direct change's key does.
+/// The member requirement is proven against the graph instead, so a move that left one declaring
+/// member behind keeps its hold.
+fn landed_as_collateral(change: &Change, outcomes: &[BatchOutcome], graph: &[Dependency]) -> bool {
+    let target = change_target_key_parts(
+        &change.package.name,
+        change.package.registry.as_deref(),
+        change.to.as_str(),
+        false,
+        &[],
+    );
+    target_reached(graph, change)
+        && outcomes
+            .iter()
+            .filter(|outcome| outcome.is_committed())
+            .flat_map(|outcome| &outcome.items)
+            .any(|item| {
+                item.applied
+                    && item.edge.is_none()
+                    && item.from == change.from.as_str()
+                    && change_target_key_parts(
+                        &item.name,
+                        item.registry.as_deref(),
+                        &item.to,
+                        false,
+                        &[],
+                    ) == target
+            })
 }
 
 /// Splits `changes` in two and pushes the halves so the left half is processed first (LIFO).
