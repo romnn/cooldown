@@ -1646,6 +1646,184 @@ fn upgrade_major_respects_an_explicit_bound_beside_a_caret() {
     assert_eq!(chalk_range(&fixture, "b"), "^4.0.0");
 }
 
+/// One workspace member declaring `chalk` at a caret in `dependencies` and at `second` in
+/// `devDependencies`, seeded under `seed`.
+/// pnpm resolves and records only the `dependencies` declaration, so the lock alone shows a plain
+/// caret.
+fn two_field_fixture(second: &str, seed: &str) -> Fixture {
+    let fixture = Fixture::new().tag_independent();
+    fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
+    fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
+    fixture.write(
+        "pkgs/a/package.json",
+        &indoc::formatdoc! {r#"
+            {{
+              "name": "@cooldown/two-fields",
+              "version": "0.1.0",
+              "dependencies": {{ "chalk": "^4.1.0" }},
+              "devDependencies": {{ "chalk": "{second}" }}
+            }}
+        "#},
+    );
+    fixture.write(".npmrc", NPMRC);
+    seed_lock(&fixture, seed);
+    fixture
+}
+
+fn member_chalk_range(fixture: &Fixture, field: &str) -> String {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fixture.read_bytes("pkgs/a/package.json"))
+            .expect("member manifest parses");
+    manifest
+        .get(field)
+        .and_then(|section| section.get("chalk"))
+        .and_then(serde_json::Value::as_str)
+        .expect("chalk is declared")
+        .to_string()
+}
+
+/// An explicit `<5` bound in `devDependencies` caps the `--major` target at planning although the
+/// caret in `dependencies` of the same manifest, the one pnpm records, would take the widen.
+#[test]
+fn upgrade_major_respects_an_explicit_bound_in_a_second_install_field() {
+    skip_if_missing!("pnpm");
+    let fixture = two_field_fixture(">=4.0.0 <5", CARET_SPELLING_SEED);
+    let seed = fixture.read_bytes("pnpm-lock.yaml");
+    let manifest = fixture.read_bytes("pkgs/a/package.json");
+    assert!(lock_has_chalk_major(&seed, "4.") && !lock_has_chalk_major(&seed, "5."));
+
+    let upgrade = fixture.cooldown_json(&[
+        "upgrade",
+        "--major",
+        "--package",
+        "chalk",
+        "--freeze",
+        FREEZE,
+    ]);
+
+    assert!(upgrade.ok(), "{upgrade:#?}");
+    assert_eq!(upgrade.summary_applied(), 0, "{upgrade:#?}");
+    assert!(
+        upgrade
+            .skipped_reasons_for("chalk")
+            .contains("declared_bound_held"),
+        "{upgrade:#?}"
+    );
+    assert_eq!(fixture.read_bytes("pnpm-lock.yaml"), seed);
+    assert_eq!(fixture.read_bytes("pkgs/a/package.json"), manifest);
+}
+
+/// Before chalk 4.1.1, so the seed resolves chalk 4.1.0 and an in-line 4.1.2 target is matured
+/// under [`FREEZE`].
+const HIDDEN_PIN_SEED: &str = "2021-01-01T00:00:00Z";
+
+/// An exact pin in `devDependencies` holds an in-line move the recorded caret admits, naming the
+/// pin, while `--rewrite`, planned through the real planner, rewrites the pin and lands it.
+#[test]
+fn upgrade_holds_a_hidden_exact_pin_until_rewrite() {
+    skip_if_missing!("pnpm");
+    let fixture = two_field_fixture("4.1.0", HIDDEN_PIN_SEED);
+    let seed = fixture.read_bytes("pnpm-lock.yaml");
+    let manifest = fixture.read_bytes("pkgs/a/package.json");
+    assert_eq!(
+        pnpm_lock_pins(&seed).get("chalk").map(String::as_str),
+        Some("4.1.0")
+    );
+
+    let held = fixture.cooldown_json(&["upgrade", "--package", "chalk", "--freeze", FREEZE]);
+    assert!(held.ok(), "{held:#?}");
+    assert_eq!(held.summary_applied(), 0, "{held:#?}");
+    assert!(
+        held.skipped_reasons_for("chalk").contains("pin_held"),
+        "{held:#?}"
+    );
+    let detail = held.skip_detail_for("chalk").unwrap_or_default();
+    assert!(detail.contains("the exact pin 4.1.0 excludes"), "{detail}");
+    assert!(detail.contains("--rewrite"), "{detail}");
+    assert_eq!(fixture.read_bytes("pnpm-lock.yaml"), seed);
+    assert_eq!(fixture.read_bytes("pkgs/a/package.json"), manifest);
+
+    let rewritten = fixture.cooldown_json(&[
+        "upgrade",
+        "--rewrite",
+        "--package",
+        "chalk",
+        "--freeze",
+        FREEZE,
+    ]);
+    assert!(rewritten.ok(), "{rewritten:#?}");
+    assert_eq!(
+        rewritten.applied_names(),
+        std::collections::BTreeSet::from(["chalk".to_string()]),
+        "{rewritten:#?}"
+    );
+    let target = pnpm_lock_pins(&fixture.read_bytes("pnpm-lock.yaml"))
+        .get("chalk")
+        .cloned()
+        .expect("chalk is locked");
+    assert_ne!(target, "4.1.0");
+    assert_eq!(member_chalk_range(&fixture, "devDependencies"), target);
+    assert_eq!(
+        member_chalk_range(&fixture, "dependencies"),
+        format!("^{target}")
+    );
+}
+
+/// A cutoff after chalk 4.1.1 and before 4.1.2, so a 4.1.2 seed is too fresh and 4.1.1 is the
+/// matured downgrade.
+const HIDDEN_PIN_FIX_FREEZE: &str = "2021-06-01T00:00:00Z";
+
+/// A plain `fix` holds a downgrade off a too-fresh exact pin in `devDependencies`, naming
+/// `--downgrade-pinned`, and fails under `--strict`; `--downgrade-pinned` then rewrites the pin,
+/// lands the downgrade, and passes.
+#[test]
+fn fix_downgrades_a_hidden_exact_pin_only_with_downgrade_pinned() {
+    skip_if_missing!("pnpm");
+    let fixture = two_field_fixture("4.1.2", CARET_SPELLING_SEED);
+    let seed = fixture.read_bytes("pnpm-lock.yaml");
+    let manifest = fixture.read_bytes("pkgs/a/package.json");
+    assert_eq!(
+        pnpm_lock_pins(&seed).get("chalk").map(String::as_str),
+        Some("4.1.2")
+    );
+
+    // The held downgrade leaves the violation in place, so a strict `fix` fails.
+    let held = fixture.cooldown_json(&["fix", "--strict", "--freeze", HIDDEN_PIN_FIX_FREEZE]);
+    assert!(!held.ok(), "{held:#?}");
+    assert_eq!(held.summary_applied(), 0, "{held:#?}");
+    assert!(
+        held.skipped_reasons_for("chalk").contains("pin_held"),
+        "{held:#?}"
+    );
+    let detail = held.skip_detail_for("chalk").unwrap_or_default();
+    assert!(
+        detail.contains("the exact pin 4.1.2 excludes 4.1.1"),
+        "{held:#?}"
+    );
+    assert!(detail.contains("--downgrade-pinned"), "{detail}");
+    assert!(!detail.contains("--rewrite"), "{detail}");
+    assert_eq!(fixture.read_bytes("pnpm-lock.yaml"), seed);
+    assert_eq!(fixture.read_bytes("pkgs/a/package.json"), manifest);
+
+    let fixed = fixture.cooldown_json(&[
+        "fix",
+        "--strict",
+        "--downgrade-pinned",
+        "--freeze",
+        HIDDEN_PIN_FIX_FREEZE,
+    ]);
+    assert!(fixed.ok(), "{fixed:#?}");
+    assert_eq!(
+        pnpm_lock_pins(&fixture.read_bytes("pnpm-lock.yaml"))
+            .get("chalk")
+            .map(String::as_str),
+        Some("4.1.1"),
+        "{fixed:#?}"
+    );
+    assert_eq!(member_chalk_range(&fixture, "devDependencies"), "4.1.1");
+    assert_eq!(member_chalk_range(&fixture, "dependencies"), "^4.1.0");
+}
+
 /// `sync` bakes the cooldown.toml policy into pnpm's native config: the default `min-age` becomes
 /// `minimumReleaseAge`, AND every `[package."…"] latest` selector becomes an entry in
 /// `minimumReleaseAgeExclude` — so a package cooldown's own policy exempts is also exempt from pnpm's

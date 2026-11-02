@@ -362,6 +362,14 @@ pub enum SplitHold {
         /// The manifest, project-relative and `/`-separated.
         manifest: String,
     },
+    /// A declaring member's manifest pins the name exactly, in an install field the lock need not
+    /// record, to a version excluding a target one joint pin would otherwise land.
+    /// Unlike a [`Declaration`](Self::Declaration) pin, the plan's permission to rewrite pins
+    /// releases it for a downgrade.
+    ManifestPin {
+        /// The pinned version, verbatim.
+        range: String,
+    },
     /// The name resolves at one version, and this declared range excludes the target in a way
     /// `--major` does not widen.
     Declaration {

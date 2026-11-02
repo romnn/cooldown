@@ -4,10 +4,10 @@ use super::planning::{
 };
 use super::{
     BatchOutcome, CommittedBatch, PlanMode, TrialRollback, candidate_scope, collapse_applied_legs,
-    collateral_rows, combine_lock_status, conflict_skip_message, followed_manifest_warning,
-    indeterminate_trial, insert_graph_violation, is_downgrade, landed_upgrade_changes,
-    newly_introduced_violations, package_label, planned_changes_landed, preserve_rollback_entries,
-    sort_planned_changes, verify_applied_targets, violation_identity,
+    collateral_rows, combine_lock_status, conflict_skip_message, conservative_hold,
+    followed_manifest_warning, indeterminate_trial, insert_graph_violation, is_downgrade,
+    landed_upgrade_changes, newly_introduced_violations, package_label, planned_changes_landed,
+    preserve_rollback_entries, sort_planned_changes, verify_applied_targets, violation_identity,
 };
 use crate::app::{TransitiveGate, UpgradeItem};
 use color_eyre::eyre;
@@ -21,6 +21,23 @@ use std::collections::HashSet;
 
 mod cargo_trials;
 mod node_trials;
+
+/// A forward move an exact manifest pin holds stays a deliberate, strict-clean choice, while a
+/// downgrade it holds leaves the cooldown violation, so a strict `fix` is incomplete.
+#[test]
+fn a_pin_hold_fails_only_a_strict_fix() {
+    let upgrade = PlanMode::Upgrade {
+        transitive: TransitiveGate::Enforce,
+    };
+    for downgrade_pinned in [false, true] {
+        let fix = PlanMode::Fix {
+            transitive: TransitiveGate::Enforce,
+            downgrade_pinned,
+        };
+        assert!(!conservative_hold(SkipReason::PinHeld, fix));
+    }
+    assert!(conservative_hold(SkipReason::PinHeld, upgrade));
+}
 
 #[test]
 fn upgrade_walks_the_graph_unless_transitive_hidden() {

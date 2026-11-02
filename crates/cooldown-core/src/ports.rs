@@ -225,6 +225,8 @@ pub trait ToolRead: Send + Sync {
     /// Every workspace member's declaration of `name`, for `explain`: the declared range, the
     /// version the member's own lock entry resolves to, and the manifest fields naming it —
     /// members the run excludes included, since the caller marks those.
+    /// A member declaring the package at several ranges (one per manifest field) yields one
+    /// declaration per range.
     /// The default is empty, for adapters whose lock records no per-member declarations.
     ///
     /// # Errors
