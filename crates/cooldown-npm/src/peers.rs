@@ -308,6 +308,8 @@ pub(crate) fn peer_held_skip<L: NodeLock>(
 /// (initialized lazily from the first settled candidate's journal snapshot): an accepted
 /// candidate's violation map becomes the next baseline, and a rolled-back candidate restores the
 /// disk to exactly the baseline state, so each candidate lock is parsed once.
+///
+/// Returns whether the candidate was accepted.
 pub(crate) fn settle_landed_candidate<L: NodeLock>(
     project: &Project,
     change: &Change,
@@ -316,7 +318,7 @@ pub(crate) fn settle_landed_candidate<L: NodeLock>(
     workspace: &[WorkspacePeer],
     baseline: &mut Option<PeerViolations>,
     report: &mut ApplyReport,
-) -> Result<()> {
+) -> Result<bool> {
     let after = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
     let current = proven_peer_violations::<L>(&after, workspace);
     let fresh = {
@@ -334,6 +336,7 @@ pub(crate) fn settle_landed_candidate<L: NodeLock>(
         None => {
             *baseline = Some(current);
             report.applied.push(change.clone());
+            Ok(true)
         }
         Some(violation) => {
             restore_after_owned_step(candidate_journal, candidate_postimage)?;
@@ -345,9 +348,9 @@ pub(crate) fn settle_landed_candidate<L: NodeLock>(
             report
                 .skipped
                 .push(peer_held_skip::<L>(change, &violation, offending));
+            Ok(false)
         }
     }
-    Ok(())
 }
 
 /// Identifies one proven violation *instance*: the dependent at its exact landed version, the
@@ -529,8 +532,9 @@ fn attribute_peer_violation(
 
 /// The immutable inputs one whole-graph apply hands its peer-verified resolve loop: the plan to
 /// land, the pre-apply journal each round restores to, the multi-version names the resolve must not
-/// pin, the per-candidate transitive-advance verdicts, the transitive age floor, and the
-/// workspace-manifest peer contracts the lock is not authoritative for.
+/// pin, the per-candidate transitive-advance verdicts, the transitive age floor, the
+/// workspace-manifest peer contracts the lock is not authoritative for, and the exact manifest pins
+/// it must leave in place.
 #[derive(Clone, Copy)]
 pub(crate) struct JointResolve<'a> {
     pub(crate) plan: &'a Plan,
@@ -540,6 +544,8 @@ pub(crate) struct JointResolve<'a> {
         &'a std::collections::HashMap<crate::tool::AdvanceKey, crate::tool::TransitiveAdvance>,
     pub(crate) window_minutes: Option<i64>,
     pub(crate) workspace: &'a [WorkspacePeer],
+    /// The baseline exact manifest pins every round's settled lock must leave in place.
+    pub(crate) protected_pins: &'a crate::pins::ProtectedPins,
 }
 
 /// One candidate rejection a verification round decided: which active change to drop, the

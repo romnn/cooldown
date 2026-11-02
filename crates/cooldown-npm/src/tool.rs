@@ -24,6 +24,7 @@ use crate::peers::{
     journaled_lock, partition_peer_held, peer_conflict_blocker, peer_held_skip,
     plan_peer_rejections, proven_peer_violations, settle_landed_candidate,
 };
+use crate::pins::{AuthorizedPins, ProtectedPins};
 use crate::registry::{NPM, NpmRegistry};
 use crate::version;
 use async_trait::async_trait;
@@ -35,10 +36,11 @@ use cooldown_adapter_util::{
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, CoreError, Declaration, DepScope,
     Dependency, Diagnostic, DiagnosticKind, FetchContext, LockStatus, LockVerifyReport, MemberRef,
-    NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation, Project, ProjectMarker,
-    ProjectMutationJournal, RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality,
-    ResolvedPolicy, Result, RewriteMode, SingleCopyPolicy, SkipReason, Skipped, SyncReport,
-    SyncScope, TargetFallback, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    MutationBaseline, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
+    Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher,
+    ReleaseOrder, ReleaseQuality, ResolvedPolicy, Result, RewriteMode, SingleCopyPolicy,
+    SkipReason, Skipped, SyncReport, SyncScope, TargetFallback, ToolId, ToolRead, ToolWrite,
+    UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use serde::de::DeserializeOwned;
@@ -48,6 +50,21 @@ use std::marker::PhantomData;
 struct WholeGraphInputs {
     exact_pins: Vec<(String, String)>,
     importer_filters: Vec<String>,
+    /// The exact pins the widen rewrote with the user's authority.
+    authorized: AuthorizedPins,
+}
+
+/// The accepted lock of a verified joint resolve, with the pin rewrites its final round authorized.
+struct SettledResolve {
+    content: String,
+    authorized: AuthorizedPins,
+}
+
+/// One joint-resolve round's settled lock and the write-set state it left, the postimage a
+/// rejection restores from.
+struct Round {
+    settled: SettledResolve,
+    postimage: cooldown_core::ProjectMutationState,
 }
 
 /// One importer-filtered exact-pin update, as [`NodeLock::whole_graph_args`] renders it.
@@ -130,6 +147,13 @@ fn pnpm_location_filter(path: &str) -> String {
 /// direct/transitive classification from lock importer data or the root `package.json`, and resolves
 /// publish times from the shared [`NpmRegistry`]. npm has no native cooldown config, so
 /// [`native_policy`] is always empty.
+///
+/// An apply never commits a lock that newly moves a dependency off an exact pin some manifest
+/// declares in an install field, whether or not the plan names that package, unless the pin is the
+/// active change's own and `--rewrite` or `fix --downgrade-pinned` authorized rewriting it.
+/// The guarantee needs a lock that records each member's resolution, as pnpm's importers and npm's
+/// v2/v3 install tree do; yarn classic, bun, and npm v1 locks record none, so this guard protects
+/// none of their exact pins.
 ///
 /// [`native_policy`]: ToolRead::native_policy
 pub struct NpmTool<L> {
@@ -278,6 +302,45 @@ fn journal<L: NodeLock>(project: &Project, plan: &Plan) -> Result<ProjectMutatio
         }
     }
     ProjectMutationJournal::capture(&project.root, rels)
+}
+
+/// Reads the root manifest, every manifest this plan could rewrite, and every other manifest the
+/// lock names, the baseline exact pins the settled resolve must leave in place
+/// ([`ProtectedPins`]) whatever the plan names.
+///
+/// The manifests are read, not journaled: cooldown writes none of the extra ones, so a member
+/// manifest that is a symbolic or hard link must not block the mutation the way it blocks a
+/// journaled write.
+fn baseline<L: NodeLock>(project: &Project, plan: &Plan) -> Result<MutationBaseline> {
+    let mut rels: Vec<Utf8PathBuf> = vec![Utf8PathBuf::from("package.json")];
+    for change in &plan.changes {
+        rels.extend(manifest::manifest_rels(&change.members));
+    }
+    let members: Vec<MemberRef> = locked_member_paths::<L>(project)?
+        .into_iter()
+        .map(|path| MemberRef {
+            name: path.clone(),
+            path,
+        })
+        .collect();
+    rels.extend(manifest::manifest_rels(&members));
+    MutationBaseline::read(&project.root, rels)
+}
+
+/// Every workspace member path the on-disk lock names, sorted; empty without a lock.
+///
+/// A present lock that cannot be read is an error.
+/// One that does not parse names no member, and the apply's strict parse reports it.
+fn locked_member_paths<L: NodeLock>(project: &Project) -> Result<BTreeSet<String>> {
+    let path = project.root.join(L::LOCKFILE);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(err) => return Err(CoreError::Filesystem(format!("{path}: {err}"))),
+    };
+    let mut paths: BTreeSet<String> = L::member_paths(&content).into_iter().collect();
+    paths.extend(L::member_sources(&content).all_paths());
+    Ok(paths)
 }
 
 fn push_journal_rel(
@@ -1494,32 +1557,102 @@ fn report_excluded_moves(
     Ok(())
 }
 
-/// The whole-lock guards on the settled resolve, before any candidate is reported applied: excluded
-/// importers accounted for ([`report_excluded_moves`]), no in-scope importer split
-/// ([`report_importer_splits`]), and every graph-level duplicate the resolve introduced named
-/// ([`report_graph_duplicates`]).
-/// All need the pre-apply lock as their baseline; without one there is nothing an importer could
-/// have moved or split away from, so a lock the run created is taken as it is.
+/// The exact manifest pins a settled lock must leave in place, and the rewrites the user
+/// authorized for the accepted round.
+#[derive(Clone, Copy)]
+struct PinGuard<'a> {
+    protected: &'a ProtectedPins,
+    authorized: &'a AuthorizedPins,
+}
+
+/// The whole-lock guards on the settled resolve, before any candidate is reported applied: no
+/// protected exact manifest pin newly violated ([`ProtectedPins`]), excluded importers accounted
+/// for ([`report_excluded_moves`]), no in-scope importer split ([`report_importer_splits`]), and
+/// every graph-level duplicate the resolve introduced named ([`report_graph_duplicates`]).
+/// The pin guard runs first and also without a pre-apply lock, since a lock the run created can
+/// still resolve a pinned dependency off its pin.
+/// The others need the pre-apply lock as their baseline; without one there is nothing an importer
+/// could have moved or split away from, so a lock the run created is otherwise taken as it is.
 fn guard_settled_lock<L: NodeLock>(
     report: &mut ApplyReport,
     lock: (Option<&str>, &str),
     members: (Option<&MemberIndex>, &MemberIndex),
     excluded: &HashSet<String>,
     single_copy: &SingleCopyPolicy,
+    pins: PinGuard<'_>,
 ) -> Result<()> {
-    let (Some(before_content), Some(before_members)) = (lock.0, members.0) else {
+    let (before_lock, after_lock) = lock;
+    let (before_members, after_members) = members;
+    pins.protected
+        .refuse_new_violations::<L>(before_lock, after_lock, pins.authorized)?;
+    let (Some(before_content), Some(before_members)) = (before_lock, before_members) else {
         return Ok(());
     };
-    report_excluded_moves(report, before_members, members.1, excluded)?;
-    let split_reported = report_importer_splits(report, before_members, members.1, excluded)?;
+    report_excluded_moves(report, before_members, after_members, excluded)?;
+    let split_reported = report_importer_splits(report, before_members, after_members, excluded)?;
     report_graph_duplicates::<L>(
         report,
         before_content,
-        lock.1,
-        members.1,
+        after_lock,
+        after_members,
         excluded,
         &split_reported,
         single_copy,
+    )
+}
+
+/// One sequential candidate whose target landed, with the journal and postimage that roll it back.
+struct LandedCandidate<'a> {
+    change: &'a Change,
+    journal: &'a ProjectMutationJournal,
+    postimage: &'a cooldown_core::ProjectMutationState,
+}
+
+/// Accepts a sequential candidate whose target landed, unless its lock newly violates a protected
+/// exact pin or a peer contract, and returns whether it was accepted.
+///
+/// The pins are judged against the candidate's own baseline, the state the earlier accepted
+/// landings left, so neither an older violation nor an earlier candidate's authorized rewrite is
+/// charged to it, yet it cannot undo either.
+/// A pin violation restores the candidate and reports a resolver conflict naming the pin; the peer
+/// contracts are then verified by [`settle_landed_candidate`].
+fn settle_sequential_landing<L: NodeLock>(
+    project: &Project,
+    landed: &LandedCandidate<'_>,
+    pins: PinGuard<'_>,
+    workspace: &[WorkspacePeer],
+    peer_baseline: &mut Option<PeerViolations>,
+    report: &mut ApplyReport,
+) -> Result<bool> {
+    let &LandedCandidate {
+        change,
+        journal,
+        postimage,
+    } = landed;
+    let settled = read_lock::<L>(project)?;
+    let violations = pins.protected.violations_between::<L>(
+        journaled_lock::<L>(journal),
+        &settled,
+        pins.authorized,
+    );
+    if !violations.is_empty() {
+        restore_after_owned_step(journal, postimage)?;
+        report.skipped.push(Skipped {
+            change: change.clone(),
+            reason: SkipReason::ResolverConflict,
+            offending: Some(change.package.clone()),
+            detail: Some(crate::pins::refusal(&violations)),
+        });
+        return Ok(false);
+    }
+    settle_landed_candidate::<L>(
+        project,
+        change,
+        journal,
+        postimage,
+        workspace,
+        peer_baseline,
+        report,
     )
 }
 
@@ -1547,12 +1680,18 @@ impl<L: NodeLock> NpmTool<L> {
     /// npm's `--before` constrains the complete resolved tree, so even a per-package command can move
     /// transitives.
     /// Diffing the journaled lock against the final lock keeps those movements visible.
+    ///
+    /// A landing that newly violates a protected exact manifest pin ([`ProtectedPins`]) is restored
+    /// and reported as a resolver conflict naming the pin.
+    /// Each candidate is judged against the state the earlier accepted landings left, so only the
+    /// candidate that moved the pin is rolled back.
     async fn apply_per_package(
         &self,
         project: &Project,
         plan: &Plan,
         baseline_journal: &ProjectMutationJournal,
         workspace: &[WorkspacePeer],
+        protected_pins: &ProtectedPins,
     ) -> Result<ApplyReport> {
         // A project without a journaled lock diffs from an empty baseline; a present but
         // unparsable one is a real error, never an empty graph.
@@ -1562,6 +1701,9 @@ impl<L: NodeLock> NpmTool<L> {
             .unwrap_or_default();
         let mut report = ApplyReport::default();
         let mut violation_baseline: Option<PeerViolations> = None;
+        // The pin rewrites of every accepted candidate, which later candidates are judged against
+        // instead of the baseline pins they replaced.
+        let mut accepted_pins = AuthorizedPins::default();
         for change in &plan.changes {
             // A failed later candidate must not leak its widened manifest when an earlier sibling
             // succeeded and makes the outer batch committable.
@@ -1572,9 +1714,12 @@ impl<L: NodeLock> NpmTool<L> {
                 ..plan.clone()
             };
             let candidate_journal = journal::<L>(project, &candidate_plan)?;
-            let landing =
+            let (landing, candidate_pins) =
                 match candidate_landing::<L>(project, change, plan.rewrite, plan.rewrite_pins)? {
-                    LandingPlan::Land(landing) => landing,
+                    LandingPlan::Land {
+                        landing,
+                        authorized,
+                    } => (landing, authorized),
                     LandingPlan::NotEligible => {
                         report.skipped.push(Skipped {
                             change: change.clone(),
@@ -1599,15 +1744,26 @@ impl<L: NodeLock> NpmTool<L> {
                 .await?;
             match attempt.result {
                 Ok(()) if exact_target_reached::<L>(project, change)? => {
-                    settle_landed_candidate::<L>(
-                        project,
+                    let authorized = accepted_pins.union(&candidate_pins);
+                    let landed = LandedCandidate {
                         change,
-                        &candidate_journal,
-                        &attempt.postimage,
+                        journal: &candidate_journal,
+                        postimage: &attempt.postimage,
+                    };
+                    let pins = PinGuard {
+                        protected: protected_pins,
+                        authorized: &authorized,
+                    };
+                    if settle_sequential_landing::<L>(
+                        project,
+                        &landed,
+                        pins,
                         workspace,
                         &mut violation_baseline,
                         &mut report,
-                    )?;
+                    )? {
+                        accepted_pins = authorized;
+                    }
                 }
                 Ok(()) => {
                     // The install ran but the target did not land: a dependent's range holds
@@ -1692,6 +1848,7 @@ impl<L: NodeLock> NpmTool<L> {
         plan: &Plan,
         journal: &ProjectMutationJournal,
         evidence: &PeerEvidence,
+        protected_pins: &ProtectedPins,
     ) -> Result<ApplyReport> {
         let mut report = ApplyReport::default();
         if plan.changes.is_empty() {
@@ -1715,13 +1872,7 @@ impl<L: NodeLock> NpmTool<L> {
         // the run's to land, so they must not talk an included catalog-only candidate out of the
         // hold.
         let excluded = excluded_paths(plan);
-        let catalog_managed = before_content
-            .map(|content| L::catalog_managed_names(content, &excluded))
-            .unwrap_or_default();
-        let managed_index =
-            before_content.map(|content| L::member_sources_excluding(content, &excluded));
-        let (plan, catalog_holds) =
-            partition_catalog_managed(plan, &catalog_managed, managed_index.as_ref());
+        let (plan, catalog_holds) = catalog_partition::<L>(plan, before_content, &excluded);
         report.skipped.extend(catalog_holds);
         if plan.changes.is_empty() {
             // Nothing left to resolve; the catalog holds are the whole report.
@@ -1734,15 +1885,7 @@ impl<L: NodeLock> NpmTool<L> {
             .map(locked_versions::<L>)
             .transpose()?
             .unwrap_or_default();
-        // Per-candidate transitive-advance verdicts against the pre-apply lock: which candidates
-        // ride the qualified-override leg, and why each of the rest must be held (importer-owned
-        // name, duplicated graph copies, no safe override scope).
-        let importer_declared = managed_importer_declarations::<L>(before_content, &excluded);
-        let version_lines = before_content
-            .map(resolved_version_lines::<L>)
-            .transpose()?
-            .unwrap_or_default();
-        let advance = classify_transitive_advance(plan, &importer_declared, &version_lines);
+        let advance = transitive_advance_verdicts::<L>(plan, before_content, &excluded)?;
 
         // pnpm's `minimumReleaseAge` is a *rolling* age, so the cutoff is realized against the
         // current instant.
@@ -1755,7 +1898,10 @@ impl<L: NodeLock> NpmTool<L> {
             window_minutes_from_cutoff(project.exclude_newer.as_deref(), jiff::Timestamp::now());
 
         let mut rejections: Vec<Skipped> = Vec::new();
-        let after_content = self
+        let SettledResolve {
+            content: after_content,
+            authorized,
+        } = self
             .resolve_and_verify(
                 project,
                 &JointResolve {
@@ -1765,6 +1911,7 @@ impl<L: NodeLock> NpmTool<L> {
                     advance: &advance,
                     window_minutes,
                     workspace,
+                    protected_pins,
                 },
                 &mut rejections,
             )
@@ -1783,6 +1930,10 @@ impl<L: NodeLock> NpmTool<L> {
             (before_members.as_ref(), &after_members),
             &excluded,
             &plan.single_copy,
+            PinGuard {
+                protected: protected_pins,
+                authorized: &authorized,
+            },
         )?;
         let before_members = before_members.unwrap_or_default();
         // The hold detail names the declarations that still disagree with the target — only the
@@ -1871,94 +2022,42 @@ impl<L: NodeLock> NpmTool<L> {
     /// An unattributable violation propagates as a non-local rejection for candidate isolation.
     /// The rounds are bounded by the plan length (each continuing round removes at least one
     /// candidate); when every candidate is rejected, the restored pre-apply lock is the result.
+    ///
+    /// Each round's resolve, repair included, is [`Self::resolve_round`].
     async fn resolve_and_verify(
         &self,
         project: &Project,
         inputs: &JointResolve<'_>,
         rejections: &mut Vec<Skipped>,
-    ) -> Result<String> {
+    ) -> Result<SettledResolve> {
         let &JointResolve {
             plan,
             journal,
             multi_version,
-            advance,
-            window_minutes,
             workspace,
+            ..
         } = inputs;
         let before_content = journaled_lock::<L>(journal);
         let baseline = PeerBaseline::gather::<L>(before_content, workspace);
         let mut active = plan.clone();
         loop {
-            let resolve_result = self
-                .whole_graph_resolve(project, &active, multi_version, advance, window_minutes)
-                .await;
-            let mut resolve = OwnedStep::capture(resolve_result, journal)?;
-            match resolve.result {
-                Ok(()) => {}
-                Err(error) if error.is_local_environment_failure() => {
-                    restore_after_owned_step(journal, &resolve.postimage)?;
-                    return Err(error);
-                }
-                Err(error)
-                    if minimum_age_lock_rejected(&error)
-                        && window_minutes.is_some_and(|minutes| minutes > 0)
-                        && L::NATIVE_MIN_AGE_FILE.is_some() =>
-                {
-                    // A persisted minimumReleaseAge validates the starting lock before pnpm applies
-                    // the exact pins.
-                    // Restore any partial resolver work, then rebuild
-                    // through temporary exact overrides while retaining the age floor.
-                    restore_after_owned_step(journal, &resolve.postimage)?;
-                    self.repair_policy_rejected_graph(
-                        project,
-                        &active,
-                        multi_version,
-                        advance,
-                        window_minutes,
-                    )
-                    .await?;
-                    resolve.postimage = journal.capture_state()?;
-                }
-                // The joint resolve is unsatisfiable as a whole.
-                // Restore its partial work, then let `apply_resilient` isolate the offending
-                // candidate (an unfetchable version or one side of a conflict) instead of holding
-                // the complete batch.
-                Err(error) => {
-                    restore_after_owned_step(journal, &resolve.postimage)?;
-                    return Err(error);
-                }
-            }
-
-            let mut after_content = read_lock::<L>(project)?;
-            if new_lock_inconsistency::<L>(before_content, &after_content).is_some() {
-                // pnpm's targeted `update` can float an *unrelated* importer entry out of its
-                // declared range: peer unification across linked workspace members pulls a sibling
-                // importer's version line into this one (observed on luup5 as `vite: ^6` landing
-                // at 7.3.5 while updating `@playwright/test`). The override-based repair engine
-                // resolves through a plain install, which provably respects declared ranges, so
-                // the same pins are retried through it; only a repair that still leaves a fresh
-                // inconsistency is a real stale-lock failure.
-                restore_after_owned_step(journal, &resolve.postimage)?;
-                self.repair_policy_rejected_graph(
-                    project,
-                    &active,
-                    multi_version,
-                    advance,
-                    window_minutes,
-                )
-                .await?;
-                resolve.postimage = journal.capture_state()?;
-                after_content = read_lock::<L>(project)?;
-                if let Some(detail) = new_lock_inconsistency::<L>(before_content, &after_content) {
-                    return Err(CoreError::StaleLock(detail));
-                }
-            }
+            let Round {
+                settled:
+                    SettledResolve {
+                        content: after_content,
+                        authorized,
+                    },
+                postimage,
+            } = self.resolve_round(project, inputs, &active).await?;
             let current = proven_peer_violations::<L>(&after_content, workspace);
             let peer = plan_peer_rejections(&baseline, &current, &active, multi_version)?;
             let partial =
                 partial_landings(&active, multi_version, &L::member_sources(&after_content));
             if peer.is_empty() && partial.is_empty() {
-                return Ok(after_content);
+                return Ok(SettledResolve {
+                    content: after_content,
+                    authorized,
+                });
             }
             // One verdict per candidate; a peer contract's blame is the more specific one when a
             // candidate earned both.
@@ -1982,12 +2081,123 @@ impl<L: NodeLock> NpmTool<L> {
                     }
                 });
             }
-            restore_after_owned_step(journal, &resolve.postimage)?;
+            restore_after_owned_step(journal, &postimage)?;
             if active.changes.is_empty() {
                 // Every candidate was rejected; the restored journal is the result.
-                return Ok(before_content.unwrap_or_default().to_string());
+                return Ok(SettledResolve {
+                    content: before_content.unwrap_or_default().to_string(),
+                    authorized: AuthorizedPins::default(),
+                });
             }
         }
+    }
+
+    /// Runs one round's joint resolve and returns the lock it settled on with the state to restore
+    /// it from.
+    ///
+    /// A starting lock pnpm's native age gate refuses, or a targeted update that floats an entry out
+    /// of its declared range, is retried through the override repair from the restored journal.
+    /// A repair that still leaves a fresh inconsistency fails as a stale lock, unless it moved a
+    /// protected exact pin ([`ProtectedPins`]): that refusal names a resolver verdict the caller's
+    /// candidate isolation can act on, which a stale lock is not.
+    async fn resolve_round(
+        &self,
+        project: &Project,
+        inputs: &JointResolve<'_>,
+        active: &Plan,
+    ) -> Result<Round> {
+        let &JointResolve {
+            journal,
+            multi_version,
+            advance,
+            window_minutes,
+            protected_pins,
+            ..
+        } = inputs;
+        let before_content = journaled_lock::<L>(journal);
+        let resolve_result = self
+            .whole_graph_resolve(project, active, multi_version, advance, window_minutes)
+            .await;
+        // A failed round's records are moot: its edits are restored and nothing is judged.
+        let (resolve_result, mut authorized) = match resolve_result {
+            Ok(authorized) => (Ok(()), authorized),
+            Err(error) => (Err(error), AuthorizedPins::default()),
+        };
+        let mut resolve = OwnedStep::capture(resolve_result, journal)?;
+        match resolve.result {
+            Ok(()) => {}
+            Err(error) if error.is_local_environment_failure() => {
+                restore_after_owned_step(journal, &resolve.postimage)?;
+                return Err(error);
+            }
+            Err(error)
+                if minimum_age_lock_rejected(&error)
+                    && window_minutes.is_some_and(|minutes| minutes > 0)
+                    && L::NATIVE_MIN_AGE_FILE.is_some() =>
+            {
+                // A persisted minimumReleaseAge validates the starting lock before pnpm applies
+                // the exact pins.
+                // Restore any partial resolver work, then rebuild
+                // through temporary exact overrides while retaining the age floor.
+                restore_after_owned_step(journal, &resolve.postimage)?;
+                authorized = self
+                    .repair_policy_rejected_graph(
+                        project,
+                        active,
+                        multi_version,
+                        advance,
+                        window_minutes,
+                    )
+                    .await?;
+                resolve.postimage = journal.capture_state()?;
+            }
+            // The joint resolve is unsatisfiable as a whole.
+            // Restore its partial work, then let `apply_resilient` isolate the offending
+            // candidate (an unfetchable version or one side of a conflict) instead of holding
+            // the complete batch.
+            Err(error) => {
+                restore_after_owned_step(journal, &resolve.postimage)?;
+                return Err(error);
+            }
+        }
+
+        let mut after_content = read_lock::<L>(project)?;
+        if new_lock_inconsistency::<L>(before_content, &after_content).is_some() {
+            // pnpm's targeted `update` can float an *unrelated* importer entry out of its
+            // declared range: peer unification across linked workspace members pulls a sibling
+            // importer's version line into this one (observed on luup5 as `vite: ^6` landing
+            // at 7.3.5 while updating `@playwright/test`). The override-based repair engine
+            // resolves through a plain install, which provably respects declared ranges, so
+            // the same pins are retried through it; only a repair that still leaves a fresh
+            // inconsistency is a real stale-lock failure.
+            restore_after_owned_step(journal, &resolve.postimage)?;
+            authorized = self
+                .repair_policy_rejected_graph(
+                    project,
+                    active,
+                    multi_version,
+                    advance,
+                    window_minutes,
+                )
+                .await?;
+            resolve.postimage = journal.capture_state()?;
+            after_content = read_lock::<L>(project)?;
+            if let Some(detail) = new_lock_inconsistency::<L>(before_content, &after_content) {
+                protected_pins.refuse_new_violations::<L>(
+                    before_content,
+                    &after_content,
+                    &authorized,
+                )?;
+                return Err(CoreError::StaleLock(detail));
+            }
+        }
+        Ok(Round {
+            settled: SettledResolve {
+                content: after_content,
+                authorized,
+            },
+            postimage: resolve.postimage,
+        })
     }
 
     /// Build the per-candidate pins, widen the manifests the exact pins need, then run one joint
@@ -2022,6 +2232,8 @@ impl<L: NodeLock> NpmTool<L> {
     /// only (`--depth` notwithstanding), so a package no importer declares is advanced through the
     /// temporary qualified-override engine instead — see
     /// [`Self::resolve_with_temporary_overrides`].
+    ///
+    /// Returns the exact pins the widen rewrote with the user's authority.
     async fn whole_graph_resolve(
         &self,
         project: &Project,
@@ -2029,7 +2241,7 @@ impl<L: NodeLock> NpmTool<L> {
         multi_version: &HashSet<String>,
         advance: &HashMap<AdvanceKey, TransitiveAdvance>,
         window_minutes: Option<i64>,
-    ) -> Result<()> {
+    ) -> Result<AuthorizedPins> {
         let inputs = Self::prepare_whole_graph_inputs(project, plan, multi_version)?;
         if !inputs.exact_pins.is_empty() {
             let minimum_age_excludes = self
@@ -2065,7 +2277,7 @@ impl<L: NodeLock> NpmTool<L> {
             )
             .await?;
         }
-        Ok(())
+        Ok(inputs.authorized)
     }
 
     fn prepare_whole_graph_inputs(
@@ -2075,6 +2287,7 @@ impl<L: NodeLock> NpmTool<L> {
     ) -> Result<WholeGraphInputs> {
         let mut pins: Vec<(String, String)> = Vec::with_capacity(plan.changes.len());
         let mut importer_filters = Some(BTreeSet::new());
+        let mut authorized = AuthorizedPins::default();
         for change in &plan.changes {
             let name = change.package.name.clone();
             if !change.direct {
@@ -2103,13 +2316,14 @@ impl<L: NodeLock> NpmTool<L> {
                 RewriteMode::Auto => !target_in_declared_range(project, change)?,
             };
             if widen {
-                manifest::widen_constraints(
+                let rewrite = manifest::widen_constraints(
                     &project.root,
                     &change.members,
                     &change.package.name,
                     change.to.as_str(),
                     plan.rewrite,
                 )?;
+                authorized.record(change, plan.rewrite, plan.rewrite_pins, &rewrite);
             }
             if change.members.is_empty() {
                 importer_filters = None;
@@ -2135,6 +2349,7 @@ impl<L: NodeLock> NpmTool<L> {
         Ok(WholeGraphInputs {
             exact_pins: pins,
             importer_filters: filters,
+            authorized,
         })
     }
 
@@ -2189,6 +2404,10 @@ impl<L: NodeLock> NpmTool<L> {
         Ok(crate::exclusions::configured_rules(configured))
     }
 
+    /// Replays the plan through the override engine from the restored baseline.
+    ///
+    /// Returns the exact pins its own widen rewrote with the user's authority, which supersede the
+    /// records of the attempt it replaces: that attempt's manifest edits were restored first.
     async fn repair_policy_rejected_graph(
         &self,
         project: &Project,
@@ -2196,17 +2415,22 @@ impl<L: NodeLock> NpmTool<L> {
         multi_version: &HashSet<String>,
         advance: &HashMap<AdvanceKey, TransitiveAdvance>,
         window_minutes: Option<i64>,
-    ) -> Result<()> {
+    ) -> Result<AuthorizedPins> {
         // The repair replays the whole plan through the override engine, so the direct exact pins
         // and the qualified transitive pins ride one temporary config together.
-        let inputs = Self::prepare_whole_graph_inputs(project, plan, multi_version)?;
-        let mut pins = qualified_direct_override_pins(inputs.exact_pins);
+        let WholeGraphInputs {
+            exact_pins,
+            authorized,
+            ..
+        } = Self::prepare_whole_graph_inputs(project, plan, multi_version)?;
+        let mut pins = qualified_direct_override_pins(exact_pins);
         pins.extend(transitive_override_pins(plan, advance));
         if pins.is_empty() {
-            return Ok(());
+            return Ok(authorized);
         }
         self.resolve_with_temporary_overrides(project, plan, pins, window_minutes)
-            .await
+            .await?;
+        Ok(authorized)
     }
 
     /// Resolves the graph under temporary `pnpm-workspace.yaml` overrides for `pins`, then settles
@@ -2461,6 +2685,28 @@ fn advance_key(change: &Change) -> AdvanceKey {
     )
 }
 
+/// Per-candidate transitive-advance verdicts against the pre-apply lock: which candidates ride the
+/// qualified-override leg, and why each of the rest must be held (importer-owned name, duplicated
+/// graph copies, no safe override scope).
+///
+/// An absent pre-apply lock has no version lines; a present but unparsable one is an error.
+fn transitive_advance_verdicts<L: NodeLock>(
+    plan: &Plan,
+    before_content: Option<&str>,
+    excluded: &HashSet<String>,
+) -> Result<HashMap<AdvanceKey, TransitiveAdvance>> {
+    let importer_declared = managed_importer_declarations::<L>(before_content, excluded);
+    let version_lines = before_content
+        .map(resolved_version_lines::<L>)
+        .transpose()?
+        .unwrap_or_default();
+    Ok(classify_transitive_advance(
+        plan,
+        &importer_declared,
+        &version_lines,
+    ))
+}
+
 /// Classifies every transitive (non-direct) candidate against the pre-apply lock: which are
 /// advanced through a qualified override, and why each of the rest is held. Computed once from the
 /// full plan — peer-rejection rounds shrink the plan, and a verdict depends only on the pre-apply
@@ -2510,6 +2756,21 @@ fn transitive_override_pins(
     pins.sort();
     pins.dedup();
     pins
+}
+
+/// [`partition_catalog_managed`] against the pre-apply lock, with the run's excluded importers left
+/// out of both the catalog evidence and the managed index.
+fn catalog_partition<L: NodeLock>(
+    plan: &Plan,
+    before_content: Option<&str>,
+    excluded: &HashSet<String>,
+) -> (Plan, Vec<Skipped>) {
+    let catalog_managed = before_content
+        .map(|content| L::catalog_managed_names(content, excluded))
+        .unwrap_or_default();
+    let managed_index =
+        before_content.map(|content| L::member_sources_excluding(content, excluded));
+    partition_catalog_managed(plan, &catalog_managed, managed_index.as_ref())
 }
 
 /// Splits the plan's `catalog:`-managed **direct** candidates into truthful up-front holds,
@@ -3128,6 +3389,10 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         journal::<L>(project, plan)
     }
 
+    async fn mutation_baseline(&self, project: &Project, plan: &Plan) -> Result<MutationBaseline> {
+        baseline::<L>(project, plan)
+    }
+
     async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
         let (project, plan, journal) = mutation.parts_for(self)?;
         // The peer-feasibility gate runs against the journaled pre-apply lock, before any resolver
@@ -3149,12 +3414,20 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         // mutually-exclusive peers settle at a single fixed point.
         // The others (npm/yarn/bun) lack a joint pin-set resolve, so they keep the per-package relock
         // path.
+        // A recovery subset shares its operation's baseline, so every trial judges the same pins.
+        let protected_pins = ProtectedPins::from_baseline(mutation.baseline())?;
         let mut report = if L::supports_whole_graph_resolve() {
-            self.apply_whole_graph(project, &plan, journal, &evidence)
+            self.apply_whole_graph(project, &plan, journal, &evidence, &protected_pins)
                 .await?
         } else {
-            self.apply_per_package(project, &plan, journal, &evidence.workspace)
-                .await?
+            self.apply_per_package(
+                project,
+                &plan,
+                journal,
+                &evidence.workspace,
+                &protected_pins,
+            )
+            .await?
         };
         report.skipped.extend(peer_held);
         Ok(report)
@@ -5007,7 +5280,13 @@ packages:
         let evidence =
             PeerEvidence::gather::<Pnpm>(Some(&root), journaled_lock::<Pnpm>(&journal), &plan);
         let report = tool
-            .apply_whole_graph(&project, &plan, &journal, &evidence)
+            .apply_whole_graph(
+                &project,
+                &plan,
+                &journal,
+                &evidence,
+                &ProtectedPins::default(),
+            )
             .await?;
 
         assert_eq!(
@@ -5113,7 +5392,8 @@ packages:
         let journal = tool.mutation_journal(&project, &plan).await?;
         let evidence =
             PeerEvidence::gather::<Pnpm>(Some(&root), journaled_lock::<Pnpm>(&journal), &plan);
-        let apply = tool.apply_whole_graph(&project, &plan, &journal, &evidence);
+        let protected_pins = ProtectedPins::default();
+        let apply = tool.apply_whole_graph(&project, &plan, &journal, &evidence, &protected_pins);
         tokio::pin!(apply);
 
         // Interrupt only once the temporary overrides are on disk and the resolver is running.
@@ -5243,7 +5523,13 @@ packages:
         let evidence =
             PeerEvidence::gather::<Pnpm>(Some(&root), journaled_lock::<Pnpm>(&journal), &plan);
         let error = tool
-            .apply_whole_graph(&project, &plan, &journal, &evidence)
+            .apply_whole_graph(
+                &project,
+                &plan,
+                &journal,
+                &evidence,
+                &ProtectedPins::default(),
+            )
             .await
             .expect_err("an unparsable post-resolve lock must fail the batch, not read as held");
         assert!(
@@ -5514,6 +5800,228 @@ packages:
         );
         let legs = std::fs::read_to_string(root.join("legs.log"))?;
         assert!(!legs.contains("dom@"), "{legs}");
+        Ok(())
+    }
+
+    /// An npm root declaring `deps` at carets and `pinned` exactly in `devDependencies`, every
+    /// package locked at 1.0.0, driven by a scripted npm whose exact pin of a name lands it at the
+    /// requested version.
+    /// The pin of `second`, and any pin while `moves-pinned` exists, also floats `pinned` to
+    /// 1.1.0, the way npm's install can re-resolve a sibling the manifest pins.
+    /// A pin carrying a `--before` cutoff fails as an unresolvable historical tree.
+    #[cfg(unix)]
+    fn sibling_pin_fixture(
+        root: &Utf8Path,
+        manifest: &str,
+        names: &[&str],
+    ) -> eyre::Result<NpmTool<Npm>> {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(root.join("package.json"), manifest)?;
+        let packages = names
+            .iter()
+            .map(|name| format!(r#""node_modules/{name}": {{ "version": "1.0.0" }}"#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            root.join("package-lock.json"),
+            indoc::formatdoc! {r#"
+                {{
+                    "name": "app",
+                    "lockfileVersion": 3,
+                    "packages": {{ "": {{ "name": "app" }}, {packages} }}
+                }}
+            "#},
+        )?;
+        let script = root.join("fake-npm.sh");
+        std::fs::write(
+            &script,
+            indoc! {r#"
+                #!/bin/sh
+                echo "$*" >> legs.log
+                set_version() {
+                    sed "s|\"node_modules/$1\": { \"version\": \"[^\"]*\"|\"node_modules/$1\": { \"version\": \"$2\"|" \
+                      package-lock.json > package-lock.next && mv package-lock.next package-lock.json
+                }
+                case "$*" in
+                  "install --package-lock-only"*)
+                    exit 0 ;;
+                  "install "*@*" --package-lock-only"*"--before="*)
+                    echo "npm error code ETARGET" >&2; exit 1 ;;
+                  "install "*@*" --package-lock-only"*)
+                    name="${2%@*}"; version="${2##*@}"
+                    set_version "$name" "$version"
+                    if [ "$name" = second ] || [ -f moves-pinned ]; then set_version pinned 1.1.0; fi
+                    exit 0 ;;
+                esac
+                echo "unexpected args: $*" >&2; exit 1
+            "#},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let mut tool = tool();
+        tool.cmd = crate::nodecmd::NodeCmd::with_bin(script.as_str());
+        Ok(tool)
+    }
+
+    #[cfg(unix)]
+    fn npm_project(root: &Utf8Path) -> Project {
+        Project {
+            root: root.to_owned(),
+            kind: Npm::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        }
+    }
+
+    /// npm lands candidates one at a time, so each is judged against the state the earlier
+    /// landings left: the first lands, the second's install floats a pinned sibling and alone is
+    /// rolled back, and the lock keeps exactly the first candidate's result.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn npm_rolls_back_only_the_candidate_that_moves_a_pin() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let tool = sibling_pin_fixture(
+            &root,
+            indoc! {r#"
+                {
+                  "name": "app",
+                  "dependencies": { "first": "^1.0.0", "second": "^1.0.0", "pinned": "^1.0.0" },
+                  "devDependencies": { "pinned": "1.0.0" }
+                }
+            "#},
+            &["first", "second", "pinned"],
+        )?;
+        let baseline = std::fs::read_to_string(root.join("package-lock.json"))?;
+        let plan = Plan {
+            changes: vec![
+                change("first", "1.0.0", "1.1.0"),
+                change("second", "1.0.0", "1.1.0"),
+            ],
+            ..Plan::default()
+        };
+
+        let mutation = PreparedMutation::prepare(&tool, &npm_project(&root), &plan).await?;
+        let report = tool.apply(&mutation).await?;
+
+        assert_eq!(
+            report
+                .applied
+                .iter()
+                .map(|change| format!("{}@{}", change.package.name, change.to))
+                .collect::<Vec<_>>(),
+            ["first@1.1.0"]
+        );
+        let [skip] = report.skipped.as_slice() else {
+            eyre::bail!("one rolled-back candidate: {:?}", report.skipped)
+        };
+        assert_eq!(skip.change.package.name, "second");
+        assert_eq!(skip.reason, SkipReason::ResolverConflict);
+        assert_eq!(
+            skip.detail.as_deref(),
+            Some(
+                "the resolve moved an exact pin it was not asked to rewrite: pinned resolves to \
+                 1.1.0 for package.json, whose devDependencies pins 1.0.0"
+            )
+        );
+        // The lock is the first candidate's post-state, byte for byte.
+        let first_landed = baseline.replace(
+            r#""node_modules/first": { "version": "1.0.0" }"#,
+            r#""node_modules/first": { "version": "1.1.0" }"#,
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("package-lock.json"))?,
+            first_landed
+        );
+        let declared = std::fs::read_to_string(root.join("package.json"))?;
+        assert!(declared.contains(r#""second": "^1.0.0""#), "{declared}");
+        assert!(
+            declared.contains(r#""devDependencies": { "pinned": "1.0.0" }"#),
+            "{declared}"
+        );
+        Ok(())
+    }
+
+    /// A `--rewrite` pin edit is recorded when cooldown writes it, so it survives npm's retry
+    /// without the cutoff and the authorized-manifest restoration before it: the candidate's own
+    /// rewritten pin lands, while an unrelated pin the retry floats is still refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn npm_keeps_a_rewrite_authority_across_the_cutoff_retry() -> eyre::Result<()> {
+        let manifest = indoc! {r#"
+            {
+              "name": "app",
+              "dependencies": { "own": "^1.0.0", "pinned": "^1.0.0" },
+              "devDependencies": { "own": "1.0.0", "pinned": "1.0.0" }
+            }
+        "#};
+        let plan = Plan {
+            changes: vec![change("own", "1.0.0", "1.1.0")],
+            rewrite: RewriteMode::Always,
+            ..Plan::default()
+        };
+        let run = |moves_pinned: bool| {
+            let plan = plan.clone();
+            async move {
+                let dir = tempfile::tempdir()?;
+                let root =
+                    Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).map_err(|path| {
+                        eyre::eyre!("temporary path is not UTF-8: {}", path.display())
+                    })?;
+                let tool = sibling_pin_fixture(&root, manifest, &["own", "pinned"])?;
+                if moves_pinned {
+                    std::fs::write(root.join("moves-pinned"), "")?;
+                }
+                let project = Project {
+                    exclude_newer: Some("2024-01-01T00:00:00Z".to_string()),
+                    ..npm_project(&root)
+                };
+                let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
+                let report = tool.apply(&mutation).await?;
+                let legs = std::fs::read_to_string(root.join("legs.log"))?;
+                let declared = std::fs::read_to_string(root.join("package.json"))?;
+                eyre::Ok((report, legs, declared))
+            }
+        };
+
+        let (landed, legs, declared) = run(false).await?;
+        assert_eq!(
+            landed
+                .applied
+                .iter()
+                .map(|change| change.package.name.as_str())
+                .collect::<Vec<_>>(),
+            ["own"]
+        );
+        assert!(landed.skipped.is_empty(), "{:?}", landed.skipped);
+        assert!(
+            legs.contains("--before="),
+            "the first pin carried the cutoff: {legs}"
+        );
+        assert!(
+            declared.contains(r#""devDependencies": { "own": "1.1.0", "pinned": "1.0.0" }"#),
+            "{declared}"
+        );
+
+        let (refused, _, declared) = run(true).await?;
+        assert!(refused.applied.is_empty(), "{:?}", refused.applied);
+        let [skip] = refused.skipped.as_slice() else {
+            eyre::bail!("one rolled-back candidate: {:?}", refused.skipped)
+        };
+        assert_eq!(skip.reason, SkipReason::ResolverConflict);
+        assert_eq!(
+            skip.detail.as_deref(),
+            Some(
+                "the resolve moved an exact pin it was not asked to rewrite: pinned resolves to \
+                 1.1.0 for package.json, whose devDependencies pins 1.0.0"
+            )
+        );
+        assert!(
+            declared.contains(r#""devDependencies": { "own": "1.0.0", "pinned": "1.0.0" }"#),
+            "{declared}"
+        );
         Ok(())
     }
 
@@ -7474,6 +7982,635 @@ mod whole_graph_tests {
             after.contains(r#""devDependencies": { "happy-dom": "20.14.6" }"#),
             "{after}"
         );
+        Ok(())
+    }
+
+    /// The hidden-pin importer of [`hidden_pin_fixture`] with a third, unrelated `nanoid`, and the
+    /// locks a scripted pnpm answers with: `lodash`'s resolve also floats `happy-dom` within the
+    /// recorded caret, past the `devDependencies` pin no planned change names, while `nanoid`'s
+    /// resolve moves nothing else.
+    fn sibling_moves_pin_fixture(root: &Utf8Path) -> eyre::Result<(String, Utf8PathBuf)> {
+        let lock = workspace(
+            root,
+            &[Importer {
+                path: "apps/app",
+                name: "app",
+                deps: vec![
+                    ("happy-dom", "^20.11.1", "20.14.5"),
+                    ("lodash", "^4.17.20", "4.17.20"),
+                    ("nanoid", "^3.3.0", "3.3.7"),
+                ],
+            }],
+        )?;
+        std::fs::write(
+            root.join("apps/app/package.json"),
+            indoc! {r#"
+                {
+                  "name": "app",
+                  "dependencies": { "happy-dom": "^20.11.1", "lodash": "^4.17.20", "nanoid": "^3.3.0" },
+                  "devDependencies": { "happy-dom": "20.14.5" }
+                }
+            "#},
+        )?;
+        std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+        let nanoid_only = moved(
+            &lock,
+            "apps/app",
+            "nanoid",
+            ("^3.3.0", "3.3.7"),
+            ("^3.3.0", "3.3.8"),
+        );
+        let culprit = moved(
+            &nanoid_only,
+            "apps/app",
+            "lodash",
+            ("^4.17.20", "4.17.20"),
+            ("^4.17.20", "4.17.21"),
+        );
+        let culprit = moved(
+            &culprit,
+            "apps/app",
+            "happy-dom",
+            ("^20.11.1", "20.14.5"),
+            ("^20.11.1", "20.14.6"),
+        );
+        std::fs::write(root.join("nanoid-only.yaml"), nanoid_only)?;
+        std::fs::write(root.join("culprit.yaml"), culprit)?;
+        let script = fake_pnpm(
+            root,
+            indoc! {r#"
+                  *"lodash@4.17.21"*)
+                    cp culprit.yaml pnpm-lock.yaml; exit 0 ;;
+                  *"nanoid@3.3.8"*)
+                    cp nanoid-only.yaml pnpm-lock.yaml; exit 0 ;;
+            "#},
+        )?;
+        Ok((lock, script))
+    }
+
+    /// A sibling's resolve that floats a package past a manifest-only exact pin is refused, though
+    /// no planned change names the pinned package and the lock's caret admits the move.
+    /// The refusal names the owner, field, pin, and resulting version, and the recovery's safe
+    /// subset, retried from the restored journal, lands with the pin kept.
+    #[tokio::test]
+    async fn a_sibling_moving_a_manifest_only_pin_is_refused_and_the_safe_subset_lands()
+    -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let (lock, script) = sibling_moves_pin_fixture(&root)?;
+        let manifest = read(&root, "apps/app/package.json")?;
+        let tool = tool_with(&script)?;
+        let project = project(&root);
+        let nanoid = change("nanoid", "3.3.7", "3.3.8", &HIDDEN_PIN_MEMBERS);
+        let plan = Plan {
+            changes: vec![
+                change("lodash", "4.17.20", "4.17.21", &HIDDEN_PIN_MEMBERS),
+                nanoid.clone(),
+            ],
+            ..Plan::default()
+        };
+        let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
+
+        let error = tool
+            .apply(&mutation)
+            .await
+            .expect_err("the joint resolve moved a protected pin");
+
+        let CoreError::UnacceptableResolve(detail) = error else {
+            panic!("a resolver verdict the recovery isolates: {error:?}");
+        };
+        assert_eq!(
+            detail,
+            "the resolve moved an exact pin it was not asked to rewrite: happy-dom resolves to \
+             20.14.6 for apps/app/package.json, whose devDependencies pins 20.14.5"
+        );
+
+        // The recovery restores the operation's journal and retries the subset without the culprit.
+        mutation.journal().restore()?;
+        assert_eq!(read(&root, "pnpm-lock.yaml")?, lock);
+        let report = tool.apply(&mutation.subset(vec![nanoid])?).await?;
+
+        assert_eq!(applied_names(&report), vec!["nanoid"]);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        let settled = read(&root, "pnpm-lock.yaml")?;
+        assert!(settled.contains("happy-dom@20.14.5:"), "{settled}");
+        assert!(!settled.contains("happy-dom@20.14.6"), "{settled}");
+        assert!(settled.contains("nanoid@3.3.8:"), "{settled}");
+        assert_eq!(read(&root, "apps/app/package.json")?, manifest);
+        assert!(!root.join("pnpm-workspace.yaml").exists());
+        Ok(())
+    }
+
+    /// How an untouched member's `package.json` is linked to its real file.
+    #[derive(Clone, Copy)]
+    enum ManifestLink {
+        Symbolic,
+        Hard,
+    }
+
+    /// A workspace whose managed `apps/app` lands `lodash` while the untouched `libs/linked`, whose
+    /// manifest is a link, pins `happy-dom` in `devDependencies` beside the caret pnpm records.
+    /// With `moves_pin`, lodash's resolve also floats the linked member's `happy-dom`.
+    async fn linked_member_apply(
+        root: &Utf8Path,
+        link: ManifestLink,
+        moves_pin: bool,
+    ) -> eyre::Result<Result<ApplyReport>> {
+        let lock = workspace(
+            root,
+            &[
+                Importer {
+                    path: "apps/app",
+                    name: "app",
+                    deps: vec![("lodash", "^4.17.20", "4.17.20")],
+                },
+                Importer {
+                    path: "libs/linked",
+                    name: "linked",
+                    deps: vec![("happy-dom", "^20.11.1", "20.14.5")],
+                },
+            ],
+        )?;
+        std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+        let manifest = root.join("libs/linked/package.json");
+        let real = root.join("shared-linked-manifest.json");
+        std::fs::write(
+            &real,
+            indoc! {r#"
+                {
+                  "name": "linked",
+                  "dependencies": { "happy-dom": "^20.11.1" },
+                  "devDependencies": { "happy-dom": "20.14.5" }
+                }
+            "#},
+        )?;
+        std::fs::remove_file(&manifest)?;
+        match link {
+            ManifestLink::Symbolic => std::os::unix::fs::symlink(&real, &manifest)?,
+            ManifestLink::Hard => std::fs::hard_link(&real, &manifest)?,
+        }
+        let mut landed = moved(
+            &lock,
+            "apps/app",
+            "lodash",
+            ("^4.17.20", "4.17.20"),
+            ("^4.17.20", "4.17.21"),
+        );
+        if moves_pin {
+            landed = moved(
+                &landed,
+                "libs/linked",
+                "happy-dom",
+                ("^20.11.1", "20.14.5"),
+                ("^20.11.1", "20.14.6"),
+            );
+        }
+        std::fs::write(root.join("landed.yaml"), landed)?;
+        let script = fake_pnpm(
+            root,
+            indoc! {r#"
+                  *"lodash@4.17.21"*)
+                    cp landed.yaml pnpm-lock.yaml; exit 0 ;;
+            "#},
+        )?;
+        let tool = tool_with(&script)?;
+        let plan = Plan {
+            changes: vec![change("lodash", "4.17.20", "4.17.21", &HIDDEN_PIN_MEMBERS)],
+            ..Plan::default()
+        };
+        Ok(apply(&tool, &project(root), plan).await)
+    }
+
+    /// An untouched member whose manifest is a symbolic or hard link, which the journal's write
+    /// restrictions refuse, does not block the mutation: its pins are read, not journaled, so an
+    /// unrelated candidate lands, while a sibling's resolve moving the linked member's pin is
+    /// still refused.
+    #[tokio::test]
+    async fn a_linked_untouched_manifest_neither_blocks_nor_loses_its_pins() -> eyre::Result<()> {
+        for link in [ManifestLink::Symbolic, ManifestLink::Hard] {
+            let (_dir, root) = tempdir_root()?;
+            let report = linked_member_apply(&root, link, false).await??;
+            assert_eq!(applied_names(&report), vec!["lodash"]);
+            assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+
+            let (_moved_dir, moved_root) = tempdir_root()?;
+            let refused = linked_member_apply(&moved_root, link, true).await?;
+            let Err(CoreError::UnacceptableResolve(detail)) = refused else {
+                panic!("the linked member's pin moved: {refused:?}");
+            };
+            assert!(
+                detail.contains(
+                    "happy-dom resolves to 20.14.6 for libs/linked/package.json, whose \
+                     devDependencies pins 20.14.5"
+                ),
+                "{detail}"
+            );
+        }
+        Ok(())
+    }
+
+    /// An excluded importer's manifest-only pin is protected too: pnpm moving the excluded copy
+    /// within its recorded caret is otherwise an accepted re-resolve, but past the pin it is
+    /// refused.
+    #[tokio::test]
+    async fn an_excluded_importers_manifest_only_pin_is_protected() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let lock = workspace(
+            &root,
+            &[
+                Importer {
+                    path: ".",
+                    name: "root",
+                    deps: vec![("happy-dom", "^20.11.1", "20.14.5")],
+                },
+                Importer {
+                    path: "apps/app",
+                    name: "app",
+                    deps: vec![("happy-dom", "^20.11.1", "20.14.5")],
+                },
+            ],
+        )?;
+        std::fs::write(
+            root.join("package.json"),
+            indoc! {r#"
+                {
+                  "name": "root",
+                  "dependencies": { "happy-dom": "^20.11.1" },
+                  "devDependencies": { "happy-dom": "20.14.5" }
+                }
+            "#},
+        )?;
+        std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+        let both = moved(
+            &lock,
+            "apps/app",
+            "happy-dom",
+            ("^20.11.1", "20.14.5"),
+            ("^20.11.1", "20.14.6"),
+        );
+        let both = moved(
+            &both,
+            ".",
+            "happy-dom",
+            ("^20.11.1", "20.14.5"),
+            ("^20.11.1", "20.14.6"),
+        );
+        std::fs::write(root.join("both.yaml"), both)?;
+        let script = fake_pnpm(
+            &root,
+            indoc! {r#"
+                  *" update "*)
+                    cp both.yaml pnpm-lock.yaml; exit 0 ;;
+            "#},
+        )?;
+        let tool = tool_with(&script)?;
+        let plan = Plan {
+            changes: vec![change(
+                "happy-dom",
+                "20.14.5",
+                "20.14.6",
+                &HIDDEN_PIN_MEMBERS,
+            )],
+            excluded_members: vec![member("root", ".")],
+            ..Plan::default()
+        };
+
+        let error = apply(&tool, &project(&root), plan)
+            .await
+            .expect_err("the excluded importer's pin moved");
+
+        let CoreError::UnacceptableResolve(detail) = error else {
+            panic!("{error:?}");
+        };
+        assert!(
+            detail.contains(
+                "happy-dom resolves to 20.14.6 for package.json, whose devDependencies pins 20.14.5"
+            ),
+            "{detail}"
+        );
+        Ok(())
+    }
+
+    /// The exemption a pin rewrite earns lasts only while its change stays in the resolve: once the
+    /// change is rolled back in an internal retry, the remainder's resolve may not keep its
+    /// package past the restored pin.
+    #[tokio::test]
+    async fn a_change_removed_in_a_retry_loses_its_pin_exemption() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let solid = ("^1.9.14", "1.9.14");
+        let lock = workspace(
+            &root,
+            &[
+                Importer {
+                    path: "apps/a",
+                    name: "a",
+                    deps: vec![
+                        ("solid-js", solid.0, solid.1),
+                        ("lodash", "^4.17.20", "4.17.20"),
+                    ],
+                },
+                Importer {
+                    path: "apps/b",
+                    name: "b",
+                    deps: vec![("solid-js", solid.0, solid.1)],
+                },
+            ],
+        )?;
+        std::fs::write(
+            root.join("apps/a/package.json"),
+            indoc! {r#"
+                {
+                  "name": "a",
+                  "dependencies": { "solid-js": "^1.9.14", "lodash": "^4.17.20" },
+                  "devDependencies": { "solid-js": "1.9.14" }
+                }
+            "#},
+        )?;
+        std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+        let lodash = moved(
+            &lock,
+            "apps/a",
+            "lodash",
+            ("^4.17.20", "4.17.20"),
+            ("^4.17.21", "4.17.21"),
+        );
+        // The first round lands solid-js in a alone, a partial landing the loop rolls back.
+        let partial = moved(&lodash, "apps/a", "solid-js", solid, ("^1.9.15", "1.9.15"));
+        // The retry without solid-js still floats it in both importers, within their carets.
+        let floated = moved(&lodash, "apps/a", "solid-js", solid, ("^1.9.14", "1.9.15"));
+        let floated = moved(&floated, "apps/b", "solid-js", solid, ("^1.9.14", "1.9.15"));
+        std::fs::write(root.join("partial.yaml"), partial)?;
+        std::fs::write(root.join("floated.yaml"), floated)?;
+        let script = fake_pnpm(
+            &root,
+            indoc! {r#"
+                  *"solid-js@1.9.15"*)
+                    cp partial.yaml pnpm-lock.yaml; exit 0 ;;
+                  *"lodash@4.17.21"*)
+                    cp floated.yaml pnpm-lock.yaml; exit 0 ;;
+            "#},
+        )?;
+        let tool = tool_with(&script)?;
+        let plan = Plan {
+            changes: vec![
+                change(
+                    "solid-js",
+                    "1.9.14",
+                    "1.9.15",
+                    &[("a", "apps/a"), ("b", "apps/b")],
+                ),
+                change("lodash", "4.17.20", "4.17.21", &[("a", "apps/a")]),
+            ],
+            rewrite: RewriteMode::Always,
+            ..Plan::default()
+        };
+
+        let error = apply(&tool, &project(&root), plan)
+            .await
+            .expect_err("the retry kept solid-js past a's restored pin");
+
+        let CoreError::UnacceptableResolve(detail) = error else {
+            panic!("{error:?}");
+        };
+        assert!(
+            detail.contains("solid-js resolves to 1.9.15 for apps/a/package.json, whose devDependencies pins 1.9.14"),
+            "{detail}"
+        );
+        let legs = legs(&root);
+        assert_eq!(
+            legs.len(),
+            2,
+            "one round with solid-js, one without: {legs:?}"
+        );
+        Ok(())
+    }
+
+    /// The `happy-dom` downgrade a `fix --downgrade-pinned` authorizes, landed through the
+    /// override repair after pnpm's targeted update floats the lock out of range, beside an
+    /// unrelated `lodash` pin whose copy the repair moves when `moves_lodash` is set.
+    async fn downgrade_through_repair(
+        root: &Utf8Path,
+        moves_lodash: bool,
+    ) -> eyre::Result<Result<ApplyReport>> {
+        let lock = workspace(
+            root,
+            &[Importer {
+                path: "apps/app",
+                name: "app",
+                deps: vec![
+                    ("happy-dom", "^20.11.1", "20.14.6"),
+                    ("lodash", "^4.17.20", "4.17.20"),
+                ],
+            }],
+        )?;
+        std::fs::write(
+            root.join("apps/app/package.json"),
+            indoc! {r#"
+                {
+                  "name": "app",
+                  "dependencies": { "happy-dom": "^20.11.1", "lodash": "^4.17.20" },
+                  "devDependencies": { "happy-dom": "20.14.6", "lodash": "4.17.20" }
+                }
+            "#},
+        )?;
+        std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+        let floated = moved(
+            &lock,
+            "apps/app",
+            "happy-dom",
+            ("^20.11.1", "20.14.6"),
+            ("^20.11.1", "21.0.0"),
+        );
+        let mut repaired = moved(
+            &lock,
+            "apps/app",
+            "happy-dom",
+            ("^20.11.1", "20.14.6"),
+            ("^20.11.1", "20.14.5"),
+        );
+        if moves_lodash {
+            repaired = moved(
+                &repaired,
+                "apps/app",
+                "lodash",
+                ("^4.17.20", "4.17.20"),
+                ("^4.17.20", "4.17.21"),
+            );
+        }
+        std::fs::write(root.join("floated.yaml"), floated)?;
+        std::fs::write(root.join("repaired.yaml"), repaired)?;
+        let script = fake_pnpm(
+            root,
+            indoc! {r#"
+                  *" update "*)
+                    cp floated.yaml pnpm-lock.yaml; exit 0 ;;
+                  *"install"*)
+                    cp repaired.yaml pnpm-lock.yaml; exit 0 ;;
+            "#},
+        )?;
+        let tool = tool_with(&script)?;
+        let plan = Plan {
+            changes: vec![Change {
+                downgrade: true,
+                ..change("happy-dom", "20.14.6", "20.14.5", &HIDDEN_PIN_MEMBERS)
+            }],
+            rewrite_pins: true,
+            ..Plan::default()
+        };
+        Ok(apply(&tool, &project(root), plan).await)
+    }
+
+    /// The pin rewrite `fix --downgrade-pinned` authorizes is recorded where the repair replays the
+    /// widen, so the downgrade lands through the override repair, while the unrelated pin beside it
+    /// stays protected there.
+    #[tokio::test]
+    async fn an_authorized_downgrade_lands_through_the_repair_beside_a_protected_pin()
+    -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let landed = downgrade_through_repair(&root, false).await??;
+        assert_eq!(applied_names(&landed), vec!["happy-dom"]);
+        assert!(landed.skipped.is_empty(), "{:?}", landed.skipped);
+        let after = read(&root, "apps/app/package.json")?;
+        assert!(
+            after.contains(r#""devDependencies": { "happy-dom": "20.14.5", "lodash": "4.17.20" }"#),
+            "{after}"
+        );
+
+        let (_moved_dir, moved_root) = tempdir_root()?;
+        let refused = downgrade_through_repair(&moved_root, true).await?;
+        let Err(CoreError::UnacceptableResolve(detail)) = refused else {
+            panic!("the repair moved the unrelated pin: {refused:?}");
+        };
+        assert_eq!(
+            detail,
+            "the resolve moved an exact pin it was not asked to rewrite: lodash resolves to \
+             4.17.21 for apps/app/package.json, whose devDependencies pins 4.17.20"
+        );
+        Ok(())
+    }
+
+    /// A repair that leaves the lock inconsistent fails as a stale lock, unless the repair also
+    /// moved a protected pin when `moves_pin` is set: that refusal is a resolver verdict the
+    /// recovery can isolate, which a stale lock is not.
+    async fn persistent_inconsistency(root: &Utf8Path, moves_pin: bool) -> eyre::Result<CoreError> {
+        let lock = workspace(
+            root,
+            &[Importer {
+                path: ".",
+                name: "app",
+                deps: vec![
+                    ("dep", "^1.0.0", "1.0.0"),
+                    ("lodash", "^4.17.20", "4.17.20"),
+                ],
+            }],
+        )?;
+        std::fs::write(
+            root.join("package.json"),
+            indoc! {r#"
+                {
+                  "name": "app",
+                  "dependencies": { "dep": "^1.0.0", "lodash": "^4.17.20" },
+                  "devDependencies": { "lodash": "4.17.20" }
+                }
+            "#},
+        )?;
+        std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+        let floated = moved(&lock, ".", "dep", ("^1.0.0", "1.0.0"), ("^1.0.0", "2.0.0"));
+        let repaired = if moves_pin {
+            moved(
+                &floated,
+                ".",
+                "lodash",
+                ("^4.17.20", "4.17.20"),
+                ("^4.17.20", "4.17.21"),
+            )
+        } else {
+            floated.clone()
+        };
+        std::fs::write(root.join("floated.yaml"), floated)?;
+        std::fs::write(root.join("repaired.yaml"), repaired)?;
+        let script = fake_pnpm(
+            root,
+            indoc! {r#"
+                  *" update "*)
+                    cp floated.yaml pnpm-lock.yaml; exit 0 ;;
+                  *"install"*)
+                    cp repaired.yaml pnpm-lock.yaml; exit 0 ;;
+            "#},
+        )?;
+        let tool = tool_with(&script)?;
+        let plan = Plan {
+            changes: vec![change("dep", "1.0.0", "1.1.0", &[("app", ".")])],
+            ..Plan::default()
+        };
+        match apply(&tool, &project(root), plan).await {
+            Ok(report) => eyre::bail!("an inconsistent repair must fail: {report:?}"),
+            Err(error) => Ok(error),
+        }
+    }
+
+    /// The pin guard runs before the persistent-inconsistency fallback, so a repair that moved a
+    /// protected pin is refused as such, while one that moved none still fails as a stale lock.
+    #[tokio::test]
+    async fn a_moved_pin_is_refused_before_the_stale_lock_fallback() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let error = persistent_inconsistency(&root, true).await?;
+        let CoreError::UnacceptableResolve(detail) = error else {
+            panic!("the pin refusal wins: {error:?}");
+        };
+        assert!(
+            detail.contains(
+                "lodash resolves to 4.17.21 for package.json, whose devDependencies pins 4.17.20"
+            ),
+            "{detail}"
+        );
+
+        let (_stale_dir, stale_root) = tempdir_root()?;
+        let error = persistent_inconsistency(&stale_root, false).await?;
+        assert!(matches!(error, CoreError::StaleLock(_)), "{error:?}");
+        Ok(())
+    }
+
+    /// A lock the run created has no baseline for the importer guards, yet its pins are still
+    /// judged: a pinned dependency resolved off its pin is refused.
+    #[test]
+    fn the_pin_guard_runs_without_a_baseline_lock() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let settled = workspace(
+            &root,
+            &[Importer {
+                path: ".",
+                name: "app",
+                deps: vec![("lodash", "^4.17.20", "4.17.21")],
+            }],
+        )?;
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "app", "devDependencies": { "lodash": "4.17.20" } }"#,
+        )?;
+        let baseline = MutationBaseline::read(&root, [Utf8PathBuf::from("package.json")])?;
+        let protected = ProtectedPins::from_baseline(&baseline)?;
+        let after_members = Pnpm::member_sources(&settled);
+        let guard = |content: &str| {
+            guard_settled_lock::<Pnpm>(
+                &mut ApplyReport::default(),
+                (None, content),
+                (None, &after_members),
+                &HashSet::new(),
+                &SingleCopyPolicy::default(),
+                PinGuard {
+                    protected: &protected,
+                    authorized: &AuthorizedPins::default(),
+                },
+            )
+        };
+
+        let refused = guard(&settled);
+        assert!(
+            matches!(&refused, Err(CoreError::UnacceptableResolve(detail)) if detail.contains("lodash resolves to 4.17.21")),
+            "{refused:?}"
+        );
+        let on_pin = settled.replace("4.17.21", "4.17.20");
+        assert!(guard(&on_pin).is_ok());
         Ok(())
     }
 

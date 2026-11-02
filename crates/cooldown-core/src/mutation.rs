@@ -119,6 +119,88 @@ impl ProjectMutationState {
     }
 }
 
+/// Read-only project files an adapter captured when a mutation was prepared, the facts every trial
+/// of that mutation is judged against.
+///
+/// Unlike a [`ProjectMutationJournal`], these files are never written or restored, so a plain read
+/// that follows symbolic and hard links captures them, and capturing one grants no write
+/// authority.
+/// A prepared mutation shares one baseline with every recovery subset derived from it.
+#[derive(Debug, Clone, Default)]
+pub struct MutationBaseline {
+    files: Vec<BaselineFile>,
+}
+
+/// One project-relative file of a [`MutationBaseline`], with the bytes read at capture.
+#[derive(Debug, Clone)]
+pub struct BaselineFile {
+    path: Utf8PathBuf,
+    contents: Option<Vec<u8>>,
+}
+
+impl MutationBaseline {
+    /// Reads each project-relative path under `root`, recording an absent file as `None`.
+    ///
+    /// Duplicate paths are read once, in first-seen order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Filesystem`] when a path is absolute or leaves the project through a
+    /// `..` component, or when an existing file cannot be read.
+    pub fn read<I, P>(root: &Utf8Path, paths: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Utf8Path>,
+    {
+        let mut files: Vec<BaselineFile> = Vec::new();
+        for path in paths {
+            let path = path.as_ref();
+            let contained = path
+                .components()
+                .all(|component| matches!(component, camino::Utf8Component::Normal(_)));
+            if !contained {
+                return Err(CoreError::Filesystem(format!(
+                    "mutation baseline path is not project-relative: {path}"
+                )));
+            }
+            if files.iter().any(|file| file.path == path) {
+                continue;
+            }
+            let absolute = root.join(path);
+            let contents = match std::fs::read(&absolute) {
+                Ok(bytes) => Some(bytes),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => return Err(CoreError::Filesystem(format!("{absolute}: {err}"))),
+            };
+            files.push(BaselineFile {
+                path: path.to_owned(),
+                contents,
+            });
+        }
+        Ok(MutationBaseline { files })
+    }
+
+    /// The captured files, in capture order.
+    #[must_use]
+    pub fn files(&self) -> &[BaselineFile] {
+        &self.files
+    }
+}
+
+impl BaselineFile {
+    /// The project-relative path.
+    #[must_use]
+    pub fn path(&self) -> &Utf8Path {
+        &self.path
+    }
+
+    /// The bytes read at capture, or `None` when the file did not exist.
+    #[must_use]
+    pub fn contents(&self) -> Option<&[u8]> {
+        self.contents.as_deref()
+    }
+}
+
 /// Resolution inputs whose identity and contents must still match before publication.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectInputSnapshot {
@@ -1035,6 +1117,55 @@ mod mutation_journal_tests {
     fn root(directory: &tempfile::TempDir) -> eyre::Result<Utf8PathBuf> {
         Utf8PathBuf::from_path_buf(directory.path().to_owned())
             .map_err(|_| eyre::eyre!("temporary path is not UTF-8"))
+    }
+
+    /// A baseline reads present files once each, records an absent one as `None`, follows a
+    /// symbolic link the journal would refuse, and rejects a path that leaves the project.
+    #[test]
+    fn a_baseline_reads_project_files_without_write_restrictions() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = root(&directory)?;
+        std::fs::write(root.join("package.json"), "root")?;
+
+        let baseline = MutationBaseline::read(
+            &root,
+            ["package.json", "missing/package.json", "package.json"],
+        )?;
+
+        let read: Vec<(String, Option<&[u8]>)> = baseline
+            .files()
+            .iter()
+            .map(|file| (file.path().to_string(), file.contents()))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("package.json".to_string(), Some(b"root".as_slice())),
+                ("missing/package.json".to_string(), None),
+            ]
+        );
+        for escaping in ["../package.json", "/package.json"] {
+            std::assert_matches!(
+                MutationBaseline::read(&root, [escaping]),
+                Err(CoreError::Filesystem(_))
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(root.join("member"))?;
+            std::os::unix::fs::symlink(
+                root.join("package.json"),
+                root.join("member/package.json"),
+            )?;
+            let linked = MutationBaseline::read(&root, ["member/package.json"])?;
+            assert_eq!(
+                linked.files().first().and_then(BaselineFile::contents),
+                Some(b"root".as_slice())
+            );
+            assert!(ProjectMutationJournal::capture(&root, ["member/package.json"]).is_err());
+        }
+        Ok(())
     }
 
     #[test]

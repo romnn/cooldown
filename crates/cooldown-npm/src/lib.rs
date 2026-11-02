@@ -17,6 +17,7 @@ pub mod nodecmd;
 mod npmrc;
 mod patches;
 mod peers;
+mod pins;
 pub mod registry;
 pub mod tool;
 pub mod version;

@@ -14,7 +14,9 @@ use crate::model::{
     LockVerifyReport, NestedOwnership, Plan, Project, ProjectMarker, Release, ToolId, UpdateKind,
     VerifyReport, Version,
 };
-use crate::mutation::{AcceptedProjectState, ProjectMutationJournal, ProjectMutationState};
+use crate::mutation::{
+    AcceptedProjectState, MutationBaseline, ProjectMutationJournal, ProjectMutationState,
+};
 use crate::policy::{Origin, PolicyLayer, Rule, Selector, WindowSpec};
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -593,6 +595,7 @@ pub struct PreparedMutation {
     project: Project,
     plan: Plan,
     journal: Arc<ProjectMutationJournal>,
+    baseline: Arc<MutationBaseline>,
     tool: ToolId,
     execution: PreparedMutationExecution,
 }
@@ -662,10 +665,12 @@ impl PreparedMutation {
         }
         let journal = writer.mutation_journal(project, plan).await?;
         journal.validate_project(&project.root)?;
+        let baseline = writer.mutation_baseline(project, plan).await?;
         Ok(PreparedMutation {
             project: project.clone(),
             plan: plan.clone(),
             journal: Arc::new(journal),
+            baseline: Arc::new(baseline),
             tool,
             execution,
         })
@@ -717,6 +722,13 @@ impl PreparedMutation {
     #[must_use]
     pub fn journal(&self) -> &ProjectMutationJournal {
         self.journal.as_ref()
+    }
+
+    /// The read-only files the adapter captured when this operation was prepared
+    /// ([`ToolWrite::mutation_baseline`]), shared with every subset derived from it.
+    #[must_use]
+    pub fn baseline(&self) -> &MutationBaseline {
+        self.baseline.as_ref()
     }
 
     /// Binds a finished adapter report and postimage to this operation's mutation authority.
@@ -789,6 +801,7 @@ impl PreparedMutation {
             project: self.project.clone(),
             plan,
             journal: Arc::clone(&self.journal),
+            baseline: Arc::clone(&self.baseline),
             tool: self.tool,
             execution: self.execution,
         })
@@ -937,6 +950,24 @@ pub trait ToolWrite: Send + Sync {
         project: &Project,
         plan: &Plan,
     ) -> Result<ProjectMutationJournal>;
+
+    /// Captures the read-only files every trial of this mutation is judged against, such as
+    /// manifests the adapter must not write but whose declarations bind the resolve.
+    ///
+    /// [`PreparedMutation::prepare`] captures it once, after the journal, and every recovery
+    /// subset shares it, so a trial never judges against state an earlier trial left.
+    /// The default captures nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](crate::CoreError) if a baseline file exists but cannot be read.
+    async fn mutation_baseline(
+        &self,
+        _project: &Project,
+        _plan: &Plan,
+    ) -> Result<MutationBaseline> {
+        Ok(MutationBaseline::default())
+    }
 
     /// Applies a prepared operation and reports what was applied or skipped.
     ///

@@ -164,6 +164,92 @@ pub fn excluding_exact_pin(
     Ok(None)
 }
 
+/// One install-field declaration of a dependency, located by its owning member and field.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DeclarationKey {
+    /// The owning member's directory, project-relative and `/`-separated (`.` for the root).
+    pub member: String,
+    /// The install field declaring it.
+    pub field: &'static str,
+    /// The declared dependency name.
+    pub dependency: String,
+}
+
+impl DeclarationKey {
+    /// The owning manifest, project-relative and `/`-separated, as a message names it.
+    #[must_use]
+    pub fn manifest(&self) -> String {
+        manifest_of_member(&self.member)
+    }
+}
+
+/// The manifest of the member at the `/`-separated `member` path (`.` for the root), as a message
+/// names it.
+#[must_use]
+pub fn manifest_of_member(member: &str) -> String {
+    if member == "." {
+        "package.json".to_string()
+    } else {
+        format!("{member}/package.json")
+    }
+}
+
+/// An exact install-field pin a manifest declares, verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactDeclaration {
+    /// Where the pin is declared.
+    pub key: DeclarationKey,
+    /// The pinned version as written (`1.2.3`, `=1.2.3`).
+    pub pin: String,
+}
+
+/// Every exact pin in the install fields of the manifest `content` owned by `member`, in field
+/// order.
+///
+/// Read from the manifest rather than the lock: pnpm records one specifier per importer, so a pin
+/// in a second install field beside a caret is visible only here.
+/// Peer contracts are not install pins and stay with the peer checks.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Parse`] when `content` is not a JSON manifest.
+pub fn exact_install_declarations(member: &str, content: &str) -> Result<Vec<ExactDeclaration>> {
+    let doc: Value = serde_json::from_str(content)
+        .map_err(|err| CoreError::Parse(format!("{}: {err}", manifest_of_member(member))))?;
+    let mut declarations = Vec::new();
+    for field in WIDENABLE_FIELDS {
+        let Some(section) = doc.get(field).and_then(Value::as_object) else {
+            continue;
+        };
+        for (dependency, specifier) in section {
+            let Some(specifier) = specifier.as_str() else {
+                continue;
+            };
+            if crate::version::exact_pin_version(specifier).is_some() {
+                declarations.push(ExactDeclaration {
+                    key: DeclarationKey {
+                        member: member.to_string(),
+                        field,
+                        dependency: dependency.clone(),
+                    },
+                    pin: specifier.to_string(),
+                });
+            }
+        }
+    }
+    Ok(declarations)
+}
+
+/// The owning member of the project-relative manifest `rel`: its directory, `/`-separated, or `.`
+/// for the root manifest.
+#[must_use]
+pub fn member_of_manifest(rel: &Utf8Path) -> String {
+    match rel.parent() {
+        Some(parent) if !parent.as_str().is_empty() => display_rel(parent),
+        _ => ".".to_string(),
+    }
+}
+
 /// A project-relative path as it leaves the process in a message: `/`-separated on every platform.
 pub fn display_rel(rel: &Utf8Path) -> String {
     rel.components()
@@ -475,6 +561,17 @@ fn push_manifest_rel(
 pub struct ManifestRewrite {
     /// Project-root-relative paths of the manifests that were modified.
     pub modified: Vec<Utf8PathBuf>,
+    /// Every declaration rewritten, with the specifier cooldown wrote for it.
+    pub rewritten: Vec<RewrittenDeclaration>,
+}
+
+/// One install-field declaration a widen rewrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewrittenDeclaration {
+    /// Where the declaration lives.
+    pub key: DeclarationKey,
+    /// The specifier cooldown wrote in place of the old one.
+    pub replacement: String,
 }
 
 /// Rewrites `name` in each declaring `package.json` according to `mode`.
@@ -495,11 +592,32 @@ pub fn widen_constraints(
     let mut rewrite = ManifestRewrite::default();
     for rel in manifest_rels(members) {
         let abs = root.join(&rel);
-        if widen_manifest(&abs, name, target, mode)? {
-            rewrite.modified.push(rel);
+        let fields = widen_manifest(&abs, name, target, mode)?;
+        if fields.is_empty() {
+            continue;
         }
+        let member = member_of_manifest(&rel);
+        rewrite.rewritten.extend(
+            fields
+                .into_iter()
+                .map(|FieldRewrite { field, replacement }| RewrittenDeclaration {
+                    key: DeclarationKey {
+                        member: member.clone(),
+                        field,
+                        dependency: name.to_string(),
+                    },
+                    replacement,
+                }),
+        );
+        rewrite.modified.push(rel);
     }
     Ok(rewrite)
+}
+
+/// One field of one manifest a widen rewrote.
+struct FieldRewrite {
+    field: &'static str,
+    replacement: String,
 }
 
 fn widen_manifest(
@@ -507,16 +625,16 @@ fn widen_manifest(
     name: &str,
     target: &str,
     mode: RewriteMode,
-) -> Result<bool> {
+) -> Result<Vec<FieldRewrite>> {
     let content = match std::fs::read_to_string(manifest) {
         Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
     };
     let doc: Value =
         serde_json::from_str(&content).map_err(|e| CoreError::Parse(format!("{manifest}: {e}")))?;
     let mut rewritten = content;
-    let mut changed = false;
+    let mut changed = Vec::new();
     for field in WIDENABLE_FIELDS {
         let Some(range) = doc
             .get(field)
@@ -545,9 +663,12 @@ fn widen_manifest(
             replace_declared_range(&rewritten, field, name, range, &next).ok_or_else(|| {
                 CoreError::Parse(format!("{manifest}: could not locate {field}.{name}"))
             })?;
-        changed = true;
+        changed.push(FieldRewrite {
+            field,
+            replacement: next,
+        });
     }
-    if changed {
+    if !changed.is_empty() {
         std::fs::write(manifest, rewritten)?;
     }
     Ok(changed)

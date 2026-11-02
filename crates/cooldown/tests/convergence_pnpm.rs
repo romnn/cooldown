@@ -1824,6 +1824,141 @@ fn fix_downgrades_a_hidden_exact_pin_only_with_downgrade_pinned() {
     assert_eq!(member_chalk_range(&fixture, "dependencies"), "^4.1.0");
 }
 
+/// The version importer `importer` of `lock` resolves `name` to, as its `version:` line records
+/// it.
+fn importer_version(lock: &[u8], importer: &str, name: &str) -> Option<String> {
+    let text = String::from_utf8_lossy(lock);
+    let mut lines = text
+        .lines()
+        .skip_while(|line| *line != format!("  {importer}:"))
+        .skip(1)
+        .take_while(|line| line.is_empty() || line.starts_with("    "));
+    lines.find(|line| line.trim() == format!("{name}:"))?;
+    lines
+        .find_map(|line| line.trim().strip_prefix("version: "))
+        .map(str::to_string)
+}
+
+/// A workspace whose excluded member `pkgs/a` pins `chalk` exactly in `devDependencies` beside the
+/// caret pnpm records, while the managed member `pkgs/b` declares `chalk` and `ansi-regex` at
+/// carets with matured in-range moves.
+/// `pkgs/b` also locks a TypeScript published after [`FREEZE`], so the windowed update refuses
+/// the starting lock and cooldown repairs through workspace-wide overrides, which reach every
+/// importer's `chalk`, the excluded pin's included.
+fn excluded_pin_fixture() -> eyre::Result<Fixture> {
+    let fixture = Fixture::new().tag_independent();
+    fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
+    fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
+    fixture.write(".npmrc", NPMRC);
+    fixture.write(
+        "pkgs/a/package.json",
+        indoc::indoc! {r#"
+            {
+              "name": "@cooldown/pinned",
+              "version": "0.1.0",
+              "dependencies": { "chalk": "^4.1.0" },
+              "devDependencies": { "chalk": "4.1.0" }
+            }
+        "#},
+    );
+    let managed = |extra: &str| {
+        indoc::formatdoc! {r#"
+            {{
+              "name": "@cooldown/managed",
+              "version": "0.1.0",
+              "dependencies": {{ "chalk": "^4.1.0", "ansi-regex": "^5.0.0"{extra} }}
+            }}
+        "#}
+    };
+    fixture.write("pkgs/b/package.json", &managed(""));
+    seed_lock(&fixture, HIDDEN_PIN_SEED);
+    fixture.write(
+        "pkgs/b/package.json",
+        &managed(r#", "typescript": "^5.0.0""#),
+    );
+    let seed_minutes = minimum_release_age_minutes(FREEZE_LATER).to_string();
+    fixture
+        .run_tool_traced(
+            "lock a too-fresh TypeScript",
+            "pnpm",
+            &[
+                "install",
+                "--lockfile-only",
+                &format!("--config.minimumReleaseAge={seed_minutes}"),
+            ],
+            &[],
+        )?
+        .require_success()?;
+    Ok(fixture)
+}
+
+/// A resolve that moves an excluded member's manifest-only exact pin is refused, though no planned
+/// change names that member and pnpm records only its caret: the recovery holds the candidate
+/// whose resolve moved it, naming the pin, and lands the unrelated sibling with the pin kept.
+#[test]
+fn upgrade_refuses_a_resolve_that_moves_an_excluded_members_exact_pin() -> eyre::Result<()> {
+    skip_if_missing!("pnpm", Ok(()));
+    let fixture = excluded_pin_fixture()?;
+    let seed = fixture.read_bytes("pnpm-lock.yaml");
+    let pinned_manifest = fixture.read_bytes("pkgs/a/package.json");
+    assert_eq!(
+        importer_version(&seed, "pkgs/a", "chalk").as_deref(),
+        Some("4.1.0")
+    );
+    assert_eq!(
+        importer_version(&seed, "pkgs/b", "chalk").as_deref(),
+        Some("4.1.0")
+    );
+
+    let upgrade = fixture.cooldown_json_traced(
+        "upgrade beside the excluded pin",
+        &[
+            "upgrade",
+            "--exclude-folders",
+            "pkgs/a",
+            "--package",
+            "chalk",
+            "--package",
+            "ansi-regex",
+            "--freeze",
+            FREEZE,
+        ],
+    )?;
+
+    assert!(upgrade.ok(), "{upgrade:#?}");
+    assert_eq!(
+        upgrade.applied_names(),
+        std::collections::BTreeSet::from(["ansi-regex".to_string()]),
+        "{upgrade:#?}"
+    );
+    assert!(
+        upgrade
+            .skipped_reasons_for("chalk")
+            .contains("resolver_conflict"),
+        "{upgrade:#?}"
+    );
+    let detail = upgrade.skip_detail_for("chalk").unwrap_or_default();
+    assert!(
+        detail.contains(
+            "chalk resolves to 4.1.2 for pkgs/a/package.json, whose devDependencies pins 4.1.0"
+        ),
+        "{detail}"
+    );
+    let settled = fixture.read_bytes("pnpm-lock.yaml");
+    assert_eq!(
+        importer_version(&settled, "pkgs/a", "chalk").as_deref(),
+        Some("4.1.0"),
+        "the excluded pin keeps its copy"
+    );
+    assert_ne!(
+        importer_version(&settled, "pkgs/b", "ansi-regex").as_deref(),
+        Some("5.0.0"),
+        "the unrelated sibling lands"
+    );
+    assert_eq!(fixture.read_bytes("pkgs/a/package.json"), pinned_manifest);
+    Ok(())
+}
+
 /// `sync` bakes the cooldown.toml policy into pnpm's native config: the default `min-age` becomes
 /// `minimumReleaseAge`, AND every `[package."…"] latest` selector becomes an entry in
 /// `minimumReleaseAgeExclude` — so a package cooldown's own policy exempts is also exempt from pnpm's
