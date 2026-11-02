@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **A Yarn Berry `yarn.lock` is refused instead of read as an empty graph.** cooldown reads only
+  Yarn Classic (v1) lockfiles. A Berry (v2+) lock, which opens with a `__metadata:` entry,
+  matched none of the Classic grammar, so `outdated` reported nothing and `upgrade` found nothing
+  to do on a project it never read. Such a lock is now reported as `lockfile_unreadable`, naming
+  Yarn Berry.
 - **The `excluded_moved` warning no longer credits pnpm for a move cooldown's repair makes.** The
   warning for an excluded workspace member whose copy moved under an unchanged declaration said
   pnpm's update re-resolves the package in every importer whatever the filter, and that the copy
