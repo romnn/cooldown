@@ -32,8 +32,8 @@ pub use evaluate::{
 };
 pub use model::*;
 pub use mutation::{
-    AcceptedProjectState, ProjectInputSnapshot, ProjectMutationFile, ProjectMutationJournal,
-    ProjectMutationState,
+    AcceptedProjectState, BaselineFile, MutationBaseline, ProjectInputSnapshot,
+    ProjectMutationFile, ProjectMutationJournal, ProjectMutationState,
 };
 pub use policy::{
     ByKind, MaxMajorPick, Origin, PatternGlob, PolicyLayer, PolicyStack, Resolution, ResolveKind,

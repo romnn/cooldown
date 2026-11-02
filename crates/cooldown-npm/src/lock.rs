@@ -140,6 +140,16 @@ pub trait NodeLock: Send + Sync + 'static {
         None
     }
 
+    /// How the lock attributes a resolved version to each workspace member declaring it, the
+    /// evidence the exact-pin guard judges a member's manifest pins against.
+    ///
+    /// Default: [`MemberAttribution::Unknown`], since yarn classic and bun record no per-member
+    /// resolution, so their exact manifest pins are not protected from a sibling's resolve.
+    #[must_use]
+    fn member_attribution(_content: &str) -> MemberAttribution {
+        MemberAttribution::Unknown
+    }
+
     /// The driver args that refresh the lock after cooldown has rewritten the declaring
     /// `package.json` range itself.
     ///
@@ -1137,6 +1147,114 @@ fn parse_npm_peer_requirements(content: &str) -> Vec<PeerRequirement> {
     out
 }
 
+/// How a lock attributes resolved versions to the workspace members that declare them.
+///
+/// The name's newest copy says nothing about one member: a transitive duplicate can sit beside a
+/// member's own unchanged copy, so only per-member evidence can tell whether that member's
+/// manifest declaration still holds.
+pub enum MemberAttribution {
+    /// Each importer records what it binds each direct dependency to (pnpm).
+    Importers(ImporterBindings),
+    /// The lock records the physical install tree a member's lookup walks (npm v2/v3).
+    InstallTree(InstallPaths),
+    /// The lock records no per-member resolution (yarn classic, bun, npm v1).
+    Unknown,
+}
+
+/// What a lock's [`MemberAttribution`] says one member resolves one name to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberResolution<'a> {
+    /// The member resolves the name to this version (pnpm's peer suffix stripped).
+    Resolved(&'a str),
+    /// The lock attributes resolutions per member and records none for this one.
+    Missing,
+    /// The lock attributes nothing per member, so no answer is known.
+    Unknown,
+}
+
+impl MemberAttribution {
+    /// The version `member` (a workspace member path, `.` for the root) resolves `name` to.
+    #[must_use]
+    pub fn resolution(&self, member: &str, name: &str) -> MemberResolution<'_> {
+        let resolved = match self {
+            MemberAttribution::Importers(bindings) => return bindings.resolution(member, name),
+            MemberAttribution::InstallTree(paths) => paths
+                .member_resolution(member, name)
+                .map(|instance| instance.version),
+            MemberAttribution::Unknown => return MemberResolution::Unknown,
+        };
+        resolved.map_or(MemberResolution::Missing, MemberResolution::Resolved)
+    }
+}
+
+/// Every importer's raw `version:` binding of each direct dependency it lists, in any group.
+///
+/// Unlike the registry-only [`MemberIndex`], it keeps local and alias references, so an importer
+/// that still lists a dependency is never mistaken for one that dropped it.
+#[derive(Debug, Default)]
+pub struct ImporterBindings {
+    /// `(importer, name)` → the recorded `version:`, `None` for an entry shape the model does not
+    /// read; an importer listing one name in two groups keeps the first.
+    bindings: HashMap<(String, String), Option<String>>,
+}
+
+impl ImporterBindings {
+    /// What importer `member` binds `name` to.
+    ///
+    /// [`MemberResolution::Missing`] means the importer no longer lists the dependency at all.
+    /// A `link:`, `file:`, or `workspace:` reference, a URL resolution, an alias to another
+    /// package, or an unread entry carries no registry version of `name`, so it is
+    /// [`MemberResolution::Unknown`].
+    /// An alias naming the dependency itself (`name@1.2.3`, `npm:name@1.2.3`) resolves to its
+    /// version.
+    #[must_use]
+    pub fn resolution(&self, member: &str, name: &str) -> MemberResolution<'_> {
+        let Some(binding) = self.bindings.get(&(member.to_string(), name.to_string())) else {
+            return MemberResolution::Missing;
+        };
+        binding
+            .as_deref()
+            .and_then(|binding| registry_version_of(name, binding))
+            .map_or(MemberResolution::Unknown, MemberResolution::Resolved)
+    }
+}
+
+/// The registry version of `name` a pnpm importer binding records, peer suffix stripped, or `None`
+/// for a local reference, a URL resolution, or an alias to another package.
+fn registry_version_of<'a>(name: &str, binding: &'a str) -> Option<&'a str> {
+    if ["link:", "file:", "workspace:"]
+        .iter()
+        .any(|protocol| binding.starts_with(protocol))
+    {
+        return None;
+    }
+    let reference = binding.split('(').next().unwrap_or(binding);
+    let reference = reference.strip_prefix("npm:").unwrap_or(reference);
+    let version = match reference.rfind('@').filter(|&at| at > 0) {
+        Some(at) => {
+            let (alias, version) = reference.split_at(at);
+            if alias != name {
+                return None;
+            }
+            version.get(1..)?
+        }
+        None => reference,
+    };
+    (!version.is_empty() && !is_url_resolution(version)).then_some(version)
+}
+
+/// Every importer's raw direct-dependency bindings ([`ImporterBindings`]), excluded importers
+/// included.
+fn parse_pnpm_importer_bindings(content: &str) -> ImporterBindings {
+    let mut bindings: HashMap<(String, String), Option<String>> = HashMap::new();
+    walk_pnpm_importer_entries(content, |member, name, _specifier, version| {
+        bindings
+            .entry((member.to_string(), name.to_string()))
+            .or_insert_with(|| version.map(str::to_string));
+    });
+    ImporterBindings { bindings }
+}
+
 /// The physical install layout of a hoisted lock: every resolved instance keyed by the directory
 /// it is installed at (`node_modules/react`, `apps/a/node_modules/react`, and a workspace
 /// member's own directory such as `apps/a`) — the tree npm resolves `require` and peers against.
@@ -1436,6 +1554,13 @@ impl NodeLock for Npm {
         parse_npm_install_paths(content)
     }
 
+    fn member_attribution(content: &str) -> MemberAttribution {
+        // A v1 lock records no `packages` install tree, so it attributes nothing per member.
+        Self::install_paths(content).map_or(MemberAttribution::Unknown, |paths| {
+            MemberAttribution::InstallTree(paths)
+        })
+    }
+
     fn relock_args(before: Option<&str>) -> Vec<String> {
         // `--package-lock-only` re-resolves the lock without touching node_modules, keeping apply
         // fast and side-effect-light.
@@ -1523,6 +1648,10 @@ impl NodeLock for Pnpm {
 
     fn member_paths(content: &str) -> HashSet<String> {
         pnpm_importer_paths(content)
+    }
+
+    fn member_attribution(content: &str) -> MemberAttribution {
+        MemberAttribution::Importers(parse_pnpm_importer_bindings(content))
     }
 
     fn local_package_consumers(content: &str) -> HashMap<String, Vec<String>> {

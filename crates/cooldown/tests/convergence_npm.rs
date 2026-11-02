@@ -1331,3 +1331,104 @@ fn fix_downgrades_a_hidden_exact_pin_only_with_downgrade_pinned() {
     assert_eq!(declared_chalk(&fixture, "devDependencies"), "4.1.1");
     assert_eq!(declared_chalk(&fixture, "dependencies"), "^4.1.0");
 }
+
+/// A workspace member pinning `chalk` exactly in `devDependencies` beside the caret npm also
+/// records, while the root declares `ansi-regex` at a caret, seeded under `before`.
+fn member_pin_beside_sibling_fixture(before: &str) -> Fixture {
+    let fixture = Fixture::new().tag_independent();
+    fixture.write(
+        "package.json",
+        indoc! {r#"
+            {
+              "name": "cooldown-npm-member-pin",
+              "version": "0.1.0",
+              "private": true,
+              "workspaces": ["pkgs/a"],
+              "dependencies": { "ansi-regex": "^5.0.0" }
+            }
+        "#},
+    );
+    fixture.write(
+        "pkgs/a/package.json",
+        indoc! {r#"
+            {
+              "name": "@cooldown/pinned",
+              "version": "0.1.0",
+              "dependencies": { "chalk": "^4.1.0" },
+              "devDependencies": { "chalk": "4.1.0" }
+            }
+        "#},
+    );
+    fixture.write(".npmrc", NPMRC);
+    fixture
+        .run_tool(
+            "npm",
+            &[
+                "install",
+                "--package-lock-only",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+                &format!("--before={before}"),
+            ],
+            &[],
+        )
+        .expect_success();
+    fixture
+}
+
+/// The version the install tree resolves `name` to from the member directory `member`, walking up
+/// to the root like npm's lookup.
+fn member_resolved_version(fixture: &Fixture, member: &str, name: &str) -> Option<String> {
+    let lock: serde_json::Value =
+        serde_json::from_slice(&fixture.read_bytes("package-lock.json")).expect("lock parses");
+    let packages = lock.get("packages")?;
+    [
+        format!("{member}/node_modules/{name}"),
+        format!("node_modules/{name}"),
+    ]
+    .iter()
+    .find_map(|key| packages.get(key)?.get("version")?.as_str())
+    .map(str::to_owned)
+}
+
+/// A sibling landing beside a member's exact pin, which no planned change names, is judged at the
+/// member's own resolution in npm's real install tree: the pin stays satisfied, so the sibling
+/// lands with no false refusal.
+#[test]
+fn upgrade_lands_a_sibling_beside_a_protected_member_pin() {
+    skip_if_missing!("npm");
+    let fixture = member_pin_beside_sibling_fixture("2021-01-01T00:00:00Z");
+    let pinned_manifest = fixture.read_bytes("pkgs/a/package.json");
+    assert_eq!(
+        member_resolved_version(&fixture, "pkgs/a", "chalk").as_deref(),
+        Some("4.1.0")
+    );
+    assert_eq!(
+        package_lock_version(&fixture, "ansi-regex").as_deref(),
+        Some("5.0.0")
+    );
+
+    let upgrade =
+        fixture.cooldown_json(&["upgrade", "--package", "ansi-regex", "--freeze", FREEZE]);
+
+    assert!(upgrade.ok(), "{upgrade:#?}");
+    assert!(
+        upgrade.applied_names().contains("ansi-regex"),
+        "{upgrade:#?}"
+    );
+    // The held-back ansi-regex 6 major is reported beside it; nothing is refused.
+    assert!(
+        !upgrade.skipped_reasons().contains("resolver_conflict"),
+        "{upgrade:#?}"
+    );
+    assert_ne!(
+        package_lock_version(&fixture, "ansi-regex").as_deref(),
+        Some("5.0.0")
+    );
+    assert_eq!(
+        member_resolved_version(&fixture, "pkgs/a", "chalk").as_deref(),
+        Some("4.1.0")
+    );
+    assert_eq!(fixture.read_bytes("pkgs/a/package.json"), pinned_manifest);
+}

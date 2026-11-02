@@ -3,6 +3,7 @@
 use crate::lock::NodeLock;
 use crate::manifest;
 use crate::nodecmd::NodeCmd;
+use crate::pins::AuthorizedPins;
 use crate::version;
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -90,7 +91,12 @@ impl CandidateLanding {
 /// What [`candidate_landing`] decided for one candidate.
 pub(crate) enum LandingPlan {
     /// Land the candidate through this transaction.
-    Land(CandidateLanding),
+    Land {
+        landing: CandidateLanding,
+        /// The exact pins the widen rewrote with the user's authority, which the settled lock is
+        /// judged against instead of the baseline pins.
+        authorized: AuthorizedPins,
+    },
     /// No manifest declares the dependency, so nothing may be written for it.
     NotEligible,
     /// An exact install-field pin excludes the target ([`holds_exact_pins`]), and nothing was
@@ -109,6 +115,9 @@ pub(crate) enum LandingPlan {
 /// Eligibility depends on declarations rather than the files widening happened to modify.
 /// A published-contract-only declaration deliberately has an empty write set but can still
 /// authorize an exact lock move.
+///
+/// Only `mode` and `rewrite_pins` authorize rewriting an exact pin ([`AuthorizedPins::record`]):
+/// the manifest mode chosen internally to steer the relock never does.
 ///
 /// # Errors
 ///
@@ -152,6 +161,8 @@ pub(crate) fn candidate_landing<L: NodeLock>(
         change.to.as_str(),
         manifest_mode,
     )?;
+    let mut authorized = AuthorizedPins::default();
+    authorized.record(change, mode, rewrite_pins, &rewrite);
     if mode == RewriteMode::Auto
         && rewrite.modified.is_empty()
         && declarations.has_install()
@@ -160,13 +171,14 @@ pub(crate) fn candidate_landing<L: NodeLock>(
         // npm's resync can select the old lock again when every install range remains compatible.
         // Shift those ranges only when no declaration needed widening.
         // If one did, its edit already steers the resync and every compatible sibling stays intact.
-        manifest::widen_constraints(
+        let shifted = manifest::widen_constraints(
             &project.root,
             &change.members,
             &change.package.name,
             change.to.as_str(),
             RewriteMode::Always,
         )?;
+        authorized.record(change, mode, rewrite_pins, &shifted);
     }
     let authorized_manifests = manifest_snapshot(project, change)?;
     let landing = if let Some(crate::lock::PreservingPin { pin, resync }) = preserving_pin {
@@ -183,7 +195,10 @@ pub(crate) fn candidate_landing<L: NodeLock>(
             authorized_manifests,
         }
     };
-    Ok(LandingPlan::Land(landing))
+    Ok(LandingPlan::Land {
+        landing,
+        authorized,
+    })
 }
 
 /// Returns the manager's exact pin and any restore/resync transaction needed to keep authorized
@@ -761,7 +776,7 @@ mod tests {
         project.exclude_newer = Some("2024-08-01T00:00:00Z".to_string());
         let change = change("nanoid", "3.1.0", "5.1.11");
 
-        let LandingPlan::Land(landing) =
+        let LandingPlan::Land { landing, .. } =
             candidate_landing::<Npm>(&project, &change, RewriteMode::Auto, false)?
         else {
             eyre::bail!("declared candidate had no landing transaction")
@@ -848,7 +863,7 @@ mod tests {
             },
         ];
 
-        let LandingPlan::Land(landing) =
+        let LandingPlan::Land { landing, .. } =
             candidate_landing::<Npm>(&project, &change, RewriteMode::Auto, false)?
         else {
             eyre::bail!("declared candidate had no landing transaction")
@@ -1078,7 +1093,7 @@ mod tests {
 
         // `--rewrite` rewrites the pin to the target.
         let (plan, manifest) = landing_of("3.1.0", &upgrade, RewriteMode::Always, false)?;
-        assert!(matches!(plan, LandingPlan::Land(_)));
+        assert!(matches!(plan, LandingPlan::Land { .. }));
         assert!(
             manifest.contains(r#""devDependencies": { "nanoid": "3.3.0" }"#),
             "{manifest}"
@@ -1100,7 +1115,7 @@ mod tests {
 
         // With it, the downgrade rewrites the pin and keeps the caret that admits the target.
         let (plan, manifest) = landing_of("3.3.0", &downgrade, RewriteMode::Auto, true)?;
-        assert!(matches!(plan, LandingPlan::Land(_)));
+        assert!(matches!(plan, LandingPlan::Land { .. }));
         assert!(
             manifest.contains(r#""devDependencies": { "nanoid": "3.1.0" }"#),
             "{manifest}"
@@ -1116,7 +1131,7 @@ mod tests {
 
         // A pin already at the target lands without any authority.
         let (plan, manifest) = landing_of("3.3.0", &upgrade, RewriteMode::Auto, false)?;
-        assert!(matches!(plan, LandingPlan::Land(_)));
+        assert!(matches!(plan, LandingPlan::Land { .. }));
         assert!(
             manifest.contains(r#""devDependencies": { "nanoid": "3.3.0" }"#),
             "{manifest}"

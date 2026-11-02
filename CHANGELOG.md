@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **A resolve that moves a manifest-only exact pin is refused.** pnpm records one specifier per
+  importer, so an exact pin in a second install field (`devDependencies: 20.14.5` beside
+  `dependencies: ^20.11.1`), or in a member the run excludes, was invisible to the lock checks: a
+  sibling candidate's resolve could move the package past it and the move was reported as
+  collateral. The exact pins of every manifest the lock names (`v`-prefixed spellings included)
+  are now read before the apply, whatever the plan touches and whether or not the manifest is a
+  link, and a settled lock that newly violates one at its owning member is refused with the
+  manifest, field, pin, and resulting version named; the recovery holds the culprit as a resolver
+  conflict and lands the rest. npm judges each candidate against the state the earlier landings
+  left, so only the candidate that moved the pin is rolled back. `--rewrite` and
+  `fix --downgrade-pinned` exempt only the active change's own rewritten pins, judged against the
+  version cooldown wrote. The guarantee covers pnpm and npm lockfile v2/v3, the formats that record
+  a resolution per member; yarn, bun, and npm v1 locks attribute none, so their exact pins are not
+  yet protected this way.
+
 - **npm-family dependencies are judged by every install field that declares them.** A package in
   both `dependencies` and `devDependencies` (or `optionalDependencies`) of one manifest is capped by
   the strictest explicit bound across them, and moves lock-only only when every one admits the

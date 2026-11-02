@@ -242,6 +242,22 @@ pub(crate) fn is_exact_npm_specifier(specifier: &str) -> bool {
     Version::parse(specifier).is_ok()
 }
 
+/// The version an exact npm pin names, as node-semver reads it: a bare version or a single `=`
+/// equality, each optionally spaced and `v`-prefixed (`= v1.2.3` → `1.2.3`); `None` for any other
+/// specifier.
+///
+/// [`is_exact_npm_specifier`] stays narrower because its callers feed the specifier to
+/// [`version_in_range`] and the widen, neither of which reads a `v` prefix.
+pub(crate) fn exact_pin_version(specifier: &str) -> Option<&str> {
+    let trimmed = specifier.trim();
+    let unequal = trimmed.strip_prefix('=').map_or(trimmed, str::trim_start);
+    if unequal.starts_with('=') {
+        return None;
+    }
+    let version = unequal.strip_prefix('v').unwrap_or(unequal);
+    Version::parse(version).is_ok().then_some(version)
+}
+
 /// Why `--major` cannot carry a declared range to a target the range excludes.
 ///
 /// `--major` authorizes one rewrite: lifting the implicit ceiling of a plain caret or tilde range
