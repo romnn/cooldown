@@ -1530,3 +1530,236 @@ fn upgrade_lands_a_sibling_beside_a_protected_member_pin() {
     );
     assert_eq!(fixture.read_bytes("pkgs/a/package.json"), pinned_manifest);
 }
+
+/// A root declaring `ansi-regex` at `^4.1.0` beside an alias `ansi-five` of `ansi-regex@^5.0.0`,
+/// seeded before ansi-regex 4.1.1 and 5.0.1, so both lines have a matured in-range patch.
+fn alias_collision_fixture() -> Fixture {
+    let fixture = Fixture::new().tag_independent();
+    fixture.write(
+        "package.json",
+        indoc! {r#"
+            {
+              "name": "cooldown-npm-alias-collision",
+              "version": "0.1.0",
+              "private": true,
+              "dependencies": { "ansi-regex": "^4.1.0", "ansi-five": "npm:ansi-regex@^5.0.0" }
+            }
+        "#},
+    );
+    fixture.write(".npmrc", NPMRC);
+    fixture
+        .run_tool(
+            "npm",
+            &[
+                "install",
+                "--package-lock-only",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+                "--before=2021-01-01T00:00:00Z",
+            ],
+            &[],
+        )
+        .expect_success();
+    fixture
+}
+
+/// The `dependencies` range the root manifest declares for `name`.
+fn root_range(fixture: &Fixture, name: &str) -> Option<String> {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fixture.read_bytes("package.json")).expect("manifest parses");
+    manifest
+        .pointer(&format!("/dependencies/{name}"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// An alias installing `ansi-regex@5` beside the root's own `ansi-regex@^4.1.0` gives the alias's
+/// copy no claim on that ordinary declaration: `upgrade` plans no move of the 5.0.0 copy, which
+/// would rewrite `^4.1.0` across a major, while the ordinary copy lands its 4.1.1 patch, the alias
+/// and its copy stay as they were, and the result is a plain-relock and second-run fixed point.
+#[test]
+fn upgrade_never_moves_an_alias_target_through_an_ordinary_declaration() {
+    skip_if_missing!("npm");
+    let fixture = alias_collision_fixture();
+    let alias = (Some("ansi-regex".to_string()), Some("5.0.0".to_string()));
+    assert_eq!(
+        lock_entry_identity(&fixture, "node_modules/ansi-five"),
+        alias
+    );
+    assert_eq!(
+        package_lock_version(&fixture, "ansi-regex").as_deref(),
+        Some("4.1.0")
+    );
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert!(upgrade.ok(), "{upgrade:#?}");
+    assert!(
+        upgrade
+            .changes_for("ansi-regex")
+            .iter()
+            .all(|change| change.from != "5.0.0"),
+        "the alias's copy is planned through no declaration: {upgrade:#?}"
+    );
+    assert_eq!(
+        upgrade.applied_names(),
+        std::collections::BTreeSet::from(["ansi-regex".to_string()]),
+        "{upgrade:#?}"
+    );
+    assert_eq!(
+        package_lock_version(&fixture, "ansi-regex").as_deref(),
+        Some("4.1.1")
+    );
+    assert_eq!(
+        lock_entry_identity(&fixture, "node_modules/ansi-five"),
+        alias
+    );
+    assert_eq!(
+        root_range(&fixture, "ansi-regex").as_deref(),
+        Some("^4.1.1")
+    );
+    assert_eq!(
+        root_range(&fixture, "ansi-five").as_deref(),
+        Some("npm:ansi-regex@^5.0.0")
+    );
+    assert_plain_npm_relock_is_noop(&fixture);
+
+    // Convergence: a second run moves nothing.
+    let manifest_after = fixture.read_bytes("package.json");
+    let lock_after = fixture.read_bytes("package-lock.json");
+    let second = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert!(second.ok(), "{second:#?}");
+    assert_eq!(second.summary_applied(), 0, "{second:#?}");
+    assert_eq!(fixture.read_bytes("package.json"), manifest_after);
+    assert_eq!(fixture.read_bytes("package-lock.json"), lock_after);
+}
+
+/// A workspace member pinning `left-pad` exactly, which a root override aliases to `ms`, beside a
+/// root `ansi-regex` caret, seeded before ansi-regex 5.0.1.
+/// The override is keyed by a member's dependency, never the root's own, since npm rejects an
+/// override that conflicts with a root dependency.
+fn aliased_member_pin_fixture() -> Fixture {
+    let fixture = Fixture::new().tag_independent();
+    fixture.write(
+        "package.json",
+        indoc! {r#"
+            {
+              "name": "cooldown-npm-aliased-pin",
+              "version": "0.1.0",
+              "private": true,
+              "workspaces": ["pkgs/a"],
+              "dependencies": { "ansi-regex": "^5.0.0" },
+              "overrides": { "left-pad": "npm:ms@2.1.2" }
+            }
+        "#},
+    );
+    fixture.write(
+        "pkgs/a/package.json",
+        indoc! {r#"
+            {
+              "name": "@cooldown/aliased",
+              "version": "0.1.0",
+              "dependencies": { "left-pad": "1.3.0" }
+            }
+        "#},
+    );
+    fixture.write(".npmrc", NPMRC);
+    fixture
+        .run_tool(
+            "npm",
+            &[
+                "install",
+                "--package-lock-only",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+                "--before=2021-01-01T00:00:00Z",
+            ],
+            &[],
+        )
+        .expect_success();
+    fixture
+}
+
+/// The `name` and `version` the lock records at the install slot `key`.
+fn lock_entry_identity(fixture: &Fixture, key: &str) -> (Option<String>, Option<String>) {
+    let lock: serde_json::Value =
+        serde_json::from_slice(&fixture.read_bytes("package-lock.json")).expect("lock parses");
+    let entry = lock.get("packages").and_then(|packages| packages.get(key));
+    let field = |field: &str| {
+        entry
+            .and_then(|entry| entry.get(field))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    (field("name"), field("version"))
+}
+
+/// An override aliasing a member's exact pin installs `ms` at `node_modules/left-pad`, which npm
+/// records with `name: "ms"`: cooldown reports that copy as `ms`, never as a `left-pad` release,
+/// while a sibling lands beside it with the declarations and the alias untouched, and the result
+/// is a plain-relock and second-run fixed point.
+#[test]
+fn upgrade_lands_a_sibling_beside_an_aliased_member_pin() {
+    skip_if_missing!("npm");
+    let fixture = aliased_member_pin_fixture();
+    let member_manifest = fixture.read_bytes("pkgs/a/package.json");
+    let alias = (Some("ms".to_string()), Some("2.1.2".to_string()));
+    assert_eq!(
+        lock_entry_identity(&fixture, "node_modules/left-pad"),
+        alias
+    );
+    assert_eq!(
+        package_lock_version(&fixture, "ansi-regex").as_deref(),
+        Some("5.0.0")
+    );
+
+    let outdated = fixture.cooldown_json(&["outdated", "--transitive", "--freeze", FREEZE]);
+    assert!(outdated.ok(), "{outdated:#?}");
+    let names = outdated.item_names();
+    assert!(!names.contains("left-pad"), "{outdated:#?}");
+    assert_eq!(
+        outdated.item_field_str("ms", "current").as_deref(),
+        Some("2.1.2"),
+        "{outdated:#?}"
+    );
+
+    let upgrade =
+        fixture.cooldown_json(&["upgrade", "--package", "ansi-regex", "--freeze", FREEZE]);
+    assert!(upgrade.ok(), "{upgrade:#?}");
+    assert_eq!(
+        upgrade.applied_names(),
+        std::collections::BTreeSet::from(["ansi-regex".to_string()]),
+        "{upgrade:#?}"
+    );
+    assert!(
+        !upgrade.skipped_reasons().contains("resolver_conflict"),
+        "{upgrade:#?}"
+    );
+    assert_eq!(
+        package_lock_version(&fixture, "ansi-regex").as_deref(),
+        Some("5.0.1")
+    );
+    assert_eq!(
+        lock_entry_identity(&fixture, "node_modules/left-pad"),
+        alias
+    );
+    assert_eq!(fixture.read_bytes("pkgs/a/package.json"), member_manifest);
+    let root: serde_json::Value =
+        serde_json::from_slice(&fixture.read_bytes("package.json")).expect("manifest parses");
+    assert_eq!(
+        root.pointer("/overrides/left-pad")
+            .and_then(serde_json::Value::as_str),
+        Some("npm:ms@2.1.2")
+    );
+    assert_plain_npm_relock_is_noop(&fixture);
+
+    // Convergence: a second run moves nothing.
+    let manifest_after = fixture.read_bytes("package.json");
+    let lock_after = fixture.read_bytes("package-lock.json");
+    let second = fixture.cooldown_json(&["upgrade", "--package", "ansi-regex", "--freeze", FREEZE]);
+    assert!(second.ok(), "{second:#?}");
+    assert_eq!(second.summary_applied(), 0, "{second:#?}");
+    assert_eq!(fixture.read_bytes("package.json"), manifest_after);
+    assert_eq!(fixture.read_bytes("package-lock.json"), lock_after);
+}

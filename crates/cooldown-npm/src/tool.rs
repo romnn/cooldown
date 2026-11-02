@@ -506,6 +506,9 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
         // names once, by reading each member's `package.json`.
         let member_index = L::member_sources(&content);
         let member_names = member_names(&project.root, &member_index.all_paths());
+        // npm's member index is name-only, so the install tree is what tells an alias's target
+        // apart from a declared copy of the same name.
+        let install = L::install_paths(&content);
         // Direct-ness comes from the same importer data as attribution: a dependency is direct iff an
         // importer declares it. For pnpm this is version-exact, so a name declared at one version but
         // only pulled in transitively at another (a second copy in the graph) is split correctly —
@@ -540,7 +543,22 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
             if version.contains(':') {
                 continue;
             }
-            let member_paths = member_index.members_for(&name, &version);
+            // A version only an npm alias installs (`"foo": "npm:other@2.0.0"`) is no copy of any
+            // `other` declaration, even where a member also declares `other` itself: crediting it
+            // to that declaration would let a move of the alias target rewrite the unrelated
+            // range, so it is owned by no member, never direct, and never pinned.
+            // Only a registry copy of the same version at `other`'s own slot gives it back that
+            // claim; a local or workspace source of the same name and version is another package.
+            // The member index is name-only, so a registry copy nested under an unrelated
+            // dependency still restores the claim, the same limitation as for any nested duplicate.
+            let alias_only = install
+                .as_ref()
+                .is_some_and(|install| install.alias_only(&name, &version));
+            let member_paths = if alias_only {
+                Vec::new()
+            } else {
+                member_index.members_for(&name, &version)
+            };
             let is_direct = match &manifest_direct {
                 Some(names) => names.contains(&name),
                 None => !member_paths.is_empty(),
@@ -561,7 +579,7 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
                     path,
                 })
                 .collect();
-            let pinned = member_index.is_exact_pinned(&name, &version);
+            let pinned = !alias_only && member_index.is_exact_pinned(&name, &version);
             let declared_bound = if is_direct {
                 manifest::declared_bound(&project.root, &members, &name)?
             } else {
@@ -693,7 +711,13 @@ fn candidate_moved(
 /// Whether the re-locked graph resolves `change` at exactly its target, judged per declaring
 /// member when the lock carries member-scoped entries, per the member's physical install-tree
 /// instance when the lock records layout (npm), and by the name's newest copy only as the last
-/// resort.
+/// resort, for a change without declaring members or a lock without either record.
+///
+/// A recorded install tree is authoritative for every declaring member: each must resolve a copy
+/// of the name itself at the target.
+/// A member bound to nothing, or to an npm alias that installs another package at the name's slot,
+/// proves no landing, even when the alias's version equals the target or a genuine copy at the
+/// target sits elsewhere in the tree.
 ///
 /// A successful install command is not proof: `npm install <name>@<version> --before=<cutoff>`
 /// exits 0 yet lands the newest pre-cutoff version when the requested one is newer than the
@@ -724,18 +748,12 @@ fn exact_target_reached<L: NodeLock>(project: &Project, change: &Change) -> Resu
     // newest-copy fallback below would read the duplicate, roll the genuine landing back as a
     // conflict, and do so again on every future run.
     if let Some(paths) = L::install_paths(&content) {
-        let instances: Vec<Option<&str>> = change
-            .members
-            .iter()
-            .map(|member| {
-                paths
-                    .member_resolution(&member.path, &change.package.name)
-                    .map(|instance| instance.version)
-            })
-            .collect();
-        if instances.iter().any(Option::is_some) {
-            return Ok(instances.into_iter().all(|version| version == Some(target)));
-        }
+        return Ok(change.members.iter().all(|member| {
+            paths
+                .member_resolution(&member.path, &change.package.name)
+                .resolved()
+                .is_some_and(|instance| instance.version == target)
+        }));
     }
     Ok(newest
         .get(&change.package.name)
@@ -3933,6 +3951,192 @@ mod tests {
         );
     }
 
+    /// An npm alias's installed copy is locked under its target's name, never the alias's.
+    #[test]
+    fn locked_versions_name_an_npm_alias_by_its_target() -> eyre::Result<()> {
+        let lock = indoc! {r#"
+            {
+              "lockfileVersion": 3,
+              "packages": {
+                "": { "name": "root", "dependencies": { "foo": "npm:other@2.0.0", "other": "^1.0.0" } },
+                "node_modules/foo": { "name": "other", "version": "2.0.0" },
+                "node_modules/other": { "version": "1.0.0" }
+              }
+            }
+        "#};
+        let versions = locked_versions::<Npm>(lock)?;
+        assert_eq!(versions.get("other").map(String::as_str), Some("2.0.0"));
+        assert_eq!(versions.get("foo"), None);
+        Ok(())
+    }
+
+    /// A version only an alias installs is the target's identity but no copy of the member's own
+    /// declaration of that name: it is transitive, owned by no member, and never pinned, so no
+    /// move of it can rewrite the ordinary range, while the ordinary copy stays direct and owned.
+    #[tokio::test]
+    async fn an_alias_only_version_gets_no_editable_members() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        for (other, pinned) in [("^1.0.0", false), ("1.0.0", true)] {
+            std::fs::write(
+                root.join("package.json"),
+                indoc::formatdoc! {r#"
+                    {{ "name": "root", "dependencies": {{ "foo": "npm:other@2.0.0", "other": "{other}" }} }}
+                "#},
+            )?;
+            std::fs::write(
+                root.join("package-lock.json"),
+                indoc::formatdoc! {r#"
+                    {{
+                      "lockfileVersion": 3,
+                      "packages": {{
+                        "": {{ "name": "root", "dependencies": {{ "foo": "npm:other@2.0.0", "other": "{other}" }} }},
+                        "node_modules/foo": {{ "name": "other", "version": "2.0.0" }},
+                        "node_modules/other": {{ "version": "1.0.0" }}
+                      }}
+                    }}
+                "#},
+            )?;
+            let project = Project {
+                root: root.clone(),
+                kind: Npm::ID,
+                manifest: root.join("package.json"),
+                exclude_newer: None,
+                exclude_newer_package: std::collections::BTreeMap::new(),
+                generated_members: cooldown_core::GeneratedMembers::undeclared(),
+            };
+
+            let deps = tool().dependencies(&project, DepScope::Graph).await?;
+
+            let rows: Vec<(String, String, bool, Vec<String>, bool)> = deps
+                .iter()
+                .map(|dep| {
+                    (
+                        dep.package.name.clone(),
+                        dep.current.as_str().to_string(),
+                        dep.direct,
+                        dep.members
+                            .iter()
+                            .map(|member| member.path.clone())
+                            .collect(),
+                        dep.pinned,
+                    )
+                })
+                .collect();
+            let mut rows = rows;
+            rows.sort();
+            assert_eq!(
+                rows,
+                [
+                    (
+                        "other".to_string(),
+                        "1.0.0".to_string(),
+                        true,
+                        vec![".".to_string()],
+                        pinned
+                    ),
+                    (
+                        "other".to_string(),
+                        "2.0.0".to_string(),
+                        false,
+                        Vec::new(),
+                        false
+                    ),
+                ],
+                "{other}"
+            );
+            let direct = tool().dependencies(&project, DepScope::Direct).await?;
+            assert_eq!(
+                direct
+                    .iter()
+                    .map(|dep| format!("{}@{}", dep.package.name, dep.current.as_str()))
+                    .collect::<Vec<_>>(),
+                ["other@1.0.0"],
+                "{other}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A local workspace package of the alias target's name and version is another package than
+    /// the registry release the alias names, so it gives the alias's version no claim on the
+    /// ordinary declaration: the version stays transitive and unowned, the manifest untouched.
+    #[tokio::test]
+    async fn a_local_source_gives_an_alias_only_version_no_editable_members() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let manifest = indoc! {r#"
+            {
+              "name": "root",
+              "dependencies": {
+                "other": "^1.0.0",
+                "foo": "npm:other@2.0.0",
+                "local": "file:./packages/other"
+              }
+            }
+        "#};
+        std::fs::write(root.join("package.json"), manifest)?;
+        std::fs::write(
+            root.join("package-lock.json"),
+            indoc! {r#"
+                {
+                  "lockfileVersion": 3,
+                  "packages": {
+                    "": {
+                      "name": "root",
+                      "dependencies": {
+                        "other": "^1.0.0",
+                        "foo": "npm:other@2.0.0",
+                        "local": "file:./packages/other"
+                      }
+                    },
+                    "node_modules/other": { "version": "1.0.0" },
+                    "node_modules/foo": { "name": "other", "version": "2.0.0" },
+                    "node_modules/local": { "resolved": "packages/other", "link": true },
+                    "packages/other": { "name": "other", "version": "2.0.0" }
+                  }
+                }
+            "#},
+        )?;
+        let project = Project {
+            root: root.clone(),
+            kind: Npm::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        };
+
+        let deps = tool().dependencies(&project, DepScope::Graph).await?;
+
+        let mut rows: Vec<(String, String, bool, usize)> = deps
+            .iter()
+            .map(|dep| {
+                (
+                    dep.package.name.clone(),
+                    dep.current.as_str().to_string(),
+                    dep.direct,
+                    dep.members.len(),
+                )
+            })
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            [
+                ("other".to_string(), "1.0.0".to_string(), true, 1),
+                ("other".to_string(), "2.0.0".to_string(), false, 0),
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("package.json"))?,
+            manifest
+        );
+        Ok(())
+    }
+
     #[test]
     fn locked_versions_keeps_the_newest_copy_of_a_duplicated_name() {
         let lock = "lockfileVersion: '9.0'\n\npackages:\n\n  foo@1.0.0:\n    resolution: {integrity: sha512-a}\n\n  foo@2.0.0:\n    resolution: {integrity: sha512-b}\n\n  bar@3.1.0:\n    resolution: {integrity: sha512-c}\n";
@@ -5679,6 +5883,71 @@ packages:
             !exact_target_reached::<Npm>(&project, &short)?,
             "an instance short of its target is still short"
         );
+        Ok(())
+    }
+
+    /// An npm alias at a member's slot installs another package, so its version proves no landing
+    /// of the name even when it equals the target and a genuine copy at the target sits elsewhere
+    /// in the tree; with several members, every one must resolve a genuine copy at the target.
+    #[test]
+    fn an_npm_alias_never_proves_a_landing() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let project = Project {
+            root: root.clone(),
+            kind: Npm::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        };
+        let lock = |member_slot: &str| {
+            indoc::formatdoc! {r#"
+                {{
+                  "name": "root",
+                  "lockfileVersion": 3,
+                  "packages": {{
+                    "": {{ "name": "root", "workspaces": ["apps/a", "apps/b"] }},
+                    "apps/a": {{ "name": "a", "version": "0.1.0" }},
+                    "apps/b": {{ "name": "b", "version": "0.1.0" }},
+                    {member_slot}
+                    "node_modules/x": {{ "version": "1.0.0" }},
+                    "node_modules/x/node_modules/chalk": {{ "version": "4.1.2" }}
+                  }}
+                }}
+            "#}
+        };
+        let member = |path: &str| cooldown_core::MemberRef {
+            name: path.to_string(),
+            path: path.to_string(),
+        };
+        let mut landed = change("chalk", "4.1.1", "4.1.2");
+        landed.members = vec![member("apps/a")];
+
+        // The alias's version equals the target, and a genuine 4.1.2 is nested under `x`.
+        std::fs::write(
+            root.join("package-lock.json"),
+            lock(r#""node_modules/chalk": { "name": "other", "version": "4.1.2" },"#),
+        )?;
+        assert!(!exact_target_reached::<Npm>(&project, &landed)?);
+
+        // A member bound to nothing proves nothing either, though the newest copy is at the target.
+        std::fs::write(root.join("package-lock.json"), lock(""))?;
+        assert!(!exact_target_reached::<Npm>(&project, &landed)?);
+
+        // One member reaches a genuine copy, the other only an alias.
+        std::fs::write(
+            root.join("package-lock.json"),
+            lock(indoc::indoc! {r#"
+                "node_modules/chalk": { "version": "4.1.2" },
+                "apps/b/node_modules/chalk": { "name": "other", "version": "4.1.2" },
+            "#}),
+        )?;
+        let mut both = landed.clone();
+        both.members.push(member("apps/b"));
+        assert!(exact_target_reached::<Npm>(&project, &landed)?);
+        assert!(!exact_target_reached::<Npm>(&project, &both)?);
         Ok(())
     }
 

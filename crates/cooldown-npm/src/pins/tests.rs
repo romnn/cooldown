@@ -726,3 +726,187 @@ fn only_a_dropped_binding_is_missing() -> eyre::Result<()> {
     );
     Ok(())
 }
+
+/// A v2 or v3 npm lock of a root and its member `apps/a`, holding the given extra `packages`
+/// entries (each a `"key": { … }` pair) beside the root, member, and member-link entries.
+fn npm_tree(lockfile_version: u8, entries: &[String]) -> String {
+    let entries = entries.join(",\n    ");
+    formatdoc! {r#"
+        {{
+          "name": "root",
+          "lockfileVersion": {lockfile_version},
+          "packages": {{
+            "": {{ "name": "root", "workspaces": ["apps/a"] }},
+            "apps/a": {{ "name": "a", "version": "0.1.0" }},
+            "node_modules/a": {{ "resolved": "apps/a", "link": true }},
+            {entries}
+          }}
+        }}
+    "#}
+}
+
+/// The `packages` entry installing `version` at `key`, with `name` recorded when given, as npm
+/// records an alias (`"chalk": "npm:other@2.0.0"` installs `other` at `node_modules/chalk`).
+fn npm_entry(key: &str, name: Option<&str>, version: &str) -> String {
+    let name = name.map_or(String::new(), |name| format!(r#""name": "{name}", "#));
+    format!(r#""{key}": {{ {name}"version": "{version}" }}"#)
+}
+
+/// What `lock` resolves the root's and `apps/a`'s `chalk` pins to.
+fn npm_observed(pins: &ProtectedPins, lock: &str) -> [Observed; 2] {
+    let observed = pins.observe::<Npm>(Some(lock));
+    [
+        observed.get(&key(".", "devDependencies", "chalk")).clone(),
+        observed
+            .get(&key("apps/a", "devDependencies", "chalk"))
+            .clone(),
+    ]
+}
+
+/// An npm alias installs another package at the alias's own slot and records that package's
+/// `name` there, so the slot binds no version of the pinned name: newly aliasing a pinned name, or
+/// moving the alias target, is unknown and violates nothing, in v2 and v3 locks alike, while an
+/// entry whose `name` is the slot's own (or absent) is the genuine copy and is still judged.
+#[test]
+fn an_npm_alias_binds_no_version_of_the_pinned_name() -> eyre::Result<()> {
+    let pins = protected(&[
+        (".", r#"{ "devDependencies": { "chalk": "4.1.0" } }"#),
+        ("apps/a", r#"{ "devDependencies": { "chalk": "4.1.0" } }"#),
+    ])?;
+    let none = AuthorizedPins::default();
+    let hoisted =
+        |name: Option<&str>, version: &str| npm_entry("node_modules/chalk", name, version);
+    for lockfile_version in [2, 3] {
+        let tree = |entries: &[String]| npm_tree(lockfile_version, entries);
+        let genuine = tree(&[hoisted(None, "4.1.0")]);
+        for target in ["other", "@scope/other"] {
+            let aliased = tree(&[hoisted(Some(target), "2.0.0")]);
+            assert_eq!(
+                npm_observed(&pins, &aliased),
+                [Observed::Unknown, Observed::Unknown],
+                "v{lockfile_version} {target}"
+            );
+
+            // A newly introduced alias
+            assert_eq!(
+                violated::<Npm>(&pins, Some(&genuine), &aliased, &none),
+                NO_VIOLATIONS,
+                "v{lockfile_version} {target}"
+            );
+
+            // A moved alias target
+            let moved = tree(&[hoisted(Some(target), "2.1.0")]);
+            assert_eq!(
+                violated::<Npm>(&pins, Some(&aliased), &moved, &none),
+                NO_VIOLATIONS,
+                "v{lockfile_version} {target}"
+            );
+        }
+
+        // A `name` equal to the slot's is the genuine copy, judged as one.
+        let named = tree(&[hoisted(Some("chalk"), "4.1.2")]);
+        assert_eq!(
+            npm_observed(&pins, &named),
+            [
+                Observed::Resolved("4.1.2".to_string()),
+                Observed::Resolved("4.1.2".to_string())
+            ]
+        );
+        assert_eq!(
+            violated::<Npm>(&pins, Some(&genuine), &named, &none),
+            [". devDependencies chalk", "apps/a devDependencies chalk"]
+        );
+
+        // A genuine copy moved off the pin still violates, and a dropped one is missing.
+        let moved = tree(&[hoisted(None, "4.1.2")]);
+        assert_eq!(
+            violated::<Npm>(&pins, Some(&genuine), &moved, &none),
+            [". devDependencies chalk", "apps/a devDependencies chalk"]
+        );
+        let dropped = tree(&[npm_entry("node_modules/ansi", None, "5.0.0")]);
+        assert_eq!(
+            npm_observed(&pins, &dropped),
+            [Observed::Missing, Observed::Missing]
+        );
+        assert_eq!(
+            violated::<Npm>(&pins, Some(&genuine), &dropped, &none),
+            [". devDependencies chalk", "apps/a devDependencies chalk"]
+        );
+    }
+    Ok(())
+}
+
+/// A member's nested alias occupies the member's own slot, so it shadows the genuine hoisted copy:
+/// the member binds no version of the name, rather than the ancestor's copy the alias hides, while
+/// the root still resolves that ancestor and is judged by it.
+#[test]
+fn a_nested_npm_alias_shadows_the_genuine_ancestor() -> eyre::Result<()> {
+    let pins = protected(&[
+        (".", r#"{ "devDependencies": { "chalk": "4.1.0" } }"#),
+        ("apps/a", r#"{ "devDependencies": { "chalk": "4.1.0" } }"#),
+    ])?;
+    let none = AuthorizedPins::default();
+    let lock = |hoisted: &str| {
+        npm_tree(
+            3,
+            &[
+                npm_entry("apps/a/node_modules/chalk", Some("other"), "4.1.2"),
+                npm_entry("node_modules/chalk", None, hoisted),
+            ],
+        )
+    };
+    let baseline = npm_tree(3, &[npm_entry("node_modules/chalk", None, "4.1.0")]);
+
+    assert_eq!(
+        npm_observed(&pins, &lock("4.1.0")),
+        [Observed::Resolved("4.1.0".to_string()), Observed::Unknown]
+    );
+    assert_eq!(
+        violated::<Npm>(&pins, Some(&baseline), &lock("4.1.0"), &none),
+        NO_VIOLATIONS
+    );
+    assert_eq!(
+        violated::<Npm>(&pins, Some(&baseline), &lock("4.1.2"), &none),
+        [". devDependencies chalk"]
+    );
+    Ok(())
+}
+
+/// A hoisted workspace link is judged by its target's `name`: a link to the member that is the
+/// pinned package binds its version, while a link at the pinned name's slot to another member is
+/// an alias and binds none.
+#[test]
+fn an_npm_workspace_link_is_judged_by_its_targets_name() -> eyre::Result<()> {
+    let pins = protected(&[(".", r#"{ "devDependencies": { "chalk": "4.1.0" } }"#)])?;
+    let linked = |target_name: &str, version: &str| {
+        npm_tree(
+            3,
+            &[
+                npm_entry("packages/chalk", Some(target_name), version),
+                r#""node_modules/chalk": { "resolved": "packages/chalk", "link": true }"#
+                    .to_string(),
+            ],
+        )
+    };
+    let observed = |lock: &str| {
+        pins.observe::<Npm>(Some(lock))
+            .get(&key(".", "devDependencies", "chalk"))
+            .clone()
+    };
+
+    assert_eq!(
+        observed(&linked("chalk", "4.1.0")),
+        Observed::Resolved("4.1.0".to_string())
+    );
+    assert_eq!(observed(&linked("other", "4.1.2")), Observed::Unknown);
+    assert_eq!(
+        violated::<Npm>(
+            &pins,
+            Some(&linked("chalk", "4.1.0")),
+            &linked("other", "4.1.2"),
+            &AuthorizedPins::default()
+        ),
+        NO_VIOLATIONS
+    );
+    Ok(())
+}

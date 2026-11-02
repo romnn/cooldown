@@ -1117,14 +1117,10 @@ fn parse_npm_peer_requirements(content: &str) -> Vec<PeerRequirement> {
         if key.is_empty() {
             continue;
         }
-        // An installed package's name is its path tail; a workspace member entry carries a
-        // path-shaped key, so its real name comes from the copied manifest's `name` field.
-        let name = if key.contains("node_modules/") {
-            key.rsplit("node_modules/").next().filter(|s| !s.is_empty())
-        } else {
-            val.get("name").and_then(|v| v.as_str())
-        };
-        let Some(name) = name else {
+        // An installed package is named by its slot unless it records its own name, as an alias
+        // does; a workspace member entry carries a path-shaped key, so its real name comes from
+        // the copied manifest's `name` field.
+        let Some(name) = npm_entry_name(key, val) else {
             continue;
         };
         let Some(version) = val.get("version").and_then(|v| v.as_str()) else {
@@ -1168,7 +1164,8 @@ pub enum MemberResolution<'a> {
     Resolved(&'a str),
     /// The lock attributes resolutions per member and records none for this one.
     Missing,
-    /// The lock attributes nothing per member, so no answer is known.
+    /// No answer is known: the lock attributes nothing per member, or the member's binding is no
+    /// registry version of the name (a local reference, or an alias to another package).
     Unknown,
 }
 
@@ -1176,14 +1173,15 @@ impl MemberAttribution {
     /// The version `member` (a workspace member path, `.` for the root) resolves `name` to.
     #[must_use]
     pub fn resolution(&self, member: &str, name: &str) -> MemberResolution<'_> {
-        let resolved = match self {
-            MemberAttribution::Importers(bindings) => return bindings.resolution(member, name),
-            MemberAttribution::InstallTree(paths) => paths
-                .member_resolution(member, name)
-                .map(|instance| instance.version),
-            MemberAttribution::Unknown => return MemberResolution::Unknown,
-        };
-        resolved.map_or(MemberResolution::Missing, MemberResolution::Resolved)
+        match self {
+            MemberAttribution::Importers(bindings) => bindings.resolution(member, name),
+            MemberAttribution::InstallTree(paths) => match paths.member_resolution(member, name) {
+                InstallLookup::Resolved(instance) => MemberResolution::Resolved(instance.version),
+                InstallLookup::Missing => MemberResolution::Missing,
+                InstallLookup::Unknown => MemberResolution::Unknown,
+            },
+            MemberAttribution::Unknown => MemberResolution::Unknown,
+        }
     }
 }
 
@@ -1262,11 +1260,54 @@ fn parse_pnpm_importer_bindings(content: &str) -> ImporterBindings {
 /// disjoint members' packages meet at the root, and a nested conflict copy shadows the hoisted
 /// one, so neither declaration paths nor a graph-wide version can answer "which copy does this
 /// dependent actually see".
+///
+/// An npm alias (`"foo": "npm:other@1.0.0"`) installs `other` at `node_modules/foo` and records
+/// `name: "other"` there.
+/// That slot stays in the tree, since it shadows any farther copy of `foo` exactly as a genuine
+/// copy would, but it binds no version of `foo` ([`InstallLookup::Unknown`]) and is no instance of
+/// `foo` or `other` that a change of either rewrites.
 pub struct InstallPaths {
-    /// Install directory → the version installed there.
-    versions: HashMap<String, String>,
-    /// Package name → every `(version, directory)` instance of it.
+    /// Install directory → the package installed there.
+    installed: HashMap<String, InstalledPackage>,
+    /// Package name → every `(version, directory)` instance of it, alias slots left out.
     instances: HashMap<String, Vec<(String, String)>>,
+    /// Every `(name, version)` an alias slot installs.
+    alias_targets: HashSet<(String, String)>,
+    /// Every `(name, version)` installed as a registry copy at a slot of its own name: no alias,
+    /// no link, and no local source.
+    registry_copies: HashSet<(String, String)>,
+}
+
+/// The package one install directory holds, each half [`None`] when the lock does not establish
+/// it, such as a link whose target entry is absent or records no version.
+struct InstalledPackage {
+    /// The package's own name: the entry's recorded `name`, else the name its path implies.
+    name: Option<String>,
+    /// The version installed there.
+    version: Option<String>,
+}
+
+/// What a lookup on the [`InstallPaths`] finds for one name.
+#[derive(Debug, PartialEq)]
+pub enum InstallLookup<'a> {
+    /// The nearest slot for the name holds a copy of it.
+    Resolved(ResolvedInstance<'a>),
+    /// No enclosing `node_modules` holds the name.
+    Missing,
+    /// The nearest slot for the name holds another package, an npm alias, or one the lock does not
+    /// identify, so the name is bound to no known version of itself and nothing farther is visible.
+    Unknown,
+}
+
+impl<'a> InstallLookup<'a> {
+    /// The resolved copy, or [`None`] when the lookup proves no copy: missing or aliased alike.
+    #[must_use]
+    pub fn resolved(self) -> Option<ResolvedInstance<'a>> {
+        match self {
+            InstallLookup::Resolved(instance) => Some(instance),
+            InstallLookup::Missing | InstallLookup::Unknown => None,
+        }
+    }
 }
 
 /// One physical copy of a package, as a lookup on the install tree resolves it.
@@ -1286,7 +1327,7 @@ impl InstallPaths {
     /// elsewhere — declaration attribution is name-only in npm's lock, but the physical lookup is
     /// exact.
     #[must_use]
-    pub fn member_resolution(&self, member: &str, name: &str) -> Option<ResolvedInstance<'_>> {
+    pub fn member_resolution(&self, member: &str, name: &str) -> InstallLookup<'_> {
         // The root project's member path is `.`; its install-tree directory is the empty key.
         let dir = if member == "." { "" } else { member };
         self.resolve_from(dir, name)
@@ -1296,8 +1337,11 @@ impl InstallPaths {
     /// walking from the directory itself up to the workspace root — as a [`ResolvedInstance`].
     /// Intermediate ancestors that are not package directories probe keys no lock ever records
     /// (`…/node_modules/node_modules/x`), which is harmless.
+    ///
+    /// The nearest slot decides even when an alias occupies it: Node's lookup stops there, so the
+    /// result is then [`InstallLookup::Unknown`] rather than a farther copy the alias hides.
     #[must_use]
-    pub fn resolve_from(&self, dir: &str, name: &str) -> Option<ResolvedInstance<'_>> {
+    pub fn resolve_from(&self, dir: &str, name: &str) -> InstallLookup<'_> {
         let mut ancestor = dir;
         loop {
             let candidate = if ancestor.is_empty() {
@@ -1305,11 +1349,16 @@ impl InstallPaths {
             } else {
                 format!("{ancestor}/node_modules/{name}")
             };
-            if let Some((directory, version)) = self.versions.get_key_value(&candidate) {
-                return Some(ResolvedInstance { version, directory });
+            if let Some((directory, installed)) = self.installed.get_key_value(&candidate) {
+                return match (installed.name.as_deref(), installed.version.as_deref()) {
+                    (Some(installed_name), Some(version)) if installed_name == name => {
+                        InstallLookup::Resolved(ResolvedInstance { version, directory })
+                    }
+                    _ => InstallLookup::Unknown,
+                };
             }
             if ancestor.is_empty() {
-                return None;
+                return InstallLookup::Missing;
             }
             ancestor = ancestor.rsplit_once('/').map_or("", |(parent, _)| parent);
         }
@@ -1317,6 +1366,7 @@ impl InstallPaths {
 
     /// The install directories holding `name` at exactly `version` — every physical copy a
     /// context-less move of that version could rewrite.
+    /// An alias slot is a copy of neither its own name nor its target, so it is never listed.
     #[must_use]
     pub fn instance_dirs(&self, name: &str, version: &str) -> Vec<&str> {
         self.instances
@@ -1326,6 +1376,17 @@ impl InstallPaths {
             .filter(|(instance_version, _)| instance_version == version)
             .map(|(_, dir)| dir.as_str())
             .collect()
+    }
+
+    /// Whether `name@version` is installed only through npm aliases: some alias slot installs it,
+    /// and no registry copy of it sits at a slot of its own name.
+    ///
+    /// A workspace or other local source of the same name and version is no such copy, since it
+    /// is a different package from the registry release an alias names.
+    #[must_use]
+    pub fn alias_only(&self, name: &str, version: &str) -> bool {
+        let key = (name.to_string(), version.to_string());
+        self.alias_targets.contains(&key) && !self.registry_copies.contains(&key)
     }
 }
 
@@ -1354,50 +1415,133 @@ fn parse_npm_member_paths(content: &str) -> HashSet<String> {
 /// version at the link's directory — the hoisted `node_modules/<member>` alias consumers actually
 /// resolve. A v1 lock has no `packages` map and yields `None` (the caller falls back to
 /// declaring-member overlap).
+///
+/// An install slot whose package is not the name the slot implies, an npm alias, is kept as an
+/// occupied slot but is no instance of either name ([`InstallPaths`]).
 fn parse_npm_install_paths(content: &str) -> Option<InstallPaths> {
     let doc = serde_json::from_str::<serde_json::Value>(content).ok()?;
     let packages = doc.get("packages")?.as_object()?;
-    let mut versions: HashMap<String, String> = HashMap::new();
+    let mut installed: HashMap<String, InstalledPackage> = HashMap::new();
     let mut instances: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut alias_targets: HashSet<(String, String)> = HashSet::new();
+    let mut registry_copies: HashSet<(String, String)> = HashSet::new();
     for (key, entry) in packages {
         // The root project itself is keyed by the empty string; it is not an installed instance.
         if key.is_empty() {
             continue;
         }
-        // A link entry records only its target path; the instance's name and version live there.
-        let entry = if entry.get("link").and_then(serde_json::Value::as_bool) == Some(true) {
-            let Some(target) = entry
+        // A link entry records only its target path; the instance's name and version live there,
+        // and the name is read in the target's own context, so a link at one name's slot to a
+        // member of another name is an alias like any other.
+        let link = entry.get("link").and_then(serde_json::Value::as_bool) == Some(true);
+        let target = if link {
+            entry
                 .get("resolved")
                 .and_then(serde_json::Value::as_str)
-                .and_then(|target| packages.get(target))
-            else {
-                continue;
-            };
-            target
+                .and_then(|target| packages.get_key_value(target))
         } else {
-            entry
+            Some((key, entry))
         };
-        // An installed package's name is its path tail; a workspace member entry carries a
-        // path-shaped key, so its real name comes from the copied manifest's `name` field.
-        let name = if let Some((_, tail)) = key.rsplit_once("node_modules/") {
-            (!tail.is_empty()).then_some(tail)
-        } else {
-            entry.get("name").and_then(serde_json::Value::as_str)
-        };
-        let version = entry.get("version").and_then(serde_json::Value::as_str);
-        let (Some(name), Some(version)) = (name, version) else {
+        let identity = target.and_then(|(target_key, target)| {
+            let name = npm_entry_name(target_key, target)?;
+            let version = target.get("version").and_then(serde_json::Value::as_str)?;
+            Some((name, version))
+        });
+        // A slot whose package cannot be identified is still occupied: Node's lookup stops there,
+        // so it must keep hiding any farther copy rather than vanish from the tree.
+        let Some((name, version)) = identity else {
+            installed.insert(
+                key.clone(),
+                InstalledPackage {
+                    name: None,
+                    version: None,
+                },
+            );
             continue;
         };
-        versions.insert(key.clone(), version.to_string());
+        let aliased = npm_slot_name(key).is_some_and(|slot| slot != name);
+        installed.insert(
+            key.clone(),
+            InstalledPackage {
+                name: Some(name.to_string()),
+                version: Some(version.to_string()),
+            },
+        );
+        let identity = (name.to_string(), version.to_string());
+        if aliased {
+            alias_targets.insert(identity);
+            continue;
+        }
+        if npm_slot_name(key).is_some() && !link && !is_local_source(entry) {
+            registry_copies.insert(identity);
+        }
         instances
             .entry(name.to_string())
             .or_default()
             .push((version.to_string(), key.clone()));
     }
     Some(InstallPaths {
-        versions,
+        installed,
         instances,
+        alias_targets,
+        registry_copies,
     })
+}
+
+/// Whether a `package-lock.json` install entry came from a local or non-registry source, which npm
+/// records as a `resolved` that is no HTTP URL (`file:../pkg`, `git+ssh://…`).
+/// An entry recording no `resolved` at all is taken as a registry copy.
+fn is_local_source(entry: &serde_json::Value) -> bool {
+    entry
+        .get("resolved")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|resolved| {
+            !resolved.starts_with("https://") && !resolved.starts_with("http://")
+        })
+}
+
+/// The name an install-path key's slot implies, its path tail (`node_modules/@scope/foo` →
+/// `@scope/foo`), or [`None`] for a key that is no install path, such as a workspace member's.
+fn npm_slot_name(key: &str) -> Option<&str> {
+    key.rsplit_once("node_modules/")
+        .map(|(_, tail)| tail)
+        .filter(|tail| !tail.is_empty())
+}
+
+/// The name of the package one `package-lock.json` entry records.
+///
+/// npm writes an entry's `name` only where it differs from the name the entry's path implies, so
+/// the path supplies it otherwise.
+/// An install-path entry is named by its slot unless it records its own `name`, as npm does for an
+/// alias (`"foo": "npm:other@1.0.0"` installs `other` at `node_modules/foo`).
+/// A workspace member entry carries a path-shaped key, so its name is the copied manifest's
+/// `name`, else the one its directory implies ([`npm_folder_name`]).
+fn npm_entry_name<'a>(key: &'a str, entry: &'a serde_json::Value) -> Option<&'a str> {
+    let recorded = entry
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty());
+    let implied = match npm_slot_name(key) {
+        Some(slot) => Some(slot),
+        None if key.contains("node_modules/") => None,
+        None => npm_folder_name(key),
+    };
+    recorded.or(implied)
+}
+
+/// The package name npm infers from a directory path, as it does for a workspace entry whose
+/// `name` it omits: the last component, scoped by its parent when that parent is an `@scope`
+/// directory (`packages/@scope/other` → `@scope/other`).
+fn npm_folder_name(path: &str) -> Option<&str> {
+    let (parent, base) = path.rsplit_once('/').unwrap_or(("", path));
+    if base.is_empty() {
+        return None;
+    }
+    let scope = parent.rsplit('/').next().unwrap_or(parent);
+    if scope.len() > 1 && scope.starts_with('@') {
+        return path.get(path.len() - base.len() - 1 - scope.len()..);
+    }
+    Some(base)
 }
 
 /// The two halves of a `name@version` specifier.
@@ -1827,12 +1971,14 @@ fn parse_npm(content: &str) -> Result<Vec<NameVersion>> {
             // path as a package name would send `apps/a` to the registry as a lookup. (A member's
             // hoisted `node_modules/<name>` alias is a link entry without a `version`, so it is
             // skipped by the version filter below.)
-            let Some((_, name)) = key.rsplit_once("node_modules/") else {
-                continue;
-            };
-            if name.is_empty() {
+            // An alias's entry records its target's identity, which is the package actually
+            // resolved there: the slot's name is only the alias.
+            if npm_slot_name(key).is_none() {
                 continue;
             }
+            let Some(name) = npm_entry_name(key, val) else {
+                continue;
+            };
             if let Some(version) = val.get("version").and_then(|v| v.as_str()) {
                 out.push(NameVersion {
                     name: name.to_string(),
@@ -4346,7 +4492,7 @@ packages:
 
         assert_eq!(
             paths.resolve_from("node_modules/plugin", "host"),
-            Some(ResolvedInstance {
+            InstallLookup::Resolved(ResolvedInstance {
                 version: "2.0.0",
                 directory: "node_modules/host"
             }),
@@ -4354,7 +4500,7 @@ packages:
         );
         assert_eq!(
             paths.resolve_from("node_modules/shadowed", "host"),
-            Some(ResolvedInstance {
+            InstallLookup::Resolved(ResolvedInstance {
                 version: "1.0.0",
                 directory: "node_modules/shadowed/node_modules/host"
             }),
@@ -4362,7 +4508,7 @@ packages:
         );
         assert_eq!(
             paths.member_resolution("apps/a", "plugin"),
-            Some(ResolvedInstance {
+            InstallLookup::Resolved(ResolvedInstance {
                 version: "1.0.0",
                 directory: "node_modules/plugin"
             }),
@@ -4370,7 +4516,7 @@ packages:
         );
         assert_eq!(
             paths.resolve_from("node_modules/lib", "host"),
-            Some(ResolvedInstance {
+            InstallLookup::Resolved(ResolvedInstance {
                 version: "2.0.0",
                 directory: "node_modules/host"
             }),
@@ -4383,7 +4529,7 @@ packages:
         );
         assert_eq!(
             paths.resolve_from("node_modules/plugin", "absent"),
-            None,
+            InstallLookup::Missing,
             "an uninstalled peer binds nowhere"
         );
 
@@ -4391,6 +4537,267 @@ packages:
             crate::lock::Npm::install_paths(r#"{"lockfileVersion": 1}"#).is_none(),
             "a v1 lock records no layout — the caller falls back to member overlap"
         );
+    }
+
+    /// An npm lock in which the root and member `apps/a` declare `foo`, with `foo`'s hoisted slot
+    /// recording `name` when given and a member-nested slot beside it when `nested` is given.
+    fn npm_alias_lock(lockfile_version: u8, name: Option<&str>, nested: Option<&str>) -> String {
+        let name = name.map_or(String::new(), |name| format!(r#""name": "{name}", "#));
+        let nested = nested.map_or(String::new(), |name| {
+            format!(r#""apps/a/node_modules/foo": {{ "name": "{name}", "version": "3.0.0" }},"#)
+        });
+        formatdoc! {r#"
+            {{
+              "lockfileVersion": {lockfile_version},
+              "packages": {{
+                "": {{ "name": "root", "dependencies": {{ "foo": "npm:other@2.0.0" }} }},
+                "apps/a": {{ "name": "a", "version": "0.1.0", "dependencies": {{ "foo": "1.0.0" }} }},
+                {nested}
+                "node_modules/foo": {{
+                  {name}"version": "2.0.0",
+                  "resolved": "https://registry.npmjs.org/other/-/other-2.0.0.tgz",
+                  "peerDependencies": {{ "host": "^1.0.0" }}
+                }}
+              }}
+            }}
+        "#}
+    }
+
+    /// An npm alias slot records its target's `name`: the slot stays occupied, so a lookup of the
+    /// alias name stops there unattributed instead of reaching a farther copy, and it is no
+    /// instance of either name, while an entry with no `name`, or its own slot's, is the genuine
+    /// copy.
+    #[test]
+    fn npm_install_paths_keep_an_alias_slot_occupied_but_unattributed() {
+        for lockfile_version in [2, 3] {
+            for target in ["other", "@scope/other"] {
+                let paths =
+                    Npm::install_paths(&npm_alias_lock(lockfile_version, Some(target), None))
+                        .expect("the lock records the layout");
+                assert_eq!(
+                    paths.member_resolution(".", "foo"),
+                    InstallLookup::Unknown,
+                    "v{lockfile_version} {target}"
+                );
+                assert_eq!(
+                    paths.member_resolution("apps/a", "foo"),
+                    InstallLookup::Unknown
+                );
+                assert_eq!(
+                    paths.member_resolution(".", target),
+                    InstallLookup::Missing,
+                    "the target is installed under the alias's name only"
+                );
+                assert_eq!(paths.instance_dirs("foo", "2.0.0"), [] as [&str; 0]);
+                assert_eq!(paths.instance_dirs(target, "2.0.0"), [] as [&str; 0]);
+            }
+            for name in [None, Some("foo")] {
+                let paths = Npm::install_paths(&npm_alias_lock(lockfile_version, name, None))
+                    .expect("the lock records the layout");
+                assert_eq!(
+                    paths.member_resolution("apps/a", "foo"),
+                    InstallLookup::Resolved(ResolvedInstance {
+                        version: "2.0.0",
+                        directory: "node_modules/foo"
+                    }),
+                    "v{lockfile_version} {name:?}"
+                );
+                assert_eq!(paths.instance_dirs("foo", "2.0.0"), ["node_modules/foo"]);
+            }
+        }
+
+        // A member-nested alias shadows the genuine hoisted copy for that member only.
+        let paths = Npm::install_paths(&npm_alias_lock(3, None, Some("other")))
+            .expect("the lock records the layout");
+        assert_eq!(
+            paths.member_resolution("apps/a", "foo"),
+            InstallLookup::Unknown
+        );
+        assert_eq!(
+            paths.member_resolution(".", "foo"),
+            InstallLookup::Resolved(ResolvedInstance {
+                version: "2.0.0",
+                directory: "node_modules/foo"
+            })
+        );
+        assert_eq!(paths.instance_dirs("foo", "2.0.0"), ["node_modules/foo"]);
+        assert_eq!(paths.instance_dirs("foo", "3.0.0"), [] as [&str; 0]);
+        assert_eq!(paths.instance_dirs("other", "3.0.0"), [] as [&str; 0]);
+    }
+
+    /// A link is identified in its target's context: npm omits a workspace entry's `name` when it
+    /// equals the directory's last component, so a link at `foo`'s slot to an unnamed
+    /// `packages/other` is an alias, while a link to an unnamed `packages/foo` is the genuine copy.
+    /// A link whose target records no version, or no entry at all, still occupies its slot, so it
+    /// keeps hiding a genuine ancestor copy.
+    #[test]
+    fn npm_link_slots_are_identified_by_their_target() {
+        let lock = |target: &str, target_entry: &str| {
+            formatdoc! {r#"
+                {{
+                  "lockfileVersion": 3,
+                  "packages": {{
+                    "": {{ "name": "root", "workspaces": ["apps/a", "{target}"] }},
+                    "apps/a": {{ "name": "a", "version": "0.1.0" }},
+                    {target_entry}
+                    "apps/a/node_modules/foo": {{ "resolved": "{target}", "link": true }},
+                    "node_modules/foo": {{ "version": "1.0.0" }}
+                  }}
+                }}
+            "#}
+        };
+        let genuine = lock("packages/foo", r#""packages/foo": { "version": "2.0.0" },"#);
+        let paths = Npm::install_paths(&genuine).expect("the lock records the layout");
+        assert_eq!(
+            paths.member_resolution("apps/a", "foo"),
+            InstallLookup::Resolved(ResolvedInstance {
+                version: "2.0.0",
+                directory: "apps/a/node_modules/foo"
+            })
+        );
+        let mut dirs = paths.instance_dirs("foo", "2.0.0");
+        dirs.sort_unstable();
+        assert_eq!(dirs, ["apps/a/node_modules/foo", "packages/foo"]);
+
+        for (target, target_entry) in [
+            (
+                "packages/other",
+                r#""packages/other": { "version": "2.0.0" },"#,
+            ),
+            (
+                "packages/other",
+                r#""packages/other": { "name": "@scope/other", "version": "2.0.0" },"#,
+            ),
+            ("packages/foo", r#""packages/foo": { "name": "foo" },"#),
+            ("packages/foo", ""),
+        ] {
+            let paths = Npm::install_paths(&lock(target, target_entry))
+                .expect("the lock records the layout");
+            assert_eq!(
+                paths.member_resolution("apps/a", "foo"),
+                InstallLookup::Unknown,
+                "{target_entry:?}: the link still hides the root copy"
+            );
+            assert_eq!(
+                paths.member_resolution(".", "foo"),
+                InstallLookup::Resolved(ResolvedInstance {
+                    version: "1.0.0",
+                    directory: "node_modules/foo"
+                })
+            );
+            assert_eq!(paths.instance_dirs("foo", "2.0.0"), [] as [&str; 0]);
+        }
+    }
+
+    /// npm infers an unnamed workspace entry's name from its directory, scoped by an `@scope`
+    /// parent, so an unnamed `packages/@scope/other` is `@scope/other`: its link at that name's
+    /// slot is the genuine copy, a link to it at `other`'s slot is an alias, and its peer contract
+    /// is recorded under the scoped name.
+    #[test]
+    fn an_unnamed_scoped_workspace_is_named_by_its_scope_and_folder() {
+        assert_eq!(
+            npm_folder_name("packages/@scope/other"),
+            Some("@scope/other")
+        );
+        assert_eq!(npm_folder_name("@scope/other"), Some("@scope/other"));
+        assert_eq!(npm_folder_name("packages/other"), Some("other"));
+        assert_eq!(npm_folder_name("other"), Some("other"));
+        assert_eq!(npm_folder_name("packages/@/other"), Some("other"));
+        assert_eq!(npm_folder_name("packages/"), None);
+
+        let lock = indoc! {r#"
+            {
+              "lockfileVersion": 3,
+              "packages": {
+                "": { "name": "root", "workspaces": ["packages/@scope/other"] },
+                "packages/@scope/other": {
+                  "version": "2.0.0",
+                  "peerDependencies": { "host": "^1.0.0" }
+                },
+                "node_modules/@scope/other": { "resolved": "packages/@scope/other", "link": true },
+                "node_modules/other": { "resolved": "packages/@scope/other", "link": true }
+              }
+            }
+        "#};
+        let paths = Npm::install_paths(lock).expect("the lock records the layout");
+        assert_eq!(
+            paths.member_resolution(".", "@scope/other"),
+            InstallLookup::Resolved(ResolvedInstance {
+                version: "2.0.0",
+                directory: "node_modules/@scope/other"
+            })
+        );
+        assert_eq!(
+            paths.member_resolution(".", "other"),
+            InstallLookup::Unknown
+        );
+        assert_eq!(paths.instance_dirs("other", "2.0.0"), [] as [&str; 0]);
+        let mut dirs = paths.instance_dirs("@scope/other", "2.0.0");
+        dirs.sort_unstable();
+        assert_eq!(dirs, ["node_modules/@scope/other", "packages/@scope/other"]);
+        assert_eq!(
+            Npm::peer_requirements(lock),
+            [PeerRequirement {
+                dependent: "@scope/other".to_string(),
+                dependent_version: "2.0.0".to_string(),
+                package: "host".to_string(),
+                range: "^1.0.0".to_string(),
+            }]
+        );
+    }
+
+    /// The flat package list and the recorded peer contracts name an alias's installed copy by its
+    /// target, the package actually resolved there, with the entry's origin kept: the alias name
+    /// never acquires the target's version.
+    #[test]
+    fn npm_packages_name_an_alias_by_its_target() -> Result<()> {
+        for target in ["other", "@scope/other"] {
+            let lock = npm_alias_lock(3, Some(target), None);
+            let parsed = Npm::parse(&lock)?;
+            assert_eq!(
+                parsed,
+                [NameVersion {
+                    name: target.to_string(),
+                    version: "2.0.0".to_string(),
+                    origin: LockOrigin::Url(
+                        "https://registry.npmjs.org/other/-/other-2.0.0.tgz".to_string()
+                    ),
+                }]
+            );
+            assert_eq!(
+                Npm::peer_requirements(&lock),
+                [PeerRequirement {
+                    dependent: target.to_string(),
+                    dependent_version: "2.0.0".to_string(),
+                    package: "host".to_string(),
+                    range: "^1.0.0".to_string(),
+                }]
+            );
+        }
+        // An entry without a `name` is still named by its slot.
+        assert_eq!(
+            Npm::parse(&npm_alias_lock(3, None, None))?
+                .into_iter()
+                .map(|NameVersion { name, .. }| name)
+                .collect::<Vec<_>>(),
+            ["foo"]
+        );
+        Ok(())
+    }
+
+    /// An alias specifier is no exact pin, and an exact pin of the alias name confers no pinned
+    /// status on the alias target.
+    #[test]
+    fn an_npm_alias_confers_no_pin() {
+        let lock = npm_alias_lock(3, Some("other"), None);
+        assert!(!is_exact_npm_specifier("npm:other@2.0.0"));
+        let index = Npm::member_sources(&lock);
+        assert!(!index.is_exact_pinned("other", "2.0.0"));
+        assert!(
+            !index.is_exact_pinned("foo", "2.0.0"),
+            "the root's alias is no pin"
+        );
+        assert_eq!(index.members_for("other", "2.0.0"), [] as [String; 0]);
     }
 
     /// A local-package target the workspace cannot contain is dropped, never clamped onto an

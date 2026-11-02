@@ -2127,3 +2127,71 @@ fn peer_conflict_blocker_is_generic_when_blame_is_ambiguous() {
     let lock = "lockfileVersion: '9.0'\n\npackages:\n\n  pkg-b@2.0.0(shared@1.0.0):\n    resolution: {integrity: sha512-b}\n\n  pkg-c@2.0.0(shared@1.0.0):\n    resolution: {integrity: sha512-c}\n";
     assert_eq!(peer_conflict_blocker(lock, "pkg-a"), None);
 }
+
+/// An npm alias installs another package at the name's slot, so neither side of a peer contract
+/// can be proven through it: an alias at the peer's slot is no copy a change of the peer rewrites,
+/// and an alias at the dependent's slot is no direct instance of the dependent, so neither a hold
+/// nor a violation is fabricated from the alias's version.
+#[test]
+fn an_npm_alias_fabricates_no_peer_hold_or_violation() {
+    let member_ref = |name: &str, path: &str| MemberRef {
+        name: name.to_string(),
+        path: path.to_string(),
+    };
+    let lock = |host: &str, plugin: &str| {
+        formatdoc! {r#"{{
+            "lockfileVersion": 3,
+            "packages": {{
+                "": {{ "name": "root" }},
+                "apps/a": {{ "name": "a", "dependencies": {{ "plugin": "^1.0.0" }} }},
+                "apps/b": {{ "name": "b", "dependencies": {{ "host": "^2.0.0" }} }},
+                "node_modules/plugin": {{
+                    {plugin}"version": "1.0.0",
+                    "peerDependencies": {{ "host": "^1.0.0 || ^2.0.0" }}
+                }},
+                "node_modules/host": {{ {host}"version": "2.0.0" }}
+            }}
+        }}"#}
+    };
+    let mut host = change("host", "2.0.0", "3.0.0");
+    host.members = vec![member_ref("b", "apps/b")];
+    let partition = |lock: &str| {
+        let PeerPartition { retained, skipped } =
+            peer_partition::<crate::lock::Npm>(&plan_of(vec![host.clone()]), Some(lock));
+        (retained.changes.len(), skipped.len())
+    };
+
+    // The genuine shape holds the move.
+    assert_eq!(partition(&lock("", "")), (0, 1));
+    // An alias at either slot proves no binding.
+    assert_eq!(partition(&lock(r#""name": "other", "#, "")), (1, 0));
+    assert_eq!(partition(&lock("", r#""name": "other-plugin", "#)), (1, 0));
+
+    // A landed alias at the peer's slot is no violated copy of the peer.
+    let landed = |host: &str, version: &str| {
+        formatdoc! {r#"{{
+            "lockfileVersion": 3,
+            "packages": {{
+                "": {{ "name": "root", "dependencies": {{ "host": "^2.0.0", "plugin": "^1.0.0" }} }},
+                "node_modules/plugin": {{
+                    "version": "1.0.0",
+                    "peerDependencies": {{ "host": "^2.0.0" }}
+                }},
+                "node_modules/host": {{ {host}"version": "{version}" }}
+            }}
+        }}"#}
+    };
+    let before = landed("", "2.0.0");
+    assert!(
+        first_new_peer_violation::<crate::lock::Npm>(Some(&before), &landed("", "3.0.0")).is_some(),
+        "a genuine copy outside the range violates"
+    );
+    assert!(
+        first_new_peer_violation::<crate::lock::Npm>(
+            Some(&before),
+            &landed(r#""name": "other", "#, "3.0.0")
+        )
+        .is_none(),
+        "an alias at the peer's slot proves nothing"
+    );
+}

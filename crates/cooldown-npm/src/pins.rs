@@ -16,6 +16,8 @@
 //! Yarn classic, bun, and npm v1 locks attribute nothing per member, so their pins are reported
 //! [`Observed::Unknown`] and protected by nothing here; the name's newest copy is never a stand-in,
 //! since a transitive duplicate beside an unchanged member copy would read as a moved pin.
+//! Within an npm install tree, an alias occupying the owner's slot (`"foo": "npm:other@1.0.0"`)
+//! installs another package, so it is unknown too rather than a version of the pinned name.
 
 use crate::lock::{MemberResolution, NodeLock};
 use crate::manifest::{self, DeclarationKey, ExactDeclaration, ManifestRewrite};
@@ -40,7 +42,8 @@ pub(crate) enum Observed {
     Resolved(String),
     /// The lock attributes resolutions per member and binds none for the owner.
     Missing,
-    /// The lock attributes nothing per member, so the pin cannot be judged.
+    /// The pin cannot be judged: the lock attributes nothing per member, or the owner's binding is
+    /// no registry version of the pinned name, such as an npm alias to another package.
     Unknown,
 }
 
