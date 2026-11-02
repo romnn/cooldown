@@ -12,10 +12,10 @@ pub(crate) struct NativeSelectors {
     /// The selectors pnpm reads exactly as cooldown does ([`is_pnpm_safe_selector`]), sorted and
     /// deduplicated.
     pub(crate) written: Vec<String>,
-    /// The selectors pnpm would read differently, sorted and deduplicated.
+    /// The selectors outside the syntax both matchers read identically, sorted and deduplicated.
     ///
     /// They are left out of the native list, so pnpm's age gate keeps governing the packages they
-    /// exempt: stricter than cooldown, never looser.
+    /// exempt unless another written rule covers them: stricter than cooldown, never looser.
     pub(crate) omitted: Vec<String>,
 }
 
