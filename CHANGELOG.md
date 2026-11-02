@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **npm attributes an aliased install to the package it actually installs.** An npm alias
+  (`"foo": "npm:other@1.0.0"`, or an override to one) installs `other` at `node_modules/foo`, and
+  `package-lock.json` records `name: "other"` there. cooldown read that entry as a release of
+  `foo`: `outdated` and `upgrade` reported `foo` at `other`'s version, the pin guard judged an
+  exact `foo` pin against `other`'s version, and the landing check could accept the alias's
+  version as `foo` reaching its target. The entry is now reported as `other` (with its recorded
+  origin) wherever cooldown lists or evaluates locked packages, and a lookup of `foo` that reaches
+  the alias binds no version of `foo`: an exact `foo` pin is neither satisfied nor violated by it,
+  it proves no landing and no peer hold or violation, and it still hides any farther copy of
+  `foo` the way npm's own lookup does. A `foo` pin never makes `other` pinned, and the alias
+  declaration is not rewritten when `other` moves. A version of `other` that only an alias
+  installs is also never credited to a member's ordinary `other` declaration: with
+  `"other": "^1.0.0"` beside `"foo": "npm:other@2.0.0"`, `upgrade` no longer plans the aliased 2.x
+  copy as a direct move that rewrites `^1.0.0` across a major; a local or workspace package of
+  the same name and version does not count as that release either. A workspace link is identified
+  by its target, whose name npm omits when the directory implies it (`packages/@scope/other` is
+  `@scope/other`), and a link whose target the lock does not fully record still hides any farther
+  copy. Only npm lockfile v2/v3 changed; the v1
+  format is unaffected.
+
 - **npm and pnpm hold a `v`-prefixed exact pin like a bare one.** node-semver reads `v1.2.3`,
   `=v1.2.3` and `= v1.2.3` as the exact version `1.2.3`, but cooldown's planner read them as
   movable ranges: an Auto upgrade widened such a pin to `^target`, and since the pin guard refuses

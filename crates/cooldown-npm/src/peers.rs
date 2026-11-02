@@ -470,15 +470,34 @@ impl PeerBaseline {
     /// pre-apply declaration (pnpm), or the member's physical resolution on the pre-apply tree
     /// (npm).
     /// `None` when the context did not demonstrably bind it, which leaves the
-    /// corresponding counterfactual unprovable.
+    /// corresponding counterfactual unprovable; an npm alias at the member's slot binds no version
+    /// of the name, so it is such a context.
     fn bound_before(&self, member: &str, name: &str) -> Option<&str> {
         self.members.resolved_version(member, name).or_else(|| {
             self.install
                 .as_ref()
-                .and_then(|install| install.member_resolution(member, name))
+                .and_then(|install| install.member_resolution(member, name).resolved())
                 .map(|instance| instance.version)
         })
     }
+}
+
+/// The version of `package` that `member`'s own copy of `dependent` resolves in npm's install
+/// tree, or [`None`] when either lookup proves no copy.
+///
+/// An alias at either slot installs another package, so it binds no version of the name it
+/// occupies and proves no violation.
+fn peer_bound_through<'i>(
+    install: &'i crate::lock::InstallPaths,
+    member: &str,
+    dependent: &str,
+    package: &str,
+) -> Option<&'i str> {
+    let dependent_instance = install.member_resolution(member, dependent).resolved()?;
+    install
+        .resolve_from(dependent_instance.directory, package)
+        .resolved()
+        .map(|instance| instance.version)
 }
 
 /// Which candidate one fresh binding proves culpable.
@@ -738,12 +757,7 @@ pub(crate) fn proven_peer_violations<L: NodeLock>(
         let mut bindings: Vec<(String, String)> = Vec::new();
         for member in dependent_members {
             let bound = match &install {
-                Some(install) => install
-                    .member_resolution(&member, &pr.dependent)
-                    .and_then(|dependent_instance| {
-                        install.resolve_from(dependent_instance.directory, &pr.package)
-                    })
-                    .map(|instance| instance.version),
+                Some(install) => peer_bound_through(install, &member, &pr.dependent, &pr.package),
                 None => members.resolved_version(&member, &pr.package),
             };
             let Some(peer_version) = bound else {
@@ -780,8 +794,9 @@ pub(crate) fn proven_peer_violations<L: NodeLock>(
             // One context, exactly identified: no same-named package elsewhere in the
             // tree can stand in for it.
             Some(install) => {
-                if let Some(instance) =
-                    install.member_resolution(&workspace_peer.origin, &pr.package)
+                if let Some(instance) = install
+                    .member_resolution(&workspace_peer.origin, &pr.package)
+                    .resolved()
                     && version::range_match(&pr.range, instance.version) == RangeMatch::Excludes
                 {
                     bindings.push((workspace_peer.origin.clone(), instance.version.to_string()));
@@ -990,6 +1005,7 @@ pub(crate) fn workspace_peer_hold<'a>(
                 && match (install, &rewritten) {
                     (Some(install), Some(rewritten)) => install
                         .member_resolution(&workspace_peer.origin, &change.package.name)
+                        .resolved()
                         .is_some_and(|instance| rewritten.contains(&instance.directory)),
                     _ => members_overlap(&change.members, &workspace_peer.contexts),
                 }
@@ -1005,6 +1021,8 @@ pub(crate) fn workspace_peer_hold<'a>(
 /// A change without
 /// member attribution moves the name in every context (the single-context default), so every
 /// instance at the current version counts.
+/// An npm alias occupying a member's slot is no copy of the name, so the change rewrites nothing
+/// there.
 fn rewritten_dirs<'i>(install: &'i crate::lock::InstallPaths, change: &Change) -> Vec<&'i str> {
     if change.members.is_empty() {
         return install.instance_dirs(&change.package.name, change.from.as_str());
@@ -1012,7 +1030,11 @@ fn rewritten_dirs<'i>(install: &'i crate::lock::InstallPaths, change: &Change) -
     let mut dirs: Vec<&str> = change
         .members
         .iter()
-        .filter_map(|member| install.member_resolution(&member.path, &change.package.name))
+        .filter_map(|member| {
+            install
+                .member_resolution(&member.path, &change.package.name)
+                .resolved()
+        })
         .filter(|instance| instance.version == change.from.as_str())
         .map(|instance| instance.directory)
         .collect();
@@ -1110,11 +1132,15 @@ fn dependent_holds_context(
     match install {
         Some(install) => {
             let rewritten = rewritten_dirs(install, change);
+            // An alias at either lookup is no copy of its name, so it proves no binding.
             dependent_members.iter().any(|member| {
                 install
                     .member_resolution(member, &pr.dependent)
+                    .resolved()
                     .and_then(|dependent_instance| {
-                        install.resolve_from(dependent_instance.directory, &change.package.name)
+                        install
+                            .resolve_from(dependent_instance.directory, &change.package.name)
+                            .resolved()
                     })
                     .is_some_and(|instance| rewritten.contains(&instance.directory))
             })
@@ -1167,8 +1193,10 @@ fn direct_dependent_members(
     let direct: Vec<String> = dependent_members
         .into_iter()
         .filter(|member| {
+            // An alias at the member's slot is no direct instance of the dependent.
             install
                 .member_resolution(member, dependent)
+                .resolved()
                 .is_some_and(|instance| instance.version == dependent_version)
         })
         .collect();
