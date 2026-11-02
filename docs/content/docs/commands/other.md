@@ -50,7 +50,9 @@ by holding one of them) shows in `outdated` and `upgrade` but not here. Under `-
 verification is skipped and the run says so; the verdict is then the per-package one. `declared
 by:` lists every workspace member's declaration — the declared range, the version that member's
 own lock entry resolves to, and the manifest fields naming it (`[peerDependencies]` is how a
-peer-only declaration shows) — with `(excluded)` on the members the run ignores; it appears for
+peer-only declaration shows), one line per distinct range when a member declares the package in
+several fields (a caret in `dependencies` beside an exact pin in `devDependencies`) — with
+`(excluded)` on the members the run ignores; it appears for
 the tools whose adapter records per-member declarations (the npm family). `--json` carries these
 as `verdicts` (the `outdated` rows) and `declarations`.
 

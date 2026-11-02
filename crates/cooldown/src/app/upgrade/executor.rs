@@ -1534,6 +1534,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     ///
     /// A candidate held as not eligible has none: the missing editable requirement (a catalog
     /// pin, a transitive-only dependency) holds every target alike.
+    /// A candidate an exact manifest pin holds ([`SkipReason::PinHeld`]) keeps its alternative,
+    /// since the pin excludes some targets and may admit the in-line one.
     fn current_line_alternatives(&self, rejected: &[RejectedUpgrade]) -> Vec<Change> {
         rejected
             .iter()
@@ -2773,6 +2775,15 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             changes: changes.to_vec(),
             evaluated_at: Some(self.ws.now()),
             rewrite: self.ctx.opts.rewrite,
+            // Only `fix --downgrade-pinned` authorizes rewriting a pin; the downgrades an upgrade
+            // reconciles never do.
+            rewrite_pins: matches!(
+                self.mode,
+                PlanMode::Fix {
+                    downgrade_pinned: true,
+                    ..
+                }
+            ),
             edge_policy: self.ctx.pctx.edge_policy,
             baseline_violations: plan_baseline_violations(&state.baseline_violations),
             excluded_members: self.excluded_members.clone(),
@@ -3725,6 +3736,10 @@ fn conservative_hold(reason: SkipReason, mode: PlanMode) -> bool {
     // live cooldown violation in the graph, so it still fails strict, consistent with fix's
     // other unfixable-hold paths (graph-held, no matured older release).
     || (reason == SkipReason::NotEligible && matches!(mode, PlanMode::Upgrade { .. }))
+    // An exact manifest pin holding a forward move is the author's own choice, so an `upgrade`
+    // leaves the matured older version in place; holding a `fix` downgrade leaves the violation,
+    // and the run is incomplete until the pin is rewritten or edited.
+    || (reason == SkipReason::PinHeld && matches!(mode, PlanMode::Upgrade { .. }))
 }
 
 /// Whether `changes` holds `change` itself: the same target from the same version.

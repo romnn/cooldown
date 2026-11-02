@@ -957,8 +957,8 @@ pub struct Declaration {
     pub range: Option<String>,
     /// The version the member's own lock entry resolves to, when the lock records it per member.
     pub resolved: Option<String>,
-    /// The manifest fields naming the package (`dependencies`, `peerDependencies`, …), in manifest
-    /// order; empty when only the lock records the declaration.
+    /// The manifest fields declaring the package at this range (`dependencies`,
+    /// `peerDependencies`, …), in manifest order; empty when only the lock records the declaration.
     pub fields: Vec<String>,
 }
 
@@ -1014,6 +1014,16 @@ pub struct Plan {
     /// flag).
     /// Defaults to [`RewriteMode::Auto`].
     pub rewrite: RewriteMode,
+    /// Whether the run may rewrite the exact pins of the changes it moves downward (`fix
+    /// --downgrade-pinned`).
+    ///
+    /// Under [`RewriteMode::Auto`] an adapter otherwise holds a move whose declaring manifest pins
+    /// the dependency exactly to a version excluding the target, whatever the lock shows, rather
+    /// than rewriting the pin.
+    /// It authorizes only [`Change::downgrade`] moves; a forward move rewrites a pin only under
+    /// [`RewriteMode::Always`].
+    /// Defaults to `false`.
+    pub rewrite_pins: bool,
     /// How the adapter treats resolved lock edge bindings after the re-resolve (the
     /// `--cargo-edge-policy` flag / `[tool.cargo] edge-policy` config key).
     /// Defaults to [`EdgePolicy::Preserve`].
@@ -1121,6 +1131,16 @@ skip_reasons! {
     /// Like [`NeedsMajor`](SkipReason::NeedsMajor) this is conservative-correct, not a failed
     /// upgrade, so it never fails a `--strict` run.
     MultiVersionHeld = "multi_version_held",
+    /// A declaring manifest pins the dependency exactly, in some install field, to a version that
+    /// excludes the target, and nothing authorized rewriting the pin.
+    /// The lock need not show the pin: a pin in a second install field beside a range, or in one
+    /// workspace member beside another member's range, leaves the dependency movable as a whole.
+    /// Unlike [`NotEligible`](Self::NotEligible) it depends on the target: another target the
+    /// pin admits can still land.
+    /// A forward move held this way is the author's deliberate choice and never fails a
+    /// `--strict` `upgrade`; a downgrade held this way leaves a cooldown violation, so it fails a
+    /// `--strict` `fix`.
+    PinHeld = "pin_held",
 }
 
 impl SkipReason {
@@ -1166,6 +1186,7 @@ impl SkipReason {
             SkipReason::MultiVersionHeld => {
                 "declared at multiple versions across the workspace; kept on its own line"
             }
+            SkipReason::PinHeld => "an exact pin in a declaring manifest excludes this target",
         }
     }
 }

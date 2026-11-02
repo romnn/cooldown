@@ -43,6 +43,19 @@ range provably excludes is reported `peer_held` instead — including a same-lin
 bound like `>=5.6.0 <5.6.2` is broken by a mere patch bump. Edit that range yourself to authorize
 the move; `--rewrite` does not cross it.
 
+A package declared in several install fields of one manifest (npm family: `dependencies` beside
+`devDependencies` or `optionalDependencies`) is judged by every declaration, not the first: the
+target must sit inside each range, and the strictest explicit bound across them caps it. On npm
+and pnpm, a package every declaration in the lock pins to the same exact version is held at
+planning (`pinned`), even under `--rewrite`; Yarn and Bun locks record no per-member pins, so their
+exact pins are judged at apply like the mixed case below. A *mixed* declaration — an exact pin beside a range, in another field or another
+workspace member — leaves the package movable, so the move is planned and the apply holds it
+instead of rewriting the pin, even where the lock records only the range (pnpm keeps one specifier
+per importer). That row is `pin_held` and names the pin; pass `--rewrite` to rewrite it, or edit it
+yourself. Under `fix`, `--downgrade-pinned` rewrites such a pin downward, except a pin beside
+another workspace member's range on pnpm, which only an edit reconciles; a held downgrade fails
+`fix --strict`, while a held forward move never fails `upgrade --strict`.
+
 The lock-only default is honored where the tool can pin an exact in-range version without editing the manifest:
 
 | Tool | In-range pin | Behavior |
@@ -260,12 +273,13 @@ Only a matured release beyond the hold is reported. A fresh release still in coo
 produce an action that cannot yet be taken. Suppress command tips with `--no-suggestions`.
 
 On the npm family, a held cross-major target does not cost the move on the current line. When the
-planned major is held or rejected (`peer_held`, `multi_version_held`, a resolver conflict, a
-transitive it would drag into cooldown), `upgrade --major` still tries the newest matured release
-on the current major line in the same run, the release `--no-major` would take. That move is
-reported as its own applied row beside the held major row, which keeps its reason, and
-`outdated --major` reports the major `blocked`. A package held as `not_eligible` has no editable
-requirement to move, so it is not retried. The retry is bounded and best effort: one attempt with
+planned major is held or rejected (`peer_held`, `multi_version_held`, `pin_held`, a resolver
+conflict, a transitive it would drag into cooldown), `upgrade --major` still tries the newest
+matured release on the current major line in the same run, the release `--no-major` would take.
+That move is reported as its own applied row beside the held major row, which keeps its reason,
+and `outdated --major` reports the major `blocked`. A package held as `not_eligible` has no
+editable requirement to move, so it is not retried; a `pin_held` major is, since the pin can admit
+the in-line release. The retry is bounded and best effort: one attempt with
 every such in-line move on top of what already landed, then one per package when there are
 several. Nothing that already landed is traded away for it.
 

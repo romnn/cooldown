@@ -51,37 +51,132 @@ pub fn direct_names(manifest: &Utf8Path) -> Result<HashSet<String>> {
     Ok(names)
 }
 
-/// The declared version range/specifier for `name` in this manifest (the first match across the
-/// regular, dev, optional, and peer fields), or `None` if the manifest is absent or does not declare
-/// `name`. Used to decide whether an upgrade target stays within the author's range.
+/// Every declared version range/specifier for `name` in this manifest: each install field's, in
+/// field order, or the `peerDependencies` range alone when no install field declares it.
+///
+/// Empty when the manifest is absent or does not declare `name`.
+/// A name declared in several install fields yields each of them, since every one of them must
+/// admit a target the lock moves to, and [`widen_constraints`] rewrites them all.
+/// Protocol specifiers (`catalog:`, `workspace:`) are kept verbatim; they admit no semver target.
 ///
 /// # Errors
 ///
 /// Returns a [`CoreError`] if the manifest exists but cannot be read or is not valid JSON.
-pub fn declared_range(manifest: &Utf8Path, name: &str) -> Result<Option<String>> {
+pub fn declared_ranges(manifest: &Utf8Path, name: &str) -> Result<Vec<String>> {
+    let Some(doc) = read_manifest(manifest)? else {
+        return Ok(Vec::new());
+    };
+    let range_in = |field: &str| {
+        doc.get(field)
+            .and_then(|section| section.get(name))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let install: Vec<String> = WIDENABLE_FIELDS
+        .iter()
+        .filter_map(|field| range_in(field))
+        .collect();
+    if install.is_empty() {
+        return Ok(range_in("peerDependencies").into_iter().collect());
+    }
+    Ok(install)
+}
+
+/// The parsed manifest, or `None` when it does not exist.
+fn read_manifest(manifest: &Utf8Path) -> Result<Option<Value>> {
     let content = match std::fs::read_to_string(manifest) {
         Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(CoreError::Filesystem(format!("{manifest}: {e}"))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(CoreError::Filesystem(format!("{manifest}: {err}"))),
     };
-    let doc: serde_json::Value =
-        serde_json::from_str(&content).map_err(|e| CoreError::Parse(format!("{manifest}: {e}")))?;
-    for field in DEPENDENCY_FIELDS {
-        if let Some(range) = doc
-            .get(field)
-            .and_then(|section| section.get(name))
-            .and_then(serde_json::Value::as_str)
-        {
-            return Ok(Some(range.to_string()));
+    serde_json::from_str(&content)
+        .map(Some)
+        .map_err(|err| CoreError::Parse(format!("{manifest}: {err}")))
+}
+
+/// An exact install-field pin, in one of a change's declaring manifests, that excludes its target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExcludingPin {
+    /// The declaring manifest, project-relative and `/`-separated.
+    pub manifest: String,
+    /// The install field holding the pin.
+    pub field: &'static str,
+    /// The pinned version, verbatim.
+    pub range: String,
+}
+
+/// A declaring manifest that exists but could not be read or parsed.
+#[derive(Debug)]
+pub struct UnreadableManifest {
+    /// The manifest, project-relative and `/`-separated.
+    pub manifest: String,
+    /// Why it could not be read.
+    pub error: CoreError,
+}
+
+/// The first exact install-field pin of `name` in the manifests `members` own under `root` that
+/// excludes `target`, in [`manifest_rels`] and field order.
+///
+/// The lock need not show such a pin: pnpm records one specifier per importer, so a pin in a second
+/// install field beside a caret is visible only here.
+/// Yet [`widen_constraints`] rewrites every install field, so moving the lock past the pin means
+/// either rewriting it or leaving the lock outside it.
+/// A missing manifest declares nothing.
+///
+/// # Errors
+///
+/// Returns the [`UnreadableManifest`] when a declaring manifest exists but cannot be read or parsed,
+/// since an unread pin cannot be ruled out.
+pub fn excluding_exact_pin(
+    root: &Utf8Path,
+    members: &[MemberRef],
+    name: &str,
+    target: &str,
+) -> std::result::Result<Option<ExcludingPin>, UnreadableManifest> {
+    for rel in manifest_rels(members) {
+        let manifest = display_rel(&rel);
+        let doc = read_manifest(&root.join(&rel)).map_err(|error| UnreadableManifest {
+            manifest: manifest.clone(),
+            error,
+        })?;
+        let Some(doc) = doc else {
+            continue;
+        };
+        for field in WIDENABLE_FIELDS {
+            let Some(range) = doc
+                .get(field)
+                .and_then(|section| section.get(name))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if crate::version::is_exact_npm_specifier(range)
+                && !crate::version::version_in_range(range, target)
+            {
+                return Ok(Some(ExcludingPin {
+                    manifest,
+                    field,
+                    range: range.to_string(),
+                }));
+            }
         }
     }
     Ok(None)
 }
 
+/// A project-relative path as it leaves the process in a message: `/`-separated on every platform.
+pub fn display_rel(rel: &Utf8Path) -> String {
+    rel.components()
+        .map(|component| component.as_str())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Every install-field range declaring `name` in this manifest, in field order.
 ///
-/// Unlike [`declared_range`], a name declared in several install fields yields each of them, since
-/// [`widen_constraints`] rewrites them all.
+/// A name declared in several install fields yields each of them, since [`widen_constraints`]
+/// rewrites them all.
+/// Unlike [`declared_ranges`], a missing manifest is an error and a peer contract never counts.
 /// Protocol specifiers (`catalog:`, `workspace:`, `npm:` aliases) are skipped, as the widen never
 /// rewrites them.
 ///
@@ -217,24 +312,59 @@ pub fn member_manifest(root: &Utf8Path, path: &str) -> Utf8PathBuf {
     }
 }
 
-/// How one member manifest declares a package: the fields naming it, and whether the package is
-/// private.
+/// How one member manifest declares a package: the fields naming it with their ranges, and whether
+/// the package is private.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberDeclaration {
-    /// The manifest fields naming the package, in [`DEPENDENCY_FIELDS`] order.
-    pub fields: Vec<&'static str>,
+    /// Each manifest field naming the package with its range, in [`DEPENDENCY_FIELDS`] order.
+    pub entries: Vec<FieldRange>,
     /// The manifest's `private: true` — an application nobody consumes, whose `peerDependencies`
     /// publish a contract to no one.
     pub private: bool,
 }
 
+/// One manifest field's declaration of a package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldRange {
+    /// The manifest field (`dependencies`, `peerDependencies`, …).
+    pub field: &'static str,
+    /// The declared range or specifier, verbatim.
+    pub range: String,
+}
+
+/// One distinct range a member declares a package at, with every field that spells it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeFields {
+    /// The declared range or specifier, verbatim.
+    pub range: String,
+    /// The fields declaring exactly this range, in [`DEPENDENCY_FIELDS`] order.
+    pub fields: Vec<&'static str>,
+}
+
 impl MemberDeclaration {
+    /// The distinct declared ranges, in the order their first field appears, each with the fields
+    /// spelling it.
+    #[must_use]
+    pub fn by_range(&self) -> Vec<RangeFields> {
+        let mut grouped: Vec<RangeFields> = Vec::new();
+        for entry in &self.entries {
+            match grouped.iter_mut().find(|group| group.range == entry.range) {
+                Some(group) => group.fields.push(entry.field),
+                None => grouped.push(RangeFields {
+                    range: entry.range.clone(),
+                    fields: vec![entry.field],
+                }),
+            }
+        }
+        grouped
+    }
+
     /// Whether the package is declared only as a published peer contract.
     /// pnpm auto-installs such a peer and records it in the importer's lock entry, but
     /// `pnpm update` has no install field to advance, so the importer's copy never moves.
     #[must_use]
     pub fn is_peer_only(&self) -> bool {
-        self.fields == ["peerDependencies"]
+        matches!(self.entries.as_slice(), [only] if only.field == "peerDependencies")
     }
 }
 
@@ -249,35 +379,37 @@ pub fn member_declaration(
     path: &str,
     name: &str,
 ) -> Result<Option<MemberDeclaration>> {
-    let manifest = member_manifest(root, path);
-    let content = match std::fs::read_to_string(&manifest) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(CoreError::Filesystem(format!("{manifest}: {e}"))),
+    let Some(doc) = read_manifest(&member_manifest(root, path))? else {
+        return Ok(None);
     };
-    let doc: Value =
-        serde_json::from_str(&content).map_err(|e| CoreError::Parse(format!("{manifest}: {e}")))?;
-    let fields: Vec<&'static str> = DEPENDENCY_FIELDS
+    let entries: Vec<FieldRange> = DEPENDENCY_FIELDS
         .iter()
         .copied()
-        .filter(|field| {
-            doc.get(field)
+        .filter_map(|field| {
+            let range = doc
+                .get(field)
                 .and_then(|section| section.get(name))
-                .and_then(Value::as_str)
-                .is_some()
+                .and_then(Value::as_str)?;
+            Some(FieldRange {
+                field,
+                range: range.to_string(),
+            })
         })
         .collect();
-    if fields.is_empty() {
+    if entries.is_empty() {
         return Ok(None);
     }
     Ok(Some(MemberDeclaration {
-        fields,
+        entries,
         private: doc.get("private").and_then(Value::as_bool).unwrap_or(false),
     }))
 }
 
 /// Finds the most restrictive explicit upper bound among the manifests declaring this resolved
 /// dependency line.
+///
+/// Every declaration counts ([`declared_ranges`]), so a bound in `devDependencies` caps a target
+/// that the caret beside it in `dependencies` would admit.
 ///
 /// # Errors
 ///
@@ -297,9 +429,7 @@ pub fn declared_bound(
     };
     let mut ranges = Vec::new();
     for manifest in manifests {
-        if let Some(range) = declared_range(&manifest, name)? {
-            ranges.push(range);
-        }
+        ranges.extend(declared_ranges(&manifest, name)?);
     }
     Ok(crate::version::most_restrictive_declared_bound(ranges))
 }
@@ -649,29 +779,128 @@ mod tests {
     }
 
     #[test]
-    fn declared_range_finds_across_fields_and_reports_absence() {
+    fn declared_ranges_find_across_fields_and_report_absence() {
         let ManifestFixture {
             guard: _guard,
             path,
         } = manifest(
             r#"{ "dependencies": { "nanoid": "^3.0.0" }, "devDependencies": { "vitest": "~1.2.0" } }"#,
         );
+        assert_eq!(declared_ranges(&path, "nanoid").expect("read"), ["^3.0.0"]);
+        assert_eq!(declared_ranges(&path, "vitest").expect("read"), ["~1.2.0"]);
         assert_eq!(
-            declared_range(&path, "nanoid").expect("read").as_deref(),
-            Some("^3.0.0")
+            declared_ranges(&path, "absent").expect("read"),
+            [] as [String; 0]
         );
-        assert_eq!(
-            declared_range(&path, "vitest").expect("read").as_deref(),
-            Some("~1.2.0")
-        );
-        assert_eq!(declared_range(&path, "absent").expect("read"), None);
     }
 
     #[test]
-    fn declared_range_on_missing_manifest_is_none() {
+    fn declared_ranges_on_missing_manifest_are_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = Utf8PathBuf::from_path_buf(dir.path().join("nope.json")).expect("utf8 path");
-        assert_eq!(declared_range(&path, "nanoid").expect("read"), None);
+        assert_eq!(
+            declared_ranges(&path, "nanoid").expect("read"),
+            [] as [String; 0]
+        );
+    }
+
+    /// Every install field declaring a name counts, protocol specifiers included, while the
+    /// published peer contract counts only when no install field declares the name.
+    #[test]
+    fn declared_ranges_read_every_install_field_and_fall_back_to_the_peer() {
+        let ManifestFixture {
+            guard: _guard,
+            path,
+        } = manifest(indoc::indoc! {r#"{
+            "dependencies": { "dep": "^20.11.1", "peer-only": "^1.0.0" },
+            "devDependencies": { "dep": ">=20 <21" },
+            "optionalDependencies": { "dep": "catalog:" },
+            "peerDependencies": { "dep": ">=19", "contract": "^2.0.0" }
+        }"#});
+
+        assert_eq!(
+            declared_ranges(&path, "dep").expect("read"),
+            ["^20.11.1", ">=20 <21", "catalog:"],
+            "each install field in field order; the peer contract beside them does not count"
+        );
+        assert_eq!(
+            declared_ranges(&path, "contract").expect("read"),
+            ["^2.0.0"],
+            "a name only the peer contract declares falls back to it"
+        );
+    }
+
+    /// A bound in `devDependencies` caps the target beside a caret in `dependencies` of the same
+    /// manifest.
+    #[test]
+    fn declared_bound_reads_a_bound_in_a_second_install_field() -> color_eyre::eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| color_eyre::eyre::eyre!("non-UTF-8 temp dir {}", path.display()))?;
+        std::fs::write(
+            root.join("package.json"),
+            indoc::indoc! {r#"{
+                "dependencies": { "happy-dom": "^20.11.1" },
+                "devDependencies": { "happy-dom": ">=20 <21" }
+            }"#},
+        )?;
+
+        assert_eq!(
+            declared_bound(&root, &[], "happy-dom")?.as_deref(),
+            Some(">=20 <21")
+        );
+        Ok(())
+    }
+
+    /// The first exact install-field pin that excludes the target is found in whichever declaring
+    /// manifest and field holds it, while a pin equal to the target, a range, or a protocol
+    /// specifier holds nothing.
+    #[test]
+    fn excluding_exact_pin_finds_a_pin_in_any_install_field() -> color_eyre::eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| color_eyre::eyre::eyre!("non-UTF-8 temp dir {}", path.display()))?;
+        std::fs::create_dir_all(root.join("apps/a"))?;
+        std::fs::write(
+            root.join("apps/a/package.json"),
+            indoc::indoc! {r#"{
+                "dependencies": { "dep": "^20.11.1" },
+                "optionalDependencies": { "dep": "=20.14.5" },
+                "peerDependencies": { "dep": "20.14.4" }
+            }"#},
+        )?;
+        let members = [member("a", "apps/a")];
+        let pin = |target: &str| excluding_exact_pin(&root, &members, "dep", target);
+
+        let held = pin("20.14.6").map_err(|unreadable| unreadable.error)?;
+        assert_eq!(
+            held,
+            Some(ExcludingPin {
+                manifest: "apps/a/package.json".to_string(),
+                field: "optionalDependencies",
+                range: "=20.14.5".to_string(),
+            }),
+            "the optional-field pin excludes the target; the peer contract is never a pin to hold"
+        );
+        assert_eq!(
+            pin("20.14.5").map_err(|unreadable| unreadable.error)?,
+            None,
+            "a pin already at the target excludes nothing"
+        );
+
+        // A member without a manifest declares nothing, and an unparsable one is reported by path.
+        let missing = [member("gone", "apps/gone")];
+        assert_eq!(
+            excluding_exact_pin(&root, &missing, "dep", "20.14.6")
+                .map_err(|unreadable| unreadable.error)?,
+            None
+        );
+        std::fs::write(root.join("apps/a/package.json"), "{ not json")?;
+        let Err(unreadable) = pin("20.14.6") else {
+            color_eyre::eyre::bail!("an unparsable manifest must not rule a pin out");
+        };
+        assert_eq!(unreadable.manifest, "apps/a/package.json");
+        Ok(())
     }
 
     fn member(name: &str, path: &str) -> MemberRef {

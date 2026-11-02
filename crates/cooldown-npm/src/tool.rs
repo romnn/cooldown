@@ -5,9 +5,9 @@
 //! and differ only in how their lock is parsed and how their CLI re-pins a dependency.
 
 use crate::apply::landing::{
-    CandidateLanding, OwnedStep, absolute_cutoff_from_project, candidate_landing,
-    restore_after_owned_step, run_candidate_landing_with, target_in_declared_range,
-    window_minutes_from_cutoff,
+    CandidateLanding, LandingPlan, OwnedStep, absolute_cutoff_from_project, candidate_landing,
+    holds_exact_pins, restore_after_owned_step, run_candidate_landing_with,
+    target_in_declared_range, window_minutes_from_cutoff,
 };
 use crate::lock::{
     EffectiveRegistryQuery, MemberIndex, NameVersion, NodeLock, SplitHold, SplitVerdict,
@@ -322,29 +322,34 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
                 .get(name)
                 .map(|entry| (*entry).clone());
             let declared = manifest::member_declaration(&project.root, &path, name)?;
-            if entry.is_none() && declared.is_none() {
-                continue;
-            }
-            // The lock's specifier is the manifest's range as pnpm read it; only a member the lock
-            // does not record for the name falls back to reading the manifest's own range.
-            let range = match entry.as_ref().and_then(|entry| entry.specifier.clone()) {
-                Some(specifier) => Some(specifier),
-                None => manifest::declared_range(
-                    &manifest::member_manifest(&project.root, &path),
-                    name,
-                )?,
+            let member = MemberRef {
+                name: names.get(&path).cloned().unwrap_or_else(|| path.clone()),
+                path,
             };
-            declarations.push(Declaration {
-                member: MemberRef {
-                    name: names.get(&path).cloned().unwrap_or_else(|| path.clone()),
-                    path,
-                },
-                range,
-                resolved: entry.map(|entry| entry.version),
-                fields: declared
-                    .map(|declared| declared.fields.iter().map(ToString::to_string).collect())
-                    .unwrap_or_default(),
-            });
+            match (declared, entry) {
+                (None, None) => {}
+                // The manifest says how the member declares the name, one row per distinct range:
+                // the lock records a single specifier per importer, so a caret in `dependencies`
+                // beside an exact pin in `devDependencies` would otherwise show as the caret alone.
+                (Some(declared), entry) => {
+                    let resolved = entry.map(|entry| entry.version);
+                    for manifest::RangeFields { range, fields } in declared.by_range() {
+                        declarations.push(Declaration {
+                            member: member.clone(),
+                            range: Some(range),
+                            resolved: resolved.clone(),
+                            fields: fields.iter().map(ToString::to_string).collect(),
+                        });
+                    }
+                }
+                // Only the lock records the declaration.
+                (None, Some(entry)) => declarations.push(Declaration {
+                    member,
+                    range: entry.specifier,
+                    resolved: Some(entry.version),
+                    fields: Vec::new(),
+                }),
+            }
         }
         Ok(declarations)
     }
@@ -1566,15 +1571,28 @@ impl<L: NodeLock> NpmTool<L> {
                 ..plan.clone()
             };
             let candidate_journal = journal::<L>(project, &candidate_plan)?;
-            let Some(landing) = candidate_landing::<L>(project, change, plan.rewrite)? else {
-                report.skipped.push(Skipped {
-                    change: change.clone(),
-                    reason: SkipReason::NotEligible,
-                    offending: Some(change.package.clone()),
-                    detail: None,
-                });
-                continue;
-            };
+            let landing =
+                match candidate_landing::<L>(project, change, plan.rewrite, plan.rewrite_pins)? {
+                    LandingPlan::Land(landing) => landing,
+                    LandingPlan::NotEligible => {
+                        report.skipped.push(Skipped {
+                            change: change.clone(),
+                            reason: SkipReason::NotEligible,
+                            offending: Some(change.package.clone()),
+                            detail: None,
+                        });
+                        continue;
+                    }
+                    LandingPlan::PinHeld { detail } => {
+                        report.skipped.push(Skipped {
+                            change: change.clone(),
+                            reason: SkipReason::PinHeld,
+                            offending: Some(change.package.clone()),
+                            detail: Some(detail),
+                        });
+                        continue;
+                    }
+                };
             let attempt = self
                 .run_candidate_landing(project, &candidate_journal, &landing)
                 .await?;
@@ -2564,6 +2582,11 @@ fn catalog_managed_hold(change: &Change) -> Skipped {
 /// The row ends with `--rewrite`, which widens the ranges, except for a range whose floor sits
 /// above the target, which no widen to that target fixes, and an unreadable manifest, which no
 /// widen can rewrite.
+/// An exact pin holds as [`SkipReason::PinHeld`], which unlike a range split depends on the
+/// target.
+/// Holding a downgrade, a manifest pin the lock does not show ends with `fix --downgrade-pinned`
+/// instead, the authority that rewrites it; a pin beside another importer's range, which that
+/// authority does not release, ends with editing the pin.
 fn multi_version_hold(
     change: &Change,
     after_members: &MemberIndex,
@@ -2587,13 +2610,14 @@ fn multi_version_hold(
     // Should the retained plan ever show a single target for such a name, the list is left out
     // rather than shortened to a misleading one.
     let several_targets = targets.len() > 1 || plan.rewrite == RewriteMode::Always;
-    let (reason, action) = if several_targets {
+    let (skip_reason, reason, action) = if several_targets {
         let listed = if targets.len() > 1 {
             format!(" ({})", targets.into_iter().collect::<Vec<_>>().join(", "))
         } else {
             String::new()
         };
         (
+            SkipReason::MultiVersionHeld,
             format!("planned at several targets{listed}, which one joint pin cannot land"),
             "admit one line for every importer (--major) before --rewrite can converge it"
                 .to_string(),
@@ -2609,18 +2633,37 @@ fn multi_version_hold(
             format!("pass --rewrite to widen every declaring range and converge on {target}");
         let (reason, rewrite_converges) =
             split_hold_reason(hold.as_ref(), after_members, name, target);
-        (
-            reason,
-            if rewrite_converges {
-                rewrite
-            } else {
-                String::new()
-            },
-        )
+        let lock_pin = matches!(
+            hold,
+            Some(SplitHold::Declaration {
+                hold: version::CeilingHold::ExactPin,
+                ..
+            })
+        );
+        let manifest_pin = matches!(hold, Some(SplitHold::ManifestPin { .. }));
+        // `--rewrite` is an `upgrade` flag, so a downgrade names `fix`'s own authority, and only
+        // where it releases the hold: a pin beside another importer's range stays held under it.
+        let action = if change.downgrade && manifest_pin {
+            "rerun fix with --downgrade-pinned to rewrite the pin, or edit it".to_string()
+        } else if change.downgrade && lock_pin {
+            "the importers declare it under several ranges, which --downgrade-pinned does not \
+             reconcile; edit the pin to move them together"
+                .to_string()
+        } else if rewrite_converges {
+            rewrite
+        } else {
+            String::new()
+        };
+        let skip_reason = if lock_pin || manifest_pin {
+            SkipReason::PinHeld
+        } else {
+            SkipReason::MultiVersionHeld
+        };
+        (skip_reason, reason, action)
     };
     Skipped {
         change: change.clone(),
-        reason: SkipReason::MultiVersionHeld,
+        reason: skip_reason,
         offending: None,
         detail: Some(if action.is_empty() {
             format!("{lines} and {reason}; each importer is kept on its own line")
@@ -2863,6 +2906,9 @@ fn split_hold_reason(
                 false,
             );
         }
+        Some(SplitHold::ManifestPin { range }) => {
+            format!("the exact pin {range} excludes {target}")
+        }
         Some(SplitHold::Declaration { range, hold }) => match hold {
             CeilingHold::ExactPin => format!("the exact pin {range} excludes {target}"),
             CeilingHold::NotPlain => {
@@ -2919,6 +2965,13 @@ pub(crate) struct HeldSplits {
 /// Only a declared (direct) change is confirmed this way: a transitive copy of the same name has
 /// no declaring manifest and is held by its own transitive verdict.
 ///
+/// A name one joint pin lands outright ([`SplitVerdict::Joint`]) is held all the same when one of
+/// its declaring manifests pins it exactly, in any install field, to a version excluding the target
+/// ([`manifest::excluding_exact_pin`]), since the Auto widen would rewrite that pin.
+/// Only the plan's authority to rewrite pins releases it, for a downgrade ([`holds_exact_pins`]).
+/// Without a `root` no manifest can show such a pin, so the name is pinned.
+/// A declaring manifest that cannot be read holds it.
+///
 /// Judged over the pre-apply `content` with the plan's excluded importers left out
 /// ([`NodeLock::member_sources_excluding`]): an importer the run excludes is not cooldown's to
 /// move, so its declaration cannot veto an update in an included one.
@@ -2951,7 +3004,15 @@ pub(crate) fn held_splits<L: NodeLock>(
             continue;
         };
         let hold = match index.split_verdict(name, target) {
-            SplitVerdict::Joint => continue,
+            // The lock records one specifier per importer, so an exact pin in a second install
+            // field is visible only in the manifest, where the widen would rewrite it.
+            SplitVerdict::Joint if !holds_exact_pins(change, plan.rewrite, plan.rewrite_pins) => {
+                continue;
+            }
+            SplitVerdict::Joint => match root.and_then(|root| manifest_pin_hold(root, change)) {
+                None => continue,
+                hold => hold,
+            },
             SplitVerdict::Held(hold) => Some(hold),
             // A copy no importer declares has no manifest to confirm, and its own transitive
             // verdict holds it; only the declared copy decides whether the name is held.
@@ -2981,16 +3042,28 @@ fn manifest_ceiling_hold(root: &Utf8Path, change: &Change) -> Option<SplitHold> 
             Ok(found) => ranges.extend(found),
             Err(_) => {
                 return Some(SplitHold::ManifestUnavailable {
-                    manifest: rel
-                        .components()
-                        .map(|component| component.as_str())
-                        .collect::<Vec<_>>()
-                        .join("/"),
+                    manifest: manifest::display_rel(&rel),
                 });
             }
         }
     }
     SplitHold::first_declaration_hold(ranges.iter().map(String::as_str), change.to.as_str())
+}
+
+/// The exact install-field pin in `change`'s declaring manifests that excludes its target, or the
+/// manifest that could not be read to tell; a missing manifest pins nothing.
+fn manifest_pin_hold(root: &Utf8Path, change: &Change) -> Option<SplitHold> {
+    match manifest::excluding_exact_pin(
+        root,
+        &change.members,
+        &change.package.name,
+        change.to.as_str(),
+    ) {
+        Ok(pin) => pin.map(|manifest::ExcludingPin { range, .. }| SplitHold::ManifestPin { range }),
+        Err(manifest::UnreadableManifest { manifest, .. }) => {
+            Some(SplitHold::ManifestUnavailable { manifest })
+        }
+    }
 }
 
 /// Every distinct target the plan names per package, ascending — several when the lines of a split
@@ -5069,6 +5142,92 @@ packages:
         Ok(())
     }
 
+    /// npm holds a candidate on its exact `devDependencies` pin, with the pin named,
+    /// while the unrelated sibling in the same batch lands, and no npm command targets the held
+    /// candidate.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn npm_holds_a_hidden_pin_and_lands_its_sibling() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let script = current_line_fallback_fixture(&root)?;
+        // npm's root lock entry mirrors both manifest fields, so the lock sees the pin as one of
+        // two declarations and the dependency is not pinned as a whole.
+        let manifest = indoc! {r#"
+            {
+              "name": "app",
+              "dependencies": { "dom": "^1.0.0", "safe": "^1.0.0" },
+              "devDependencies": { "dom": "1.0.0" }
+            }
+        "#};
+        std::fs::write(root.join("package.json"), manifest)?;
+        let lock = std::fs::read_to_string(root.join("package-lock.json"))?.replace(
+            r#""dependencies": { "dom": "^1.0.0", "safe": "^1.0.0" } }"#,
+            r#""dependencies": { "dom": "^1.0.0", "safe": "^1.0.0" }, "devDependencies": { "dom": "1.0.0" } }"#,
+        );
+        assert!(lock.contains("devDependencies"), "{lock}");
+        std::fs::write(root.join("package-lock.json"), lock)?;
+        let mut tool = tool();
+        tool.cmd = crate::nodecmd::NodeCmd::with_bin(script.as_str());
+        let project = Project {
+            root: root.clone(),
+            kind: Npm::ID,
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        };
+        // The lock sees the pin beside the caret, so the dependency is not pinned as a whole and the
+        // planner may move it.
+        let deps = tool.dependencies(&project, DepScope::Direct).await?;
+        assert!(
+            deps.iter()
+                .any(|dep| dep.package.name == "dom" && !dep.pinned),
+            "{deps:?}"
+        );
+        let plan = Plan {
+            changes: vec![
+                change("dom", "1.0.0", "1.1.0"),
+                change("safe", "1.0.0", "1.1.0"),
+            ],
+            ..Plan::default()
+        };
+
+        let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
+        let report = tool.apply(&mutation).await?;
+
+        assert_eq!(
+            report
+                .applied
+                .iter()
+                .map(|change| format!("{}@{}", change.package.name, change.to))
+                .collect::<Vec<_>>(),
+            ["safe@1.1.0"]
+        );
+        let [skip] = report.skipped.as_slice() else {
+            eyre::bail!("one held candidate: {:?}", report.skipped)
+        };
+        assert_eq!(skip.change.package.name, "dom");
+        assert_eq!(skip.reason, SkipReason::PinHeld);
+        assert_eq!(
+            skip.detail.as_deref(),
+            Some(
+                "the exact pin 1.0.0 in devDependencies of package.json excludes 1.1.0; \
+                 pass --rewrite to rewrite it, or edit the pin"
+            )
+        );
+        let declared = std::fs::read_to_string(root.join("package.json"))?;
+        assert!(declared.contains(r#""dom": "^1.0.0""#), "{declared}");
+        assert!(
+            declared.contains(r#""devDependencies": { "dom": "1.0.0" }"#),
+            "{declared}"
+        );
+        let legs = std::fs::read_to_string(root.join("legs.log"))?;
+        assert!(!legs.contains("dom@"), "{legs}");
+        Ok(())
+    }
+
     /// The per-package post-apply diff fails the batch when the on-disk lock turns unparsable
     /// during the apply loop: the journaled BEFORE parsed fine, but the AFTER is new content whose
     /// failed parse must surface instead of diffing as an empty graph that hides every move.
@@ -5903,6 +6062,50 @@ mod whole_graph_tests {
         Ok(())
     }
 
+    /// A member declaring a name at several ranges shows each, with the fields spelling it and the
+    /// version its lock entry resolves to, although the lock records only one of them.
+    #[tokio::test]
+    async fn declarations_show_every_range_a_member_declares() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        hidden_pin_fixture(&root, "20.14.5", "20.14.5")?;
+        std::fs::write(
+            root.join("apps/app/package.json"),
+            indoc! {r#"
+                {
+                  "name": "app",
+                  "dependencies": { "happy-dom": "^20.11.1" },
+                  "devDependencies": { "happy-dom": "20.14.5" },
+                  "optionalDependencies": { "happy-dom": "^20.11.1" }
+                }
+            "#},
+        )?;
+        let tool = tool_with(&fake_pnpm(&root, "")?)?;
+
+        let declarations = tool.declarations(&project(&root), "happy-dom").await?;
+
+        // Each row as `path range resolved [fields]`; the caret's two fields share one row.
+        let rows: Vec<String> = declarations
+            .iter()
+            .map(|declaration| {
+                format!(
+                    "{} {} {} [{}]",
+                    declaration.member.path,
+                    declaration.range.as_deref().unwrap_or("-"),
+                    declaration.resolved.as_deref().unwrap_or("-"),
+                    declaration.fields.join(", ")
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                "apps/app ^20.11.1 20.14.5 [dependencies, optionalDependencies]",
+                "apps/app 20.14.5 20.14.5 [devDependencies]",
+            ]
+        );
+        Ok(())
+    }
+
     /// The structural cause behind the luup partial landings: the importer left behind declares
     /// the package only in `peerDependencies`, which pnpm auto-installs and records in the lock
     /// but `pnpm update` has no install field to advance.
@@ -6631,7 +6834,7 @@ mod whole_graph_tests {
         let [skip] = report.skipped.as_slice() else {
             panic!("{:?}", report.skipped);
         };
-        assert_eq!(skip.reason, SkipReason::MultiVersionHeld);
+        assert_eq!(skip.reason, SkipReason::PinHeld);
         let detail = skip.detail.as_deref().expect("detail");
         assert!(
             detail.contains("the exact pin 20.14.5 excludes 21.0.4"),
@@ -6642,6 +6845,411 @@ mod whole_graph_tests {
         assert_eq!(read(&root, "apps/frontend/package.json")?, frontend);
         assert_eq!(read(&root, "apps/legacy/package.json")?, legacy_manifest);
         assert_eq!(read(&root, "pnpm-lock.yaml")?, lock);
+        Ok(())
+    }
+
+    const HIDDEN_PIN_MEMBERS: [(&str, &str); 1] = [("app", "apps/app")];
+
+    /// One importer declaring `happy-dom` at a caret in `dependencies` and at `second` in
+    /// `devDependencies`, locked at `locked`, beside `lodash` on a caret.
+    /// Like pnpm's own, the lock records only the `dependencies` specifier, so the lock alone sees
+    /// one plain range a joint pin may land.
+    fn hidden_pin_fixture(
+        root: &Utf8Path,
+        second: &str,
+        locked: &'static str,
+    ) -> eyre::Result<String> {
+        let lock = workspace(
+            root,
+            &[Importer {
+                path: "apps/app",
+                name: "app",
+                deps: vec![
+                    ("happy-dom", "^20.11.1", locked),
+                    ("lodash", "^4.17.20", "4.17.20"),
+                ],
+            }],
+        )?;
+        std::fs::write(
+            root.join("apps/app/package.json"),
+            formatdoc! {r#"
+                {{
+                  "name": "app",
+                  "dependencies": {{ "happy-dom": "^20.11.1", "lodash": "^4.17.20" }},
+                  "devDependencies": {{ "happy-dom": "{second}" }}
+                }}
+            "#},
+        )?;
+        std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+        Ok(lock)
+    }
+
+    /// An exact pin in a second install field holds a move the lock alone would pin jointly: the
+    /// Auto widen would rewrite the pin, so the name is held, its row names the pin and the
+    /// `--rewrite` remedy, and nothing is handed to pnpm.
+    #[tokio::test]
+    async fn a_hidden_exact_pin_holds_a_joint_pin() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let lock = hidden_pin_fixture(&root, "20.14.5", "20.14.5")?;
+        let manifest = read(&root, "apps/app/package.json")?;
+        let tool = tool_with(&fake_pnpm(&root, "")?)?;
+        let plan = Plan {
+            changes: vec![change(
+                "happy-dom",
+                "20.14.5",
+                "20.14.6",
+                &HIDDEN_PIN_MEMBERS,
+            )],
+            ..Plan::default()
+        };
+
+        let report = apply(&tool, &project(&root), plan).await?;
+
+        assert_eq!(report.applied, []);
+        let [skip] = report.skipped.as_slice() else {
+            panic!("{:?}", report.skipped);
+        };
+        assert_eq!(skip.reason, SkipReason::PinHeld);
+        let detail = skip.detail.as_deref().expect("detail");
+        assert!(
+            detail.contains("the exact pin 20.14.5 excludes 20.14.6"),
+            "{detail}"
+        );
+        assert!(detail.contains("pass --rewrite"), "{detail}");
+        assert_eq!(legs(&root), [] as [String; 0]);
+        assert_eq!(read(&root, "apps/app/package.json")?, manifest);
+        assert_eq!(read(&root, "pnpm-lock.yaml")?, lock);
+        Ok(())
+    }
+
+    /// A held hidden-pin candidate does not hold its batch: the unrelated sibling lands through the
+    /// joint update, which carries no selector for the held name, and the held name's manifest
+    /// declarations stay as written.
+    #[tokio::test]
+    async fn a_hidden_pin_hold_lets_an_unrelated_sibling_land() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let lock = hidden_pin_fixture(&root, "20.14.5", "20.14.5")?;
+        let manifest = read(&root, "apps/app/package.json")?;
+        let landed = moved(
+            &lock,
+            "apps/app",
+            "lodash",
+            ("^4.17.20", "4.17.20"),
+            ("^4.17.20", "4.17.21"),
+        );
+        std::fs::write(root.join("landed.yaml"), landed)?;
+        let script = fake_pnpm(
+            &root,
+            indoc! {r#"
+                  *"lodash@4.17.21"*)
+                    cp landed.yaml pnpm-lock.yaml; exit 0 ;;
+            "#},
+        )?;
+        let tool = tool_with(&script)?;
+        let plan = Plan {
+            changes: vec![
+                change("happy-dom", "20.14.5", "20.14.6", &HIDDEN_PIN_MEMBERS),
+                change("lodash", "4.17.20", "4.17.21", &HIDDEN_PIN_MEMBERS),
+            ],
+            ..Plan::default()
+        };
+
+        let report = apply(&tool, &project(&root), plan).await?;
+
+        assert_eq!(applied_names(&report), vec!["lodash"]);
+        let [skip] = report.skipped.as_slice() else {
+            panic!("{:?}", report.skipped);
+        };
+        assert_eq!(skip.change.package.name, "happy-dom");
+        assert_eq!(skip.reason, SkipReason::PinHeld);
+        // The one joint update targets the sibling alone.
+        let legs = legs(&root);
+        let [update] = legs.as_slice() else {
+            panic!("one joint update: {legs:?}");
+        };
+        assert!(update.contains("lodash@4.17.21"), "{update}");
+        assert!(!update.contains("happy-dom"), "{update}");
+        // lodash's caret already admits its target, so no declaration changes at all.
+        assert_eq!(read(&root, "apps/app/package.json")?, manifest);
+        Ok(())
+    }
+
+    /// A downgrade held by a hidden exact pin names `fix --downgrade-pinned`, never the `upgrade`
+    /// flag `--rewrite`; the plan's permission to rewrite pins lands the same downgrade, rewriting
+    /// the pin and keeping the caret that already admits the target.
+    #[tokio::test]
+    async fn a_hidden_pin_holds_a_downgrade_until_pins_may_be_rewritten() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let lock = hidden_pin_fixture(&root, "20.14.6", "20.14.6")?;
+        let manifest = read(&root, "apps/app/package.json")?;
+        let landed = moved(
+            &lock,
+            "apps/app",
+            "happy-dom",
+            ("^20.11.1", "20.14.6"),
+            ("^20.11.1", "20.14.5"),
+        );
+        std::fs::write(root.join("landed.yaml"), landed)?;
+        let script = fake_pnpm(
+            &root,
+            indoc! {r#"
+                  *"happy-dom@20.14.5"*)
+                    cp landed.yaml pnpm-lock.yaml; exit 0 ;;
+            "#},
+        )?;
+        let tool = tool_with(&script)?;
+        let plan = |rewrite_pins| Plan {
+            changes: vec![Change {
+                downgrade: true,
+                ..change("happy-dom", "20.14.6", "20.14.5", &HIDDEN_PIN_MEMBERS)
+            }],
+            rewrite_pins,
+            ..Plan::default()
+        };
+
+        // Plain `fix`: held, with the pin, the target, and the `fix` remedy named.
+        let held = apply(&tool, &project(&root), plan(false)).await?;
+        assert_eq!(held.applied, []);
+        let [skip] = held.skipped.as_slice() else {
+            panic!("{:?}", held.skipped);
+        };
+        assert_eq!(skip.reason, SkipReason::PinHeld);
+        let detail = skip.detail.as_deref().expect("detail");
+        assert!(
+            detail.contains("the exact pin 20.14.6 excludes 20.14.5"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("rerun fix with --downgrade-pinned"),
+            "{detail}"
+        );
+        assert!(!detail.contains("--rewrite"), "{detail}");
+        assert_eq!(legs(&root), [] as [String; 0]);
+        assert_eq!(read(&root, "apps/app/package.json")?, manifest);
+        assert_eq!(read(&root, "pnpm-lock.yaml")?, lock);
+
+        // `fix --downgrade-pinned`: the pin is rewritten to the target and the downgrade lands.
+        let landed = apply(&tool, &project(&root), plan(true)).await?;
+        assert_eq!(applied_names(&landed), vec!["happy-dom"]);
+        assert!(landed.skipped.is_empty(), "{:?}", landed.skipped);
+        let after = read(&root, "apps/app/package.json")?;
+        assert!(
+            after.contains(r#""devDependencies": { "happy-dom": "20.14.5" }"#),
+            "{after}"
+        );
+        assert!(after.contains(r#""happy-dom": "^20.11.1""#), "{after}");
+        Ok(())
+    }
+
+    /// A pin the lock shows beside another importer's range splits the workspace, which the
+    /// permission to rewrite pins does not reconcile: the downgrade stays held even with it, and
+    /// the row asks for an edit instead of recommending `--downgrade-pinned`.
+    #[tokio::test]
+    async fn a_pin_split_across_importers_holds_a_downgrade_despite_the_permission()
+    -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let lock = workspace(
+            &root,
+            &[
+                Importer {
+                    path: "apps/pinned",
+                    name: "pinned",
+                    deps: vec![("happy-dom", "20.14.6", "20.14.6")],
+                },
+                Importer {
+                    path: "apps/caret",
+                    name: "caret",
+                    deps: vec![("happy-dom", "^20.11.1", "20.14.6")],
+                },
+            ],
+        )?;
+        std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+        let pinned = read(&root, "apps/pinned/package.json")?;
+        let tool = tool_with(&fake_pnpm(&root, "")?)?;
+        let plan = Plan {
+            changes: vec![Change {
+                downgrade: true,
+                ..change(
+                    "happy-dom",
+                    "20.14.6",
+                    "20.14.5",
+                    &[("pinned", "apps/pinned"), ("caret", "apps/caret")],
+                )
+            }],
+            rewrite_pins: true,
+            ..Plan::default()
+        };
+
+        let report = apply(&tool, &project(&root), plan).await?;
+
+        assert_eq!(report.applied, []);
+        let [skip] = report.skipped.as_slice() else {
+            panic!("{:?}", report.skipped);
+        };
+        assert_eq!(skip.reason, SkipReason::PinHeld);
+        let detail = skip.detail.as_deref().expect("detail");
+        assert!(
+            detail.contains("the exact pin 20.14.6 excludes 20.14.5"),
+            "{detail}"
+        );
+        assert!(detail.contains("edit the pin"), "{detail}");
+        assert!(
+            !detail.contains("rerun fix with --downgrade-pinned"),
+            "the permission was granted and did not release it: {detail}"
+        );
+        assert!(!detail.contains("--rewrite"), "{detail}");
+        assert_eq!(legs(&root), [] as [String; 0]);
+        assert_eq!(read(&root, "apps/pinned/package.json")?, pinned);
+        Ok(())
+    }
+
+    /// An exact declaration already equal to the target excludes nothing, so the joint pin lands
+    /// and no declaration changes.
+    #[tokio::test]
+    async fn a_hidden_pin_at_the_target_lands() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let lock = hidden_pin_fixture(&root, "20.14.6", "20.14.5")?;
+        let manifest = read(&root, "apps/app/package.json")?;
+        let landed = moved(
+            &lock,
+            "apps/app",
+            "happy-dom",
+            ("^20.11.1", "20.14.5"),
+            ("^20.11.1", "20.14.6"),
+        );
+        std::fs::write(root.join("landed.yaml"), landed)?;
+        let script = fake_pnpm(
+            &root,
+            indoc! {r#"
+                  *"happy-dom@20.14.6"*)
+                    cp landed.yaml pnpm-lock.yaml; exit 0 ;;
+            "#},
+        )?;
+        let tool = tool_with(&script)?;
+        let plan = Plan {
+            changes: vec![change(
+                "happy-dom",
+                "20.14.5",
+                "20.14.6",
+                &HIDDEN_PIN_MEMBERS,
+            )],
+            ..Plan::default()
+        };
+
+        let report = apply(&tool, &project(&root), plan).await?;
+
+        assert_eq!(applied_names(&report), vec!["happy-dom"]);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        assert_eq!(read(&root, "apps/app/package.json")?, manifest);
+        Ok(())
+    }
+
+    /// `--rewrite` is the explicit authority to rewrite every declaration, the hidden pin
+    /// included, so the move lands.
+    #[tokio::test]
+    async fn rewrite_lands_a_move_past_a_hidden_pin() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let lock = hidden_pin_fixture(&root, "20.14.5", "20.14.5")?;
+        let landed = moved(
+            &lock,
+            "apps/app",
+            "happy-dom",
+            ("^20.11.1", "20.14.5"),
+            ("^20.14.6", "20.14.6"),
+        );
+        std::fs::write(root.join("landed.yaml"), landed)?;
+        let script = fake_pnpm(
+            &root,
+            indoc! {r#"
+                  *"happy-dom@20.14.6"*)
+                    cp landed.yaml pnpm-lock.yaml; exit 0 ;;
+            "#},
+        )?;
+        let tool = tool_with(&script)?;
+        let plan = Plan {
+            changes: vec![change(
+                "happy-dom",
+                "20.14.5",
+                "20.14.6",
+                &HIDDEN_PIN_MEMBERS,
+            )],
+            rewrite: RewriteMode::Always,
+            ..Plan::default()
+        };
+
+        let report = apply(&tool, &project(&root), plan).await?;
+
+        assert_eq!(applied_names(&report), vec!["happy-dom"]);
+        let after = read(&root, "apps/app/package.json")?;
+        assert!(
+            after.contains(r#""devDependencies": { "happy-dom": "20.14.6" }"#),
+            "{after}"
+        );
+        Ok(())
+    }
+
+    /// Only the declaring members the run manages can hold a move on a hidden pin: an excluded
+    /// importer's pin is not the run's to judge, while the same pin in a managed member holds.
+    #[test]
+    fn an_excluded_importers_hidden_pin_does_not_hold() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let lock = workspace(
+            &root,
+            &[
+                Importer {
+                    path: ".",
+                    name: "root",
+                    deps: vec![("happy-dom", "^20.11.1", "20.14.5")],
+                },
+                Importer {
+                    path: "apps/app",
+                    name: "app",
+                    deps: vec![("happy-dom", "^20.11.1", "20.14.5")],
+                },
+            ],
+        )?;
+        std::fs::write(
+            root.join("package.json"),
+            indoc! {r#"
+                {
+                  "name": "root",
+                  "dependencies": { "happy-dom": "^20.11.1" },
+                  "devDependencies": { "happy-dom": "20.14.5" }
+                }
+            "#},
+        )?;
+        let managed = Plan {
+            changes: vec![change(
+                "happy-dom",
+                "20.14.5",
+                "20.14.6",
+                &HIDDEN_PIN_MEMBERS,
+            )],
+            excluded_members: vec![member("root", ".")],
+            ..Plan::default()
+        };
+        let both = Plan {
+            changes: vec![change(
+                "happy-dom",
+                "20.14.5",
+                "20.14.6",
+                &[("root", "."), ("app", "apps/app")],
+            )],
+            ..Plan::default()
+        };
+
+        assert!(
+            held_splits::<Pnpm>(Some(&root), Some(&lock), &managed)
+                .names
+                .is_empty()
+        );
+        let held = held_splits::<Pnpm>(Some(&root), Some(&lock), &both);
+        assert_eq!(
+            held.reasons.get("happy-dom"),
+            Some(&SplitHold::ManifestPin {
+                range: "20.14.5".to_string(),
+            })
+        );
         Ok(())
     }
 

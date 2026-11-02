@@ -11,7 +11,7 @@ use cooldown_core::{
 use serde::{Serialize, Serializer};
 
 /// The JSON schema version.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// The one common envelope, identical in shape across tools and commands.
 ///
@@ -692,7 +692,8 @@ pub struct ExplainDeclaration {
     /// The version the member's own lock entry resolves to, when the lock records it per member.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved: Option<String>,
-    /// The manifest fields naming the package (`dependencies`, `peerDependencies`, …).
+    /// The manifest fields declaring the package at this range (`dependencies`, `peerDependencies`,
+    /// …).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
     /// Whether the run's scope and exclude policy ignore this member's declaration: it is neither

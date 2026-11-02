@@ -1196,3 +1196,138 @@ fn upgrade_holds_a_hoisted_peer_contract_across_disjoint_workspace_members() {
     assert!(second.skipped_reasons_for("react").contains("peer_held"));
     assert_eq!(lock_before, fixture.read_bytes("package-lock.json"));
 }
+
+/// A cutoff after chalk 4.1.1 and before 4.1.2, so a 4.1.2 seed is too fresh and 4.1.1 is the
+/// matured downgrade.
+const HIDDEN_PIN_FIX_FREEZE: &str = "2021-06-01T00:00:00Z";
+
+/// A package declaring `chalk` at a caret in `dependencies` and at the exact `pin` in
+/// `devDependencies`.
+/// npm resolves the pin and records both declarations in the lock's root entry, so the dependency
+/// is not pinned as a whole and the planner moves it.
+fn two_field_fixture(pin: &str) -> Fixture {
+    let fixture = Fixture::new().tag_independent();
+    fixture.write(
+        "package.json",
+        &indoc::formatdoc! {r#"
+            {{
+              "name": "cooldown-npm-two-fields",
+              "version": "0.1.0",
+              "private": true,
+              "dependencies": {{ "chalk": "^4.1.0" }},
+              "devDependencies": {{ "chalk": "{pin}" }}
+            }}
+        "#},
+    );
+    fixture.write(".npmrc", NPMRC);
+    fixture
+        .run_tool(
+            "npm",
+            &[
+                "install",
+                "--package-lock-only",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+            ],
+            &[],
+        )
+        .expect_success();
+    assert_eq!(
+        package_lock_version(&fixture, "chalk").as_deref(),
+        Some(pin)
+    );
+    fixture
+}
+
+fn declared_chalk(fixture: &Fixture, field: &str) -> String {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fixture.read_bytes("package.json")).expect("manifest parses");
+    manifest
+        .get(field)
+        .and_then(|section| section.get("chalk"))
+        .and_then(serde_json::Value::as_str)
+        .expect("chalk is declared")
+        .to_string()
+}
+
+/// The exact pin in `devDependencies` holds an in-line move the caret beside it admits: the row
+/// names the pin and nothing changes, until `--rewrite`, planned through the real planner, rewrites
+/// the pin and lands the move.
+#[test]
+fn upgrade_holds_a_hidden_exact_pin_until_rewrite() {
+    skip_if_missing!("npm");
+    let fixture = two_field_fixture("4.1.0");
+    let manifest_before = fixture.read_bytes("package.json");
+    let lock_before = fixture.read_bytes("package-lock.json");
+
+    let held = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    // The held-back chalk 5 major is reported beside it.
+    assert!(
+        held.skipped_reasons_for("chalk").contains("pin_held"),
+        "{held:#?}"
+    );
+    assert_eq!(held.summary_applied(), 0, "{held:#?}");
+    let detail = held.skip_detail_for("chalk").unwrap_or_default();
+    assert!(
+        detail.contains("the exact pin 4.1.0 in devDependencies of package.json excludes"),
+        "{detail}"
+    );
+    assert!(detail.contains("--rewrite"), "{detail}");
+    assert_eq!(manifest_before, fixture.read_bytes("package.json"));
+    assert_eq!(lock_before, fixture.read_bytes("package-lock.json"));
+
+    let rewritten = fixture.cooldown_json(&["upgrade", "--rewrite", "--freeze", FREEZE]);
+    assert!(
+        rewritten.applied_names().contains("chalk"),
+        "{rewritten:#?}"
+    );
+    let target = package_lock_version(&fixture, "chalk").expect("chalk is locked");
+    assert_ne!(target, "4.1.0");
+    assert_eq!(declared_chalk(&fixture, "devDependencies"), target);
+}
+
+/// A plain `fix` holds a downgrade off a too-fresh exact pin in `devDependencies`, naming
+/// `--downgrade-pinned`, and fails under `--strict`; `--downgrade-pinned` then rewrites the pin,
+/// lands the downgrade, and passes.
+#[test]
+fn fix_downgrades_a_hidden_exact_pin_only_with_downgrade_pinned() {
+    skip_if_missing!("npm");
+    let fixture = two_field_fixture("4.1.2");
+    let manifest_before = fixture.read_bytes("package.json");
+    let lock_before = fixture.read_bytes("package-lock.json");
+
+    // The held downgrade leaves the violation in place, so a strict `fix` fails.
+    let held = fixture.cooldown_json(&["fix", "--strict", "--freeze", HIDDEN_PIN_FIX_FREEZE]);
+    assert!(!held.ok(), "{held:#?}");
+    assert_eq!(held.summary_applied(), 0, "{held:#?}");
+    assert!(
+        held.skipped_reasons_for("chalk").contains("pin_held"),
+        "{held:#?}"
+    );
+    let detail = held.skip_detail_for("chalk").unwrap_or_default();
+    assert!(
+        detail.contains("the exact pin 4.1.2 in devDependencies of package.json excludes 4.1.1"),
+        "{held:#?}"
+    );
+    assert!(detail.contains("--downgrade-pinned"), "{detail}");
+    assert!(!detail.contains("--rewrite"), "{detail}");
+    assert_eq!(manifest_before, fixture.read_bytes("package.json"));
+    assert_eq!(lock_before, fixture.read_bytes("package-lock.json"));
+
+    let fixed = fixture.cooldown_json(&[
+        "fix",
+        "--strict",
+        "--downgrade-pinned",
+        "--freeze",
+        HIDDEN_PIN_FIX_FREEZE,
+    ]);
+    assert!(fixed.ok(), "{fixed:#?}");
+    assert_eq!(
+        package_lock_version(&fixture, "chalk").as_deref(),
+        Some("4.1.1"),
+        "{fixed:#?}"
+    );
+    assert_eq!(declared_chalk(&fixture, "devDependencies"), "4.1.1");
+    assert_eq!(declared_chalk(&fixture, "dependencies"), "^4.1.0");
+}
