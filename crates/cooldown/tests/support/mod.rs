@@ -439,6 +439,15 @@ impl ChangeVersions {
     }
 }
 
+/// One warning of a report, extracted by [`Envelope::warnings_of_kind`].
+#[derive(Debug)]
+pub struct WarningRow {
+    /// The package the warning is attached to, if any.
+    pub package: Option<String>,
+    /// The human-readable message.
+    pub message: String,
+}
+
 /// One lock-edge row of an `upgrade`/`fix` report (an item carrying an `edge` block), extracted by
 /// [`Envelope::edge_rows`].
 #[derive(Debug)]
@@ -792,6 +801,22 @@ impl Envelope {
         })
     }
 
+    /// The `from -> to` change applied for a named item, skipping its unapplied rows (a held major,
+    /// for instance), if one was applied.
+    pub fn applied_change_for(&self, name: &str) -> Option<ChangeVersions> {
+        self.items().iter().find_map(|item| {
+            if item.get("name").and_then(serde_json::Value::as_str) != Some(name)
+                || item.get("applied").and_then(serde_json::Value::as_bool) != Some(true)
+            {
+                return None;
+            }
+            Some(ChangeVersions {
+                from: item.get("from")?.as_str()?.to_owned(),
+                to: item.get("to")?.as_str()?.to_owned(),
+            })
+        })
+    }
+
     /// Every `from -> to` row reported for a package, preserving report order.
     pub fn changes_for(&self, name: &str) -> Vec<ChangeVersions> {
         self.items()
@@ -842,6 +867,29 @@ impl Envelope {
 
     pub fn warning_messages(&self) -> BTreeSet<String> {
         self.diagnostic_values("warnings", "message")
+    }
+
+    /// Every warning of `kind`, in report order and with duplicates kept, so a test can count them.
+    pub fn warnings_of_kind(&self, kind: &str) -> Vec<WarningRow> {
+        self.value
+            .get("warnings")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|warning| warning.get("kind").and_then(serde_json::Value::as_str) == Some(kind))
+            .map(|warning| {
+                let field = |key: &str| {
+                    warning
+                        .get(key)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                };
+                WarningRow {
+                    package: field("package"),
+                    message: field("message").unwrap_or_default(),
+                }
+            })
+            .collect()
     }
 
     pub fn warning_paths(&self) -> BTreeSet<String> {

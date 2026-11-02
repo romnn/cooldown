@@ -861,9 +861,11 @@ fn reached(
 /// Committing that would split a name that resolved at one version before the run and report
 /// nothing — so the candidate is rejected and the graph re-resolved without it
 /// ([`NpmTool::resolve_and_verify`]).
-/// Importers the run excludes are not part of this contract: pnpm re-resolves the named package in
-/// every importer whose range admits it whatever the update's filter, so an excluded importer moving
-/// is the resolver's doing and is reported by the settled-lock guard ([`report_excluded_moves`]).
+/// Importers the run excludes are not part of this contract.
+/// The filtered update never names them, but the override repair ([`NpmTool::resolve_round`])
+/// re-resolves the whole workspace under temporary overrides for the planned targets.
+/// An excluded importer whose declared range intersects the override's key can therefore move to
+/// the target, and the settled-lock guard reports or refuses that move ([`report_excluded_moves`]).
 struct PartialLanding {
     index: usize,
     /// The in-scope importers that reached the target.
@@ -1462,26 +1464,45 @@ impl ExcludedMove {
 /// The direct entries the settled resolve changed in importers the run excludes, ascending by
 /// importer and name, sorted into what the resolver does on its own and what it does not.
 ///
-/// `pnpm update <name>@<target>` re-resolves the named package in *every* importer whose declared
-/// range admits a newer version, whatever `--filter` it carried: the filtered importers get the
-/// exact target, every other one the newest version its own range admits under the release-age
-/// floor (verified against pnpm 10: an unfiltered importer on `^2.0.0` moved to the newest `2.x`,
-/// not to the filtered importer's target, and one on `~2.0.0` stayed).
-/// An excluded importer moving within its own range is therefore the resolver's doing, not a pin
-/// cooldown placed — refusing it would let an excluded subtree veto every shared upgrade, the very
-/// thing exclusions must not do — so it is `re_resolved`: committed and reported.
+/// The filtered `pnpm update <name>@<target>` re-pins the named package only in the selected
+/// importers.
+/// The override repair ([`NpmTool::resolve_round`]) is different: it runs an unfiltered install
+/// under temporary overrides keyed by each target's major line, and pnpm applies an override to
+/// every declaration whose range intersects its key, an excluded importer's included.
+/// An excluded importer can therefore move within its own range without cooldown ever naming it or
+/// rewriting its manifest.
+/// Refusing that move would let an excluded subtree veto every shared upgrade, the very thing
+/// exclusions must not do, so it is `re_resolved`: committed and reported.
+/// An exact manifest pin it moves is refused separately ([`ProtectedPins`]).
 /// A changed declaration (`specifier:`), an entry appearing or disappearing, or a version its own
 /// range provably excludes is `drifted`: pnpm never does that on its own, so it is a stale excluded
 /// importer refreshed or an override that reached it, and it must not be committed as if the
 /// exclusion had been honored.
 /// The range judgment is proof-only, like [`MemberIndex::splits_for`]: a range cooldown cannot read
-/// (a `||` union, a protocol) proves nothing, so the move counts as re-resolved rather than as drift.
+/// (a `||` union, a protocol) or a missing specifier proves nothing, so the move still counts as
+/// re-resolved rather than as drift, [`RangeAdmission::Unjudged`].
 /// `link:`/`workspace:`/`file:` entries are layout facts no resolve changes and are not compared;
 /// one turning into or out of a registry version still shows as an added or removed entry.
 #[derive(Default)]
 struct ExcludedMoves {
-    re_resolved: Vec<ExcludedMove>,
+    re_resolved: Vec<ReResolved>,
     drifted: Vec<ExcludedMove>,
+}
+
+/// An excluded importer's entry that moved under an unchanged declaration.
+struct ReResolved {
+    moved: ExcludedMove,
+    admission: RangeAdmission,
+}
+
+/// Whether the unchanged declaration of a [`ReResolved`] entry provably admits its new version.
+#[derive(Clone, Copy)]
+enum RangeAdmission {
+    /// The declared range admits the new version.
+    Proven,
+    /// The declaration is missing or a range cooldown cannot judge, so its warning claims no
+    /// range membership.
+    Unjudged,
 }
 
 fn excluded_importer_moves(
@@ -1505,16 +1526,25 @@ fn excluded_importer_moves(
             match (was.get(name), now.get(name)) {
                 (Some(from), Some(to)) if from == to => {}
                 (Some(from), Some(to)) if from.specifier == to.specifier => {
-                    let excluded_by_range = to.specifier.as_deref().is_some_and(|specifier| {
-                        crate::version::range_match(specifier, &to.version)
-                            == crate::version::RangeMatch::Excludes
+                    let range_match = to
+                        .specifier
+                        .as_deref()
+                        .map(|specifier| crate::version::range_match(specifier, &to.version));
+                    let entry = record(format!("{} → {}", from.version, to.version));
+                    let admission = match range_match {
+                        Some(crate::version::RangeMatch::Excludes) => {
+                            moves.drifted.push(entry);
+                            continue;
+                        }
+                        Some(crate::version::RangeMatch::Matches) => RangeAdmission::Proven,
+                        Some(crate::version::RangeMatch::Unknown) | None => {
+                            RangeAdmission::Unjudged
+                        }
+                    };
+                    moves.re_resolved.push(ReResolved {
+                        moved: entry,
+                        admission,
                     });
-                    let movement = record(format!("{} → {}", from.version, to.version));
-                    if excluded_by_range {
-                        moves.drifted.push(movement);
-                    } else {
-                        moves.re_resolved.push(movement);
-                    }
                 }
                 (Some(from), Some(to)) => moves.drifted.push(record(format!(
                     "declared {} → {}, {} → {}",
@@ -1542,6 +1572,8 @@ fn excluded_importer_moves(
 /// candidate whose landing did it — while re-resolved copies are committed under one warning each,
 /// naming the importer and carrying the package, so the excluded subtree can neither veto the
 /// upgrade nor move silently.
+/// The warning says the move stayed within the declared range only when the range provably admits
+/// the new version ([`RangeAdmission`]).
 fn report_excluded_moves(
     report: &mut ApplyReport,
     before: &MemberIndex,
@@ -1560,16 +1592,19 @@ fn report_excluded_moves(
                 .join(", ")
         )));
     }
-    for moved in &moves.re_resolved {
+    for ReResolved { moved, admission } in &moves.re_resolved {
+        let described = moved.describe();
+        let message = match admission {
+            RangeAdmission::Proven => format!(
+                "the resolve moved {described} within the range that excluded importer declares; its manifest was not touched"
+            ),
+            RangeAdmission::Unjudged => format!(
+                "the resolve moved {described} under an unchanged declaration cooldown cannot judge against the new version; the excluded manifest was not touched"
+            ),
+        };
         report.warnings.push(
-            Diagnostic::new(
-                DiagnosticKind::ExcludedMoved,
-                format!(
-                    "pnpm re-resolved {} to the newest version its own range admits, as its update does in every importer whatever the filter; the excluded manifest was not touched",
-                    moved.describe()
-                ),
-            )
-            .with_package(moved.name.clone()),
+            Diagnostic::new(DiagnosticKind::ExcludedMoved, message)
+                .with_package(moved.name.clone()),
         );
     }
     Ok(())
@@ -2115,6 +2150,10 @@ impl<L: NodeLock> NpmTool<L> {
     ///
     /// A starting lock pnpm's native age gate refuses, or a targeted update that floats an entry out
     /// of its declared range, is retried through the override repair from the restored journal.
+    /// The repair's install is unfiltered, so its overrides can also reach an excluded importer
+    /// whose declared range intersects their key: a move that survives the settlement under an
+    /// unchanged declaration is an accepted side effect the settled-lock guard reports
+    /// ([`report_excluded_moves`]).
     /// A repair that still leaves a fresh inconsistency fails as a stale lock, unless it moved a
     /// protected exact pin ([`ProtectedPins`]): that refusal names a resolver verdict the caller's
     /// candidate isolation can act on, which a stale lock is not.
@@ -3022,13 +3061,18 @@ fn resolved_version_lines<L: NodeLock>(content: &str) -> Result<HashMap<String, 
 }
 
 /// The plan's direct exact pins re-keyed for the override engine: each name gains its target's
-/// major-line qualifier (`semver` pinned to `7.7.3` becomes `semver@^7.0.0`). An unqualified
-/// `name: target` override captures *every* same-name request in the graph, so an undeclared copy
-/// on another major would be silently collapsed onto the direct target — and the newest-copy
-/// report projection would never show it. Qualified to the target's line, the override addresses
-/// only requests the plan actually steers (after widening, the declaring importer's range lives on
-/// that line) while a foreign line keeps its own resolution. A target with no parsable major keeps
-/// the unqualified key: better a broad pin than a repair that cannot steer its own candidate.
+/// major-line qualifier (`semver` pinned to `7.7.3` becomes `semver@^7.0.0`).
+/// An unqualified `name: target` override captures *every* same-name request in the graph, so an
+/// undeclared copy on another major would be silently collapsed onto the direct target — and the
+/// newest-copy report projection would never show it.
+/// Qualified to the target's line, the override addresses the requests on the line the plan
+/// steers (after widening, the declaring importer's range lives on that line) while a foreign line
+/// keeps its own resolution.
+/// The qualifier scopes by range, not by importer: pnpm overrides a request whose range intersects
+/// the key in an importer the run excludes too, a move the settled-lock guard reports
+/// ([`report_excluded_moves`]) or, for an exact manifest pin, refuses ([`ProtectedPins`]).
+/// A target with no parsable major keeps the unqualified key: better a broad pin than a repair that
+/// cannot steer its own candidate.
 fn qualified_direct_override_pins(exact_pins: Vec<(String, String)>) -> Vec<(String, String)> {
     exact_pins
         .into_iter()
@@ -7372,9 +7416,6 @@ mod whole_graph_tests {
         // The planner can admit a two-day-old security fix through its shorter window.
         // The adapter must retain that exact pin beneath pnpm's seven-day native gate.
         // The fixed January clock keeps the pin young even when this test runs months later.
-        // The planner can admit a two-day-old security fix through its shorter window.
-        // The adapter must retain that exact pin beneath pnpm's seven-day native gate.
-        // The fixed January clock keeps the pin young even when this test runs months later.
         let cache = tempfile::tempdir()?;
         let now: jiff::Timestamp = "2026-01-18T00:00:00Z".parse()?;
         let tool = young_pin_tool(cache.path(), &script, now)?;
@@ -8167,15 +8208,10 @@ mod whole_graph_tests {
         Ok(())
     }
 
-    /// pnpm re-resolves the named package in every importer whose range admits a newer version
-    /// whatever the update's filter, so the excluded importer's `^9.8.0` copy moves too: the
-    /// upgrade lands (an excluded subtree must not veto it) and the move is reported with the
-    /// package attached, with the excluded manifest untouched.
-    #[tokio::test]
-    async fn an_excluded_importer_re_resolved_in_range_is_reported_not_rolled_back()
-    -> eyre::Result<()> {
-        let (_dir, root) = tempdir_root()?;
-        let lock = mongoose_workspace(&root, "9.9.1")?;
+    /// `app` at 9.9.1 and the excluded `legacy` at 9.8.0, both on `mongoose@^9.8.0`, with the lock
+    /// a resolve that moves both importers' copies to 9.9.3 would write.
+    fn mongoose_moved_in_both(root: &Utf8Path) -> eyre::Result<String> {
+        let lock = mongoose_workspace(root, "9.9.1")?;
         let both = moved(
             &lock,
             "app",
@@ -8183,19 +8219,41 @@ mod whole_graph_tests {
             ("^9.8.0", "9.9.1"),
             ("^9.8.0", "9.9.3"),
         );
-        let both = moved(
+        Ok(moved(
             &both,
             "legacy",
             "mongoose",
             ("^9.8.0", "9.8.0"),
             ("^9.8.0", "9.9.3"),
-        );
-        std::fs::write(root.join("both.yaml"), both)?;
+        ))
+    }
+
+    /// The override repair re-resolves the whole workspace, so it moves the excluded importer's
+    /// `^9.8.0` copy too.
+    /// pnpm's native age gate refuses the windowed update, and the repair's resolution-only
+    /// install under the temporary `mongoose@^9.0.0` override moves both range-compatible copies.
+    /// The upgrade lands (an excluded subtree must not veto it) and the move is reported with the
+    /// package attached, with the excluded manifest untouched and no override left behind.
+    #[tokio::test]
+    async fn an_excluded_importer_re_resolved_in_range_is_reported_not_rolled_back()
+    -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let both = mongoose_moved_in_both(&root)?;
+        std::fs::write(root.join("both.yaml"), &both)?;
+        // The update fails as pnpm's age gate fails a too-fresh starting lock.
+        // Only the resolution-only install moves the lock, and only while the temporary override
+        // is written; the settlement install must see the user's configuration restored.
         let script = fake_pnpm(
             &root,
             indoc! {r#"
                   *" update "*)
+                    echo '[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] lock rejected' >&2; exit 1 ;;
+                  *"--resolution-only"*)
+                    grep -q 'mongoose@^9.0.0' pnpm-workspace.yaml || exit 1
                     cp both.yaml pnpm-lock.yaml; exit 0 ;;
+                  *"install"*)
+                    if grep -qs '^overrides:' pnpm-workspace.yaml; then exit 1; fi
+                    exit 0 ;;
             "#},
         )?;
         let tool = tool_with(&script)?;
@@ -8204,12 +8262,35 @@ mod whole_graph_tests {
             excluded_members: vec![member("legacy", "legacy")],
             ..Plan::default()
         };
+        // A cutoff gives the update a native age window, the precondition of the age repair.
+        let project = Project {
+            exclude_newer: Some("2024-01-01T00:00:00Z".to_string()),
+            ..project(&root)
+        };
 
         let legacy_manifest = read(&root, "legacy/package.json")?;
-        let report = apply(&tool, &project(&root), plan).await?;
+        let report = apply(&tool, &project, plan).await?;
 
+        // The refused update, then the repair's two installs, in that order
+        let legs = legs(&root);
+        let [update, repair, settle] = legs.as_slice() else {
+            panic!("an update, then the repair's two installs: {legs:?}");
+        };
+        assert!(
+            update.contains(" update ") && update.contains("--filter ./app"),
+            "{update}"
+        );
+        assert!(!update.contains("legacy"), "{update}");
+        assert!(repair.contains("--resolution-only"), "{repair}");
+        assert!(
+            settle.starts_with("install ") && !settle.contains("--resolution-only"),
+            "{settle}"
+        );
+
+        // The upgrade lands with the excluded copy moved alongside it.
         assert_eq!(applied_names(&report), vec!["mongoose"]);
         assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        assert_eq!(read(&root, "pnpm-lock.yaml")?, both);
         let [warning] = report.warnings.as_slice() else {
             panic!(
                 "the re-resolved excluded copy is reported once: {:?}",
@@ -8227,13 +8308,151 @@ mod whole_graph_tests {
             "{}",
             warning.message
         );
+        // `^9.8.0` provably admits 9.9.3, so the warning may say the move stayed in range.
         assert!(
-            warning.message.contains("re-resolved"),
+            warning.message.contains("within the range"),
             "{}",
             warning.message
         );
+
+        // The exclusion is honored where cooldown writes: no excluded manifest edit, and no
+        // temporary override left in the workspace configuration.
         assert_eq!(read(&root, "legacy/package.json")?, legacy_manifest);
-        assert!(read(&root, "pnpm-lock.yaml")?.contains("version: 9.9.3"));
+        assert!(
+            !root.join("pnpm-workspace.yaml").exists(),
+            "the temporary overrides must not persist"
+        );
+        Ok(())
+    }
+
+    /// An excluded importer whose unchanged declaration is a range cooldown cannot judge (an npm
+    /// hyphen range) still has its move committed and reported, but the warning claims no range
+    /// membership cooldown did not prove.
+    #[tokio::test]
+    async fn an_excluded_move_under_an_unjudged_range_is_reported_without_a_range_claim()
+    -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let hyphen = "9.8.0 - 9.8.5";
+        let lock = workspace(
+            &root,
+            &[
+                Importer {
+                    path: "app",
+                    name: "app",
+                    deps: vec![("mongoose", "^9.8.0", "9.9.1")],
+                },
+                Importer {
+                    path: "legacy",
+                    name: "legacy",
+                    deps: vec![("mongoose", hyphen, "9.8.0")],
+                },
+            ],
+        )?;
+        std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+        let settled = moved(
+            &lock,
+            "app",
+            "mongoose",
+            ("^9.8.0", "9.9.1"),
+            ("^9.8.0", "9.9.3"),
+        );
+        let settled = moved(
+            &settled,
+            "legacy",
+            "mongoose",
+            (hyphen, "9.8.0"),
+            (hyphen, "9.9.3"),
+        );
+        std::fs::write(root.join("settled.yaml"), &settled)?;
+        let script = fake_pnpm(
+            &root,
+            indoc! {r#"
+                  *" update "*)
+                    cp settled.yaml pnpm-lock.yaml; exit 0 ;;
+            "#},
+        )?;
+        let tool = tool_with(&script)?;
+        let plan = Plan {
+            changes: vec![change("mongoose", "9.9.1", "9.9.3", &[("app", "app")])],
+            excluded_members: vec![member("legacy", "legacy")],
+            ..Plan::default()
+        };
+
+        let report = apply(&tool, &project(&root), plan).await?;
+
+        // The acceptance policy is unchanged: an unprovable range is no proof of drift.
+        assert_eq!(applied_names(&report), vec!["mongoose"]);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        assert_eq!(read(&root, "pnpm-lock.yaml")?, settled);
+        let [warning] = report.warnings.as_slice() else {
+            panic!("the excluded move is reported once: {:?}", report.warnings);
+        };
+        assert_eq!(warning.kind, DiagnosticKind::ExcludedMoved);
+        assert_eq!(warning.package.as_deref(), Some("mongoose"));
+        assert!(
+            warning
+                .message
+                .contains("mongoose in legacy (9.8.0 → 9.9.3)"),
+            "{}",
+            warning.message
+        );
+        // Only the wording changes: nothing proved 9.9.3 inside the hyphen range.
+        assert!(
+            !warning.message.contains("within the range"),
+            "{}",
+            warning.message
+        );
+        Ok(())
+    }
+
+    /// The control for the repair case above: a filtered update that succeeds moves only the
+    /// importers it selects, so the excluded copy stays put, no repair runs, and nothing reports
+    /// an excluded move.
+    #[tokio::test]
+    async fn a_filtered_update_leaves_an_excluded_importers_copy_in_place() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let lock = mongoose_workspace(&root, "9.9.1")?;
+        let app_only = moved(
+            &lock,
+            "app",
+            "mongoose",
+            ("^9.8.0", "9.9.1"),
+            ("^9.8.0", "9.9.3"),
+        );
+        std::fs::write(root.join("app-only.yaml"), &app_only)?;
+        let script = fake_pnpm(
+            &root,
+            indoc! {r#"
+                  *" update "*)
+                    cp app-only.yaml pnpm-lock.yaml; exit 0 ;;
+            "#},
+        )?;
+        let tool = tool_with(&script)?;
+        let plan = Plan {
+            changes: vec![change("mongoose", "9.9.1", "9.9.3", &[("app", "app")])],
+            excluded_members: vec![member("legacy", "legacy")],
+            ..Plan::default()
+        };
+        let project = Project {
+            exclude_newer: Some("2024-01-01T00:00:00Z".to_string()),
+            ..project(&root)
+        };
+
+        let report = apply(&tool, &project, plan).await?;
+
+        // One filtered update that never names the excluded importer, and no repair
+        let legs = legs(&root);
+        let [update] = legs.as_slice() else {
+            panic!("only the filtered update runs: {legs:?}");
+        };
+        assert!(update.contains("--filter ./app"), "{update}");
+        assert!(!update.contains("legacy"), "{update}");
+
+        // The included importer lands; the excluded one keeps 9.8.0 and nothing is reported.
+        assert_eq!(applied_names(&report), vec!["mongoose"]);
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        assert_eq!(read(&root, "pnpm-lock.yaml")?, app_only);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
         Ok(())
     }
 

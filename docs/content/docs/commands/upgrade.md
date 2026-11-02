@@ -91,13 +91,17 @@ in the importer's lock entry, but `pnpm update` has no install field to advance,
 cannot help because the declared range already admits the target — the row says so and names the
 change that lets it move: a library adds the package to `devDependencies` as well, an application
 (`private: true`) moves the entry to `dependencies`. Importers the run excludes are not
-part of that contract: `pnpm update <name>@<target>` re-resolves the named package in *every*
-importer whose range admits a newer version, whatever `--filter` it carried — the filtered importers
-get the exact target, every other one the newest version its own range admits under the release-age
-floor (verified against pnpm 10). That is the resolver's doing, not a pin cooldown placed — the
-excluded importer's manifest is never rewritten and it is never named in the update — and refusing
-it would let the excluded subtree veto the upgrade, so the move is committed and reported as an
-`excluded_moved` warning naming the importer and the package. A package the resolver itself splits — one it was not asked
+part of that contract. The filtered `pnpm update` never names them, but when pnpm's native
+release-age gate rejects the starting lock, or the targeted update leaves the lock inconsistent,
+cooldown repairs the resolve with an unfiltered install under temporary overrides for the planned
+targets, scoped to each target's major line. pnpm applies those overrides to every declaration
+whose range intersects that line, so an excluded importer can move to the target, even when its
+range admits a newer version; a version its range provably excludes is never committed. The excluded importer's manifest is never rewritten, and refusing the
+move would let the excluded subtree veto the upgrade, so it is committed and reported as an
+`excluded_moved` warning naming the importer and the package; the warning says the move stayed
+within the declared range only when cooldown can prove it. An excluded importer's exact
+manifest pin is still protected: a repair that would move it holds the responsible candidate
+instead. A package the resolver itself splits — one it was not asked
 to pin, floated in only some importers — is never committed: the batch is refused with the split
 named, and candidate isolation holds the candidate whose landing caused it (a resolver-conflict row
 carrying that detail) while the rest of the batch lands. A split whose managed
@@ -242,8 +246,8 @@ When `upgrade` holds a cross-major update back, it explains the required action:
   versions converges on a target it admits. An importer the run excludes (`exclude-folders`,
   `exclude-packages`, a `-C` selection) contributes no range and no version to this judgment, so
   a copy cooldown was told to ignore cannot hold an update in an included importer; the report
-  says when such a copy is left behind on its old version, or re-resolved within its own range
-  because pnpm's update reaches every importer whose range admits a newer version. Pass `--rewrite`
+  says when such a copy is left behind on its old version, or moved within its own range because
+  cooldown's override repair reaches every importer whose range intersects the override. Pass `--rewrite`
   to converge a genuine
   split: every declaring importer's range is widened to admit the target and the name is pinned
   there. A name planned at two targets (a `^22` and a `^25` line each advancing within itself

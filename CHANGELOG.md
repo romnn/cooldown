@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **The `excluded_moved` warning no longer credits pnpm for a move cooldown's repair makes.** The
+  warning for an excluded workspace member whose copy moved under an unchanged declaration said
+  pnpm's update re-resolves the package in every importer whatever the filter, and that the copy
+  went to the newest version its range admits. Against pnpm 11.8.0 a filtered update left the
+  excluded copy in place; the move observed came from cooldown's override repair, which runs when
+  pnpm's native release-age gate rejects the starting lock or the targeted update leaves the lock
+  inconsistent. The repair re-resolves the whole workspace under temporary overrides for the
+  planned targets, so it lands the planned target, which can be older than the newest version the
+  range admits. The warning now states only what happened (`the resolve moved chalk in pkgs/a
+  (4.1.0 → 4.1.2) within the range that excluded importer declares; its manifest was not
+  touched`), and says the move stayed in range only when cooldown can prove it: under a
+  declaration it cannot judge, such as a hyphen range, the warning makes no range claim. The
+  `upgrade` docs describe the repair. The kind, the package it carries, and when it fires are
+  unchanged, and an excluded member's exact manifest pin is still refused rather than moved.
+
 - **A literal package rule beats a glob in the same config file, whatever the table order.**
   Two matching `[package."…"]` rules of one layer used to tie, and the tie went to whichever
   pattern sorted first as text, so with `[package."@corp/*"] latest = true` beside
