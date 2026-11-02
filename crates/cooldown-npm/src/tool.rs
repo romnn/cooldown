@@ -6334,6 +6334,107 @@ packages:
         Ok(())
     }
 
+    /// npm holds a `v`-prefixed or spaced hidden pin up front like a bare one: a lone held
+    /// candidate runs no npm command at all and leaves every byte in place, and `--rewrite` lands
+    /// it on an exact pin of the target, never a caret.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn npm_holds_a_prefixed_hidden_pin_without_running_npm() -> eyre::Result<()> {
+        for (prefix, rewritten) in [("v", ""), ("=v", "="), ("= v", "=")] {
+            let dir = tempfile::tempdir()?;
+            let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+                .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+            let script = current_line_fallback_fixture(&root)?;
+            let pin = format!("{prefix}1.0.0");
+            let manifest = indoc::formatdoc! {r#"
+                {{
+                  "name": "app",
+                  "dependencies": {{ "dom": "^1.0.0", "safe": "^1.0.0" }},
+                  "devDependencies": {{ "dom": "{pin}" }}
+                }}
+            "#};
+            std::fs::write(root.join("package.json"), &manifest)?;
+            let lock = std::fs::read_to_string(root.join("package-lock.json"))?.replace(
+                r#""dependencies": { "dom": "^1.0.0", "safe": "^1.0.0" } }"#,
+                &format!(
+                    r#""dependencies": {{ "dom": "^1.0.0", "safe": "^1.0.0" }}, "devDependencies": {{ "dom": "{pin}" }} }}"#
+                ),
+            );
+            assert!(lock.contains("devDependencies"), "{lock}");
+            std::fs::write(root.join("package-lock.json"), &lock)?;
+            let mut tool = tool();
+            tool.cmd = crate::nodecmd::NodeCmd::with_bin(script.as_str());
+            let project = Project {
+                root: root.clone(),
+                kind: Npm::ID,
+                manifest: root.join("package.json"),
+                exclude_newer: None,
+                exclude_newer_package: std::collections::BTreeMap::new(),
+                generated_members: cooldown_core::GeneratedMembers::undeclared(),
+            };
+            let plan = |rewrite| Plan {
+                changes: vec![change("dom", "1.0.0", "1.1.0")],
+                rewrite,
+                ..Plan::default()
+            };
+
+            let mutation =
+                PreparedMutation::prepare(&tool, &project, &plan(RewriteMode::Auto)).await?;
+            let report = tool.apply(&mutation).await?;
+
+            assert_eq!(report.applied, [], "{pin}");
+            let [skip] = report.skipped.as_slice() else {
+                eyre::bail!("{pin}: one held candidate: {:?}", report.skipped)
+            };
+            assert_eq!(skip.reason, SkipReason::PinHeld, "{pin}");
+            assert_eq!(
+                skip.detail.as_deref(),
+                Some(
+                    format!(
+                        "the exact pin {pin} in devDependencies of package.json excludes 1.1.0; \
+                         pass --rewrite to rewrite it, or edit the pin"
+                    )
+                    .as_str()
+                )
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("package.json"))?,
+                manifest
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("package-lock.json"))?,
+                lock
+            );
+            assert!(
+                !root.join("legs.log").exists(),
+                "{pin}: a lone held candidate runs no npm command"
+            );
+
+            let mutation =
+                PreparedMutation::prepare(&tool, &project, &plan(RewriteMode::Always)).await?;
+            let report = tool.apply(&mutation).await?;
+
+            assert!(report.skipped.is_empty(), "{pin}: {:?}", report.skipped);
+            assert_eq!(
+                report
+                    .applied
+                    .iter()
+                    .map(|change| format!("{}@{}", change.package.name, change.to))
+                    .collect::<Vec<_>>(),
+                ["dom@1.1.0"]
+            );
+            let declared = std::fs::read_to_string(root.join("package.json"))?;
+            assert!(
+                declared.contains(&format!(
+                    r#""devDependencies": {{ "dom": "{rewritten}1.1.0" }}"#
+                )),
+                "{declared}"
+            );
+            assert!(declared.contains(r#""dom": "^1.1.0""#), "{declared}");
+        }
+        Ok(())
+    }
+
     /// An npm root declaring `deps` at carets and `pinned` exactly in `devDependencies`, every
     /// package locked at 1.0.0, driven by a scripted npm whose exact pin of a name lands it at the
     /// requested version.
@@ -8513,6 +8614,238 @@ mod whole_graph_tests {
             after.contains(r#""devDependencies": { "happy-dom": "20.14.6" }"#),
             "{after}"
         );
+        Ok(())
+    }
+
+    /// node-semver's `v`-prefixed and spaced spellings of an exact pin, each with the prefix an
+    /// authorized rewrite keeps: a bare spelling becomes the bare target, an `=` one `=target`.
+    const PREFIXED_PIN_SPELLINGS: [(&str, &str); 3] = [("v", ""), ("=v", "="), ("= v", "=")];
+
+    /// A prefixed hidden pin holds a joint upgrade like a bare one, with nothing handed to pnpm,
+    /// even when the plan may rewrite pins for a downgrade; `--rewrite` lands the move and keeps
+    /// the pin exact.
+    #[tokio::test]
+    async fn a_prefixed_hidden_pin_holds_a_joint_pin_until_rewrite() -> eyre::Result<()> {
+        for (prefix, rewritten) in PREFIXED_PIN_SPELLINGS {
+            let (_dir, root) = tempdir_root()?;
+            let pin = format!("{prefix}20.14.5");
+            let lock = hidden_pin_fixture(&root, &pin, "20.14.5")?;
+            let manifest = read(&root, "apps/app/package.json")?;
+            let landed = moved(
+                &lock,
+                "apps/app",
+                "happy-dom",
+                ("^20.11.1", "20.14.5"),
+                ("^20.14.6", "20.14.6"),
+            );
+            std::fs::write(root.join("landed.yaml"), landed)?;
+            let script = fake_pnpm(
+                &root,
+                indoc! {r#"
+                      *"happy-dom@20.14.6"*)
+                        cp landed.yaml pnpm-lock.yaml; exit 0 ;;
+                "#},
+            )?;
+            let tool = tool_with(&script)?;
+            let plan = |rewrite, rewrite_pins| Plan {
+                changes: vec![change(
+                    "happy-dom",
+                    "20.14.5",
+                    "20.14.6",
+                    &HIDDEN_PIN_MEMBERS,
+                )],
+                rewrite,
+                rewrite_pins,
+                ..Plan::default()
+            };
+
+            for rewrite_pins in [false, true] {
+                let report = apply(
+                    &tool,
+                    &project(&root),
+                    plan(RewriteMode::Auto, rewrite_pins),
+                )
+                .await?;
+                assert_eq!(report.applied, [], "{pin}");
+                let [skip] = report.skipped.as_slice() else {
+                    panic!("{pin}: {:?}", report.skipped);
+                };
+                assert_eq!(skip.reason, SkipReason::PinHeld, "{pin}");
+                let detail = skip.detail.as_deref().expect("detail");
+                assert!(
+                    detail.contains(&format!("the exact pin {pin} excludes 20.14.6")),
+                    "{detail}"
+                );
+                assert!(detail.contains("pass --rewrite"), "{detail}");
+                assert_eq!(legs(&root), [] as [String; 0], "{pin}");
+                assert_eq!(read(&root, "apps/app/package.json")?, manifest, "{pin}");
+                assert_eq!(read(&root, "pnpm-lock.yaml")?, lock, "{pin}");
+            }
+
+            let report = apply(&tool, &project(&root), plan(RewriteMode::Always, false)).await?;
+            assert_eq!(applied_names(&report), vec!["happy-dom"], "{pin}");
+            let after = read(&root, "apps/app/package.json")?;
+            assert!(
+                after.contains(&format!(
+                    r#""devDependencies": {{ "happy-dom": "{rewritten}20.14.6" }}"#
+                )),
+                "{after}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A prefixed hidden pin holds a downgrade until the plan may rewrite pins, which then lands
+    /// it on an exact pin of the target and keeps the caret that already admits it.
+    #[tokio::test]
+    async fn a_prefixed_hidden_pin_holds_a_downgrade_until_pins_may_be_rewritten()
+    -> eyre::Result<()> {
+        for (prefix, rewritten) in PREFIXED_PIN_SPELLINGS {
+            let (_dir, root) = tempdir_root()?;
+            let pin = format!("{prefix}20.14.6");
+            let lock = hidden_pin_fixture(&root, &pin, "20.14.6")?;
+            let manifest = read(&root, "apps/app/package.json")?;
+            let landed = moved(
+                &lock,
+                "apps/app",
+                "happy-dom",
+                ("^20.11.1", "20.14.6"),
+                ("^20.11.1", "20.14.5"),
+            );
+            std::fs::write(root.join("landed.yaml"), landed)?;
+            let script = fake_pnpm(
+                &root,
+                indoc! {r#"
+                      *"happy-dom@20.14.5"*)
+                        cp landed.yaml pnpm-lock.yaml; exit 0 ;;
+                "#},
+            )?;
+            let tool = tool_with(&script)?;
+            let plan = |rewrite_pins| Plan {
+                changes: vec![Change {
+                    downgrade: true,
+                    ..change("happy-dom", "20.14.6", "20.14.5", &HIDDEN_PIN_MEMBERS)
+                }],
+                rewrite_pins,
+                ..Plan::default()
+            };
+
+            let held = apply(&tool, &project(&root), plan(false)).await?;
+            assert_eq!(held.applied, [], "{pin}");
+            let [skip] = held.skipped.as_slice() else {
+                panic!("{pin}: {:?}", held.skipped);
+            };
+            assert_eq!(skip.reason, SkipReason::PinHeld, "{pin}");
+            let detail = skip.detail.as_deref().expect("detail");
+            assert!(
+                detail.contains(&format!("the exact pin {pin} excludes 20.14.5")),
+                "{detail}"
+            );
+            assert!(
+                detail.contains("rerun fix with --downgrade-pinned"),
+                "{detail}"
+            );
+            assert_eq!(legs(&root), [] as [String; 0], "{pin}");
+            assert_eq!(read(&root, "apps/app/package.json")?, manifest, "{pin}");
+            assert_eq!(read(&root, "pnpm-lock.yaml")?, lock, "{pin}");
+
+            let landed = apply(&tool, &project(&root), plan(true)).await?;
+            assert_eq!(applied_names(&landed), vec!["happy-dom"], "{pin}");
+            assert!(landed.skipped.is_empty(), "{:?}", landed.skipped);
+            let after = read(&root, "apps/app/package.json")?;
+            assert!(
+                after.contains(&format!(
+                    r#""devDependencies": {{ "happy-dom": "{rewritten}20.14.5" }}"#
+                )),
+                "{after}"
+            );
+            assert!(after.contains(r#""happy-dom": "^20.11.1""#), "{after}");
+        }
+        Ok(())
+    }
+
+    /// A prefixed pin the lock records beside another importer's caret splits the workspace like a
+    /// bare one: the split holds the upgrade as a pin, naming the pin as written, and runs nothing.
+    #[tokio::test]
+    async fn a_prefixed_pin_split_across_importers_is_held_as_a_pin() -> eyre::Result<()> {
+        for pin in ["v20.14.5", "=v20.14.5", "= v20.14.5"] {
+            let (_dir, root) = tempdir_root()?;
+            let lock = workspace(
+                &root,
+                &[
+                    Importer {
+                        path: "apps/pinned",
+                        name: "pinned",
+                        deps: vec![("happy-dom", pin, "20.14.5")],
+                    },
+                    Importer {
+                        path: "apps/caret",
+                        name: "caret",
+                        deps: vec![("happy-dom", "^20.11.1", "20.14.5")],
+                    },
+                ],
+            )?;
+            std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+            let pinned = read(&root, "apps/pinned/package.json")?;
+            let tool = tool_with(&fake_pnpm(&root, "")?)?;
+            let plan = Plan {
+                changes: vec![change(
+                    "happy-dom",
+                    "20.14.5",
+                    "20.14.6",
+                    &[("pinned", "apps/pinned"), ("caret", "apps/caret")],
+                )],
+                ..Plan::default()
+            };
+
+            let report = apply(&tool, &project(&root), plan).await?;
+
+            assert_eq!(report.applied, [], "{pin}");
+            let [skip] = report.skipped.as_slice() else {
+                panic!("{pin}: {:?}", report.skipped);
+            };
+            assert_eq!(skip.reason, SkipReason::PinHeld, "{pin}");
+            let detail = skip.detail.as_deref().expect("detail");
+            assert!(
+                detail.contains(&format!("the exact pin {pin} excludes 20.14.6")),
+                "{detail}"
+            );
+            assert_eq!(legs(&root), [] as [String; 0], "{pin}");
+            assert_eq!(read(&root, "apps/pinned/package.json")?, pinned, "{pin}");
+            assert_eq!(read(&root, "pnpm-lock.yaml")?, lock, "{pin}");
+        }
+        Ok(())
+    }
+
+    /// A prefixed pin the lock records for every declaring importer pins the dependency as a whole,
+    /// so the planner holds it at its current version like a bare pin.
+    #[tokio::test]
+    async fn a_prefixed_lock_pin_is_reported_pinned() -> eyre::Result<()> {
+        for pin in ["20.14.5", "v20.14.5", "=v20.14.5", "= v20.14.5"] {
+            let (_dir, root) = tempdir_root()?;
+            let lock = workspace(
+                &root,
+                &[Importer {
+                    path: ".",
+                    name: "app",
+                    deps: vec![
+                        ("happy-dom", pin, "20.14.5"),
+                        ("lodash", "^4.17.20", "4.17.20"),
+                    ],
+                }],
+            )?;
+            std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+            let tool = tool_with(&fake_pnpm(&root, "")?)?;
+
+            let deps = tool.dependencies(&project(&root), DepScope::Direct).await?;
+
+            let pinned: BTreeSet<&str> = deps
+                .iter()
+                .filter(|dep| dep.pinned)
+                .map(|dep| dep.package.name.as_str())
+                .collect();
+            assert_eq!(pinned, BTreeSet::from(["happy-dom"]), "{pin}");
+        }
         Ok(())
     }
 

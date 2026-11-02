@@ -55,6 +55,10 @@ per importer). That row is `pin_held` and names the pin; pass `--rewrite` to rew
 yourself. Under `fix`, `--downgrade-pinned` rewrites such a pin downward, except a pin beside
 another workspace member's range on pnpm, which only an edit reconciles; a held downgrade fails
 `fix --strict`, while a held forward move never fails `upgrade --strict`.
+An exact pin is any spelling npm reads as one version: `1.2.3`, `=1.2.3`, `v1.2.3`, or
+`= v1.2.3`. A rewrite keeps it exact, writing the bare target for a bare spelling and `=target` for
+an `=` spelling, and leaves a pin that already admits the target as written; a range that only
+carries a `v` (`^v1.2.3`, `>=v1`) is not a pin.
 
 The lock-only default is honored where the tool can pin an exact in-range version without editing the manifest:
 

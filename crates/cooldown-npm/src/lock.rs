@@ -2740,7 +2740,7 @@ fn strip_trailing_commas(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
 
     fn sorted(mut entries: Vec<NameVersion>) -> Vec<NameVersion> {
         entries.sort();
@@ -3926,6 +3926,53 @@ packages:
         assert!(!is_exact_npm_specifier(">=2.0.0"));
         assert!(!is_exact_npm_specifier("2.x"));
         assert!(!is_exact_npm_specifier("workspace:*"));
+        // node-semver's prefixed and spaced spellings are the same exact pin.
+        assert!(is_exact_npm_specifier("v2.11.0"));
+        assert!(is_exact_npm_specifier("=v2.11.0"));
+        assert!(is_exact_npm_specifier("= v2.11.0"));
+        assert!(!is_exact_npm_specifier("^v2.11.0"));
+        assert!(!is_exact_npm_specifier("v2.x"));
+    }
+
+    /// A prefixed or spaced pin counts as exact in both lock formats' pin detection, so a
+    /// dependency every member pins that way is pinned as a whole.
+    #[test]
+    fn prefixed_lock_specifiers_are_exact_pins() {
+        for pin in ["v2.11.0", "=v2.11.0", "= v2.11.0"] {
+            let pnpm = formatdoc! {"
+                importers:
+
+                  apps/a:
+                    dependencies:
+                      pinned:
+                        specifier: {pin}
+                        version: 2.11.0
+
+                packages:
+
+                  pinned@2.11.0:
+                    resolution: {{integrity: sha512-x}}
+            "};
+            assert!(
+                parse_pnpm_exact_pins(&pnpm, &HashSet::new())
+                    .contains(&("pinned".to_string(), "2.11.0".to_string())),
+                "{pin}"
+            );
+            let npm = serde_json::json!({
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "dependencies": { "pinned": pin, "loose": "^1.0.0" } },
+                    "node_modules/pinned": { "version": "2.11.0" },
+                    "node_modules/loose": { "version": "1.0.0" }
+                }
+            })
+            .to_string();
+            assert_eq!(
+                parse_npm_exact_pins(&npm, &HashSet::new()),
+                HashSet::from(["pinned".to_string()]),
+                "{pin}"
+            );
+        }
     }
 
     #[test]
