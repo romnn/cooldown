@@ -15,8 +15,8 @@
 //!
 //! # Determinism
 //!
-//! The freeze pins the resolution clock as in `convergence_cargo.rs`; the lock is seeded at
-//! "newest now" and the `bitflags 2` line rolled down to the newest release under the freeze, so
+//! The freeze pins the resolution clock as in `convergence_cargo.rs`; the lock is seeded as of an
+//! instant at which the `bitflags 2` line's newest release is the newest one under the freeze, so
 //! the cross-major target of the `1.x` line is the same node the `2` line already holds and the
 //! move is a clean unification rather than a resolver-order question.
 
@@ -30,7 +30,7 @@
 mod support;
 
 use indoc::indoc;
-use support::Fixture;
+use support::{CargoAsOf, Fixture, REGISTRY_HISTORY};
 
 /// The absolute resolution cutoff (the instant `convergence_cargo.rs` uses): crates.io history
 /// before it is immutable. `bitflags 2.5.0` (2024-03) is the newest `2.x` release under it, and
@@ -38,8 +38,15 @@ use support::Fixture;
 const FREEZE: &str = "2024-06-01T00:00:00Z";
 
 /// The newest `bitflags 2.x` release under [`FREEZE`]: the target of the `1.x` line's cross-major
-/// move, and the version the `2` line is rolled down to so that move unifies onto it.
+/// move, and the version the `2` line is seeded at so that move unifies onto it.
 const BITFLAGS_UNDER_FREEZE: &str = "2.5.0";
+
+/// The seed is the newest graph between `bitflags` [`BITFLAGS_UNDER_FREEZE`] (2024-03-19) and 2.6.0
+/// (2024-06-24); the run horizon is the instant the scenario was written.
+const HAKARI_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2024-05-01T00:00:00Z",
+    run: "2026-09-14T12:29:14Z",
+};
 
 const ROOT_MANIFEST: &str = indoc! {r#"
     [workspace]
@@ -121,10 +128,10 @@ fn lock_versions_of(crate_name: &str, lock: &[u8]) -> Vec<String> {
     versions
 }
 
-/// Seeds the workspace and its lock: resolve at "newest now" with the real cargo, then roll the
-/// `bitflags 2` line down to the newest release under the freeze.
+/// Seeds the workspace and its lock: resolve with the real cargo as of [`HAKARI_AS_OF`], whose
+/// newest `bitflags 2` release is the newest one under the freeze.
 fn hakari_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(HAKARI_AS_OF);
     fixture
         .write("Cargo.toml", ROOT_MANIFEST)
         .write("crates/app/Cargo.toml", APP_MANIFEST)
@@ -138,27 +145,10 @@ fn hakari_fixture() -> Fixture {
     fixture
         .run_tool("cargo", &["generate-lockfile"], &[])
         .expect_success();
-    let newest_two = lock_versions_of("bitflags", &fixture.read_bytes("Cargo.lock"))
-        .into_iter()
-        .find(|version| version.starts_with("2."))
-        .expect("lib seeds a bitflags 2.x line");
-    fixture
-        .run_tool(
-            "cargo",
-            &[
-                "update",
-                "-p",
-                &format!("bitflags@{newest_two}"),
-                "--precise",
-                BITFLAGS_UNDER_FREEZE,
-            ],
-            &[],
-        )
-        .expect_success();
     assert_eq!(
         lock_versions_of("bitflags", &fixture.read_bytes("Cargo.lock")),
         ["1.3.2", BITFLAGS_UNDER_FREEZE],
-        "the seed holds both bitflags lines"
+        "the seed horizon holds both bitflags lines; {REGISTRY_HISTORY}"
     );
     fixture
 }

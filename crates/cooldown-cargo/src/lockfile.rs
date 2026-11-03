@@ -284,6 +284,86 @@ fn without_precise(source: &str) -> &str {
     source.split_once('#').map_or(source, |(base, _)| base)
 }
 
+/// Resolves the dependency entries of a lock's packages to the blocks they bind.
+///
+/// A dependency entry is `"name"` when the name is unique in the lock, `"name x.y.z"` when several
+/// versions coexist, and `"name x.y.z (source)"` when several sources do — with a git source
+/// spelled *without* the `#commit` the package block carries, so sources are compared with that
+/// fragment stripped.
+struct EntryIndex<'lock> {
+    lock: &'lock CargoLock,
+    by_name: HashMap<&'lock str, Vec<usize>>,
+}
+
+impl<'lock> EntryIndex<'lock> {
+    fn new(lock: &'lock CargoLock) -> Self {
+        let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (index, package) in lock.package.iter().enumerate() {
+            by_name
+                .entry(package.name.as_str())
+                .or_default()
+                .push(index);
+        }
+        EntryIndex { lock, by_name }
+    }
+
+    /// The index of the block `entry` binds, or `None` when the entry is ambiguous or dangling.
+    fn resolve(&self, entry: &str) -> Option<usize> {
+        let (name, remainder) = entry.split_once(' ').unwrap_or((entry, ""));
+        let candidates = self.by_name.get(name)?;
+        if remainder.is_empty() {
+            return match candidates.as_slice() {
+                [only] => Some(*only),
+                _ => None,
+            };
+        }
+        let version = remainder.split(' ').next().unwrap_or(remainder);
+        let source = remainder
+            .split_once(" (")
+            .and_then(|(_, source)| source.strip_suffix(')'))
+            .map(without_precise);
+        candidates.iter().copied().find(|&index| {
+            self.lock.package.get(index).is_some_and(|package| {
+                package.version.as_deref() == Some(version)
+                    && source.is_none_or(|source| {
+                        package.source.as_deref().map(without_precise) == Some(source)
+                    })
+            })
+        })
+    }
+}
+
+/// One dependency an authored local package declares, as the exact node its lock entry binds.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct DeclaredEndpoint {
+    /// The authored package whose dependency list carries the entry.
+    pub(crate) dependent: LockPackageId,
+    /// The node the entry binds.
+    pub(crate) endpoint: LockPackageId,
+}
+
+/// The [`DeclaredEndpoint`]s of one lock (see [`CargoLock::declared_endpoints`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DeclaredEndpoints(BTreeSet<DeclaredEndpoint>);
+
+impl DeclaredEndpoints {
+    /// Whether some authored package declares the node `name@version` from the lock `source`.
+    pub(crate) fn declares(&self, name: &str, version: &str, source: &str) -> bool {
+        let node = LockPackageId::new(name, version, Some(source));
+        self.0.iter().any(|declared| declared.endpoint == node)
+    }
+
+    /// Whether this lock carries `declared` too: the same dependent binding the same node.
+    pub(crate) fn contains(&self, declared: &DeclaredEndpoint) -> bool {
+        self.0.contains(declared)
+    }
+
+    /// The declarations in their sorted order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &DeclaredEndpoint> {
+        self.0.iter()
+    }
+}
+
 /// The blocks each walk of [`CargoLock::reachability`] visits, by index into the lock.
 struct LockReachability {
     authored: HashSet<usize>,
@@ -306,21 +386,37 @@ impl CargoLock {
         })
     }
 
-    /// The names the authored local packages list among their own dependencies.
+    /// Every dependency the authored local packages declare, each as the exact node its lock entry
+    /// binds.
     ///
     /// Every path or workspace package counts except a generated member, whose entries only mirror
     /// what the authored members already reach.
-    pub(crate) fn authored_dependency_names(&self, generated: &GeneratedMembers) -> HashSet<&str> {
-        self.package
-            .iter()
-            .filter(|package| package.source.is_none() && !generated.contains(&package.name))
-            .flat_map(|package| &package.dependencies)
-            .map(|entry| {
-                entry
-                    .split_once(' ')
-                    .map_or(entry.as_str(), |(name, _)| name)
-            })
-            .collect()
+    /// Each entry resolves to one concrete `(name, version, source)`, so a workspace that declares
+    /// `syn` 1 while `syn` 2 is only transitive declares the 1.x node alone.
+    pub(crate) fn declared_endpoints(&self, generated: &GeneratedMembers) -> DeclaredEndpoints {
+        let entries = EntryIndex::new(self);
+        let mut endpoints = BTreeSet::new();
+        for package in &self.package {
+            if package.source.is_some() || generated.contains(&package.name) {
+                continue;
+            }
+            let Some(dependent) = package.id() else {
+                continue;
+            };
+            for entry in &package.dependencies {
+                if let Some(endpoint) = entries
+                    .resolve(entry)
+                    .and_then(|position| self.package.get(position))
+                    .and_then(LockPackage::id)
+                {
+                    endpoints.insert(DeclaredEndpoint {
+                        dependent: dependent.clone(),
+                        endpoint,
+                    });
+                }
+            }
+        }
+        DeclaredEndpoints(endpoints)
     }
 
     /// Every crates.io version the lock carries of `name`.
@@ -430,46 +526,12 @@ impl CargoLock {
 
     /// Walks the lock's dependency lists twice: from the authored members without stepping
     /// through a generated one, and from the generated members alone.
-    ///
-    /// A dependency entry is `"name"` when the name is unique in the lock, `"name x.y.z"` when
-    /// several versions coexist, and `"name x.y.z (source)"` when several sources do — with a
-    /// git source spelled *without* the `#commit` the package block carries, so sources are
-    /// compared with that fragment stripped.
     fn reachability(
         &self,
         authored: &[LockPackageId],
         generated: &[LockPackageId],
     ) -> LockReachability {
-        let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
-        for (index, package) in self.package.iter().enumerate() {
-            by_name
-                .entry(package.name.as_str())
-                .or_default()
-                .push(index);
-        }
-        let resolve = |entry: &str| -> Option<usize> {
-            let (name, remainder) = entry.split_once(' ').unwrap_or((entry, ""));
-            let candidates = by_name.get(name)?;
-            if remainder.is_empty() {
-                return match candidates.as_slice() {
-                    [only] => Some(*only),
-                    _ => None,
-                };
-            }
-            let version = remainder.split(' ').next().unwrap_or(remainder);
-            let source = remainder
-                .split_once(" (")
-                .and_then(|(_, source)| source.strip_suffix(')'))
-                .map(without_precise);
-            candidates.iter().copied().find(|&index| {
-                self.package.get(index).is_some_and(|package| {
-                    package.version.as_deref() == Some(version)
-                        && source.is_none_or(|source| {
-                            package.source.as_deref().map(without_precise) == Some(source)
-                        })
-                })
-            })
-        };
+        let entries = EntryIndex::new(self);
         let members_of = |identities: &[LockPackageId]| -> Vec<usize> {
             self.package
                 .iter()
@@ -499,7 +561,7 @@ impl CargoLock {
                     package
                         .dependencies
                         .iter()
-                        .filter_map(|entry| resolve(entry)),
+                        .filter_map(|entry| entries.resolve(entry)),
                 );
             }
             seen

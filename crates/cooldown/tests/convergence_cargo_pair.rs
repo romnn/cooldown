@@ -9,12 +9,20 @@ mod support;
 
 use color_eyre::eyre;
 use indoc::formatdoc;
-use support::Fixture;
+use support::{CargoAsOf, Fixture};
 
 const FREEZE: &str = "2023-09-21T00:00:00Z";
 
+/// The seed resolves as of the freeze, below the historical pins the fixture rolls rayon back to;
+/// the run horizon is the instant the scenario was written, so cooldown's own resolves still float
+/// `rayon-core` and the crossbeam crates to the fresh releases it has to cool.
+const PAIR_AS_OF: CargoAsOf = CargoAsOf {
+    seed: FREEZE,
+    run: "2026-10-09T16:10:16Z",
+};
+
 fn pair_fixture(core_requirement: &str) -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(PAIR_AS_OF);
     fixture
         .write(
             "Cargo.toml",
@@ -108,8 +116,10 @@ fn assert_converged_pair(
 #[test]
 fn caret_companion_reconciles_fresh_transitives_and_converges() -> eyre::Result<()> {
     skip_if_missing!("cargo", Ok(()));
-    // Core ^1.11 admits the September pair and today's newer patches and minor releases.
-    // Cargo has no date cutoff, so floated core and crossbeam nodes must be cooled after resolving.
+    // Core ^1.11 admits the September pair and the newer patches and minor releases of the run
+    // horizon.
+    // Cargo has no date cutoff of its own, so floated core and crossbeam nodes must be cooled after
+    // resolving.
     let fixture = pair_fixture("^1.11.0");
     assert_converged_pair(&fixture, "1.8.0", "1.12.0")
 }
