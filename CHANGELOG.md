@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **An npm alias in a lockfile v1 is read as its target, not as a version of the alias name.**
+  A v1 `package-lock.json` records `"foo": "npm:other@2.0.0"` as an entry `foo` at version
+  `npm:other@2.0.0`, which cooldown took verbatim, so the alias target never reached evaluation.
+  cooldown now reads such an entry as `other@2.0.0` with its `resolved` origin, scoped targets
+  included, and skips a `file:`, git, or tarball entry, which names no registry release. A
+  release only an alias installs is never direct and takes no declared bound from the root's own
+  `other` declaration, unless a genuine registry copy of the same release sits under `other`
+  itself. `upgrade` and `fix` skip such a release as not eligible instead of rewriting that
+  unrelated declaration, and, for any npm lock version, an alias's release no longer proves or
+  hides the landing of a move of the genuine `other`.
+
 - **A git-sourced Bun package no longer reads as a registry package that does not exist.**
   cooldown split each `bun.lock` identity at its last `@`, so `pkg@git+ssh://git@github.com/…`
   became a package named `pkg@git+ssh://git` at a version with no `:`, which the non-registry
