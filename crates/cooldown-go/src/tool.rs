@@ -1,5 +1,5 @@
-//! The Go [`Tool`]: a thin adapter shell over Go-specific graph reading, release discovery, and
-//! `go`-driven apply/build helpers.
+//! The Go [`Tool`](cooldown_core::Tool): a thin adapter shell over Go-specific
+//! graph reading, release discovery, and `go`-driven apply/build helpers.
 
 mod apply;
 mod graph;

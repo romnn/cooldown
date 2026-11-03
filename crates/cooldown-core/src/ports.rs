@@ -201,7 +201,7 @@ pub trait ToolRead: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the manifest or lock cannot be read or parsed.
+    /// Returns a [`CoreError`] if the manifest or lock cannot be read or parsed.
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>>;
 
     /// Non-fatal observations about `project`'s manifests that a reporting command surfaces as
@@ -218,7 +218,7 @@ pub trait ToolRead: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the manifests or graph the observations
+    /// Returns a [`CoreError`] if the manifests or graph the observations
     /// need cannot be read.
     async fn manifest_notices(&self, _project: &Project) -> Result<Vec<crate::Diagnostic>> {
         Ok(Vec::new())
@@ -233,7 +233,7 @@ pub trait ToolRead: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the lock or a manifest cannot be read.
+    /// Returns a [`CoreError`] if the lock or a manifest cannot be read.
     async fn declarations(
         &self,
         _project: &Project,
@@ -253,7 +253,7 @@ pub trait ToolRead: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if a lock or manifest cannot be re-read.
+    /// Returns a [`CoreError`] if a lock or manifest cannot be re-read.
     async fn rescope_members(
         &self,
         project: &Project,
@@ -275,7 +275,7 @@ pub trait ToolRead: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the manifest cannot be read or parsed.
+    /// Returns a [`CoreError`] if the manifest cannot be read or parsed.
     async fn manifest_constraints(&self, _project: &Project) -> Result<Vec<Dependency>> {
         Ok(Vec::new())
     }
@@ -288,15 +288,16 @@ pub trait ToolRead: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the native config exists but cannot be parsed.
+    /// Returns a [`CoreError`] if the native config exists but cannot be parsed.
     async fn native_policy(&self, project: &Project) -> Result<Option<NativePolicyLayer>>;
 
     /// Verifies the lock is current relative to its manifest — the fail-closed `check` precondition.
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) when the probe itself fails. A known stale lock or
-    /// unsupported currency proof is reported in the [`LockVerifyReport`].
+    /// Returns a [`CoreError`] when the probe itself fails.
+    /// A known stale lock or unsupported currency proof is reported in the
+    /// [`LockVerifyReport`].
     async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport>;
 
     /// The files outside the lock that a current lock resolves against, as absolute paths:
@@ -310,7 +311,7 @@ pub trait ToolRead: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) when the lock cannot be read.
+    /// Returns a [`CoreError`] when the lock cannot be read.
     async fn lock_inputs(&self, _project: &Project) -> Result<Vec<Utf8PathBuf>> {
         Ok(Vec::new())
     }
@@ -348,7 +349,7 @@ pub trait ReleaseFetcher: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the registry lookup fails.
+    /// Returns a [`CoreError`] if the registry lookup fails.
     async fn releases(
         &self,
         dep: &Dependency,
@@ -371,7 +372,7 @@ pub trait ReleaseFetcher: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the locked version cannot be read or its
+    /// Returns a [`CoreError`] if the locked version cannot be read or its
     /// publish instant cannot be resolved.
     async fn locked_release(&self, dep: &Dependency, fetch: &FetchContext<'_>) -> Result<Release>;
 
@@ -944,7 +945,7 @@ pub trait ToolWrite: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the relevant local files cannot be read.
+    /// Returns a [`CoreError`] if the relevant local files cannot be read.
     async fn mutation_journal(
         &self,
         project: &Project,
@@ -960,7 +961,7 @@ pub trait ToolWrite: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if a baseline file exists but cannot be read.
+    /// Returns a [`CoreError`] if a baseline file exists but cannot be read.
     async fn mutation_baseline(
         &self,
         _project: &Project,
@@ -980,15 +981,15 @@ pub trait ToolWrite: Send + Sync {
     /// (the npm-family peer verification does), provided every rejected candidate is reported as
     /// a skip and the tree it returns is consistent — never a partially-applied state the caller
     /// cannot see. An adapter should still return only changes it believes reached their exact
-    /// [`Change::to`](crate::model::Change::to) target, plus any collateral lock diff it can
+    /// [`Change::to`] target, plus any collateral lock diff it can
     /// derive from the before/after lock state. Skips are reported as `Ok` data in the
     /// [`ApplyReport`], not errors.
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::LockConflict`](crate::CoreError::LockConflict) when the prepared
+    /// Returns [`CoreError::LockConflict`] when the prepared
     /// project's identity or writable topology changed.
-    /// Returns another [`CoreError`](crate::CoreError) if the manifest cannot be rewritten or
+    /// Returns another [`CoreError`] if the manifest cannot be rewritten or
     /// re-locking fails.
     async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport>;
 
@@ -1002,7 +1003,7 @@ pub trait ToolWrite: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the journal postimage cannot be captured.
+    /// Returns a [`CoreError`] if the journal postimage cannot be captured.
     /// The adapter's own apply error remains inside [`ApplyAttemptOutcome::Finished`] so the caller
     /// receives the postimage even after a failed resolver mutates files.
     async fn apply_with_observer(
@@ -1022,7 +1023,7 @@ pub trait ToolWrite: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the build/sync invocation itself fails to run;
+    /// Returns a [`CoreError`] if the build/sync invocation itself fails to run;
     /// a failed build is reported in the [`VerifyReport`].
     async fn build(&self, project: &Project) -> Result<VerifyReport>;
 
@@ -1035,7 +1036,7 @@ pub trait ToolWrite: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the package manager cannot be spawned or
+    /// Returns a [`CoreError`] if the package manager cannot be spawned or
     /// rejects the refresh — a failed refresh establishes nothing about the lock, so it must stay
     /// fatal even where a *stale* lock may be waved through (`--allow-stale-lock`), exactly like
     /// a [`verify_lock_current`](ToolRead::verify_lock_current) probe that cannot run.
@@ -1056,7 +1057,7 @@ pub trait ToolWrite: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the lock still does not resolve, for the same
+    /// Returns a [`CoreError`] if the lock still does not resolve, for the same
     /// reason a failed [`refresh_lock`](ToolWrite::refresh_lock) is fatal.
     async fn refresh_conflicted_lock(
         &self,
@@ -1090,7 +1091,7 @@ pub trait ToolWrite: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) describing the pending transaction.
+    /// Returns a [`CoreError`] describing the pending transaction.
     async fn ensure_no_pending_mutation(&self, _project: &Project) -> Result<()> {
         Ok(())
     }
@@ -1104,7 +1105,7 @@ pub trait ToolWrite: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if pending state cannot be validated or recovered.
+    /// Returns a [`CoreError`] if pending state cannot be validated or recovered.
     async fn recover_pending_mutation(
         &self,
         _project: &Project,
@@ -1122,7 +1123,7 @@ pub trait ToolWrite: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the adapter's edge-bearing lock state cannot be
+    /// Returns a [`CoreError`] if the adapter's edge-bearing lock state cannot be
     /// read.
     async fn lock_edge_snapshot(&self, _project: &Project) -> Result<Option<Vec<u8>>> {
         Ok(None)
@@ -1142,7 +1143,7 @@ pub trait ToolWrite: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the package manager cannot be spawned, the
+    /// Returns a [`CoreError`] if the package manager cannot be spawned, the
     /// lock cannot be read, or the metadata the policy's requirement checks need cannot be fetched
     /// — a failed prerequisite must surface as the project error it is, never as a successful
     /// no-op.
@@ -1176,7 +1177,7 @@ pub trait ToolWrite: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the native config cannot be written.
+    /// Returns a [`CoreError`] if the native config cannot be written.
     async fn write_native(
         &self,
         _project: &Project,
@@ -1211,7 +1212,7 @@ pub trait ToolWrite: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the repo-level native config cannot be written.
+    /// Returns a [`CoreError`] if the repo-level native config cannot be written.
     async fn write_repo_native(
         &self,
         _repo_root: &Utf8Path,
@@ -1415,7 +1416,7 @@ pub trait PackageRegistry: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the registry is unreachable or its response
+    /// Returns a [`CoreError`] if the registry is unreachable or its response
     /// cannot be parsed.
     async fn releases(&self, package: &crate::model::PackageId) -> Result<Vec<RawRelease>>;
 
@@ -1428,7 +1429,7 @@ pub trait PackageRegistry: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the registry lookup fails.
+    /// Returns a [`CoreError`] if the registry lookup fails.
     async fn published_at(
         &self,
         pkg: &crate::model::PackageId,

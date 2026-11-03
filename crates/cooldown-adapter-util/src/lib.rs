@@ -186,7 +186,7 @@ pub fn skipped_on_apply_error(change: &Change, error: CoreError) -> Result<Skipp
 ///
 /// # Errors
 ///
-/// Returns a [`CoreError`](cooldown_core::CoreError) if the lock file state cannot be captured.
+/// Returns a [`CoreError`] if the lock file state cannot be captured.
 pub fn single_lock_journal(root: &Utf8Path, lockfile: &Utf8Path) -> Result<ProjectMutationJournal> {
     ProjectMutationJournal::capture(root, [lockfile])
 }

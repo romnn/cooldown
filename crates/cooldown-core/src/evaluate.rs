@@ -27,7 +27,7 @@ use jiff::Timestamp;
 /// reference.
 #[derive(Debug, Clone, Copy)]
 pub struct ResolveContext<'a> {
-    /// The tool being evaluated, used to build the [`ResolveQuery`](crate::ResolveQuery)
+    /// The tool being evaluated, used to build the [`ResolveQuery`]
     /// for each candidate.
     pub tool: ToolId,
     /// The project root the policy cascade resolves against (matches `project=` selectors).
@@ -292,7 +292,7 @@ fn advisories_fixed_by_candidate<'a>(
 /// The advisories a rollback from `current` to `target` would re-enter: each non-withdrawn
 /// advisory the current pin escapes and the older target does not.
 ///
-/// The mirror of [`advisories_fixed_by_candidate`], for the direction `fix` moves.
+/// The mirror of `advisories_fixed_by_candidate`, for the direction `fix` moves.
 /// `fix` exists to make `check` pass and is not a vulnerability gate, so this changes no verdict
 /// — but rolling a pin back *into* a known-affected version is the one thing a user would want
 /// said out loud, so callers report it.
@@ -437,7 +437,7 @@ fn classify_candidate(
 /// quality (with the prerelease rule from [`ReleaseQuality`], honouring the current pin), within
 /// the current major unless [`ResolveContext::allow_major`] is set, and not yanked. Each eligible
 /// release newer than the current pin becomes a [`Candidate`]: its per-kind cooldown window is
-/// [`resolve`](crate::resolve)d, and its publish instant is judged against that window's
+/// [`resolve`]d, and its publish instant is judged against that window's
 /// [`cutoff`](crate::ResolvedWindow::cutoff) at `now`:
 ///
 /// - [`Status::Exempt`] — an `allow` rule waives the window.

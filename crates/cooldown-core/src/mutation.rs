@@ -497,7 +497,7 @@ impl ProjectMutationJournal {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) when the project identity or a file cannot be
+    /// Returns a [`CoreError`] when the project identity or a file cannot be
     /// captured safely.
     /// Writable paths with a symbolic-link ancestor or final entry are rejected.
     /// Existing multiply-linked files are rejected because an in-place write could mutate an
@@ -522,7 +522,7 @@ impl ProjectMutationJournal {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) when the project identity, a path, or a snapshot is
+    /// Returns a [`CoreError`] when the project identity, a path, or a snapshot is
     /// invalid.
     /// Writable paths with a symbolic-link ancestor or final entry are rejected, as are existing
     /// multiply-linked files.
@@ -609,7 +609,7 @@ impl ProjectMutationJournal {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the project identity changed or a file cannot
+    /// Returns a [`CoreError`] if the project identity changed or a file cannot
     /// be read safely.
     pub fn capture_state(&self) -> Result<ProjectMutationState> {
         self.project.validate_live()?;
@@ -647,7 +647,7 @@ impl ProjectMutationJournal {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::LockConflict`](crate::CoreError::LockConflict) when the expected state
+    /// Returns [`CoreError::LockConflict`] when the expected state
     /// belongs to another project, does not describe this journal, or a live file changed
     /// independently.
     /// Returns a filesystem error if validation or restoration cannot read, replace, or remove a
@@ -693,7 +693,7 @@ impl ProjectMutationJournal {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) if the project identity changed or a file cannot
+    /// Returns a [`CoreError`] if the project identity changed or a file cannot
     /// be restored safely.
     pub fn restore(&self) -> Result<()> {
         self.project.validate_live()?;
@@ -842,7 +842,7 @@ impl ProjectMutationFile {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoreError`](crate::CoreError) when the path is unsafe or the snapshot fields are
+    /// Returns a [`CoreError`] when the path is unsafe or the snapshot fields are
     /// inconsistent.
     pub fn from_snapshot(
         path: Utf8PathBuf,

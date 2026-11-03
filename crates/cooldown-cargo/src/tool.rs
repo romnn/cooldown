@@ -1,5 +1,6 @@
-//! The Rust/Cargo [`Tool`]: detection, the resolved graph via `cargo metadata`, classified
-//! releases from the crates.io sparse index, and `cargo`-driven apply/build.
+//! The Rust/Cargo [`Tool`](cooldown_core::Tool): detection, the
+//! resolved graph via `cargo metadata`, classified releases from
+//! the crates.io sparse index, and `cargo`-driven apply/build.
 //!
 //! Cargo has no publish-date cutoff flag (no `--exclude-newer` equivalent), so the cooldown window
 //! is realized entirely in [`cooldown_core`].
@@ -77,7 +78,7 @@ struct GeneratedFacts {
     notices: Vec<Diagnostic>,
 }
 
-/// The Rust/Cargo implementation of the [`Tool`] port.
+/// The Rust/Cargo implementation of the [`Tool`](cooldown_core::Tool) port.
 ///
 /// Pairs the crates.io sparse-index client ([`CratesIoIndex`]) with a [`Cargo`]
 /// CLI wrapper: the index supplies publish times and the release set, while
@@ -341,7 +342,7 @@ fn classify_quality(v: &str) -> ReleaseQuality {
 ///
 /// Unparsable versions are dropped, the rest are sorted by [`version::compare`] and deduplicated,
 /// then each is stamped with a [`ReleaseOrder`] token reflecting its rank (ascending). `current` is
-/// the currently pinned version, used to compute each release's [`UpdateKind`](cooldown_core::UpdateKind)
+/// the currently pinned version, used to compute each release's [`UpdateKind`]
 /// via [`version::classify_kind`].
 #[must_use]
 pub fn build_releases(current: &str, raw: Vec<cooldown_core::RawRelease>) -> Vec<Release> {

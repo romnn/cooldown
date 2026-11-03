@@ -1,5 +1,6 @@
-//! The Ruby/Bundler [`Tool`]: detection by `Gemfile.lock`, the resolved graph read from that lock,
-//! and `RubyGems` publish times. The core owns the verdict; `bundle` is driven only to apply.
+//! The Ruby/Bundler [`Tool`](cooldown_core::Tool): detection by `Gemfile.lock`,
+//! the resolved graph read from that lock, and `RubyGems` publish times.
+//! The core owns the verdict; `bundle` is driven only to apply.
 
 use crate::lock;
 use crate::registry::{RUBYGEMS, RubyGems};
@@ -22,7 +23,7 @@ use cooldown_registry::SharedHttp;
 /// The [`ToolId`] for the Ruby/Bundler adapter (`"bundler"`).
 pub const BUNDLER_ID: ToolId = ToolId("bundler");
 
-/// The Ruby/Bundler implementation of the [`Tool`] port.
+/// The Ruby/Bundler implementation of the [`Tool`](cooldown_core::Tool) port.
 pub struct BundlerTool {
     registry: RubyGems,
     bundle: Driver,
