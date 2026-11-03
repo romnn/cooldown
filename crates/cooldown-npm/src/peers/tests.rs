@@ -2,6 +2,7 @@ use super::*;
 use crate::lock::Npm;
 use crate::manifest;
 use camino::Utf8PathBuf;
+use color_eyre::eyre;
 use cooldown_core::{RewriteMode, UpdateKind, Version};
 use indoc::{formatdoc, indoc};
 
@@ -2194,4 +2195,43 @@ fn an_npm_alias_fabricates_no_peer_hold_or_violation() {
         .is_none(),
         "an alias at the peer's slot proves nothing"
     );
+}
+
+/// A Bun member's peer contract holds nothing, because neither the member's own declaration nor
+/// a recorded tree proves which copy Bun binds that peer to.
+///
+/// The lock's members are readable, so the member manifest declaring the contract is found, and
+/// the member index is not authoritative here, so the change carries no members whose overlap
+/// could stand in for a binding: pnpm's isolated-layout rule would hold every move of the name.
+#[test]
+fn a_bun_members_peer_contract_holds_nothing() -> eyre::Result<()> {
+    use crate::lock::Bun;
+    use crate::lock::bun_fixtures::COLLIDING_MEMBER;
+    let dir = tempfile::tempdir()?;
+    let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+        .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+    std::fs::create_dir_all(root.join("packages/a"))?;
+    std::fs::write(
+        root.join("packages/a/package.json"),
+        indoc! {r#"
+            {
+              "name": "is-number",
+              "version": "1.0.0",
+              "dependencies": { "chalk": "4.1.0" },
+              "peerDependencies": { "chalk": "^4.0.0" }
+            }
+        "#},
+    )?;
+    assert!(Bun::member_paths(COLLIDING_MEMBER).contains("packages/a"));
+
+    let plan = plan_of(vec![change("chalk", "4.1.2", "5.3.0")]);
+    let evidence = PeerEvidence::gather::<Bun>(Some(&root), Some(COLLIDING_MEMBER), &plan);
+    assert!(evidence.workspace.is_empty());
+    let PeerPartition { retained, skipped } = partition_peer_held::<Bun>(&plan, &evidence);
+    assert_eq!(retained.changes.len(), 1, "{skipped:?}");
+    assert!(skipped.is_empty(), "{skipped:?}");
+
+    // The post-resolve verifier proves no violation from the same evidence either.
+    assert!(proven_peer_violations::<Bun>(COLLIDING_MEMBER, &evidence.workspace).is_empty());
+    Ok(())
 }

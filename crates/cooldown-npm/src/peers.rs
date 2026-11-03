@@ -59,9 +59,12 @@ impl PeerEvidence {
         lock: Option<&str>,
         plan: &Plan,
     ) -> Self {
-        let requirements = lock.map(L::peer_requirements).unwrap_or_default();
+        // A layout whose peer bindings cannot be proven contributes no contract at all, so its
+        // member attribution can never stand in for one (`NodeLock::PEER_CONTEXTS_MODELED`).
+        let modeled = lock.filter(|_| L::PEER_CONTEXTS_MODELED);
+        let requirements = modeled.map(L::peer_requirements).unwrap_or_default();
         let members = L::member_sources(lock.unwrap_or_default());
-        let workspace = match (root, lock) {
+        let workspace = match (root, modeled) {
             (Some(root), Some(lock)) => workspace_peer_requirements::<L>(root, lock, &members),
             _ => Vec::new(),
         };
@@ -719,12 +722,16 @@ pub(crate) fn plan_peer_rejections(
 /// is the moved package's fault, and an unplanned collateral move that breaks one is escalated to
 /// candidate isolation.
 ///
-/// A lock with no recorded peer contracts (yarn, bun) and no workspace contracts returns empty
-/// without any further parsing.
+/// A lock with no recorded peer contracts and no workspace contracts returns empty without any
+/// further parsing, and so does a manager whose peer bindings cannot be proven (yarn, bun —
+/// [`NodeLock::PEER_CONTEXTS_MODELED`]).
 pub(crate) fn proven_peer_violations<L: NodeLock>(
     content: &str,
     workspace: &[WorkspacePeer],
 ) -> PeerViolations {
+    if !L::PEER_CONTEXTS_MODELED {
+        return PeerViolations::new();
+    }
     let requirements = L::peer_requirements(content);
     if requirements.is_empty() && workspace.is_empty() {
         return PeerViolations::new();

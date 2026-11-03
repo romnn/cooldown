@@ -28,11 +28,17 @@ pub use lock::{Bun, Npm, Pnpm, Yarn};
 pub use registry::{NPM, NpmRegistry};
 pub use tool::NpmTool;
 
-/// The Bun adapter (`bun.lock`).
+/// The Bun adapter, reading the text `bun.lock`; the binary `bun.lockb` is not read.
+///
+/// Each workspace member's direct dependencies are attributed through the lock's package keys, so
+/// its exact manifest pins are protected like pnpm's and npm's (see [`Bun`]).
 pub type BunTool = NpmTool<Bun>;
 /// The npm adapter (`package-lock.json`).
 pub type NpmCliTool = NpmTool<Npm>;
 /// The pnpm adapter (`pnpm-lock.yaml`).
 pub type PnpmTool = NpmTool<Pnpm>;
-/// The Yarn (classic) adapter (`yarn.lock`).
+/// The Yarn Classic (v1) adapter (`yarn.lock`); a Yarn Berry lock is refused as unreadable.
+///
+/// A Classic lock records no workspace member, so nothing is attributed per member and exact
+/// manifest pins are judged only before the resolve.
 pub type YarnTool = NpmTool<Yarn>;
