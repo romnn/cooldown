@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **A git-sourced Bun package no longer reads as a registry package that does not exist.**
+  cooldown split each `bun.lock` identity at its last `@`, so `pkg@git+ssh://git@github.com/…`
+  became a package named `pkg@git+ssh://git` at a version with no `:`, which the non-registry
+  check let through. It now splits at the first `@` after an optional scope and keeps only
+  registry identities, so git, tarball, `file:`, `link:`, and `workspace:` sources are dropped.
+
 - **Bun workspace members are attributed their own copies, and their exact pins are protected.**
   cooldown read a `bun.lock` without its workspace members, so every dependency was the root
   manifest's, a member's own declaration was not upgradeable, and an exact pin in a member

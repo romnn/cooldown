@@ -7343,6 +7343,61 @@ packages:
         Ok(())
     }
 
+    /// A git identity's inner `@` must not make a registry package: the lock's `pkg` is a git
+    /// dependency, so neither a row for it nor one for its `pkg@git+ssh://git` split reaches
+    /// evaluation, while the registry copy beside it still does.
+    #[tokio::test]
+    async fn bun_git_identity_is_not_a_registry_package() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            root.join("bun.lock"),
+            indoc! {r#"
+                {
+                    "lockfileVersion": 1,
+                    "workspaces": {
+                        "": {
+                            "name": "root",
+                            "dependencies": {
+                                "chalk": "4.1.2",
+                                "pkg": "git+ssh://git@github.com/x/pkg.git#abc123",
+                            },
+                        },
+                    },
+                    "packages": {
+                        "chalk": ["chalk@4.1.2", "", {}, "sha512-a"],
+                        "pkg": ["pkg@git+ssh://git@github.com/x/pkg.git#abc123", {}],
+                    },
+                }"#},
+        )?;
+        std::fs::write(
+            root.join("package.json"),
+            indoc! {r#"
+                {
+                    "name": "root",
+                    "dependencies": {
+                        "chalk": "4.1.2",
+                        "pkg": "git+ssh://git@github.com/x/pkg.git#abc123"
+                    }
+                }"#},
+        )?;
+        let tool = NpmTool::<Bun>::from_http(SharedHttp::new(
+            dir.path().join("cache").as_path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+
+        let deps = tool
+            .dependencies(&bun_project(&root), DepScope::Graph)
+            .await?;
+        let rows: Vec<String> = deps
+            .iter()
+            .map(|dep| format!("{}@{}", dep.package.name, dep.current.as_str()))
+            .collect();
+        assert_eq!(rows, ["chalk@4.1.2"]);
+        Ok(())
+    }
+
     /// A name the root and a member each declare both as a dev dependency and as a peer stays
     /// direct, each copy attributed to the member whose key records it and bounded by its
     /// declarations, though the lock leaves which copy each finally binds unknown.
