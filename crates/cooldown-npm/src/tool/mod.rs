@@ -4012,7 +4012,6 @@ fn omitted_selector_warnings(omitted: &[String]) -> Vec<Diagnostic> {
 }
 
 #[cfg(test)]
-#[path = "tool/npm_attribution_tests.rs"]
 mod npm_attribution_tests;
 
 #[cfg(test)]

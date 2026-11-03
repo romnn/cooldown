@@ -12,10 +12,17 @@
 //! the adapter pins that as a concrete `cargo update --precise <version>`. Every test pins the
 //! resolution clock with `--freeze <FREEZE>` (an absolute cutoff the core applies to the index
 //! publish times), so the set of matured versions — and therefore the precise targets cooldown
-//! computes — is reproducible from crates.io's immutable history. The starting lock is seeded with
-//! the real `cargo` against live crates.io; most assertions check INVARIANTS (convergence,
-//! no-silent-change, cross-command agreement). The focused `clap` regression below hard-pins
-//! historical immutable crates.io versions to recreate a specific float-up/hold-back failure.
+//! computes — is reproducible from crates.io's immutable history.
+//!
+//! A precise pin still lets cargo float the target's dependencies to whatever crates.io published
+//! since, so every fixture also carries a [`CargoAsOf`]: its seed horizon fixes the starting lock,
+//! and its run horizon fixes what cooldown's own cargo runs can float to.
+//! A fixture seeded at "newest" takes the instant its scenario was written; one that needs specific
+//! versions takes an instant at which they were the newest, instead of resolving the newest and
+//! rolling crates back.
+//! Most assertions check INVARIANTS (convergence, no-silent-change, cross-command agreement).
+//! The focused `clap` regression below hard-pins historical immutable crates.io versions to
+//! recreate a specific float-up/hold-back failure.
 //!
 //! # The conflict
 //!
@@ -38,7 +45,8 @@ use indoc::{formatdoc, indoc};
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf, Prefix};
 use support::{
-    ChangeVersions, Envelope, Fixture, changed_packages, toml_lock_entries, toml_lock_pins,
+    CargoAsOf, ChangeVersions, Envelope, Fixture, REGISTRY_HISTORY, changed_packages,
+    toml_lock_entries, toml_lock_pins,
 };
 
 /// The absolute resolution cutoff. crates.io's release history before this instant is immutable, so
@@ -83,12 +91,18 @@ edition = "2021"
 serde_derive = "=1.0.180"
 "#;
 
-/// Seed a `Cargo.lock` by resolving the fixture with the real cargo against live crates.io. cargo has
-/// no publish-date flag, so the seed is at "newest now"; cooldown then re-resolves to the
-/// freeze-bounded targets it computes from the index. `cutoff` is unused by cargo itself — it only
-/// affects how fresh the seed is relative to a later freeze (the `fix` test seeds against a window
-/// where deps are too-fresh), which we approximate by seeding identically and letting the freeze
-/// classify them.
+/// The horizon of the conflict fixture: the instant its scenario was written, so the seed is the
+/// "newest" lock of that day, far fresher than [`FREEZE`].
+const CONFLICT_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2026-06-23T02:33:03Z",
+    run: "2026-06-23T02:33:03Z",
+};
+
+/// Seed a `Cargo.lock` by resolving the fixture with the real cargo as of [`CONFLICT_AS_OF`], the
+/// "newest" of that day; cooldown then re-resolves to the freeze-bounded targets it computes from
+/// the index.
+/// The `fix` test relies on that seed being far fresher than [`FREEZE`], so the freeze classifies
+/// its deps too-fresh.
 fn seed_lock(fixture: &Fixture) {
     fixture
         .write("Cargo.toml", ROOT_MANIFEST)
@@ -102,12 +116,20 @@ fn seed_lock(fixture: &Fixture) {
 }
 
 fn conflict_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(CONFLICT_AS_OF);
     seed_lock(&fixture);
     fixture
 }
 
 const FLOATED_TRANSITIVE_FREEZE: &str = "2026-06-20T00:00:00Z";
+
+/// The seed is the newest graph between clap 4.5.55 (2026-01-27) and 4.5.56, with quote at 1.0.44
+/// (2026-01-23, before 1.0.45 on 2026-03-03); the run sees quote 1.0.46 (2026-06-22), the too-fresh
+/// release cargo floats quote to once clap moves.
+const FLOATED_TRANSITIVE_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2026-01-28T00:00:00Z",
+    run: "2026-06-27T15:38:46Z",
+};
 
 const FLOATED_TRANSITIVE_MANIFEST: &str = r#"[package]
 name = "cargo-floated-transitive"
@@ -119,7 +141,7 @@ clap = { version = "4", features = ["derive"] }
 "#;
 
 fn floated_transitive_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(FLOATED_TRANSITIVE_AS_OF);
     fixture
         .write("Cargo.toml", FLOATED_TRANSITIVE_MANIFEST)
         .write("src/lib.rs", "");
@@ -127,25 +149,18 @@ fn floated_transitive_fixture() -> Fixture {
         .run_tool("cargo", &["generate-lockfile"], &[])
         .expect_success();
     fixture
-        .run_tool(
-            "cargo",
-            &["update", "-p", "clap", "--precise", "4.5.55"],
-            &[],
-        )
-        .expect_success();
-    fixture
-        .run_tool(
-            "cargo",
-            &["update", "-p", "quote", "--precise", "1.0.44"],
-            &[],
-        )
-        .expect_success();
-    fixture
 }
 
 /// The cutoff admits the paired `jsonschema` / `referencing` 0.46.6 releases from 2026-06-23,
 /// while excluding their paired 0.46.7 releases from 2026-06-30.
 const INVALIDATED_PIN_FREEZE: &str = "2026-06-29T00:00:00Z";
+
+/// The instant the scenario was written: the run sees `referencing` 0.46.10 (2026-07-05), the
+/// newest 0.46 release the jsonschema pin floats it to.
+const INVALIDATED_PIN_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2026-07-13T22:10:34Z",
+    run: "2026-07-13T22:10:34Z",
+};
 
 const INVALIDATED_PIN_SEED_MANIFEST: &str = indoc! {r#"
     [package]
@@ -170,7 +185,7 @@ const INVALIDATED_PIN_MANIFEST: &str = indoc! {r#"
 "#};
 
 fn invalidated_pin_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(INVALIDATED_PIN_AS_OF);
     fixture
         .write("Cargo.toml", INVALIDATED_PIN_SEED_MANIFEST)
         .write("src/lib.rs", "");
@@ -192,7 +207,7 @@ fn upgrade_stabilizes_a_planned_pin_moved_by_an_earlier_pin() {
         assert_eq!(
             cargo_lock_versions_of(crate_name, &seeded),
             vec!["0.46.5".to_owned()],
-            "the fixture must seed {crate_name} at the shared source version"
+            "the fixture must seed {crate_name} at the shared source version; {REGISTRY_HISTORY}"
         );
     }
 
@@ -249,7 +264,7 @@ fn upgrade_stabilizes_a_planned_pin_moved_by_an_earlier_pin() {
         assert_eq!(
             cargo_lock_versions_of(crate_name, &lock_after),
             vec!["0.46.6".to_owned()],
-            "{crate_name} must land exactly on the newest release admitted by the freeze"
+            "{crate_name} must land exactly on the newest release admitted by the freeze; {REGISTRY_HISTORY}"
         );
     }
 
@@ -330,6 +345,14 @@ fn upgrade_reports_every_moved_version_no_silent_change() {
 /// `rand 0.8.5` (2022-02-14) keeps the direct layer inert.
 const TRANSITIVE_ADVANCE_FREEZE: &str = "2023-01-01T00:00:00Z";
 
+/// The seed is the newest graph after `rand` 0.8.5 (2022-02-14) and before `rand_core` 0.6.4
+/// (2022-09-15), which holds the undeclared transitive at 0.6.3; the run horizon is the instant the
+/// scenario was written.
+const TRANSITIVE_ADVANCE_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2022-06-01T00:00:00Z",
+    run: "2026-08-10T15:19:20Z",
+};
+
 const TRANSITIVE_ADVANCE_MANIFEST: &str = r#"[package]
 name = "cargo-transitive-advance"
 version = "0.1.0"
@@ -340,22 +363,16 @@ rand = "=0.8.5"
 "#;
 
 fn transitive_advance_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(TRANSITIVE_ADVANCE_AS_OF);
     fixture
         .write("Cargo.toml", TRANSITIVE_ADVANCE_MANIFEST)
         .write("src/lib.rs", "");
+    // The seed horizon holds the undeclared transitive behind its line's newest: rand_core 0.6.3
+    // (2021-06-15), with 0.6.4 matured under the freeze.
+    // The exact-pinned parent never plans, so nothing drags the line — the standalone shape only
+    // graph-wide transitive advance can move.
     fixture
         .run_tool("cargo", &["generate-lockfile"], &[])
-        .expect_success();
-    // Push the undeclared transitive behind its line's newest: rand_core 0.6.3 (2021-06-15), with
-    // 0.6.4 matured under the freeze. The exact-pinned parent never plans, so nothing drags the
-    // line — the standalone shape only graph-wide transitive advance can move.
-    fixture
-        .run_tool(
-            "cargo",
-            &["update", "-p", "rand_core", "--precise", "0.6.3"],
-            &[],
-        )
         .expect_success();
     fixture
 }
@@ -368,7 +385,7 @@ fn upgrade_advances_a_matured_transitive_no_direct_pin_drags() {
     assert_eq!(
         cargo_lock_versions_of("rand_core", &lock_before),
         vec!["0.6.3".to_owned()],
-        "the seed must hold the behind transitive"
+        "the seed horizon must hold the behind transitive; {REGISTRY_HISTORY}"
     );
 
     let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", TRANSITIVE_ADVANCE_FREEZE]);
@@ -386,7 +403,7 @@ fn upgrade_advances_a_matured_transitive_no_direct_pin_drags() {
     assert_eq!(
         cargo_lock_versions_of("rand_core", &lock_after),
         vec!["0.6.4".to_owned()],
-        "rand_core advances to the newest release matured under the freeze"
+        "rand_core advances to the newest release matured under the freeze; {REGISTRY_HISTORY}"
     );
     assert_eq!(
         cargo_lock_versions_of("rand", &lock_after),
@@ -413,12 +430,12 @@ fn upgrade_holds_back_a_cargo_floated_transitive_instead_of_skipping() {
     assert_eq!(
         cargo_lock_versions_of("clap", &lock_before),
         vec!["4.5.55".to_owned()],
-        "fixture must start with a cooled clap that can move forward"
+        "fixture must start with a cooled clap that can move forward; {REGISTRY_HISTORY}"
     );
     assert_eq!(
         cargo_lock_versions_of("quote", &lock_before),
         vec!["1.0.44".to_owned()],
-        "fixture must start with the older cooled transitive from the regression"
+        "fixture must start with the older cooled transitive from the regression; {REGISTRY_HISTORY}"
     );
 
     let upgrade = fixture.cooldown_json(&[
@@ -452,12 +469,12 @@ fn upgrade_holds_back_a_cargo_floated_transitive_instead_of_skipping() {
     assert_eq!(
         cargo_lock_versions_of("clap", &lock_after),
         vec!["4.6.1".to_owned()],
-        "freeze cutoff admits clap 4.6.1 as the newest mature compatible release"
+        "freeze cutoff admits clap 4.6.1 as the newest mature compatible release; {REGISTRY_HISTORY}"
     );
     assert_eq!(
         cargo_lock_versions_of("quote", &lock_after),
         vec!["1.0.45".to_owned()],
-        "cargo floats quote to latest semver-compatible, but cooldown must hold it at the newest mature version"
+        "cargo floats quote to latest semver-compatible, but cooldown must hold it at the newest mature version; {REGISTRY_HISTORY}"
     );
 }
 
@@ -686,11 +703,24 @@ fn check_fails_closed_on_stale_lock_unless_allowed() {
     assert_eq!(stale_lock, fixture.read_bytes("Cargo.lock"));
 }
 
+/// The instant the discovery scenarios were written; their seeds only need some lock to exist.
+const DISCOVERY_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2026-09-15T03:07:06Z",
+    run: "2026-09-15T03:07:06Z",
+};
+
+/// The lockless-nested seed is the newest graph between `itoa` [`LOCKLESS_ROOT_PIN`] (2023-07-15)
+/// and 1.0.10 (2023-12-09), so the root has a real upgrade to plan.
+const LOCKLESS_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2023-08-01T00:00:00Z",
+    run: DISCOVERY_AS_OF.run,
+};
+
 /// The shape that surfaced the lockless gap: a workspace with a lock beside a cargo-fuzz-style
 /// crate that declares its own `[workspace]` — so the root resolve can never cover it — and whose
 /// `Cargo.lock` is gitignored, hence absent from a fresh checkout.
 fn lockless_nested_workspace_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(LOCKLESS_AS_OF);
     fixture
         .write(
             "Cargo.toml",
@@ -728,18 +758,17 @@ fn lockless_nested_workspace_fixture() -> Fixture {
             "#},
         )
         .write("fuzz/src/lib.rs", "");
+    // The seed horizon holds the root's own dependency at an immutable historical release, so the
+    // root project has a real upgrade to plan while the lockless nested project is being reported
+    // or skipped.
     fixture
         .run_tool("cargo", &["generate-lockfile"], &[])
         .expect_success();
-    // Hold the root's own dependency at an immutable historical release, so the root project has a
-    // real upgrade to plan while the lockless nested project is being reported or skipped.
-    fixture
-        .run_tool(
-            "cargo",
-            &["update", "-p", "itoa", "--precise", LOCKLESS_ROOT_PIN],
-            &[],
-        )
-        .expect_success();
+    assert_eq!(
+        cargo_lock_versions_of("itoa", &fixture.read_bytes("Cargo.lock")),
+        [LOCKLESS_ROOT_PIN],
+        "the seed horizon must hold the root's itoa at its historical pin; {REGISTRY_HISTORY}"
+    );
     fixture
 }
 
@@ -845,7 +874,7 @@ fn a_lockless_nested_workspace_fails_the_gate_instead_of_passing_silently() {
 #[test]
 fn a_lockless_excluded_package_fails_the_gate() {
     skip_if_missing!("cargo");
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(DISCOVERY_AS_OF);
     fixture
         .write(
             "Cargo.toml",
@@ -893,7 +922,7 @@ fn a_lockless_excluded_package_fails_the_gate() {
 /// A repository-root package beside a `bridge/` that points at a sibling `owner/` workspace, which
 /// lists both `bridge` and `bridge/child` as members from outside its own directory.
 fn sibling_owner_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(DISCOVERY_AS_OF);
     fixture
         .write(
             "Cargo.toml",
@@ -1030,7 +1059,7 @@ fn selecting_a_directory_another_project_resolves_runs_that_project() {
 /// A workspace that excludes two siblings, the later-sorting of which (`b`) path-depends on the
 /// earlier (`a`) and holds the lock that resolves it.
 fn later_sibling_resolver_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(DISCOVERY_AS_OF);
     fixture
         .write(
             "Cargo.toml",
@@ -1165,7 +1194,7 @@ fn a_directory_resolved_by_a_later_sorting_sibling_is_not_a_project() {
 #[test]
 fn an_optional_dependency_of_a_reached_package_is_its_own_project() {
     skip_if_missing!("cargo");
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(DISCOVERY_AS_OF);
     fixture
         .write(
             "Cargo.toml",
@@ -1339,7 +1368,7 @@ fn write_outside_pointer_member(fixture: &Fixture) -> &Fixture {
 }
 
 fn member_discovery_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(DISCOVERY_AS_OF);
     fixture
         .write("src/lib.rs", "")
         .write(
@@ -1485,7 +1514,7 @@ fn member_discovery_follows_cargos_own_rules() {
 #[test]
 fn a_member_entry_spelled_around_an_exclusion_does_not_cancel_it() {
     skip_if_missing!("cargo");
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(DISCOVERY_AS_OF);
     fixture
         .write(
             "Cargo.toml",
@@ -1550,7 +1579,7 @@ fn a_member_entry_spelled_around_an_exclusion_does_not_cancel_it() {
 /// A workspace with a member, and inside that member a cargo-fuzz-style workspace of its own with
 /// no lock.
 fn fuzz_inside_a_member_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(DISCOVERY_AS_OF);
     fixture
         .write(
             "Cargo.toml",
@@ -1627,7 +1656,7 @@ fn selecting_a_lockless_workspace_inside_a_covered_member_evaluates_it_alone() {
 #[test]
 fn a_dev_dependency_ring_between_plain_packages_does_not_abort_discovery() {
     skip_if_missing!("cargo");
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(DISCOVERY_AS_OF);
     fixture
         .write(
             "Cargo.toml",
@@ -1714,7 +1743,7 @@ fn a_dev_dependency_ring_between_plain_packages_does_not_abort_discovery() {
 #[test]
 fn a_lone_crate_without_a_lock_is_a_stale_lock_not_a_missing_tool() {
     skip_if_missing!("cargo");
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(DISCOVERY_AS_OF);
     fixture
         .write(
             "Cargo.toml",
@@ -1814,6 +1843,12 @@ fn allow_stale_lock_skips_the_lockless_project_and_plans_the_rest() {
     );
 }
 
+/// The instant the run-staled scenarios were written.
+const RUN_STALED_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2026-09-30T13:40:07Z",
+    run: "2026-09-30T13:40:07Z",
+};
+
 /// `file` in the fixture directory `dir`, which is the fixture root when empty.
 fn under(dir: &str, file: &str) -> String {
     if dir.is_empty() {
@@ -1830,7 +1865,7 @@ fn under(dir: &str, file: &str) -> String {
 /// Both locks are seeded current, with `itoa` on the old `0.4` line, so `upgrade --major` rewrites
 /// the workspace's requirement and stales the standalone lock mid-run.
 fn run_staled_fixture(workspace: &str, standalone: &str, member_from_standalone: &str) -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(RUN_STALED_AS_OF);
     fixture
         .write(
             &under(workspace, "Cargo.toml"),
@@ -1976,10 +2011,16 @@ fn upgrade_reruns_a_project_a_later_project_staled() {
     assert_run_absorbs_the_lock_it_staled(&fixture, "b", "a");
 }
 
+/// The instant the excluded-subtree scenarios were written.
+const EXCLUDED_SUBTREES_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2026-09-03T00:17:22Z",
+    run: "2026-09-03T00:17:22Z",
+};
+
 /// A monorepo whose root config excludes both a nested incubator workspace and one of its own
 /// members, each workspace seeded with its own lock by the real cargo.
 fn excluded_subtrees_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(EXCLUDED_SUBTREES_AS_OF);
     fixture
         .write(
             "cooldown.toml",
@@ -2496,8 +2537,14 @@ edition = "2021"
 bitflags = "2"
 "#;
 
+/// The instant the multi-version scenario was written.
+const MULTI_VERSION_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2026-06-23T19:48:53Z",
+    run: "2026-06-23T19:48:53Z",
+};
+
 fn multi_version_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(MULTI_VERSION_AS_OF);
     fixture
         .write("Cargo.toml", MULTI_VERSION_ROOT_MANIFEST)
         .write("crates/old/Cargo.toml", MULTI_VERSION_OLD_MANIFEST)
@@ -2585,20 +2632,30 @@ const SHARED_TARGET_MANIFEST: &str = indoc! {r#"
     futures-io = "0.3"
 "#};
 
+/// The seed is the newest graph between `futures-core` / `futures-io` 0.3.29 (2023-10-26) and
+/// 0.3.30 (2023-12-24); the run horizon is the instant the scenario was written.
+const SHARED_TARGET_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2023-11-01T00:00:00Z",
+    run: "2026-07-09T21:55:24Z",
+};
+
 fn shared_target_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(SHARED_TARGET_AS_OF);
     fixture
         .write("Cargo.toml", SHARED_TARGET_MANIFEST)
         .write("src/lib.rs", "");
+    // The seed horizon holds both at 0.3.29 (2023-10-26) so the FREEZE cutoff (2024-06-01) plans
+    // the same matured target for both: 0.3.30 (2023-12-24) — one shared target-version string.
     fixture
         .run_tool("cargo", &["generate-lockfile"], &[])
         .expect_success();
-    // Seed both at 0.3.29 (2023-10-26) so the FREEZE cutoff (2024-06-01) plans the same matured
-    // target for both: 0.3.30 (2023-12-24) — one shared target-version string.
-    for spec in ["futures-core", "futures-io"] {
-        fixture
-            .run_tool("cargo", &["update", "-p", spec, "--precise", "0.3.29"], &[])
-            .expect_success();
+    let lock = fixture.read_bytes("Cargo.lock");
+    for crate_name in ["futures-core", "futures-io"] {
+        assert_eq!(
+            cargo_lock_versions_of(crate_name, &lock),
+            ["0.3.29"],
+            "the seed horizon must hold {crate_name} at 0.3.29; {REGISTRY_HISTORY}"
+        );
     }
     fixture
 }
@@ -2627,7 +2684,7 @@ fn upgrade_moves_every_crate_sharing_a_target_version() {
         assert_eq!(
             cargo_lock_versions_of(crate_name, &lock_after),
             vec!["0.3.30".to_owned()],
-            "{crate_name} must land on the shared matured target, not stay at the seed"
+            "{crate_name} must land on the shared matured target, not stay at the seed; {REGISTRY_HISTORY}"
         );
     }
 }
@@ -2637,6 +2694,14 @@ fn upgrade_moves_every_crate_sharing_a_target_version() {
 /// the too-fresh 29.0.4 / 5.17.0+4.3.3 wave (2026-07-02 / 2026-07-07), so a re-lock floats the
 /// families to versions the gate rejects while a matured target exists for every floated node.
 const FAMILY_FREEZE: &str = "2026-06-20T00:00:00Z";
+
+/// Just after the too-fresh wave both family regressions float into (wgpu 29.0.4 on 2026-07-02,
+/// zbus 5.17.0 and `zbus_names` 4.3.3 on 2026-07-07) and before the next one (zbus 5.18.0 on
+/// 2026-07-17), so a re-lock floats each family exactly to that wave.
+const FAMILY_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2026-07-08T00:00:00Z",
+    run: "2026-07-08T00:00:00Z",
+};
 
 /// The real-world shape behind the "0 applied · 58 skipped" regression: a cross-major bump of one
 /// direct dep (`wgpu 26 → 29`) drags a whole family of same-versioned, dependency-connected
@@ -2658,7 +2723,7 @@ const WGPU_FAMILY_MANIFEST: &str = indoc! {r#"
 #[test]
 fn upgrade_reconciles_a_cross_major_family_float_instead_of_rolling_back() {
     skip_if_missing!("cargo");
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(FAMILY_AS_OF);
     fixture
         .write("Cargo.toml", WGPU_FAMILY_MANIFEST)
         .write("src/lib.rs", "");
@@ -2690,7 +2755,7 @@ fn upgrade_reconciles_a_cross_major_family_float_instead_of_rolling_back() {
         assert_eq!(
             cargo_lock_versions_of(crate_name, &lock_after),
             vec!["29.0.3".to_owned()],
-            "{crate_name} must mature to the newest release under the freeze"
+            "{crate_name} must mature to the newest release under the freeze; {REGISTRY_HISTORY}"
         );
     }
 }
@@ -2713,7 +2778,7 @@ const ZBUS_CHAIN_MANIFEST: &str = indoc! {r#"
 "#};
 
 fn zbus_chain_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(FAMILY_AS_OF);
     fixture
         .write("Cargo.toml", ZBUS_CHAIN_MANIFEST)
         .write("src/lib.rs", "");
@@ -2769,7 +2834,7 @@ fn upgrade_reconciles_a_violation_unblocked_by_an_earlier_round() {
         assert_eq!(
             cargo_lock_versions_of(crate_name, &lock_after),
             vec![expected.to_owned()],
-            "{crate_name} must settle on the newest matured version under the freeze"
+            "{crate_name} must settle on the newest matured version under the freeze; {REGISTRY_HISTORY}"
         );
     }
 }
@@ -2795,34 +2860,29 @@ const DUAL_ENTRY_MANIFEST: &str = indoc! {r#"
     itoa = "0.4"
 "#};
 
+/// The seed is the newest graph between `itoa` 1.0.11 (2024-03-26) and 1.0.12 (2024-11-20); the
+/// run horizon is the instant the scenario was written.
+const DUAL_ENTRY_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2024-04-01T00:00:00Z",
+    run: "2026-07-09T22:31:05Z",
+};
+
 fn dual_entry_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(DUAL_ENTRY_AS_OF);
     fixture
         .write("Cargo.toml", DUAL_ENTRY_MANIFEST)
         .write("src/lib.rs", "");
+    // The seed horizon holds the 1.x line at the exact version the freeze will target (itoa
+    // 1.0.11, 2024-03-26), so the sibling edge sits precisely at the planned target — the masking
+    // shape.
     fixture
         .run_tool("cargo", &["generate-lockfile"], &[])
         .expect_success();
-    // Pin the 1.x line to the exact version the freeze will target (itoa 1.0.11, 2024-03-26), so
-    // the sibling edge sits precisely at the planned target — the masking shape. The seed version
-    // is whatever generate-lockfile picked, so read it back rather than hard-coding it.
-    let seeded = cargo_lock_versions_of("itoa", &fixture.read_bytes("Cargo.lock"))
-        .into_iter()
-        .find(|version| version.starts_with("1."))
-        .expect("the [dependencies] itoa entry seeds a 1.x line");
-    fixture
-        .run_tool(
-            "cargo",
-            &[
-                "update",
-                "-p",
-                &format!("itoa@{seeded}"),
-                "--precise",
-                "1.0.11",
-            ],
-            &[],
-        )
-        .expect_success();
+    assert_eq!(
+        cargo_lock_versions_of("itoa", &fixture.read_bytes("Cargo.lock")),
+        ["0.4.8", "1.0.11"],
+        "the seed horizon must hold both itoa lines, the 1.x one at the freeze target; {REGISTRY_HISTORY}"
+    );
     fixture
 }
 
@@ -2847,7 +2907,7 @@ fn upgrade_moves_a_dual_entry_crate_for_real_and_converges() {
     assert_eq!(
         cargo_lock_versions_of("itoa", &fixture.read_bytes("Cargo.lock")),
         vec!["1.0.11".to_owned()],
-        "the 0.4 line must vacate: both entries settle on the single matured 1.x line"
+        "the 0.4 line must vacate: both entries settle on the single matured 1.x line; {REGISTRY_HISTORY}"
     );
 
     // The move must persist: a second run has nothing left to do and the lock stays byte-stable.
@@ -2877,10 +2937,16 @@ const VERSION_BOUND_MANIFEST: &str = indoc! {r#"
     clap = { version = ">=3, <4", default-features = false }
 "#};
 
+/// The instant the explicit-bound scenario was written.
+const VERSION_BOUND_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2026-07-24T13:50:15Z",
+    run: "2026-07-24T13:50:15Z",
+};
+
 #[test]
 fn explicit_upper_bound_holds_until_rewrite() {
     skip_if_missing!("cargo");
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(VERSION_BOUND_AS_OF);
     fixture
         .write("Cargo.toml", VERSION_BOUND_MANIFEST)
         .write("src/lib.rs", "");
@@ -2893,7 +2959,7 @@ fn explicit_upper_bound_holds_until_rewrite() {
         cargo_lock_versions_of("clap", &lock_before)
             .iter()
             .all(|version| version.starts_with("3.")),
-        "the explicit bound must seed clap 3.x"
+        "the explicit bound must seed clap 3.x; {REGISTRY_HISTORY}"
     );
 
     let held = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
@@ -2919,8 +2985,18 @@ fn explicit_upper_bound_holds_until_rewrite() {
 }
 
 /// The cutoff admits pest 2.9.3 (2026-10-09) but neither 2.9.4 (2026-10-16) nor 2.9.5, and every
-/// version the shared-path-crate fixture pins was published before it.
+/// version the shared-path-crate fixture seeds was published before it.
 const SHARED_PATH_FREEZE: &str = "2026-10-12T00:00:00Z";
+
+/// The seed is the newest graph after pest 2.9.2 (2026-09-21) and before 2.9.3 (2026-10-09):
+/// handlebars 6.4.4, stacker 0.1.25, and the `psm` 0.1.32 stacker requires.
+/// The run sees `pest_stack_guard` 1.0.1 (2026-11-03T07:13:36Z), which relaxed its `psm = "=0.1.24"`
+/// to `^0.1.24`, so a pin of `pest_derive` floats the pest family to the too-fresh 2.9.5 without
+/// moving `psm` — the drift the held pin must not let back in through a re-pin.
+const SHARED_PATH_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2026-10-01T00:00:00Z",
+    run: "2026-11-03T12:00:00Z",
+};
 
 /// The four crates of the pest family, which move together.
 const PEST_FAMILY: [&str; 4] = ["pest", "pest_derive", "pest_generator", "pest_meta"];
@@ -2928,8 +3004,9 @@ const PEST_FAMILY: [&str; 4] = ["pest", "pest_derive", "pest_generator", "pest_m
 /// The issue #5 layout: a root workspace of `shared` and `app`, and a standalone `nested`
 /// workspace whose `tool` reaches `shared` by path, so both locks resolve `shared`'s requirements.
 /// `shared` declares `pest = "2"`, which already admits the matured 2.9.3.
-/// Both locks hold the pest family at 2.9.2 and `psm` at 0.1.32 through `stacker`, while pest
-/// 2.9.3 requires `psm = "=0.1.24"`, so the precise pin of pest is refused until `psm` moves too.
+/// Both locks hold the pest family at 2.9.2 and `psm` at 0.1.32 through `stacker`, the newest graph
+/// of [`SHARED_PATH_AS_OF`]'s seed horizon, while pest 2.9.3 requires `psm = "=0.1.24"`, so the
+/// precise pin of pest is refused until `psm` moves too.
 /// `consumer_extra` is appended to both consumers' `[dependencies]`.
 fn shared_path_crate_fixture(consumer_extra: &str) -> Fixture {
     let consumer = |shared: &str, name: &str| {
@@ -2946,7 +3023,7 @@ fn shared_path_crate_fixture(consumer_extra: &str) -> Fixture {
             {consumer_extra}
         "#}
     };
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(SHARED_PATH_AS_OF);
     fixture
         .write(
             "Cargo.toml",
@@ -2988,31 +3065,34 @@ fn shared_path_crate_fixture(consumer_extra: &str) -> Fixture {
         .write("nested/tool/Cargo.toml", &consumer("../../shared", "tool"))
         .write("nested/tool/src/lib.rs", "");
     for manifest in ["Cargo.toml", "nested/Cargo.toml"] {
-        let run = |args: &[&str]| {
-            let mut args = args.to_vec();
-            args.extend(["--manifest-path", manifest]);
-            fixture.run_tool("cargo", &args, &[]).expect_success();
-        };
-        run(&["generate-lockfile"]);
-        run(&["update", "-p", "handlebars", "--precise", "6.4.4"]);
-        run(&["update", "-p", "stacker", "--precise", "0.1.25"]);
-        // One crate per command, since cargo pins only the first of several `-p` specs precisely,
-        // and dependents first, since each requires its dependencies at its own version or newer.
-        for name in ["pest_derive", "pest_generator", "pest_meta", "pest"] {
-            run(&["update", "-p", name, "--precise", "2.9.2"]);
-        }
-        run(&["update", "-p", "psm", "--precise", "0.1.32"]);
+        fixture
+            .run_tool(
+                "cargo",
+                &["generate-lockfile", "--manifest-path", manifest],
+                &[],
+            )
+            .expect_success();
     }
     for lock in ["Cargo.lock", "nested/Cargo.lock"] {
         let pins = toml_lock_pins(&fixture.read_bytes(lock));
         for name in PEST_FAMILY {
-            assert_eq!(pins.get(name).map(String::as_str), Some("2.9.2"), "{lock}");
+            assert_eq!(
+                pins.get(name).map(String::as_str),
+                Some("2.9.2"),
+                "{lock}; {REGISTRY_HISTORY}"
+            );
         }
-        assert_eq!(
-            pins.get("psm").map(String::as_str),
-            Some("0.1.32"),
-            "{lock}"
-        );
+        for (name, version) in [
+            ("psm", "0.1.32"),
+            ("stacker", "0.1.25"),
+            ("handlebars", "6.4.4"),
+        ] {
+            assert_eq!(
+                pins.get(name).map(String::as_str),
+                Some(version),
+                "{lock}; {REGISTRY_HISTORY}"
+            );
+        }
     }
     fixture
 }
@@ -3023,7 +3103,11 @@ fn assert_both_locks_land_pest(fixture: &Fixture) {
     for lock in ["Cargo.lock", "nested/Cargo.lock"] {
         let pins = toml_lock_pins(&fixture.read_bytes(lock));
         for name in PEST_FAMILY {
-            assert_eq!(pins.get(name).map(String::as_str), Some("2.9.3"), "{lock}");
+            assert_eq!(
+                pins.get(name).map(String::as_str),
+                Some("2.9.3"),
+                "{lock}; {REGISTRY_HISTORY}"
+            );
         }
     }
     fixture
@@ -3098,6 +3182,10 @@ fn assert_blocked_pin_landed(fixture: &Fixture, upgraded: &Envelope, shared_befo
 /// A blocker the consumers declare themselves is never moved outside the plan: with `psm = "0.1"`
 /// declared beside `stacker`, the pin of pest 2.9.3 stays refused and is held, `psm` keeps its
 /// matured 0.1.32, and no requirement is raised to force the move.
+///
+/// Issue #55: the run horizon sees `pest_stack_guard` 1.0.1, so the pins of the rest of the family
+/// float pest to the too-fresh 2.9.5, and the re-pin down to 2.9.3 would then move the declared
+/// `psm` after all; the whole family stays where it started instead.
 #[test]
 fn upgrade_holds_a_pin_whose_blocker_is_a_direct_dependency() {
     skip_if_missing!("cargo");
@@ -3114,11 +3202,9 @@ fn upgrade_holds_a_pin_whose_blocker_is_a_direct_dependency() {
     );
     for lock in ["Cargo.lock", "nested/Cargo.lock"] {
         let pins = toml_lock_pins(&fixture.read_bytes(lock));
-        assert_eq!(
-            pins.get("pest").map(String::as_str),
-            Some("2.9.2"),
-            "{lock}"
-        );
+        for name in PEST_FAMILY {
+            assert_eq!(pins.get(name).map(String::as_str), Some("2.9.2"), "{lock}");
+        }
         assert_eq!(
             pins.get("psm").map(String::as_str),
             Some("0.1.32"),
@@ -3168,4 +3254,56 @@ fn rewrite_refreshes_a_lock_a_raised_shared_floor_left_unresolvable() {
         upgraded.warning_messages()
     );
     assert_both_locks_land_pest(&fixture);
+}
+
+/// A horizon before `pest_stack_guard` 1.0.1 (2026-11-03T07:13:36Z), whose only `1.x` release is
+/// then 1.0.0 (2026-10-26).
+const HORIZON_PROBE_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2026-11-01T00:00:00Z",
+    run: "2026-11-01T00:00:00Z",
+};
+
+/// Every cargo fixture relies on cargo honoring its horizon, both in the commands the fixture runs
+/// itself and in those cooldown runs for it: `pest_stack_guard = "1"` resolves to 1.0.0 as of
+/// 2026-11-01, not to the 1.0.1 the live index serves.
+/// A toolchain whose cargo renames or drops the unstable `min-publish-age` fails here, rather than
+/// letting every fixture silently resolve against the live index.
+#[test]
+fn cargo_resolves_as_of_the_fixture_horizon() {
+    skip_if_missing!("cargo");
+    let fixture = Fixture::cargo(HORIZON_PROBE_AS_OF);
+    fixture
+        .write(
+            "Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "cargo-horizon-probe"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                pest_stack_guard = "1"
+            "#},
+        )
+        .write("src/lib.rs", "");
+    let horizon_held = |phase: &str| {
+        assert_eq!(
+            cargo_lock_versions_of("pest_stack_guard", &fixture.read_bytes("Cargo.lock")),
+            ["1.0.0"],
+            "{phase} must resolve as of the horizon; does this cargo still honor \
+             `CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE`?"
+        );
+    };
+
+    // The fixture's own seed
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+    horizon_held("the seed");
+
+    // The lock cooldown generates through `--lock`
+    std::fs::remove_file(fixture.root().join("Cargo.lock")).expect("remove the seeded lock");
+    let refreshed = fixture.cooldown_json(&["check", "--latest", "--lock"]);
+    assert!(refreshed.ok(), "{:?}", refreshed.error_messages());
+    horizon_held("cooldown's own lock refresh");
 }

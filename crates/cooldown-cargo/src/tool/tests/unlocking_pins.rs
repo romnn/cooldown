@@ -188,10 +188,13 @@ async fn a_pin_a_locked_crate_blocks_lands_with_that_crate_released() -> eyre::R
         &CargoLock::parse(&lock("1.0.0", "1.0.0", "1.0.0"))?.locked_versions_by_source(),
         &read_lock(&fixture.project)?.locked_versions_by_source(),
         &report.applied,
+        &DeclaredSides::default(),
     );
     assert_eq!(
         collateral,
-        vec![collateral_change(CRATES_IO, "blocker", "1.0.0", "0.9.0")]
+        vec![collateral_change(
+            CRATES_IO, "blocker", "1.0.0", "0.9.0", false
+        )]
     );
     Ok(())
 }
@@ -289,6 +292,41 @@ async fn a_directly_declared_blocker_is_not_released() -> eyre::Result<()> {
 
     assert!(!fixture.released_blocker()?, "{:?}", fixture.invocations()?);
     assert_eq!(fixture.lock()?, declared);
+    Ok(())
+}
+
+/// Only the exact node an authored package declares is protected: a blocker that merely shares its
+/// name with a declared line of another major is released like any transitive crate.
+#[tokio::test]
+async fn a_transitive_namesake_of_a_declared_line_is_released() -> eyre::Result<()> {
+    let fixture = UnlockFixture::new(SCRIPT)?;
+    let with_declared_line = |lock: String| {
+        formatdoc! {r#"
+            {lock}
+            [[package]]
+            name = "app"
+            version = "0.1.0"
+            dependencies = ["blocker 2.0.0", "pkg", "sibling"]
+
+            [[package]]
+            name = "blocker"
+            version = "2.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+        "#}
+    };
+    let declared = with_declared_line(lock("1.0.0", "1.0.0", "1.0.0"));
+    let landed = with_declared_line(lock("1.2.0", "1.0.0", "0.9.0"));
+    std::fs::write(fixture.project.root.join("Cargo.lock"), &declared)?;
+    std::fs::write(fixture.project.root.join("landed.lock"), &landed)?;
+
+    fixture
+        .resolve(&UnlockFixture::plan(vec![change(
+            "pkg", "1.0.0", "1.2.0", false,
+        )]))
+        .await?;
+
+    assert!(fixture.released_blocker()?, "{:?}", fixture.invocations()?);
+    assert_eq!(fixture.lock()?, landed);
     Ok(())
 }
 

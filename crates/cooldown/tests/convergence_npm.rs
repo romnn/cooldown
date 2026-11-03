@@ -11,7 +11,7 @@
 mod support;
 
 use indoc::{formatdoc, indoc};
-use support::{ChangeVersions, Fixture};
+use support::{ChangeVersions, Fixture, REGISTRY_HISTORY};
 
 const SEED_BEFORE: &str = "2025-05-20T00:00:00Z";
 const FREEZE: &str = "2026-06-30T00:00:00Z";
@@ -78,7 +78,8 @@ fn package_lock_dependency_range(fixture: &Fixture, importer: &str, name: &str) 
 fn assert_plain_npm_relock_is_noop(fixture: &Fixture) {
     let lock_before = fixture.read_bytes("package-lock.json");
     fixture
-        .run_tool(
+        .run_unbounded(
+            "an ordinary relock, as a user would run it against today's registry, must keep the lock",
             "npm",
             &[
                 "install",
@@ -1033,6 +1034,10 @@ fn upgrade_lands_the_exact_target_under_a_broad_peer_range() {
     assert_eq!(lock_after, fixture.read_bytes("package-lock.json"));
 }
 
+/// The instant the peer-only `fix` scenario was written, after chalk 5.6.2 (2025-09-08), the newest
+/// release its `>=5.6.0 <5.7.0` peer range admits.
+const PEER_ONLY_FIX_SEED_BEFORE: &str = "2026-07-30T16:07:01Z";
+
 /// `fix` rolls a too-fresh pin *backwards*, which a within-range update cannot do at all — it would
 /// exit successfully without moving and leave the violation installed. The exact pin must downgrade,
 /// again without touching the published contract.
@@ -1042,8 +1047,8 @@ fn fix_downgrades_a_peer_only_declaration_without_rewriting_it() {
     let fixture = Fixture::new().tag_independent();
     fixture.write("package.json", PEER_ONLY_PACKAGE_JSON);
     fixture.write(".npmrc", NPMRC);
-    // Seed the newest 5.x, then judge against a cutoff that predates it: the locked pin is a
-    // violation and the remedy is a downgrade to 5.6.0.
+    // Seed the newest 5.x the peer range admits, then judge against a cutoff that predates it:
+    // the locked pin is a violation and the remedy is a downgrade to 5.6.0.
     fixture
         .run_tool(
             "npm",
@@ -1053,6 +1058,7 @@ fn fix_downgrades_a_peer_only_declaration_without_rewriting_it() {
                 "--ignore-scripts",
                 "--no-audit",
                 "--no-fund",
+                &format!("--before={PEER_ONLY_FIX_SEED_BEFORE}"),
             ],
             &[],
         )
@@ -1060,7 +1066,7 @@ fn fix_downgrades_a_peer_only_declaration_without_rewriting_it() {
     assert_eq!(
         package_lock_version(&fixture, "chalk").as_deref(),
         Some("5.6.2"),
-        "the seed must start on a pin the cutoff rejects"
+        "the seed must start on a pin the cutoff rejects; {REGISTRY_HISTORY}"
     );
     let manifest_before = fixture.read_bytes("package.json");
 
@@ -1201,6 +1207,10 @@ fn upgrade_holds_a_hoisted_peer_contract_across_disjoint_workspace_members() {
 /// matured downgrade.
 const HIDDEN_PIN_FIX_FREEZE: &str = "2021-06-01T00:00:00Z";
 
+/// The instant the two-field scenarios were written: the seed resolves chalk's own dependencies as
+/// of that day.
+const TWO_FIELD_SEED_BEFORE: &str = "2026-11-02T01:50:02Z";
+
 /// A package declaring `chalk` at a caret in `dependencies` and at the exact `pin` in
 /// `devDependencies`.
 /// npm resolves the pin and records both declarations in the lock's root entry, so the dependency
@@ -1229,6 +1239,7 @@ fn two_field_fixture(pin: &str) -> Fixture {
                 "--ignore-scripts",
                 "--no-audit",
                 "--no-fund",
+                &format!("--before={TWO_FIELD_SEED_BEFORE}"),
             ],
             &[],
         )
