@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Which `allow` entry is reported as the source no longer depends on list order.** When several
+  `allow` entries matched one package, cooldown named the last matching entry of the highest layer,
+  so `allow = ["@corp/ui", "@corp/*"]` reported `@corp/*` for `@corp/ui` while the reversed list
+  reported `@corp/ui`. The reported entry is now the highest-ranked match under the ordering
+  `min-age` uses: the highest layer, then the more specific selector, then the narrower pattern,
+  with the first entry winning a tie. The decision is unchanged, since every matching entry still
+  applies; only the source that `explain` and `minAgeSource` name can differ.
+
 - **pnpm's stale-lock check reads specifiers as npm does, so a floated exact pin is caught.**
   After a resolve, cooldown checks each `pnpm-lock.yaml` importer's version against its recorded
   specifier, but it parsed the specifier as a Rust semver requirement. A bare `6.0.0` read as

@@ -547,7 +547,10 @@ pub struct ResolvedWindow {
     pub floor_origin: Option<Origin>,
     /// Whether an `allow` entry exempts this package (and bypasses any floor).
     pub exempt: bool,
-    /// The origin of the `allow` entry that granted the exemption, if [`exempt`](Self::exempt).
+    /// The origin of the highest-ranked matching `allow` entry, if any matched.
+    ///
+    /// It is set even when a residual floor keeps [`exempt`](Self::exempt) false, so a reader can
+    /// see which `allow` applied but could not lift that floor.
     pub exempt_origin: Option<Origin>,
     /// The advisory that replaced the ordinary window with the security window, when the
     /// `[advisories]` shorten mode applied (the JSON `shortenedBy`, a sibling of `clampedBy` —
