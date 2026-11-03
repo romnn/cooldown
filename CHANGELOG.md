@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **A cargo upgrade no longer moves a crate the workspace declares as a side effect of another
+  pin.** A precise pin lets cargo float the target's dependencies to the newest versions their
+  requirements admit, so pinning `pest_derive` could carry the planned `pest` past its target to a
+  release younger than the cooldown, and the re-pin back down then dragged the directly declared
+  `psm` along. Every lock-changing step of a cargo apply (each precise pin, its unlocking retry,
+  seeded and atomic resolves, widening, and projection follows) is now judged against the lock it
+  started from: a node an authored package declares keeps its exact version unless a planned
+  change moves that very node, a planned target already reached stays reached, and a planned crate
+  still at its original version either stays or lands on its target. A path package the upgraded
+  graph no longer reaches, such as an obsolete `[patch]` shim, takes its declarations with it. A step that breaks this is rolled back, manifest
+  edits included, and its candidate is held with the move it would have made. A pin that carries
+  its own crate past the target, as one into a widened major does, is re-pinned to the target
+  before it is judged. Declarations are matched by exact version, so a workspace that declares
+  `syn` 1 still lets a transitive `syn` 2 move, a plan for one member's `foo` 1 cannot unify
+  another member's declared `foo` 2.0.0 onto its target, and a collateral row for a declared crate
+  is now reported as direct.
+
 - **Which `allow` entry is reported as the source no longer depends on list order.** When several
   `allow` entries matched one package, cooldown named the last matching entry of the highest layer,
   so `allow = ["@corp/ui", "@corp/*"]` reported `@corp/*` for `@corp/ui` while the reversed list
