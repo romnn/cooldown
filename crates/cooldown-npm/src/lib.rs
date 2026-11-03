@@ -3,6 +3,8 @@
 //! CLI that re-resolves it. A single generic adapter ([`NpmTool`]) is specialised over a
 //! [`NodeLock`](lock::NodeLock) per manager, so each is exposed as its own [`ToolId`] while reusing
 //! the registry client, release classification, and apply machinery.
+//! Yarn's two lock formats share one tool, so [`YarnTool`] routes each project to the
+//! specialisation its own lock's format names.
 //!
 //! [`ToolId`]: cooldown_core::ToolId
 
@@ -21,12 +23,14 @@ mod pins;
 pub mod registry;
 pub mod tool;
 pub mod version;
+mod yarn;
 
 pub use deno::{DENO_ID, DenoTool};
 pub use jsr::{JSR, JsrRegistry};
 pub use lock::{Bun, Npm, Pnpm, Yarn};
 pub use registry::{NPM, NpmRegistry};
 pub use tool::NpmTool;
+pub use yarn::YarnTool;
 
 /// The Bun adapter, reading the text `bun.lock`; the binary `bun.lockb` is not read.
 ///
@@ -37,9 +41,3 @@ pub type BunTool = NpmTool<Bun>;
 pub type NpmCliTool = NpmTool<Npm>;
 /// The pnpm adapter (`pnpm-lock.yaml`).
 pub type PnpmTool = NpmTool<Pnpm>;
-/// The Yarn Classic (v1) adapter (`yarn.lock`); a Yarn Berry lock is refused as unreadable.
-///
-/// A Classic lock records no workspace member, so the members come from the root `workspaces`
-/// field and each member's direct dependencies are attributed through the lock entry its own
-/// manifest selector names, which protects its exact manifest pins like npm's (see [`Yarn`]).
-pub type YarnTool = NpmTool<Yarn>;

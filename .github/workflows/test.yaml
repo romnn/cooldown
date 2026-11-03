@@ -65,7 +65,7 @@ jobs:
           install: false
           cache: true
           env: false
-      - run: mise install task aqua:nextest-rs/nextest/cargo-nextest uv go node pnpm deno
+      - run: mise install task aqua:nextest-rs/nextest/cargo-nextest uv go node pnpm yarn deno
       - name: Resolve Rust toolchain from rust-toolchain.toml
         id: rust
         shell: bash

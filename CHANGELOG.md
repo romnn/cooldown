@@ -121,11 +121,31 @@
   `bun.lockb` is still not read. Yarn locks still record no per-member
   resolution, so their exact pins are judged only before the install.
 
-- **A Yarn Berry `yarn.lock` is refused instead of read as an empty graph.** cooldown reads only
-  Yarn Classic (v1) lockfiles. A Berry (v2+) lock, which opens with a `__metadata:` entry,
-  matched none of the Classic grammar, so `outdated` reported nothing and `upgrade` found nothing
-  to do on a project it never read. Such a lock is now reported as `lockfile_unreadable`, naming
-  Yarn Berry.
+- **A Yarn Berry `yarn.lock` is read for its registry releases instead of as an empty graph.**
+  cooldown read only Yarn Classic (v1) lockfiles. A Berry (v2+) lock, which opens with a
+  `__metadata:` entry, matched none of the Classic grammar, so `outdated` reported nothing and
+  `upgrade` found nothing to do on a project it never read. cooldown now reads the lock Yarn 2
+  through 4.18 writes, lockfile versions 4 to 6 and 8 to 10, and evaluates every npm release it
+  resolves, so `outdated` and `explain` cover a Berry project, while `check` fails closed on it,
+  as on a Yarn Classic one, until the lock's currency can be verified. An npm alias is read as
+  its target's release, which no declaration of the target's name claims unless a descriptor of
+  that name resolves to it too, a patched package's own npm release is read like any other, and
+  workspaces and `link:`, `portal:`, `file:`, `patch:`, `exec:`, git, and tarball URL entries are
+  left out, whatever version, checksum, or link type they record. A malformed lock, a descriptor
+  bound to two different packages, and a lockfile version no released Yarn wrote, such as the 7
+  of Yarn 4's release candidates, are reported as `lockfile_unreadable`, never read as a smaller
+  graph. Berry support is read-only for now: workspace members are not attributed, so the rows
+  follow the root `package.json` and a run on a Berry workspace warns that a member's own
+  dependencies read as transitive; advisory identity is not established, and `sync` writes
+  nothing. `upgrade`, `fix`, and `--build` refuse a Berry project before running Yarn, and
+  `outdated` warns that its adoptable rows were not verified against `upgrade`. cooldown also no
+  longer runs a Yarn Berry executable on a Classic lock, which its first install would migrate to
+  the Berry format: before running Yarn on a Classic lock it checks the root `packageManager` and
+  the version `yarn --version` reports in the project, through any `yarnPath` or Corepack, and
+  refuses a Berry Yarn with what to do instead. Every Yarn run turns Corepack's auto-pin off, so
+  neither that probe nor an install writes a `packageManager` field into the root manifest, and a
+  lock that changed between the Classic and Berry formats after cooldown read it stops the run as
+  a lock conflict before Yarn writes anything, leaving the files as they are.
 - **The `excluded_moved` warning no longer credits pnpm for a move cooldown's repair makes.** The
   warning for an excluded workspace member whose copy moved under an unchanged declaration said
   pnpm's update re-resolves the package in every importer whatever the filter, and that the copy

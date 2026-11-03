@@ -20,6 +20,7 @@ bookCollapseSection: false
 | npm | `npm` | npm registry | `package.json` / `package-lock.json` |
 | pnpm | `pnpm` | npm registry | `pnpm-lock.yaml` |
 | Yarn (Classic v1) | `yarn` | npm registry | `yarn.lock` |
+| Yarn (Berry v2+, read-only) | `yarn` | npm registry | `yarn.lock` |
 | Bun | `bun` | npm registry | `bun.lock` |
 | Deno | `deno` | npm + JSR | `deno.json` / `deno.lock` |
 | Ruby | `bundler` | rubygems.org | `Gemfile` / `Gemfile.lock` |
@@ -27,6 +28,29 @@ bookCollapseSection: false
 | Java (Maven) | `maven` | Maven Central | `pom.xml` |
 | Java (Gradle) | `gradle` | Maven Central | `gradle.lockfile` |
 | Swift | `swift` | GitHub Releases | `Package.resolved` |
+
+Yarn Classic and Yarn Berry share the `yarn` tool, its `[tool.yarn]` config, and `yarn.lock`;
+cooldown tells them apart by the lock itself, since only a Berry lock opens with a `__metadata`
+entry. A Berry lock written by Yarn 2 through 4.18 (lockfile versions 4 to 6 and 8 to 10) is read
+for every npm release it resolves, so `outdated` and `explain` cover it. An npm alias is read as
+its target's release, a patched package's own npm release as usual, and workspaces and `link:`,
+`portal:`, `file:`, `patch:`, `exec:`, git, and tarball URL entries are no registry releases and
+are left out. A lock that is malformed or of another lockfile version is reported
+`lockfile_unreadable`. Not yet supported for Berry:
+
+- workspace member attribution: the rows follow the root `package.json`, so a dependency only a
+  member declares reads as transitive, which the run warns about;
+- lock-currency verification, so `check` fails closed on a Berry project as it does on a Yarn
+  Classic one, and advisory identity;
+- `sync` of Yarn's native `npmMinimalAgeGate`;
+- every mutation: `upgrade`, `fix`, and `--build` refuse a Berry project before running Yarn, and
+  `outdated` warns that its adoptable rows were not verified against `upgrade`.
+
+Before running Yarn on a Classic lock, cooldown checks that the Yarn the project declares
+(`packageManager`) and the one `yarn --version` reports there, through `yarnPath` or Corepack, are
+Yarn 1, and otherwise refuses rather than let a Berry Yarn migrate the lock. It runs Yarn with
+Corepack's auto-pin off (`COREPACK_ENABLE_AUTO_PIN=0`), so the check never writes a
+`packageManager` field into the root `package.json`.
 
 A cargo-hakari workspace-hack — a member whose `[dependencies]` are generated from the lock —
 should be declared in [`[tool.cargo] generated-members`]({{< relref "../configuration/selectors.md" >}}#toolcargo-generated-members);

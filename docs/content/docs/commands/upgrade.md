@@ -61,6 +61,12 @@ lock is one Yarn's own reader refuses, `check`, `outdated`, and `upgrade` warn t
 the root `package.json` alone: no member owns a copy, a landing is judged by the name's newest
 locked copy, and no member's exact pin is protected from another candidate's resolve.
 
+A Yarn Berry (v2+) project is read but not yet upgraded: `upgrade` and `fix` refuse it, and so
+does `--build`, before running Yarn, leaving its files as they were. A Classic lock is never handed
+to a Berry Yarn either, since that Yarn's first install would migrate the lock: when the root
+`packageManager` declares Yarn 2 or later, or `yarn --version` in the project reports it, through
+a `yarnPath` or Corepack, the run refuses the project and says what to do instead.
+
 A package declared in several install fields of one manifest (npm family: `dependencies` beside
 `devDependencies` or `optionalDependencies`) is judged by every declaration, not the first: the
 target must sit inside each range, and the strictest explicit bound across them caps it. On npm,
@@ -84,7 +90,7 @@ The lock-only default is honored where the tool can pin an exact in-range versio
 | cargo | `update --precise` | lock-only |
 | uv | `lock --upgrade-package` | lock-only |
 | pnpm | `update --no-save` | lock-only |
-| npm, yarn, bun | *(no such command)* | always rewrites the manifest |
+| npm, yarn (Classic), bun | *(no such command)* | always rewrites the manifest |
 | Go | `go.mod` *is* the version source | always rewrites the manifest |
 
 Cargo resolver and edge-normalization trials run in an isolated project copy. Cooldown compares the
