@@ -43,11 +43,16 @@ range provably excludes is reported `peer_held` instead — including a same-lin
 bound like `>=5.6.0 <5.6.2` is broken by a mere patch bump. Edit that range yourself to authorize
 the move; `--rewrite` does not cross it.
 
+On npm, a dependency a member installs from git or from a local or remote tarball is that
+member's direct dependency, but no registry release can replace its source through the
+declaration, so `upgrade` and `fix` hold it as `not_eligible`, and it takes no `pinned` status or
+declared bound.
+
 A package declared in several install fields of one manifest (npm family: `dependencies` beside
 `devDependencies` or `optionalDependencies`) is judged by every declaration, not the first: the
 target must sit inside each range, and the strictest explicit bound across them caps it. On npm,
-pnpm, and Bun, a package every declaration in the lock pins to the same exact version is held at
-planning (`pinned`), even under `--rewrite`; Yarn locks record no per-member pins, so their exact
+pnpm, and Bun, a locked copy that every declaration binding it pins exactly is held at planning
+(`pinned`), even under `--rewrite`; Yarn locks record no per-member pins, so their exact
 pins are judged at apply like the mixed case below. A *mixed* declaration — an exact pin beside a range, in another field or another
 workspace member — leaves the package movable, so the move is planned and the apply holds it
 instead of rewriting the pin, even where the lock records only the range (pnpm keeps one specifier

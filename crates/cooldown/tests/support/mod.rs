@@ -949,6 +949,24 @@ impl Envelope {
             .collect()
     }
 
+    /// Every `from -> to` row reported for a package that is `direct`, a member's own
+    /// declaration, preserving report order.
+    pub fn direct_changes_for(&self, name: &str) -> Vec<ChangeVersions> {
+        self.items()
+            .iter()
+            .filter(|item| {
+                item.get("name").and_then(serde_json::Value::as_str) == Some(name)
+                    && item.get("direct").and_then(serde_json::Value::as_bool) == Some(true)
+            })
+            .filter_map(|item| {
+                Some(ChangeVersions {
+                    from: item.get("from")?.as_str()?.to_owned(),
+                    to: item.get("to")?.as_str()?.to_owned(),
+                })
+            })
+            .collect()
+    }
+
     /// The lock-edge rows of an `upgrade`/`fix` report, in report order.
     /// Empty when no edge binding moved (or the tool has no edge policy).
     pub fn edge_rows(&self) -> Vec<EdgeRow> {

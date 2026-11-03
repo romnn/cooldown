@@ -124,6 +124,54 @@ fn newest_versions(entries: impl IntoIterator<Item = NameVersion>) -> HashMap<St
     versions
 }
 
+/// The root manifest's declared names, the direct set of a lock without per-member attribution
+/// (npm v1, yarn classic, an unsupported `bun.lock`).
+struct ManifestDirect {
+    /// Every name the root manifest declares.
+    names: HashSet<String>,
+    /// The releases only npm aliases install ([`NodeLock::alias_only_versions`]).
+    alias_only: AliasOnlyVersions,
+}
+
+impl ManifestDirect {
+    /// Whether the root's declaration of `name` claims the copy at `version`.
+    ///
+    /// The names are read without versions, so a version only an npm alias installs
+    /// (`"foo": "npm:other@2.0.0"`) must be held out explicitly: crediting it to the root's own
+    /// declaration of `other` would let a move of the alias target rewrite that unrelated range,
+    /// and its declared bound would fall back to the root manifest too.
+    /// A registry copy of the same version at `other`'s own key gives the release back that claim,
+    /// while a local or workspace source of the same name and version is another package.
+    fn claims(&self, name: &str, version: &str) -> bool {
+        self.names.contains(name) && !self.alias_only.contains(name, version)
+    }
+}
+
+/// The declared bound of `name` from the manifests of those `members` that `index` lets an edit
+/// move the copy at `version` through ([`MemberIndex::editable_members_for`]).
+///
+/// A row whose every owner binds it through a source of its own, such as a git dependency, has no
+/// registry declaration to bound it, so it has no bound rather than the root manifest's, which
+/// only a row without members falls back to.
+fn editable_declared_bound(
+    root: &Utf8Path,
+    index: &MemberIndex,
+    members: &[MemberRef],
+    name: &str,
+    version: &str,
+) -> Result<Option<String>> {
+    let editable = index.editable_members_for(name, version);
+    let bounding: Vec<MemberRef> = members
+        .iter()
+        .filter(|member| editable.contains(&member.path))
+        .cloned()
+        .collect();
+    if bounding.is_empty() && !members.is_empty() {
+        return Ok(None);
+    }
+    manifest::declared_bound(root, &bounding, name)
+}
+
 /// Resolve each member path to its `package.json` "name", read once per `dependencies()` call. A
 /// path with no readable name is omitted, so the caller falls back to showing the path itself.
 fn member_names(root: &Utf8Path, paths: &HashSet<String>) -> HashMap<String, String> {
@@ -457,8 +505,10 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
             .filter(|dep| dep.direct && !dep.members.is_empty())
         {
             let name = dep.package.name.as_str();
-            dep.pinned = index.is_exact_pinned(name, dep.current.as_str());
-            dep.declared_bound = manifest::declared_bound(&project.root, &dep.members, name)?;
+            let version = dep.current.as_str();
+            dep.pinned = index.is_exact_pinned(name, version);
+            dep.declared_bound =
+                editable_declared_bound(&project.root, &index, &dep.members, name, version)?;
         }
         Ok(())
     }
@@ -523,24 +573,29 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         let content = read_lock::<L>(project)?;
         let entries = L::parse(&content)?;
-        // Which workspace member(s) declare each dependency, for source attribution; empty for lock
-        // formats without per-member data (yarn classic, bun). Member paths are resolved to package
-        // names once, by reading each member's `package.json`.
+        // Which workspace member(s) own each resolved copy, for source attribution; empty for lock
+        // formats without per-member data (yarn classic, npm v1, an unsupported bun.lock).
+        // npm's index attributes a copy only to the members whose own install-tree lookup binds
+        // it, so a nested duplicate of a declared name stays transitive.
+        // Member paths are resolved to package names once, by reading each member's
+        // `package.json`.
         let member_index = L::member_sources(&content);
         let member_names = member_names(&project.root, &member_index.all_paths());
-        // npm's member index is name-only, so the install tree, or a v1 lock's top-level entries,
-        // is what tells an alias's target apart from a declared copy of the same name.
-        // It is read from the whole lock, so an entry's status never depends on entry order.
-        let alias_only_versions = L::alias_only_versions(&content);
         // Direct-ness comes from the same importer data as attribution: a dependency is direct iff an
         // importer declares it. For pnpm this is version-exact, so a name declared at one version but
         // only pulled in transitively at another (a second copy in the graph) is split correctly —
         // the transitive copy is not reported as a direct dependency with a blank source. Lock
         // formats without importer data fall back to the root `package.json`'s declared names.
+        // npm's v2/v3 index already gives an alias's release no owner, since a lookup stopping at
+        // an alias slot binds no copy of either name, while a member's own copy from any source
+        // keeps its owner even when an alias installs a registry release of the same version.
         let manifest_direct = if member_index.is_authoritative() {
             None
         } else {
-            Some(manifest::direct_names(&project.manifest)?)
+            Some(ManifestDirect {
+                names: manifest::direct_names(&project.manifest)?,
+                alias_only: L::alias_only_versions(&content),
+            })
         };
 
         // Advisory identity needs positive origin evidence: the lock entry's own record — npm's and
@@ -566,28 +621,13 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
             if version.contains(':') {
                 continue;
             }
-            // A version only an npm alias installs (`"foo": "npm:other@2.0.0"`) is no copy of any
-            // `other` declaration, even where a member also declares `other` itself: crediting it
-            // to that declaration would let a move of the alias target rewrite the unrelated
-            // range, so it is owned by no member, never direct, and never pinned.
-            // Only a registry copy of the same version at `other`'s own slot gives it back that
-            // claim; a local or workspace source of the same name and version is another package.
-            // The member index is name-only, so a registry copy nested under an unrelated
-            // dependency still restores the claim, the same limitation as for any nested duplicate.
-            let alias_only = alias_only_versions.contains(&name, &version);
-            let member_paths = if alias_only {
-                Vec::new()
-            } else {
-                member_index.members_for(&name, &version)
+            // On a v2/v3 lock a copy is owned only by the members whose own lookup binds it, so one
+            // nested under an unrelated dependency gives a declaration of its name no claim.
+            let member_paths = member_index.members_for(&name, &version);
+            let is_direct = match &manifest_direct {
+                Some(fallback) => fallback.claims(&name, &version),
+                None => !member_paths.is_empty(),
             };
-            // The root-manifest fallback is name-only and would claim an alias's target for the
-            // root's own declaration of that name, so it is held out explicitly: no members alone
-            // is not enough, since the declared bound then falls back to the root manifest too.
-            let is_direct = !alias_only
-                && match &manifest_direct {
-                    Some(names) => names.contains(&name),
-                    None => !member_paths.is_empty(),
-                };
             if scope == DepScope::Direct && !is_direct {
                 continue;
             }
@@ -604,9 +644,9 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
                     path,
                 })
                 .collect();
-            let pinned = !alias_only && member_index.is_exact_pinned(&name, &version);
+            let pinned = member_index.is_exact_pinned(&name, &version);
             let declared_bound = if is_direct {
-                manifest::declared_bound(&project.root, &members, &name)?
+                editable_declared_bound(&project.root, &member_index, &members, &name, &version)?
             } else {
                 None
             };
@@ -716,8 +756,8 @@ impl<L: NodeLock> ReleaseFetcher for NpmTool<L> {
 /// The newest copy alone is blind in the other direction, though: an importer copy that genuinely
 /// moved beneath a newer transitive duplicate shows no net newest-copy change, and its applied row
 /// would vanish. The importer-resolved version sets restore that visibility (empty on both sides
-/// for npm's name-only index, which keeps its newest-copy judgment); a converged re-run still
-/// moves neither.
+/// for npm's index, which records no per-importer versions and keeps its newest-copy judgment); a
+/// converged re-run still moves neither.
 fn candidate_moved(
     name: &str,
     before: &HashMap<String, String>,
@@ -739,11 +779,13 @@ fn candidate_moved(
 /// the last resort, for a change without declaring members, a lock without any such record, or a
 /// bun member that declares the name itself while the lock leaves its copy undetermined.
 ///
-/// A recorded install tree is authoritative for every declaring member: each must resolve a copy
-/// of the name itself at the target.
-/// A member bound to nothing, or to an npm alias that installs another package at the name's slot,
-/// proves no landing, even when the alias's version equals the target or a genuine copy at the
-/// target sits elsewhere in the tree.
+/// A recorded install tree is authoritative for every declaring member: each must bind a registry
+/// copy of the name itself at the target
+/// ([`member_registry_version`](crate::lock::InstallPaths::member_registry_version)), one no
+/// declaration marks as a remote tarball ([`MemberIndex::non_registry_owners`]).
+/// A member bound to nothing, to a link, a git source, or a local or remote tarball, or to an npm
+/// alias that installs another package at the name's slot proves no landing, even when that
+/// slot's version equals the target or a genuine copy at the target sits elsewhere in the tree.
 /// The newest-copy fallback likewise leaves out releases only npm aliases install
 /// ([`landing_versions`]).
 ///
@@ -789,17 +831,18 @@ fn exact_target_reached<L: NodeLock>(project: &Project, change: &Change) -> Resu
             .into_iter()
             .all(|version| version == Some(target)));
     }
-    // npm's declaration attribution is name-only, but its lock records the physical install tree:
-    // judge each declaring member's own resolved instance — the nearest enclosing copy — so a
-    // newer duplicate nested under another dependent cannot mask a landed root copy. The
-    // newest-copy fallback below would read the duplicate, roll the genuine landing back as a
+    // npm's index records no per-importer version, but its lock records the physical install
+    // tree: judge each declaring member on the registry copy its own lookup binds — the binding
+    // that made the member own the copy at planning — so a newer duplicate nested under another
+    // dependent cannot mask a landed root copy.
+    // The newest-copy fallback below would read the duplicate, roll the genuine landing back as a
     // conflict, and do so again on every future run.
     if let Some(paths) = L::install_paths(&content) {
+        let name = change.package.name.as_str();
+        let non_registry = members.non_registry_owners(name, target);
         return Ok(change.members.iter().all(|member| {
-            paths
-                .member_resolution(&member.path, &change.package.name)
-                .resolved()
-                .is_some_and(|instance| instance.version == target)
+            paths.member_registry_version(&member.path, name) == Some(target)
+                && !non_registry.contains(&member.path)
         }));
     }
     Ok(newest_reached)
@@ -816,6 +859,14 @@ enum CandidateDecision {
     Skip(Skipped),
 }
 
+/// What the baseline lock of a per-package apply says about the copies its candidates move.
+struct LandingBaseline {
+    /// The releases only npm aliases install ([`NodeLock::alias_only_versions`]).
+    alias_only: AliasOnlyVersions,
+    /// The members owning each copy, and which of them bind it through a source of their own.
+    members: MemberIndex,
+}
+
 /// Plans one per-package candidate's landing ([`candidate_landing`]), or the row that skips it.
 ///
 /// A release the baseline lock installs only through npm aliases
@@ -823,11 +874,26 @@ enum CandidateDecision {
 /// It has no declaration of its own, so the manifest fallback would find the root's unrelated
 /// declaration of the target's name and rewrite it, bypassing the pin hold, which guards only
 /// direct changes.
+///
+/// Any other transitive candidate is rejected too, before any manifest is inspected.
+/// No member owns its copy, so with its empty members the manifest fallback would reach the root's
+/// declaration of the name, which binds another copy, and the landing moves a copy only through a
+/// declaration of its own.
+/// A direct candidate without members, which a lock without per-member attribution plans, keeps
+/// the root manifest as its owner.
+///
+/// A direct candidate is not eligible either when a member binds its copy through a source of its
+/// own, a git dependency or a local or remote tarball ([`MemberIndex::non_registry_owners`]).
+/// The member declares it directly, but npm's exact pin would replace that source with a registry
+/// release, and no range the widen writes could land one either.
+/// That check runs first: an alias can install a registry release of the same version beside
+/// such a copy, and the copy still has its owner, so the row names the source rather than the
+/// alias.
 fn decide_candidate<L: NodeLock>(
     project: &Project,
     plan: &Plan,
     change: &Change,
-    baseline_alias_only: &AliasOnlyVersions,
+    baseline: &LandingBaseline,
 ) -> Result<CandidateDecision> {
     let skip = |reason, detail| {
         CandidateDecision::Skip(Skipped {
@@ -838,9 +904,33 @@ fn decide_candidate<L: NodeLock>(
         })
     };
     let name = &change.package.name;
-    if baseline_alias_only.contains(name, change.from.as_str()) {
+    let non_registry = baseline
+        .members
+        .non_registry_owners(name, change.from.as_str());
+    let sourced: Vec<String> = change
+        .members
+        .iter()
+        .filter(|member| non_registry.contains(&member.path))
+        .map(|member| member.name.clone())
+        .collect();
+    if !sourced.is_empty() {
+        let detail = format!(
+            "{name}@{} is installed for {} from a source of its own (git, or a local or remote tarball), so no registry release may replace it through that declaration",
+            change.from,
+            list_members(&sourced),
+        );
+        return Ok(skip(SkipReason::NotEligible, Some(detail)));
+    }
+    if baseline.alias_only.contains(name, change.from.as_str()) {
         let detail = format!(
             "{name}@{} is installed only through an npm alias, so no declaration of {name} owns it",
+            change.from
+        );
+        return Ok(skip(SkipReason::NotEligible, Some(detail)));
+    }
+    if !change.direct {
+        let detail = format!(
+            "{name}@{} is a transitive copy that no member's declaration binds, so no manifest edit may move it",
             change.from
         );
         return Ok(skip(SkipReason::NotEligible, Some(detail)));
@@ -1852,9 +1942,14 @@ impl<L: NodeLock> NpmTool<L> {
             .map(locked_versions::<L>)
             .transpose()?
             .unwrap_or_default();
-        let baseline_alias_only = journaled_lock::<L>(baseline_journal)
-            .map(L::alias_only_versions)
-            .unwrap_or_default();
+        let landing_baseline = LandingBaseline {
+            alias_only: journaled_lock::<L>(baseline_journal)
+                .map(L::alias_only_versions)
+                .unwrap_or_default(),
+            members: journaled_lock::<L>(baseline_journal)
+                .map(L::member_sources)
+                .unwrap_or_default(),
+        };
         let mut report = ApplyReport::default();
         let mut violation_baseline: Option<PeerViolations> = None;
         // The pin rewrites of every accepted candidate, which later candidates are judged against
@@ -1871,7 +1966,7 @@ impl<L: NodeLock> NpmTool<L> {
             };
             let candidate_journal = journal::<L>(project, &candidate_plan)?;
             let (landing, candidate_pins) =
-                match decide_candidate::<L>(project, plan, change, &baseline_alias_only)? {
+                match decide_candidate::<L>(project, plan, change, &landing_baseline)? {
                     CandidateDecision::Land {
                         landing,
                         authorized,
@@ -3750,6 +3845,9 @@ fn omitted_selector_warnings(omitted: &[String]) -> Vec<Diagnostic> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod npm_attribution_tests;
 
 #[cfg(test)]
 mod tests {

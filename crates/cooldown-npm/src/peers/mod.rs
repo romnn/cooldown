@@ -137,10 +137,10 @@ pub(crate) struct PeerPartition {
 ///   transitive cooldown gate.
 ///   A direct dependent has no such latitude: an in-range version that
 ///   lifts the peer would itself have been planned as a move (and then the co-move rule applies);
-/// - npm's package-lock attributes importer declarations by *name* only, but its physical layout
+/// - npm's package-lock records importer declarations by *name* only, but its physical layout
 ///   is instance-exact: a declaring member's own nearest-ancestor lookup identifies its direct
-///   copy ([`direct_dependent_members`]), so a name resolved at several versions still gates
-///   through the proven-direct instance — and only through it.
+///   copy, whatever its source ([`direct_dependent_members`]), so a name resolved at several
+///   versions still gates through the proven-direct instance — and only through it.
 ///   Without a physical layout (an npm
 ///   v1 lock) the split stays ambiguous and never gates (pnpm's attribution is version-exact and
 ///   unaffected);
@@ -859,8 +859,8 @@ pub(crate) fn first_new_peer_violation<L: NodeLock>(
 /// Names the lock resolves at more than one distinct version — the whole resolved graph, nested
 /// copies included, unlike [`held_splits`](crate::tool::held_splits), which judges
 /// importer *declarations* only.
-/// Tells the gate when npm's name-only importer attribution is ambiguous — consulted only when no
-/// physical layout can resolve the split instance-exactly (see [`direct_dependent_members`]).
+/// Tells the gate when an attribution that is not version-exact is ambiguous — consulted only when
+/// no physical layout can resolve the split instance-exactly (see [`direct_dependent_members`]).
 /// An unparsable lock yields the empty set; unreachable in practice, since the peer requirements
 /// that trigger the query parse from the same document.
 fn resolved_multi_version_names<L: NodeLock>(content: &str) -> HashSet<String> {
@@ -946,8 +946,9 @@ fn workspace_peer_requirements<L: NodeLock>(
         };
         let mut contexts = vec![path.clone()];
         contexts.extend(locals.get(&path).into_iter().flatten().cloned());
-        // npm attributes importer declarations by name, so a member consumed as a workspace
-        // dependency contributes its declarers as binding contexts too.
+        // A member owning a copy of this package at its version binds the contract there too.
+        // npm judges the contract from the origin directory instead, whatever the contexts say
+        // (see `workspace_peer_hold`), and its index gives a linked workspace package no owner.
         contexts.extend(members.members_for(name, version));
         contexts.sort();
         contexts.dedup();
@@ -1174,10 +1175,15 @@ fn dependent_holds_context(
 ///   name-only: a declaring member is direct for THIS record exactly when its own
 ///   nearest-ancestor lookup resolves the dependent at this record's version — a nested copy of
 ///   the same name (even at another version) neither masquerades as direct nor blinds the real
-///   direct copy;
-/// - without one (pnpm is version-exact and unaffected; an npm v1 lock records no layout),
-///   name-only attribution of a name resolved at several versions cannot single out the direct
-///   instance from a nested transitive copy — fail open.
+///   direct copy.
+///   The candidates are every member declaring the name ([`declaring_members`]), not only the
+///   copy's editable owners: a dependent installed from git, a tarball, or a linked workspace
+///   package still binds its peers wherever a member's lookup reaches it;
+/// - without one (pnpm is version-exact and unaffected; an npm v1 lock records no layout), an
+///   attribution that is not version-exact cannot single out the direct instance of a name
+///   resolved at several versions from a nested transitive copy — fail open.
+///
+/// [`declaring_members`]: crate::lock::MemberIndex::declaring_members
 fn direct_dependent_members(
     members: &crate::lock::MemberIndex,
     install: Option<&crate::lock::InstallPaths>,
@@ -1185,19 +1191,18 @@ fn direct_dependent_members(
     dependent_version: &str,
     resolved_splits: &HashSet<String>,
 ) -> Option<Vec<String>> {
-    let dependent_members = members.members_for(dependent, dependent_version);
-    if dependent_members.is_empty() {
-        return None;
-    }
     let Some(install) = install else {
-        if !members.version_attributed(dependent, dependent_version)
-            && resolved_splits.contains(dependent)
+        let dependent_members = members.members_for(dependent, dependent_version);
+        if dependent_members.is_empty()
+            || (!members.version_attributed(dependent, dependent_version)
+                && resolved_splits.contains(dependent))
         {
             return None;
         }
         return Some(dependent_members);
     };
-    let direct: Vec<String> = dependent_members
+    let direct: Vec<String> = members
+        .declaring_members(dependent)
         .into_iter()
         .filter(|member| {
             // An alias at the member's slot is no direct instance of the dependent.
