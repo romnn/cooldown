@@ -1263,5 +1263,4 @@ fn pnpm_peer_suffixed_names(lock: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
-#[path = "peers/tests.rs"]
 mod tests;
