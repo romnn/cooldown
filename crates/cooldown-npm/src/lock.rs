@@ -160,6 +160,21 @@ pub trait NodeLock: Send + Sync + 'static {
         MemberAttribution::Unknown
     }
 
+    /// The registry releases the lock installs only through npm aliases.
+    ///
+    /// An alias (`"foo": "npm:other@2.0.0"`) resolves `other@2.0.0` without being a copy of any
+    /// `other` declaration.
+    /// Such a release is owned by no member, never direct, never a manifest landing's source, and
+    /// no evidence that a move of `other` landed.
+    /// npm answers from its install tree ([`InstallPaths::alias_only_versions`]) and, for a v1 lock
+    /// that records none, from its top-level entries.
+    ///
+    /// Default: empty, for lock formats that record no alias distinctly from the copy it installs.
+    #[must_use]
+    fn alias_only_versions(_content: &str) -> AliasOnlyVersions {
+        AliasOnlyVersions::default()
+    }
+
     /// The driver args that refresh the lock after cooldown has rewritten the declaring
     /// `package.json` range itself.
     ///
@@ -1308,6 +1323,32 @@ pub struct InstallPaths {
     registry_copies: HashSet<(String, String)>,
 }
 
+/// The registry releases that only npm aliases install, as
+/// [`NodeLock::alias_only_versions`] reads them.
+#[derive(Debug, Default)]
+pub struct AliasOnlyVersions {
+    releases: HashSet<RegistryRelease>,
+}
+
+/// One registry release, by package name and version.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct RegistryRelease {
+    name: String,
+    version: String,
+}
+
+impl AliasOnlyVersions {
+    /// Whether `name@version` is installed only through npm aliases, so no declaration of `name`
+    /// owns it.
+    #[must_use]
+    pub fn contains(&self, name: &str, version: &str) -> bool {
+        self.releases.contains(&RegistryRelease {
+            name: name.to_string(),
+            version: version.to_string(),
+        })
+    }
+}
+
 /// The package one install directory holds, each half [`None`] when the lock does not establish
 /// it, such as a link whose target entry is absent or records no version.
 struct InstalledPackage {
@@ -1408,15 +1449,22 @@ impl InstallPaths {
             .collect()
     }
 
-    /// Whether `name@version` is installed only through npm aliases: some alias slot installs it,
-    /// and no registry copy of it sits at a slot of its own name.
+    /// Every release installed only through npm aliases: some alias slot installs it, and no
+    /// registry copy of it sits at a slot of its own name.
     ///
     /// A workspace or other local source of the same name and version is no such copy, since it
     /// is a different package from the registry release an alias names.
     #[must_use]
-    pub fn alias_only(&self, name: &str, version: &str) -> bool {
-        let key = (name.to_string(), version.to_string());
-        self.alias_targets.contains(&key) && !self.registry_copies.contains(&key)
+    pub fn alias_only_versions(&self) -> AliasOnlyVersions {
+        let releases = self
+            .alias_targets
+            .difference(&self.registry_copies)
+            .map(|(name, version)| RegistryRelease {
+                name: name.clone(),
+                version: version.clone(),
+            })
+            .collect();
+        AliasOnlyVersions { releases }
     }
 }
 
@@ -1738,6 +1786,13 @@ impl NodeLock for Npm {
         Self::install_paths(content).map_or(MemberAttribution::Unknown, |paths| {
             MemberAttribution::InstallTree(paths)
         })
+    }
+
+    fn alias_only_versions(content: &str) -> AliasOnlyVersions {
+        Self::install_paths(content).map_or_else(
+            || parse_npm_v1_alias_only_versions(content),
+            |paths| paths.alias_only_versions(),
+        )
     }
 
     fn relock_args(before: Option<&str>) -> Vec<String> {
@@ -2065,6 +2120,9 @@ impl NodeLock for Bun {
 /// Parses `package-lock.json` (lockfileVersion 2/3): the flat `packages` map keys every install
 /// path (`node_modules/<name>`, possibly nested) to a record carrying its resolved `version`. The
 /// v1 `dependencies` tree is handled as a fallback for older locks.
+///
+/// Only the v1 tree's top-level entries are read, each through [`read_npm_v1_entry`], so an alias
+/// is named by its target and a non-registry entry yields no row.
 fn parse_npm(content: &str) -> Result<Vec<NameVersion>> {
     let doc: serde_json::Value = serde_json::from_str(content)
         .map_err(|e| CoreError::Parse(format!("package-lock.json: {e}")))?;
@@ -2094,17 +2152,91 @@ fn parse_npm(content: &str) -> Result<Vec<NameVersion>> {
             }
         }
     } else if let Some(deps) = doc.get("dependencies").and_then(|v| v.as_object()) {
-        for (name, val) in deps {
-            if let Some(version) = val.get("version").and_then(|v| v.as_str()) {
-                out.push(NameVersion {
-                    name: name.clone(),
-                    version: version.to_string(),
-                    origin: lock_entry_origin(val),
-                });
-            }
-        }
+        out.extend(
+            deps.iter()
+                .filter_map(|(key, entry)| read_npm_v1_entry(key, entry))
+                .map(|NpmV1Entry { package, .. }| package),
+        );
     }
     Ok(out)
+}
+
+/// The registry release one top-level entry of a v1 `dependencies` tree installs.
+struct NpmV1Entry {
+    /// The release, named by an alias's target, with the entry's `resolved` origin.
+    package: NameVersion,
+    /// Whether the entry is an npm alias of another package, which installs the release under the
+    /// entry's key without being a copy of that key's package or of any declaration of the target.
+    aliased: bool,
+}
+
+/// Reads one top-level entry of a v1 `dependencies` tree, or `None` when it resolves no registry
+/// release.
+///
+/// v1 records an alias as `"foo": { "version": "npm:other@2.0.0" }`, so a `version` naming the
+/// `npm:` protocol is read as its target's identity before any other protocol is rejected.
+/// A target that does not split into a name and a registry version yields `None` rather than
+/// falling back to the entry's key, which names only the alias.
+/// Any other non-registry `version` (`file:`, a git or tarball reference) is skipped.
+fn read_npm_v1_entry(key: &str, entry: &serde_json::Value) -> Option<NpmV1Entry> {
+    let version = entry.get("version").and_then(serde_json::Value::as_str)?;
+    let (name, version) = match version.strip_prefix("npm:") {
+        Some(target) => {
+            let NameVersion { name, version, .. } = split_name_version(target)?;
+            (name, version)
+        }
+        None => (key.to_string(), version.to_string()),
+    };
+    if !is_registry_reference(&version) {
+        return None;
+    }
+    let aliased = name != key;
+    Some(NpmV1Entry {
+        package: NameVersion {
+            name,
+            version,
+            origin: lock_entry_origin(entry),
+        },
+        aliased,
+    })
+}
+
+/// The releases a v1 lock installs only through npm aliases ([`NodeLock::alias_only_versions`]).
+///
+/// It reads the same top-level entries [`parse_npm`] does: a foreign alias target counts unless a
+/// registry copy of the same release sits under the target's own key.
+/// A copy whose `resolved` names a local source is another package than the registry release an
+/// alias names, so it restores nothing.
+fn parse_npm_v1_alias_only_versions(content: &str) -> AliasOnlyVersions {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(content) else {
+        return AliasOnlyVersions::default();
+    };
+    let Some(deps) = doc
+        .get("dependencies")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return AliasOnlyVersions::default();
+    };
+    let mut alias_targets = HashSet::new();
+    let mut registry_copies = HashSet::new();
+    for (key, entry) in deps {
+        let Some(NpmV1Entry { package, aliased }) = read_npm_v1_entry(key, entry) else {
+            continue;
+        };
+        let release = RegistryRelease {
+            name: package.name,
+            version: package.version,
+        };
+        if aliased {
+            alias_targets.insert(release);
+        } else if !is_local_source(entry) {
+            registry_copies.insert(release);
+        }
+    }
+    alias_targets.retain(|release| !registry_copies.contains(release));
+    AliasOnlyVersions {
+        releases: alias_targets,
+    }
 }
 
 /// The `resolved` URL of one `package-lock.json` entry — npm's record of where the tarball was
@@ -5801,6 +5933,176 @@ packages:
             "the root's alias is no pin"
         );
         assert_eq!(index.members_for("other", "2.0.0"), [] as [String; 0]);
+    }
+
+    /// A v1 lock records an alias as `"foo": { "version": "npm:other@2.0.0" }`, so the flat list
+    /// names the entry by its target, scoped or not, with the entry's own `resolved` origin.
+    /// A plain entry keeps its key.
+    #[test]
+    fn npm_v1_names_an_alias_by_its_target() -> Result<()> {
+        let lock = indoc! {r#"
+            {
+              "lockfileVersion": 1,
+              "dependencies": {
+                "foo": {
+                  "version": "npm:other@2.0.0",
+                  "resolved": "https://registry.npmjs.org/other/-/other-2.0.0.tgz"
+                },
+                "bar": {
+                  "version": "npm:@scope/other@3.0.0",
+                  "resolved": "https://npm.corp.example/@scope/other/-/other-3.0.0.tgz"
+                },
+                "unrecorded-alias": { "version": "npm:target@1.2.0" },
+                "unsaved-alias": { "version": "npm:target@1.3.0", "resolved": false },
+                "lodash": {
+                  "version": "4.17.15",
+                  "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.15.tgz"
+                },
+                "unrecorded": { "version": "1.0.0" }
+              }
+            }
+        "#};
+        assert_eq!(
+            sorted(Npm::parse(lock)?),
+            sorted(vec![
+                NameVersion {
+                    name: "other".to_string(),
+                    version: "2.0.0".to_string(),
+                    origin: LockOrigin::Url(
+                        "https://registry.npmjs.org/other/-/other-2.0.0.tgz".to_string()
+                    ),
+                },
+                NameVersion {
+                    name: "@scope/other".to_string(),
+                    version: "3.0.0".to_string(),
+                    origin: LockOrigin::Url(
+                        "https://npm.corp.example/@scope/other/-/other-3.0.0.tgz".to_string()
+                    ),
+                },
+                NameVersion::new("target", "1.2.0"),
+                NameVersion::new("target", "1.3.0"),
+                NameVersion {
+                    name: "lodash".to_string(),
+                    version: "4.17.15".to_string(),
+                    origin: LockOrigin::Url(
+                        "https://registry.npmjs.org/lodash/-/lodash-4.17.15.tgz".to_string()
+                    ),
+                },
+                NameVersion::new("unrecorded", "1.0.0"),
+            ])
+        );
+        Ok(())
+    }
+
+    /// A v1 entry that resolves no registry release yields no row, and a malformed alias is never
+    /// read as a version of the alias name instead.
+    #[test]
+    fn npm_v1_skips_non_registry_and_malformed_versions() -> Result<()> {
+        let lock = indoc! {r#"
+            {
+              "lockfileVersion": 1,
+              "dependencies": {
+                "local": { "version": "file:packages/local" },
+                "tarball": { "version": "file:vendor/tarball-1.0.0.tgz" },
+                "repo": { "version": "git+https://github.com/user/repo.git#0123abc" },
+                "shorthand": { "version": "github:user/repo#0123abc" },
+                "remote": { "version": "https://example.com/remote-1.0.0.tgz" },
+                "empty": { "version": "" },
+                "missing": { "resolved": "https://registry.npmjs.org/missing/-/missing-1.0.0.tgz" },
+                "bare-alias": { "version": "npm:target" },
+                "scope-only-alias": { "version": "npm:@scope/target" },
+                "versionless-alias": { "version": "npm:target@" },
+                "git-alias": { "version": "npm:target@git+https://github.com/user/target.git" },
+                "kept": { "version": "1.0.0" }
+              }
+            }
+        "#};
+        assert_eq!(Npm::parse(lock)?, [NameVersion::new("kept", "1.0.0")]);
+        Ok(())
+    }
+
+    /// A v1 lock records no install tree, so the alias evidence comes from its top-level entries:
+    /// a foreign alias target counts until a genuine registry copy of the same release sits under
+    /// the target's own key, which a local source of that name never is.
+    #[test]
+    fn npm_v1_alias_only_versions() {
+        let alias_only = |entries: &str| {
+            let lock = formatdoc! {r#"
+                {{ "lockfileVersion": 1, "dependencies": {{ {entries} }} }}
+            "#};
+            Npm::alias_only_versions(&lock)
+        };
+        let alias = r#""foo": { "version": "npm:other@2.0.0" }"#;
+
+        // Alias alone
+        let versions = alias_only(alias);
+        assert!(versions.contains("other", "2.0.0"));
+        assert!(!versions.contains("foo", "2.0.0"));
+        assert!(!versions.contains("other", "1.0.0"));
+
+        // A scoped target
+        let versions = alias_only(r#""foo": { "version": "npm:@scope/other@2.0.0" }"#);
+        assert!(versions.contains("@scope/other", "2.0.0"));
+
+        // Genuine registry copies of the same release, recorded or not
+        for copy in [
+            r#""other": { "version": "2.0.0" }"#,
+            r#""other": { "version": "2.0.0", "resolved": false }"#,
+            r#""other": { "version": "2.0.0", "resolved": "https://registry.npmjs.org/o.tgz" }"#,
+        ] {
+            assert!(
+                !alias_only(&format!("{alias}, {copy}")).contains("other", "2.0.0"),
+                "{copy}"
+            );
+        }
+
+        // Local sources of the alias target's name
+        for copy in [
+            r#""other": { "version": "file:packages/other" }"#,
+            r#""other": { "version": "2.0.0", "resolved": "file:vendor/other-2.0.0.tgz" }"#,
+        ] {
+            assert!(
+                alias_only(&format!("{alias}, {copy}")).contains("other", "2.0.0"),
+                "{copy}"
+            );
+        }
+
+        // Same-name alias and an unrelated release of the target
+        assert!(!alias_only(r#""foo": { "version": "npm:foo@2.0.0" }"#).contains("foo", "2.0.0"));
+        assert!(
+            alias_only(&format!(r#"{alias}, "other": {{ "version": "1.0.0" }}"#))
+                .contains("other", "2.0.0")
+        );
+
+        // The install tree answers for a v2/v3 lock
+        let versions = Npm::alias_only_versions(&npm_alias_lock(3, Some("other"), None));
+        assert!(versions.contains("other", "2.0.0"));
+        assert!(!versions.contains("foo", "2.0.0"));
+    }
+
+    /// Normalizing v1 identities manufactures no install tree: an alias and a plain binding alike
+    /// keep the conservative v1 readers, which attribute no members, pins, or peers.
+    #[test]
+    fn npm_v1_aliases_keep_the_conservative_readers() {
+        let lock = indoc! {r#"
+            {
+              "lockfileVersion": 1,
+              "dependencies": {
+                "foo": { "version": "npm:other@2.0.0" },
+                "other": { "version": "1.0.0" }
+              }
+            }
+        "#};
+        let index = Npm::member_sources(lock);
+        assert!(!index.is_exact_pinned("other", "1.0.0"));
+        assert!(!index.is_exact_pinned("other", "2.0.0"));
+        assert_eq!(index.members_for("other", "2.0.0"), [] as [String; 0]);
+        assert_eq!(Npm::peer_requirements(lock), [] as [PeerRequirement; 0]);
+        assert!(Npm::install_paths(lock).is_none());
+        assert!(matches!(
+            Npm::member_attribution(lock),
+            MemberAttribution::Unknown
+        ));
     }
 
     /// A local-package target the workspace cannot contain is dropped, never clamped onto an
