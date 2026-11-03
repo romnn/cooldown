@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **pnpm's stale-lock check reads specifiers as npm does, so a floated exact pin is caught.**
+  After a resolve, cooldown checks each `pnpm-lock.yaml` importer's version against its recorded
+  specifier, but it parsed the specifier as a Rust semver requirement. A bare `6.0.0` read as
+  `^6.0.0`, and a `v6.0.0`, `=v6.0.0`, or `= v6.0.0` pin was not read at all, so a resolve that
+  floated an exact pin to `6.1.0` passed unnoticed. The check now uses the npm-family matcher and
+  reports only a version the specifier provably excludes, `||` unions and comparator sets
+  included. A newly floated pin now sends the round through the override repair, and fails it as
+  a stale lock when the repair leaves the pin floated. A range cooldown cannot read, such as
+  `^v6.0.0`, `>=v6`, `v6.x`, or a hyphen range, is still never reported, and a mismatch the lock
+  already carried before the resolve, such as an override, stays grandfathered. The npm-family
+  matcher itself now judges a prerelease beside a partial as node-semver does, so
+  `1.x >=1.2.3-beta.1` admits `1.2.3-beta.2`, while `^1 >=1.0.0-alpha` still rejects
+  `1.0.0-beta`, and it drops a `>=0.0.0` floor, so `^0.0 >=0.0.0-alpha` admits `0.0.0-beta`.
+
 - **An npm alias in a lockfile v1 is read as its target, not as a version of the alias name.**
   A v1 `package-lock.json` records `"foo": "npm:other@2.0.0"` as an entry `foo` at version
   `npm:other@2.0.0`, which cooldown took verbatim, so the alias target never reached evaluation.

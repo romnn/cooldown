@@ -8,7 +8,7 @@
 //! adapter uses that same data for both direct/transitive classification and source attribution;
 //! older formats fall back to the root manifest's declared dependency names.
 
-use crate::version::{CeilingHold, is_exact_npm_specifier};
+use crate::version::{CeilingHold, RangeMatch, is_exact_npm_specifier, range_match};
 use cooldown_core::{CoreError, Result, ToolId};
 use serde::Deserialize;
 use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
@@ -2848,14 +2848,17 @@ fn pnpm_lock_consistency_error(content: &str) -> Option<String> {
     error
 }
 
-/// Validates one pnpm importer entry with a deliberately one-way semver approximation.
+/// Validates one pnpm importer entry, reporting only a resolved version its specifier provably
+/// excludes.
 ///
-/// The Rust `semver` crate is not node-semver. Forms it cannot parse (`||` unions, hyphen ranges
-/// `1.2 - 3.4`, space-separated comparator sets, dist tags like `latest`) fail
-/// `VersionReq::parse` and skip the check, never causing a false flag. The one known semantic
-/// divergence is a bare `6.0.0`: node-semver treats it as exact, while Rust semver treats it as
-/// caret, so a real mismatch can be missed. Overall, divergences can only under-report stale locks;
-/// they must never mark a healthy lock stale.
+/// The specifier is judged with npm's grammar by [`range_match`]: a bare `6.0.0` and its
+/// `v6.0.0`, `=v6.0.0`, and `= v6.0.0` spellings are exact pins, and `||` unions and comparator
+/// sets are read branch by branch.
+/// Only [`RangeMatch::Excludes`] is reported.
+/// [`RangeMatch::Matches`] and [`RangeMatch::Unknown`] produce no error, because a range the
+/// matcher cannot read (`^v6`, `>=v6`, `v6.x`, a hyphen range, a dist tag) proves nothing.
+/// A false report would send a healthy lock into repair or fail it as stale, so divergences from
+/// node-semver may only under-report.
 fn pnpm_importer_entry_error(
     member: &str,
     name: &str,
@@ -2873,13 +2876,7 @@ fn pnpm_importer_entry_error(
         return None;
     }
     let version = raw_version.split('(').next().unwrap_or(raw_version);
-    let Ok(requirement) = semver::VersionReq::parse(specifier) else {
-        return None;
-    };
-    let Ok(version) = semver::Version::parse(version) else {
-        return None;
-    };
-    if requirement.matches(&version) {
+    if range_match(specifier, version) != RangeMatch::Excludes {
         return None;
     }
     Some(format!(
@@ -4328,6 +4325,145 @@ mod tests {
         "};
 
         assert_eq!(pnpm_lock_consistency_error(lock), None);
+    }
+
+    /// The importer check reads specifiers with npm's grammar and reports only a proven exclusion.
+    ///
+    /// Every row is `(specifier, version, reported)`.
+    /// A range the matcher cannot read proves nothing, so it must never be reported: a false
+    /// report sends a healthy lock into repair or fails it as stale.
+    #[test]
+    fn pnpm_importer_entries_report_only_proven_exclusions() {
+        let cases: &[(Option<&str>, Option<&str>, bool)] = &[
+            // Exact pins in every node-semver spelling, resolved off the pin
+            (Some("6.0.0"), Some("6.1.0"), true),
+            (Some("=6.0.0"), Some("6.1.0"), true),
+            (Some("v6.0.0"), Some("6.1.0"), true),
+            (Some("=v6.0.0"), Some("6.1.0"), true),
+            (Some("= v6.0.0"), Some("6.1.0"), true),
+            (Some(" 6.0.0 "), Some("6.1.0(react@18.2.0)"), true),
+            // The same pins resolved at the pinned version
+            (Some("6.0.0"), Some("6.0.0"), false),
+            (Some("v6.0.0"), Some("6.0.0(react@18.2.0)"), false),
+            (Some("=v6.0.0"), Some("6.0.0+build.7"), false),
+            (Some("= v6.0.0"), Some("6.0.0+build.7(react@18.2.0)"), false),
+            (Some("6.0.0+build.7"), Some("6.0.0"), false),
+            // Ranges npm reads that the matcher cannot, whatever the version
+            (Some("^v6.0.0"), Some("7.0.0"), false),
+            (Some(">=v6"), Some("5.0.0"), false),
+            (Some("v6.x"), Some("7.0.0"), false),
+            (Some("6.0.0 - 6.0.5"), Some("6.1.0"), false),
+            (Some("latest"), Some("6.1.0"), false),
+            (Some("next"), Some("6.1.0-rc.1"), false),
+            // Understood ranges, partials, and comparator sets
+            (Some("^6"), Some("7.3.5"), true),
+            (Some("^6"), Some("6.4.3"), false),
+            (Some("6.0"), Some("6.1.0"), true),
+            (Some("6.0"), Some("6.0.9"), false),
+            (Some(">=6.0.0 <6.1.0"), Some("6.1.0"), true),
+            (Some(">=6.0.0 <6.1.0"), Some("6.0.4"), false),
+            // Understood unions
+            (Some("^5.0.0 || ^6.0.0"), Some("6.1.0"), false),
+            (Some("^4.0.0 || ^5.0.0"), Some("6.1.0"), true),
+            (Some("5.0.0 || 6.0.0"), Some("6.1.0"), true),
+            // A prerelease opted in by a comparator of its tuple, beside a partial
+            (Some("1.x >=1.2.3-beta.1"), Some("1.2.3-beta.2"), false),
+            (Some("1.2 >=1.2.3-beta.1"), Some("1.2.3-beta.2"), false),
+            (
+                Some("1.x >=1.2.3-beta.1 || ^2"),
+                Some("1.2.3-beta.2"),
+                false,
+            ),
+            (Some("1.x"), Some("1.2.3-beta.2"), true),
+            (Some("1.x"), Some("2.0.0"), true),
+            // A `>=0.0.0` floor, written or implied, bounds nothing in node-semver
+            (Some("^0.0 >=0.0.0-alpha"), Some("0.0.0-beta"), false),
+            (Some("0.x >=0.0.0-alpha"), Some("0.0.0-beta"), false),
+            (Some(">=0.0.0 >=0.0.0-alpha"), Some("0.0.0-beta"), false),
+            (Some("^0.0.0 >=0.0.0-alpha"), Some("0.0.0-beta"), false),
+            (Some("~0.0.0 >=0.0.0-alpha"), Some("0.0.0-beta"), false),
+            (Some("^0.0.0 >=0.0.0-alpha"), Some("0.0.1"), true),
+            (Some("^0.0"), Some("0.0.0-beta"), true),
+            // A union with an unreadable branch and no matching branch proves nothing
+            (Some("^5.0.0 || 6.0.0 - 6.0.5"), Some("6.1.0"), false),
+            (Some("^5.0.0 || ^v6.0.0"), Some("7.0.0"), false),
+            // Protocols, aliases, and local or non-registry resolutions
+            (Some("npm:other@6.0.0"), Some("other@6.1.0"), false),
+            (Some("catalog:"), Some("6.1.0"), false),
+            (Some("catalog:react18"), Some("6.1.0"), false),
+            (Some("workspace:*"), Some("link:../pkg"), false),
+            (Some("workspace:^1.0.0"), Some("2.0.0"), false),
+            (Some("link:../pkg"), Some("link:../pkg"), false),
+            (Some("file:../pkg"), Some("file:../pkg"), false),
+            (Some("github:user/repo"), Some("6.1.0"), false),
+            (Some("6.0.0"), Some("link:../pkg"), false),
+            (Some("6.0.0"), Some("file:../pkg(react@18.2.0)"), false),
+            (Some("6.0.0"), Some("workspace:../pkg"), false),
+            (
+                Some("6.0.0"),
+                Some("https://codeload.github.com/user/repo/tar.gz/abc123"),
+                false,
+            ),
+            (Some("6.0.0"), Some("other@6.1.0"), false),
+            // Missing, empty, or unreadable values
+            (None, Some("6.1.0"), false),
+            (Some("6.0.0"), None, false),
+            (None, None, false),
+            (Some(""), Some("6.1.0"), false),
+            (Some("   "), Some("6.1.0"), false),
+            (Some("6.0.0"), Some(""), false),
+            (Some("6.0.0"), Some("not-a-version"), false),
+        ];
+        for &(specifier, version, reported) in cases {
+            let error = pnpm_importer_entry_error("apps/web", "dep", specifier, version);
+            assert_eq!(
+                error.is_some(),
+                reported,
+                "specifier {specifier:?} at version {version:?}: {error:?}"
+            );
+        }
+    }
+
+    /// A reported exact-pin mismatch names the importer, the dependency, the resolved version
+    /// without its peer suffix, and the specifier as the manifest spelled it.
+    #[test]
+    fn pnpm_lock_consistency_names_a_floated_exact_pin() {
+        let lock = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              apps/web:
+                dependencies:
+                  vite:
+                    specifier: = v6.0.0
+                    version: 6.1.0(@types/node@22.19.20)
+        "};
+
+        let error = pnpm_lock_consistency_error(lock).expect("a floated exact pin");
+
+        assert_eq!(
+            error,
+            "pnpm-lock.yaml importer apps/web dependency vite: version 6.1.0 does not satisfy \
+             range = v6.0.0"
+        );
+    }
+
+    /// An importer entry whose shape the model does not recognize (a pre-v9 scalar) and a lock
+    /// that does not parse carry no specifier to judge, so neither is reported.
+    #[test]
+    fn pnpm_lock_consistency_skips_unreadable_entries() {
+        let scalar = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              apps/web:
+                dependencies:
+                  vite: 6.1.0
+        "};
+        assert_eq!(pnpm_lock_consistency_error(scalar), None);
+        assert_eq!(pnpm_lock_consistency_error("importers: [unclosed"), None);
     }
 
     /// A Berry `yarn.lock` is refused as unreadable instead of parsing as an empty graph that

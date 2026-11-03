@@ -3277,8 +3277,8 @@ fn minimum_age_repair_versions(plan: &Plan) -> BTreeMap<String, BTreeSet<String>
 /// a direct dependency outside its declared range — `--frozen-lockfile` accepts that via the lock's
 /// `overrides:` section, which the cheap check does not read) must not fail apply: every recovery
 /// trial would fail identically and the run would misreport all candidates as held.
-/// The before/after gate also absorbs any node-semver vs rust-semver divergence: whatever the check
-/// misjudges, it misjudges identically on both sides.
+/// The before/after gate also absorbs any divergence of the check from node-semver: whatever the
+/// check misjudges, it misjudges identically on both sides.
 fn new_lock_inconsistency<L: NodeLock>(before: Option<&str>, after: &str) -> Option<String> {
     let detail = L::lock_consistency_error(after)?;
     before
@@ -4530,6 +4530,141 @@ mod tests {
         assert_eq!(new_lock_inconsistency::<Pnpm>(Some(stale), stale), None);
         // A consistent after-lock is never an error.
         assert_eq!(new_lock_inconsistency::<Pnpm>(Some(stale), clean), None);
+    }
+
+    /// An exact pin is judged as npm reads it, an equality, under the same before/after gate.
+    #[test]
+    fn a_floated_exact_pin_is_charged_only_to_the_resolve_that_floated_it() {
+        let lock = |specifier: &str, version: &str| {
+            indoc::formatdoc! {"
+                lockfileVersion: '9.0'
+
+                importers:
+
+                  apps/admin:
+                    dependencies:
+                      vite:
+                        specifier: {specifier}
+                        version: {version}(@types/node@22.19.20)
+            "}
+        };
+        for specifier in ["6.0.0", "v6.0.0", "= v6.0.0"] {
+            let clean = lock(specifier, "6.0.0");
+            let stale = lock(specifier, "6.1.0");
+
+            // The resolve floated the pin within its major (clean or absent before), so it surfaces.
+            assert!(
+                new_lock_inconsistency::<Pnpm>(Some(&clean), &stale).is_some(),
+                "{specifier}"
+            );
+            assert!(
+                new_lock_inconsistency::<Pnpm>(None, &stale).is_some(),
+                "{specifier}"
+            );
+            // A floated pin the lock already carried is not this resolve's doing.
+            assert_eq!(
+                new_lock_inconsistency::<Pnpm>(Some(&stale), &stale),
+                None,
+                "{specifier}"
+            );
+            // A resolve that brings the pin back to its version settles cleanly.
+            assert_eq!(
+                new_lock_inconsistency::<Pnpm>(Some(&stale), &clean),
+                None,
+                "{specifier}"
+            );
+        }
+    }
+
+    /// A resolve that moves a stable version to a prerelease the specifier opts in is consistent.
+    /// `1.x >=1.2.3-beta.1` admits `1.2.3-beta.2` in node-semver, since the explicit comparator
+    /// opts that tuple in and `1.x` expands to bounds around it.
+    #[test]
+    fn a_prerelease_its_comparator_set_opts_in_is_not_charged_to_the_resolve() {
+        let lock = |version: &str| {
+            indoc::formatdoc! {"
+                lockfileVersion: '9.0'
+
+                importers:
+
+                  .:
+                    dependencies:
+                      dep:
+                        specifier: '1.x >=1.2.3-beta.1'
+                        version: {version}
+            "}
+        };
+        let stable = lock("1.9.0");
+        let prerelease = lock("1.2.3-beta.2");
+
+        assert_eq!(Pnpm::lock_consistency_error(&prerelease), None);
+        assert_eq!(
+            new_lock_inconsistency::<Pnpm>(Some(&stable), &prerelease),
+            None
+        );
+    }
+
+    /// A resolve that moves a stable version to a `0.0.0` prerelease its own comparator opts in is
+    /// consistent.
+    /// node-semver drops the `>=0.0.0` floor of `^0.0`, so `^0.0 >=0.0.0-alpha` admits
+    /// `0.0.0-beta`.
+    #[test]
+    fn a_zero_prerelease_beside_a_dropped_zero_floor_is_not_charged_to_the_resolve() {
+        let lock = |version: &str| {
+            indoc::formatdoc! {"
+                lockfileVersion: '9.0'
+
+                importers:
+
+                  .:
+                    dependencies:
+                      dep:
+                        specifier: '^0.0 >=0.0.0-alpha'
+                        version: {version}
+            "}
+        };
+        let stable = lock("0.0.4");
+        let prerelease = lock("0.0.0-beta");
+
+        assert_eq!(Pnpm::lock_consistency_error(&stable), None);
+        assert_eq!(Pnpm::lock_consistency_error(&prerelease), None);
+        assert_eq!(
+            new_lock_inconsistency::<Pnpm>(Some(&stable), &prerelease),
+            None
+        );
+    }
+
+    /// A persisted pnpm override legally resolves a direct exact pin off its pin.
+    /// The lock records the manifest's specifier beside the overridden version, so the check flags
+    /// it, and only the before/after gate keeps that legal lock from failing every apply.
+    #[test]
+    fn a_persisted_override_of_an_exact_pin_stays_grandfathered() {
+        let overridden = |sibling: &str| {
+            indoc::formatdoc! {"
+                lockfileVersion: '9.0'
+
+                overrides:
+                  vite: 6.1.0
+
+                importers:
+
+                  .:
+                    dependencies:
+                      chalk:
+                        specifier: ^4.1.0
+                        version: {sibling}
+                      vite:
+                        specifier: 6.0.0
+                        version: 6.1.0
+            "}
+        };
+        let before = overridden("4.1.0");
+        let after = overridden("4.1.2");
+
+        // The check cannot read the override, so the legal lock alone looks inconsistent.
+        assert!(Pnpm::lock_consistency_error(&before).is_some());
+        // A sibling update that keeps the override is not charged with its mismatch.
+        assert_eq!(new_lock_inconsistency::<Pnpm>(Some(&before), &after), None);
     }
 
     #[test]
@@ -6472,19 +6607,30 @@ packages:
         Ok(())
     }
 
-    /// Writes the floated-lock fixture: a manifest declaring `dep: ^1.0.0`, a consistent seed
-    /// lock, the floated and repaired lock shapes, and a scripted fake pnpm whose `update` leg
-    /// floats the importer entry out of its declared range (the shape pnpm was observed to
-    /// produce under `--no-save`) while the override-engine legs repair it. Returns the script
-    /// path to inject via [`crate::nodecmd::NodeCmd::with_bin`].
+    /// How the fake pnpm's targeted `update` leaves the lock in [`write_floated_lock_fixture`].
     #[cfg(unix)]
-    fn write_floated_lock_fixture(root: &Utf8Path) -> eyre::Result<Utf8PathBuf> {
+    #[derive(Clone, Copy)]
+    enum Float {
+        /// `dep` floats out of its declared `^1.0.0` to `2.0.0`.
+        OutOfRange,
+        /// `dep` lands at its `1.1.0` target, but the unrelated exact pin `pinned: 1.0.0` floats
+        /// to `1.2.0`, within its major, which only an npm-grammar check sees.
+        UnrelatedExactPin,
+    }
+
+    /// Writes the floated-lock fixture: a manifest declaring `dep: ^1.0.0` beside the exact pin
+    /// `pinned: 1.0.0`, a consistent seed lock, the floated and repaired lock shapes, and a
+    /// scripted fake pnpm whose `update` leg floats an importer entry out of its declared range
+    /// (the shape pnpm was observed to produce under `--no-save`) while the override-engine legs
+    /// repair it. Returns the script path to inject via [`crate::nodecmd::NodeCmd::with_bin`].
+    #[cfg(unix)]
+    fn write_floated_lock_fixture(root: &Utf8Path, float: Float) -> eyre::Result<Utf8PathBuf> {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::write(
             root.join("package.json"),
-            r#"{ "name": "app", "dependencies": { "dep": "^1.0.0" } }"#,
+            r#"{ "name": "app", "dependencies": { "dep": "^1.0.0", "pinned": "1.0.0" } }"#,
         )?;
-        let lock = |version: &str| {
+        let lock = |dep: &str, pinned: &str| {
             indoc::formatdoc! {"
                 lockfileVersion: '9.0'
 
@@ -6494,17 +6640,27 @@ packages:
                     dependencies:
                       dep:
                         specifier: ^1.0.0
-                        version: {version}
+                        version: {dep}
+                      pinned:
+                        specifier: 1.0.0
+                        version: {pinned}
 
                 packages:
 
-                  dep@{version}:
+                  dep@{dep}:
                     resolution: {{integrity: sha512-a}}
+
+                  pinned@{pinned}:
+                    resolution: {{integrity: sha512-b}}
             "}
         };
-        std::fs::write(root.join("pnpm-lock.yaml"), lock("1.0.0"))?;
-        std::fs::write(root.join("floated.yaml"), lock("2.0.0"))?;
-        std::fs::write(root.join("repaired.yaml"), lock("1.1.0"))?;
+        let floated = match float {
+            Float::OutOfRange => lock("2.0.0", "1.0.0"),
+            Float::UnrelatedExactPin => lock("1.1.0", "1.2.0"),
+        };
+        std::fs::write(root.join("pnpm-lock.yaml"), lock("1.0.0", "1.0.0"))?;
+        std::fs::write(root.join("floated.yaml"), floated)?;
+        std::fs::write(root.join("repaired.yaml"), lock("1.1.0", "1.0.0"))?;
         let script = root.join("fake-pnpm.sh");
         std::fs::write(
             &script,
@@ -6539,10 +6695,27 @@ packages:
     #[cfg(unix)]
     #[tokio::test]
     async fn floated_lock_is_repaired_through_the_override_engine() -> eyre::Result<()> {
+        repairs_floated_lock(Float::OutOfRange).await
+    }
+
+    /// An unrelated exact pin that the targeted `update` floats within its major (`1.0.0` to
+    /// `1.2.0`) is a fresh inconsistency too.
+    /// The repair runs and the committed lock holds the pin at its version again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_floated_unrelated_exact_pin_is_repaired_through_the_override_engine()
+    -> eyre::Result<()> {
+        repairs_floated_lock(Float::UnrelatedExactPin).await
+    }
+
+    /// Runs the floated-lock fixture for `float` and asserts the override repair lands `dep` and
+    /// commits the repaired lock.
+    #[cfg(unix)]
+    async fn repairs_floated_lock(float: Float) -> eyre::Result<()> {
         let dir = tempfile::tempdir()?;
         let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
             .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
-        let script = write_floated_lock_fixture(&root)?;
+        let script = write_floated_lock_fixture(&root, float)?;
         let cache = tempfile::tempdir()?;
         let mut tool = NpmTool::<Pnpm>::from_http(cooldown_registry::SharedHttp::new(
             cache.path(),
@@ -6610,9 +6783,11 @@ packages:
             !root.join("pnpm-workspace.yaml").exists(),
             "the temporary overrides file must not persist"
         );
+        let committed = std::fs::read_to_string(root.join("pnpm-lock.yaml"))?;
         assert!(
-            std::fs::read_to_string(root.join("pnpm-lock.yaml"))?.contains("dep@1.1.0"),
-            "the repaired lock is the committed result"
+            committed.contains("dep@1.1.0") && committed.contains("pinned@1.0.0"),
+            "the repaired lock, with the exact pin back at its version, is the committed result: \
+             {committed}"
         );
         Ok(())
     }
@@ -6630,7 +6805,7 @@ packages:
         let dir = tempfile::tempdir()?;
         let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
             .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
-        let script = write_floated_lock_fixture(&root)?;
+        let script = write_floated_lock_fixture(&root, Float::OutOfRange)?;
         let workspace = indoc! {"
             # Exact pins the codegen toolchain needs.
             overrides:
@@ -10944,10 +11119,28 @@ mod whole_graph_tests {
         Ok(())
     }
 
+    /// The inconsistency a repair leaves behind in [`persistent_inconsistency`].
+    #[derive(Clone, Copy)]
+    enum Persistent {
+        /// `dep` stays out of its caret range, and no pin moves.
+        OutOfRange,
+        /// `dep` stays out of its caret range, and the repair also moves the protected `lodash`
+        /// pin.
+        OutOfRangeMovingPin,
+        /// `dep` lands at its target, but the importer's exact `pinned: 1.0.0` stays floated to
+        /// `1.2.0`.
+        /// The manifest declares the pin in `dependencies`, where it is protected, or in
+        /// `peerDependencies`, where the pin guard does not judge it.
+        FloatedExactPin { protected: bool },
+    }
+
     /// A repair that leaves the lock inconsistent fails as a stale lock, unless the repair also
-    /// moved a protected pin when `moves_pin` is set: that refusal is a resolver verdict the
-    /// recovery can isolate, which a stale lock is not.
-    async fn persistent_inconsistency(root: &Utf8Path, moves_pin: bool) -> eyre::Result<CoreError> {
+    /// moved a protected pin: that refusal is a resolver verdict the recovery can isolate, which a
+    /// stale lock is not.
+    async fn persistent_inconsistency(
+        root: &Utf8Path,
+        persistent: Persistent,
+    ) -> eyre::Result<CoreError> {
         let lock = workspace(
             root,
             &[Importer {
@@ -10956,31 +11149,59 @@ mod whole_graph_tests {
                 deps: vec![
                     ("dep", "^1.0.0", "1.0.0"),
                     ("lodash", "^4.17.20", "4.17.20"),
+                    ("pinned", "1.0.0", "1.0.0"),
                 ],
             }],
         )?;
+        // The pin sits beside `dep` where the manifest protects it, and in `peerDependencies`,
+        // which the pin guard does not judge, where nothing does.
+        let (dependencies, peers) = match persistent {
+            Persistent::FloatedExactPin { protected: false } => (
+                r#""dep": "^1.0.0", "lodash": "^4.17.20""#,
+                r#", "peerDependencies": { "pinned": "1.0.0" }"#,
+            ),
+            Persistent::OutOfRange
+            | Persistent::OutOfRangeMovingPin
+            | Persistent::FloatedExactPin { protected: true } => (
+                r#""dep": "^1.0.0", "lodash": "^4.17.20", "pinned": "1.0.0""#,
+                "",
+            ),
+        };
         std::fs::write(
             root.join("package.json"),
-            indoc! {r#"
-                {
+            formatdoc! {r#"
+                {{
                   "name": "app",
-                  "dependencies": { "dep": "^1.0.0", "lodash": "^4.17.20" },
-                  "devDependencies": { "lodash": "4.17.20" }
-                }
+                  "dependencies": {{ {dependencies} }},
+                  "devDependencies": {{ "lodash": "4.17.20" }}{peers}
+                }}
             "#},
         )?;
         std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
-        let floated = moved(&lock, ".", "dep", ("^1.0.0", "1.0.0"), ("^1.0.0", "2.0.0"));
-        let repaired = if moves_pin {
-            moved(
-                &floated,
-                ".",
-                "lodash",
-                ("^4.17.20", "4.17.20"),
-                ("^4.17.20", "4.17.21"),
-            )
-        } else {
-            floated.clone()
+        let out_of_range = moved(&lock, ".", "dep", ("^1.0.0", "1.0.0"), ("^1.0.0", "2.0.0"));
+        let (floated, repaired) = match persistent {
+            Persistent::OutOfRange => (out_of_range.clone(), out_of_range),
+            Persistent::OutOfRangeMovingPin => {
+                let repaired = moved(
+                    &out_of_range,
+                    ".",
+                    "lodash",
+                    ("^4.17.20", "4.17.20"),
+                    ("^4.17.20", "4.17.21"),
+                );
+                (out_of_range, repaired)
+            }
+            Persistent::FloatedExactPin { .. } => {
+                let landed = moved(&lock, ".", "dep", ("^1.0.0", "1.0.0"), ("^1.0.0", "1.1.0"));
+                let floated = moved(
+                    &landed,
+                    ".",
+                    "pinned",
+                    ("1.0.0", "1.0.0"),
+                    ("1.0.0", "1.2.0"),
+                );
+                (floated.clone(), floated)
+            }
         };
         std::fs::write(root.join("floated.yaml"), floated)?;
         std::fs::write(root.join("repaired.yaml"), repaired)?;
@@ -11009,7 +11230,7 @@ mod whole_graph_tests {
     #[tokio::test]
     async fn a_moved_pin_is_refused_before_the_stale_lock_fallback() -> eyre::Result<()> {
         let (_dir, root) = tempdir_root()?;
-        let error = persistent_inconsistency(&root, true).await?;
+        let error = persistent_inconsistency(&root, Persistent::OutOfRangeMovingPin).await?;
         let CoreError::UnacceptableResolve(detail) = error else {
             panic!("the pin refusal wins: {error:?}");
         };
@@ -11021,8 +11242,58 @@ mod whole_graph_tests {
         );
 
         let (_stale_dir, stale_root) = tempdir_root()?;
-        let error = persistent_inconsistency(&stale_root, false).await?;
+        let error = persistent_inconsistency(&stale_root, Persistent::OutOfRange).await?;
         assert!(matches!(error, CoreError::StaleLock(_)), "{error:?}");
+        Ok(())
+    }
+
+    /// An exact importer pin that the targeted `update` floats within its major and the repair
+    /// leaves floated takes the same path.
+    /// Where the manifest protects the pin, the pin refusal still wins over the stale lock.
+    /// Where nothing protects it, the persistent mismatch fails as a stale lock instead of being
+    /// committed.
+    #[tokio::test]
+    async fn a_persistently_floated_exact_pin_is_refused_or_stale() -> eyre::Result<()> {
+        // Both runs reach the verdict through the repair: the targeted update floats the pin, and
+        // the override engine's resolution-only install retries the same pins.
+        let repaired = |root: &Utf8Path| {
+            let legs = legs(root);
+            assert!(
+                legs.first().is_some_and(|leg| leg.contains(" update "))
+                    && legs.iter().any(|leg| leg.contains("--resolution-only")),
+                "the floated pin sends the round through the repair: {legs:?}"
+            );
+        };
+
+        let (_dir, root) = tempdir_root()?;
+        let error =
+            persistent_inconsistency(&root, Persistent::FloatedExactPin { protected: true })
+                .await?;
+        let CoreError::UnacceptableResolve(detail) = error else {
+            panic!("the pin refusal wins: {error:?}");
+        };
+        assert!(
+            detail.contains(
+                "pinned resolves to 1.2.0 for package.json, whose dependencies pins 1.0.0"
+            ),
+            "{detail}"
+        );
+        repaired(&root);
+
+        let (_stale_dir, stale_root) = tempdir_root()?;
+        let error = persistent_inconsistency(
+            &stale_root,
+            Persistent::FloatedExactPin { protected: false },
+        )
+        .await?;
+        let CoreError::StaleLock(detail) = error else {
+            panic!("an unprotected floated pin is a stale lock: {error:?}");
+        };
+        assert!(
+            detail.contains("dependency pinned: version 1.2.0 does not satisfy range 1.0.0"),
+            "{detail}"
+        );
+        repaired(&stale_root);
         Ok(())
     }
 
