@@ -6,6 +6,8 @@
 //! the adapter asks the package manager to refresh the lockfile, which keeps workspace-member
 //! mutations explicit instead of relying on root-scoped `add` commands.
 
+pub(crate) mod workspaces;
+
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{CoreError, MemberRef, Result, RewriteMode};
 use serde_json::Value;

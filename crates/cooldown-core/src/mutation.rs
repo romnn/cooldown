@@ -126,9 +126,15 @@ impl ProjectMutationState {
 /// that follows symbolic and hard links captures them, and capturing one grants no write
 /// authority.
 /// A prepared mutation shares one baseline with every recovery subset derived from it.
+///
+/// Beside the files, an adapter may [record](Self::record) a fact it derived at capture beyond any
+/// one file's bytes, such as the members it found by walking the project, so every trial reads
+/// the capture-time fact rather than re-deriving it from a project the trials may have changed.
 #[derive(Debug, Clone, Default)]
 pub struct MutationBaseline {
     files: Vec<BaselineFile>,
+    /// Adapter-derived facts, by the name the adapter records them under.
+    records: std::collections::BTreeMap<String, String>,
 }
 
 /// One project-relative file of a [`MutationBaseline`], with the bytes read at capture.
@@ -177,13 +183,29 @@ impl MutationBaseline {
                 contents,
             });
         }
-        Ok(MutationBaseline { files })
+        Ok(MutationBaseline {
+            files,
+            records: std::collections::BTreeMap::new(),
+        })
     }
 
     /// The captured files, in capture order.
     #[must_use]
     pub fn files(&self) -> &[BaselineFile] {
         &self.files
+    }
+
+    /// Records `fact` under `name`, replacing an earlier fact of that name.
+    ///
+    /// The name is the adapter's own, so it should carry the adapter's prefix.
+    pub fn record(&mut self, name: impl Into<String>, fact: impl Into<String>) {
+        self.records.insert(name.into(), fact.into());
+    }
+
+    /// The fact recorded under `name`, or `None` when the adapter recorded none.
+    #[must_use]
+    pub fn recorded(&self, name: &str) -> Option<&str> {
+        self.records.get(name).map(String::as_str)
     }
 }
 
@@ -1165,6 +1187,23 @@ mod mutation_journal_tests {
             );
             assert!(ProjectMutationJournal::capture(&root, ["member/package.json"]).is_err());
         }
+        Ok(())
+    }
+
+    /// A recorded fact travels with the baseline, a later record of one name replacing the earlier
+    /// one, and a name never recorded reads as absent.
+    #[test]
+    fn a_baseline_carries_the_facts_recorded_at_capture() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = root(&directory)?;
+        let mut baseline = MutationBaseline::read(&root, ["package.json"])?;
+
+        baseline.record("adapter/members", "[]");
+        baseline.record("adapter/members", r#"["a"]"#);
+        let shared = baseline.clone();
+
+        assert_eq!(shared.recorded("adapter/members"), Some(r#"["a"]"#));
+        assert_eq!(shared.recorded("adapter/other"), None);
         Ok(())
     }
 

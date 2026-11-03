@@ -3,7 +3,7 @@
 use crate::lock::NodeLock;
 use crate::manifest;
 use crate::nodecmd::NodeCmd;
-use crate::pins::AuthorizedPins;
+use crate::pins::{AuthorizedPins, ManifestEdits};
 use crate::version;
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -96,6 +96,9 @@ pub(crate) enum LandingPlan {
         /// The exact pins the widen rewrote with the user's authority, which the settled lock is
         /// judged against instead of the baseline pins.
         authorized: AuthorizedPins,
+        /// Every declaration the widen rewrote, authorized pin or not: the selectors the settled
+        /// lock was resolved under.
+        edits: ManifestEdits,
     },
     /// No manifest declares the dependency, so nothing may be written for it.
     NotEligible,
@@ -165,6 +168,8 @@ pub(crate) fn candidate_landing<L: NodeLock>(
     )?;
     let mut authorized = AuthorizedPins::default();
     authorized.record(change, mode, rewrite_pins, &rewrite);
+    let mut edits = ManifestEdits::default();
+    edits.record(&rewrite);
     if mode == RewriteMode::Auto
         && rewrite.modified.is_empty()
         && declarations.has_install()
@@ -181,6 +186,7 @@ pub(crate) fn candidate_landing<L: NodeLock>(
             RewriteMode::Always,
         )?;
         authorized.record(change, mode, rewrite_pins, &shifted);
+        edits.record(&shifted);
     }
     let authorized_manifests = manifest_snapshot(project, change)?;
     let landing = if let Some(crate::lock::PreservingPin { pin, resync }) = preserving_pin {
@@ -200,6 +206,7 @@ pub(crate) fn candidate_landing<L: NodeLock>(
     Ok(LandingPlan::Land {
         landing,
         authorized,
+        edits,
     })
 }
 

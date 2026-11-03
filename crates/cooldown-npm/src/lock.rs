@@ -5,8 +5,16 @@
 //!
 //! Every parser returns the flat list of resolved [`NameVersion`] pairs the lock pins.
 //! Where the lock records importer/member declarations (npm v2/v3, pnpm, bun's text lock), the
-//! adapter uses that same data for both direct/transitive classification and source attribution;
-//! older formats fall back to the root manifest's declared dependency names.
+//! adapter uses that same data for both direct/transitive classification and source attribution.
+//! A Yarn Classic lock records none, so its members' declarations come from the workspace
+//! manifests ([`WorkspaceManifests`]) and are looked up through the lock's selector keys
+//! ([`YarnBindings`]).
+//! Formats without either fall back to the root manifest's declared dependency names.
+
+mod yarn;
+
+pub use crate::manifest::workspaces::WorkspaceManifests;
+pub use yarn::YarnBindings;
 
 use crate::version::{CeilingHold, RangeMatch, is_exact_npm_specifier, range_match};
 use cooldown_core::{CoreError, Result, ToolId};
@@ -51,6 +59,17 @@ pub trait NodeLock: Send + Sync + 'static {
     /// rather than borrowing pnpm's rule: yarn classic and bun.
     const PEER_CONTEXTS_MODELED: bool = true;
 
+    /// Whether the lock records no workspace member, so this manager's member evidence comes from
+    /// the workspace manifests the root `package.json` names ([`WorkspaceManifests`]): yarn
+    /// classic.
+    ///
+    /// The adapter then reads those manifests, captures every member's in the mutation baseline,
+    /// and hands them to [`member_paths_in`](NodeLock::member_paths_in),
+    /// [`member_sources_in`](NodeLock::member_sources_in), and
+    /// [`member_attribution_in`](NodeLock::member_attribution_in); the other managers' hooks
+    /// ignore them.
+    const READS_WORKSPACE_MANIFESTS: bool = false;
+
     /// Parses the lockfile body into the flat list of resolved [`NameVersion`] pairs.
     ///
     /// # Errors
@@ -60,8 +79,9 @@ pub trait NodeLock: Send + Sync + 'static {
 
     /// The workspace member package(s) that declare each dependency, for attributing a dependency
     /// to its source package(s) in reports.
-    /// Empty for yarn classic, which records no per-member data in its lock, and for a `bun.lock`
-    /// whose members [`Bun`] cannot attribute, so their `members` column stays blank.
+    /// Empty for a `bun.lock` whose members [`Bun`] cannot attribute, and for yarn classic, whose
+    /// lock records no member, so their `members` column stays blank; yarn classic's members come
+    /// from [`member_sources_in`](NodeLock::member_sources_in) instead.
     #[must_use]
     fn member_sources(content: &str) -> MemberIndex {
         Self::member_sources_excluding(content, &HashSet::new())
@@ -132,10 +152,33 @@ pub trait NodeLock: Send + Sync + 'static {
     /// that declares no dependencies appears nowhere in [`member_sources`](NodeLock::member_sources)
     /// yet still owns a `package.json` whose `peerDependencies` bind, so peer evidence enumerates
     /// members from here rather than from what they declare. Default: empty (yarn classic records
-    /// no member data).
+    /// no member data in its lock; see [`member_paths_in`](NodeLock::member_paths_in)).
     #[must_use]
     fn member_paths(_content: &str) -> HashSet<String> {
         HashSet::new()
+    }
+
+    /// [`member_paths`](NodeLock::member_paths) given the workspace manifests the adapter read
+    /// when [`READS_WORKSPACE_MANIFESTS`](NodeLock::READS_WORKSPACE_MANIFESTS) asks for them.
+    ///
+    /// `None` is a context without them, which attributes no member for yarn classic.
+    /// Default: the lock-only [`member_paths`](NodeLock::member_paths).
+    #[must_use]
+    fn member_paths_in(content: &str, _workspace: Option<&WorkspaceManifests>) -> HashSet<String> {
+        Self::member_paths(content)
+    }
+
+    /// [`member_sources_excluding`](NodeLock::member_sources_excluding) given the workspace
+    /// manifests, as [`member_paths_in`](NodeLock::member_paths_in) takes them.
+    ///
+    /// Default: the lock-only [`member_sources_excluding`](NodeLock::member_sources_excluding).
+    #[must_use]
+    fn member_sources_in(
+        content: &str,
+        _workspace: Option<&WorkspaceManifests>,
+        excluded: &HashSet<String>,
+    ) -> MemberIndex {
+        Self::member_sources_excluding(content, excluded)
     }
 
     /// The physical install layout the lock records, when this manager materializes a hoisted
@@ -153,11 +196,26 @@ pub trait NodeLock: Send + Sync + 'static {
     /// How the lock attributes a resolved version to each workspace member declaring it, the
     /// evidence the exact-pin guard judges a member's manifest pins against.
     ///
-    /// Default: [`MemberAttribution::Unknown`], since yarn classic records no per-member
-    /// resolution, so its exact manifest pins are not protected from a sibling's resolve.
+    /// Default: [`MemberAttribution::Unknown`], for a lock that records no per-member resolution
+    /// by itself; yarn classic attributes its members only through
+    /// [`member_attribution_in`](NodeLock::member_attribution_in).
     #[must_use]
     fn member_attribution(_content: &str) -> MemberAttribution {
         MemberAttribution::Unknown
+    }
+
+    /// [`member_attribution`](NodeLock::member_attribution) given the workspace manifests, as
+    /// [`member_paths_in`](NodeLock::member_paths_in) takes them.
+    ///
+    /// The manifests are the selectors the lock was resolved under, so after cooldown edits a
+    /// declaration they must carry its replacement.
+    /// Default: the lock-only [`member_attribution`](NodeLock::member_attribution).
+    #[must_use]
+    fn member_attribution_in(
+        content: &str,
+        _workspace: Option<&WorkspaceManifests>,
+    ) -> MemberAttribution {
+        Self::member_attribution(content)
     }
 
     /// The registry releases the lock installs only through npm aliases.
@@ -433,6 +491,8 @@ impl SplitHold {
 /// registry release may be moved by editing that declaration ([`Self::editable_members_for`]).
 /// Bun keys a registry binding by version like pnpm, and a declaration whose binding the lock
 /// leaves undetermined by the one copy its package key records, as a declared copy.
+/// Yarn classic attributes each declaration to the one copy its member's selector names, as a
+/// declared copy, like npm.
 #[derive(Debug, Default)]
 pub struct MemberIndex {
     by_version: HashMap<(String, String), Vec<String>>,
@@ -447,14 +507,17 @@ pub struct MemberIndex {
     /// npm records here the copy each member's own install-tree lookup binds: its per-package
     /// apply lands one candidate at a time and judges every landing on the tree itself, so the
     /// joint resolve's per-importer versions would only manufacture split evidence for it.
+    /// Yarn classic records here the copy each member's own selector identifies, the lock having
+    /// no importer record at all.
     declared_copies: HashMap<(String, String), Vec<String>>,
-    /// The owners in `declared_copies` whose binding is no registry release (npm): a git source,
-    /// a local or remote tarball.
+    /// The owners in `declared_copies` whose binding no edit of their declaration is proven to
+    /// move, each with why: npm's git sources and local or remote tarballs, and yarn classic's
+    /// local paths and selectors the lock or workspace may answer otherwise.
     /// They declare the copy directly, but no edit of their declaration can land a registry
     /// release in its place, so they neither pin nor bound it.
-    non_registry_copies: HashMap<(String, String), Vec<String>>,
+    fixed_copies: HashMap<(String, String), Vec<FixedOwner>>,
     /// `(name, version)` pairs every registry declaration binding them pins exactly (pnpm, npm,
-    /// and Bun).
+    /// Bun, and yarn classic).
     exact_version: HashSet<(String, String)>,
     /// The distinct declared *range specifiers* per name across importers (pnpm records a
     /// `specifier:` per importer).
@@ -465,6 +528,34 @@ pub struct MemberIndex {
     /// `version:` per importer), the baseline the excluded-importer guard diffs.
     importer_entries: HashMap<String, BTreeMap<String, ImporterEntry>>,
     authoritative: bool,
+}
+
+/// One owner of a copy whose binding no edit of its declaration is proven to move
+/// ([`MemberIndex::fixed_owners`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FixedOwner {
+    /// The owning member's path (`.` for the root).
+    pub member: String,
+    /// Why no edit of its declaration is proven to move the copy.
+    pub reason: FixedBinding,
+}
+
+/// Why a member owning a copy cannot move it by editing its declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FixedBinding {
+    /// The member binds the copy through a source of its own: git, or a local or remote tarball.
+    OwnSource,
+    /// The member binds the copy through a local path, a `file:` or `link:` specifier (yarn
+    /// classic).
+    LocalPath,
+    /// The root `resolutions` field can rewrite the member's selector (yarn classic).
+    Resolutions,
+    /// A workspace package carries the dependency's name, which Yarn links in place of a registry
+    /// release whenever its version satisfies a range (yarn classic).
+    WorkspaceName,
+    /// The lock records the copy from a `resolved` URL that is no registry tarball of it (yarn
+    /// classic).
+    UnrecognizedOrigin,
 }
 
 /// One importer's record of one direct dependency in `pnpm-lock.yaml`: the declared range and the
@@ -735,7 +826,8 @@ impl MemberIndex {
     /// `version` is a registry release, sorted: the declarations an edit may move that copy
     /// through, and the ones its pin and declared bound come from.
     ///
-    /// Outside npm every owner qualifies, since those indexes attribute registry bindings only.
+    /// Outside npm and yarn classic every owner qualifies, since those indexes attribute registry
+    /// bindings only.
     #[must_use]
     pub fn editable_members_for(&self, name: &str, version: &str) -> Vec<String> {
         let non_registry = self.non_registry_owners(name, version);
@@ -745,21 +837,35 @@ impl MemberIndex {
             .collect()
     }
 
-    /// The members owning `name` at `version` through a binding that is no registry release, a
-    /// git source or a local or remote tarball, sorted; empty outside npm.
+    /// The members owning `name` at `version` through a binding no edit of their declaration is
+    /// proven to move ([`fixed_owners`](Self::fixed_owners)), sorted; empty outside npm and yarn
+    /// classic.
     ///
     /// Such a member declares the copy directly, yet no registry release can replace it through
     /// that declaration.
     #[must_use]
     pub fn non_registry_owners(&self, name: &str, version: &str) -> Vec<String> {
-        let mut members = self
-            .non_registry_copies
+        let mut members: Vec<String> = self
+            .fixed_owners(name, version)
+            .into_iter()
+            .map(|FixedOwner { member, .. }| member)
+            .collect();
+        members.dedup();
+        members
+    }
+
+    /// The owners of `name` at `version` whose binding no edit of their declaration is proven to
+    /// move, each with why, sorted by member.
+    #[must_use]
+    pub fn fixed_owners(&self, name: &str, version: &str) -> Vec<FixedOwner> {
+        let mut owners = self
+            .fixed_copies
             .get(&(name.to_string(), version.to_string()))
             .cloned()
             .unwrap_or_default();
-        members.sort();
-        members.dedup();
-        members
+        owners.sort();
+        owners.dedup();
+        owners
     }
 
     /// Every member declaring `name`, whatever copy it binds, sorted and deduplicated.
@@ -1258,8 +1364,11 @@ pub enum MemberAttribution {
     /// The lock records each member's declarations and the package keys Bun binds them through
     /// (`bun.lock`).
     PackageKeys(BunBindings),
-    /// The lock records no per-member resolution (yarn classic, npm v1, an unsupported
-    /// `bun.lock`).
+    /// The lock keys each entry by the selectors resolving to it, and the workspace manifests
+    /// name each member's selector (yarn classic).
+    Selectors(YarnBindings),
+    /// The lock records no per-member resolution (npm v1, an unsupported `bun.lock`, or a yarn
+    /// classic lock read without complete workspace manifests).
     Unknown,
 }
 
@@ -1288,6 +1397,7 @@ impl MemberAttribution {
                 InstallLookup::Unknown => MemberResolution::Unknown,
             },
             MemberAttribution::PackageKeys(bindings) => bindings.resolution(member, name),
+            MemberAttribution::Selectors(bindings) => bindings.resolution(member, name),
             MemberAttribution::Unknown => MemberResolution::Unknown,
         }
     }
@@ -1859,6 +1969,11 @@ pub struct Npm;
 /// The pnpm package manager: `pnpm-lock.yaml` backed by the npm registry.
 pub struct Pnpm;
 /// The Yarn (classic, v1) package manager: `yarn.lock` backed by the npm registry.
+///
+/// The lock records no workspace member, so member attribution reads each member's selectors
+/// from the workspace manifests ([`YarnBindings`]).
+/// Yarn hoists without recording its tree and binds peers by version, so the peer gate stays out
+/// of its locks ([`NodeLock::PEER_CONTEXTS_MODELED`]).
 pub struct Yarn;
 /// The Bun package manager: `bun.lock` (text lockfile) backed by the npm registry.
 ///
@@ -2128,6 +2243,7 @@ impl NodeLock for Yarn {
     const LOCKFILE: &'static str = "yarn.lock";
     const BIN: &'static str = "yarn";
     const PEER_CONTEXTS_MODELED: bool = false;
+    const READS_WORKSPACE_MANIFESTS: bool = true;
 
     fn parse(content: &str) -> Result<Vec<NameVersion>> {
         // A Berry lock shares the file name but none of the Classic grammar, so the Classic
@@ -2141,6 +2257,32 @@ impl NodeLock for Yarn {
             ));
         }
         Ok(parse_yarn(content))
+    }
+
+    fn member_paths_in(_content: &str, workspace: Option<&WorkspaceManifests>) -> HashSet<String> {
+        workspace
+            .map(WorkspaceManifests::member_paths)
+            .unwrap_or_default()
+    }
+
+    fn member_sources_in(
+        content: &str,
+        workspace: Option<&WorkspaceManifests>,
+        excluded: &HashSet<String>,
+    ) -> MemberIndex {
+        workspace
+            .and_then(|workspace| YarnBindings::read(content, workspace))
+            .map(|bindings| bindings.member_index(excluded))
+            .unwrap_or_default()
+    }
+
+    fn member_attribution_in(
+        content: &str,
+        workspace: Option<&WorkspaceManifests>,
+    ) -> MemberAttribution {
+        workspace
+            .and_then(|workspace| YarnBindings::read(content, workspace))
+            .map_or(MemberAttribution::Unknown, MemberAttribution::Selectors)
     }
 
     fn relock_args(_before: Option<&str>) -> Vec<String> {
@@ -3032,7 +3174,7 @@ fn parse_npm_member_index(content: &str, excluded: &HashSet<String>) -> Option<M
     let non_registry_slots = non_registry_slots(&install, &members);
     let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
     let mut owners: HashMap<(String, String), Vec<String>> = HashMap::new();
-    let mut non_registry: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut non_registry: HashMap<(String, String), Vec<FixedOwner>> = HashMap::new();
     let mut declared: HashMap<(String, String), usize> = HashMap::new();
     let mut exact: HashMap<(String, String), usize> = HashMap::new();
     for NpmMemberEntry { path, declarations } in members
@@ -3060,10 +3202,10 @@ fn parse_npm_member_index(content: &str, excluded: &HashSet<String>) -> Option<M
                 .or_default()
                 .push((*path).to_string());
             if !registry {
-                non_registry
-                    .entry(copy)
-                    .or_default()
-                    .push((*path).to_string());
+                non_registry.entry(copy).or_default().push(FixedOwner {
+                    member: (*path).to_string(),
+                    reason: FixedBinding::OwnSource,
+                });
                 continue;
             }
             *declared.entry(copy.clone()).or_default() += specifiers.len();
@@ -3081,7 +3223,7 @@ fn parse_npm_member_index(content: &str, excluded: &HashSet<String>) -> Option<M
     Some(MemberIndex {
         by_name,
         declared_copies: owners,
-        non_registry_copies: non_registry,
+        fixed_copies: non_registry,
         exact_version,
         authoritative: true,
         ..MemberIndex::default()
@@ -3211,6 +3353,10 @@ fn parse_pnpm_exact_pins(content: &str, excluded: &HashSet<String>) -> HashSet<(
 
 /// Parses a classic (v1) `yarn.lock`: each entry is one or more comma-separated `name@range`
 /// specifiers ending in `:`, followed by an indented `version "x.y.z"` line that resolves them.
+///
+/// This lenient line reading is the flat graph's projection only.
+/// Member attribution reads the lock through Yarn's own grammar instead ([`YarnBindings`]), so a
+/// descriptor this reading would misspell never names a member's copy.
 fn parse_yarn(content: &str) -> Vec<NameVersion> {
     let mut out = Vec::new();
     let mut pending: Vec<String> = Vec::new();
@@ -3806,6 +3952,9 @@ fn strip_trailing_commas(s: &str) -> String {
     flush(&mut out, &mut pending_comma, &mut pending_ws);
     out
 }
+
+#[cfg(test)]
+pub(crate) mod yarn_fixtures;
 
 /// Real `bun.lock` files the Bun readers' tests share.
 ///

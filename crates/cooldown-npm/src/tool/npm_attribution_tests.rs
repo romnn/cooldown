@@ -434,7 +434,7 @@ fn a_landing_requires_every_member_to_bind_the_target() -> eyre::Result<()> {
             project.root.join("package-lock.json"),
             lock_declaring(b_declares, slots),
         )?;
-        Ok(exact_target_reached::<Npm>(&project, &change)?)
+        Ok(exact_target_reached::<Npm>(&project, &change, None)?)
     };
     let reached = |slots: &str| reached_declaring("^1.0.0", slots);
 

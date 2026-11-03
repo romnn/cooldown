@@ -48,12 +48,24 @@ member's direct dependency, but no registry release can replace its source throu
 declaration, so `upgrade` and `fix` hold it as `not_eligible`, and it takes no `pinned` status or
 declared bound.
 
+A Yarn Classic lock records no workspace member, so cooldown discovers the members from the root
+`workspaces` field as Yarn 1 does and credits each member the `yarn.lock` entry its own selector
+names, the one Yarn's manifest normalization keeps when a name sits in several fields. Where that
+selector binds the copy in a way no manifest edit is proven to move — a git, URL, `file:`, or
+`link:` source, a name the root `resolutions` can rewrite, a name a workspace package carries, or a
+`resolved` URL that is no registry tarball — the copy is still the member's direct dependency, but
+`upgrade` and `fix` hold it as `not_eligible`, naming the member and the reason, and it takes no
+`pinned` status or declared bound. An npm alias and a selector the lock does not record bind no
+copy. When the members cannot all be discovered (a brace glob, a symbolic link on the way) or the
+lock is one Yarn's own reader refuses, `check`, `outdated`, and `upgrade` warn that the rows follow
+the root `package.json` alone: no member owns a copy, a landing is judged by the name's newest
+locked copy, and no member's exact pin is protected from another candidate's resolve.
+
 A package declared in several install fields of one manifest (npm family: `dependencies` beside
 `devDependencies` or `optionalDependencies`) is judged by every declaration, not the first: the
 target must sit inside each range, and the strictest explicit bound across them caps it. On npm,
-pnpm, and Bun, a locked copy that every declaration binding it pins exactly is held at planning
-(`pinned`), even under `--rewrite`; Yarn locks record no per-member pins, so their exact
-pins are judged at apply like the mixed case below. A *mixed* declaration — an exact pin beside a range, in another field or another
+pnpm, Bun, and Yarn Classic, a locked copy that every declaration binding it pins exactly is held
+at planning (`pinned`), even under `--rewrite`. A *mixed* declaration — an exact pin beside a range, in another field or another
 workspace member — leaves the package movable, so the move is planned and the apply holds it
 instead of rewriting the pin, even where the lock records only the range (pnpm keeps one specifier
 per importer). That row is `pin_held` and names the pin; pass `--rewrite` to rewrite it, or edit it

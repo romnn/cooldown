@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- **Yarn Classic workspace pins are protected from a sibling's resolve.** A Classic `yarn.lock`
+  records no workspace member, so cooldown attributed nothing per member: every locked copy of a
+  name the root manifest declares was a direct dependency without members, and the guard that
+  refuses a resolve moving a manifest's exact pin protected no Yarn pin at all. cooldown now
+  discovers the members from the root `workspaces` field the way Yarn 1 does, in either field
+  shape with `*`, `?`, and `**` globs, a private root, and named, versioned members, and credits
+  each member the lock entry its own selector names, looked up as an exact `yarn.lock` key, never
+  a copy that merely satisfies the range. That selector is the one Yarn's manifest normalization
+  keeps when a name sits in several fields, so a `devDependencies` pin beside a `dependencies`
+  caret is judged at the caret's copy, and two members pinning different versions each own their
+  own. A landing that moves such a pin in any member, an excluded one or one the plan does not
+  name included, is rolled back alone as a resolver conflict naming the pin, a selector cooldown
+  rewrote is read under its replacement, and a change lands only where every declaring member's
+  own entry reached the target, judged against the members and manifests captured before the
+  first trial. A copy whose selector binds it through a git, URL, `file:`, or `link:` source, a
+  name the root `resolutions` can rewrite, a workspace package's own name, or a `resolved` URL
+  that is no registry tarball stays the member's direct dependency, but no manifest edit is proven
+  to move it, so `upgrade` holds it `not_eligible` with the member and the reason, and no pin is
+  judged through it. An alias, a descriptor the lock records ambiguously or not at all, and an
+  entry whose `version`, `name`, or `resolved` is no string bind no copy. A workspace whose members cannot all
+  be discovered, such as one with a brace glob or a symbolic link on the way, and a lock Yarn's
+  own reader refuses keep the root-manifest reading, and `check`, `outdated`, and `upgrade` now
+  warn that its member attribution and pin protection are lost.
+
 - **npm credits each locked copy only to the members whose own lookup reaches it.**
   `package-lock.json` records a workspace member's declarations as ranges, and cooldown credited
   every locked version of a declared name to each member declaring it. A copy another dependency

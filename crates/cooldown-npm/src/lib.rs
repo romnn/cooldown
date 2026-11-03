@@ -39,6 +39,7 @@ pub type NpmCliTool = NpmTool<Npm>;
 pub type PnpmTool = NpmTool<Pnpm>;
 /// The Yarn Classic (v1) adapter (`yarn.lock`); a Yarn Berry lock is refused as unreadable.
 ///
-/// A Classic lock records no workspace member, so nothing is attributed per member and exact
-/// manifest pins are judged only before the resolve.
+/// A Classic lock records no workspace member, so the members come from the root `workspaces`
+/// field and each member's direct dependencies are attributed through the lock entry its own
+/// manifest selector names, which protects its exact manifest pins like npm's (see [`Yarn`]).
 pub type YarnTool = NpmTool<Yarn>;

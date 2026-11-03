@@ -17,7 +17,10 @@ fn protected(manifests: &[(&str, &str)]) -> eyre::Result<ProtectedPins> {
         declarations.extend(manifest::exact_install_declarations(member, content)?);
     }
     declarations.sort_by(|left, right| left.key.cmp(&right.key));
-    Ok(ProtectedPins { declarations })
+    Ok(ProtectedPins {
+        declarations,
+        workspace: None,
+    })
 }
 
 fn key(member: &str, field: &'static str, dependency: &str) -> DeclarationKey {
@@ -28,6 +31,36 @@ fn key(member: &str, field: &'static str, dependency: &str) -> DeclarationKey {
     }
 }
 
+/// A Yarn workspace of `manifests`, each a project-relative path and its contents, written into a
+/// temporary directory: the protected pins of every manifest with the workspace snapshot the
+/// attribution reads, as [`ProtectedPins::from_baseline`] yields them.
+fn protected_yarn(manifests: &[(&str, &str)]) -> eyre::Result<ProtectedPins> {
+    let guard = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(guard.path())
+        .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+    let mut rels = Vec::new();
+    for (rel, contents) in manifests {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, contents)?;
+        rels.push(Utf8PathBuf::from(rel));
+    }
+    let discovery = crate::manifest::workspaces::BaselineDiscovery::run(root);
+    rels.extend(discovery.manifests.iter().cloned());
+    let mut baseline = MutationBaseline::read(root, rels)?;
+    discovery.record(&mut baseline);
+    let pins = ProtectedPins::from_baseline::<Yarn>(&baseline)?;
+    if let Some(reason) = pins
+        .workspace()
+        .and_then(WorkspaceManifests::unavailable_reason)
+    {
+        eyre::bail!("the fixture workspace is unavailable: {reason}");
+    }
+    Ok(pins)
+}
+
 /// Every new violation of `settled` against `baseline`, each as `member field dependency`.
 fn violated<L: NodeLock>(
     pins: &ProtectedPins,
@@ -35,7 +68,7 @@ fn violated<L: NodeLock>(
     settled: &str,
     authorized: &AuthorizedPins,
 ) -> Vec<String> {
-    pins.violations_between::<L>(baseline, settled, authorized)
+    pins.violations_between::<L>(baseline, settled, authorized, EditStates::NONE)
         .iter()
         .map(|violation| {
             let DeclarationKey {
@@ -151,8 +184,12 @@ fn a_moved_second_field_pin_is_a_new_violation() -> eyre::Result<()> {
     let baseline = pnpm_lock(&[("apps/a", "^4.1.0", "4.1.0")], &["4.1.0"]);
     let settled = pnpm_lock(&[("apps/a", "^4.1.0", "4.1.2")], &["4.1.2"]);
 
-    let violations =
-        pins.violations_between::<Pnpm>(Some(&baseline), &settled, &AuthorizedPins::default());
+    let violations = pins.violations_between::<Pnpm>(
+        Some(&baseline),
+        &settled,
+        &AuthorizedPins::default(),
+        EditStates::NONE,
+    );
 
     assert_eq!(
         refusal(&violations),
@@ -257,7 +294,7 @@ fn a_peer_suffixed_resolution_matches_its_pin() -> eyre::Result<()> {
         NO_VIOLATIONS
     );
     assert_eq!(
-        pins.observe::<Pnpm>(Some(&lock))
+        pins.observe::<Pnpm>(Some(&lock), &ManifestEdits::default())
             .get(&key("apps/a", "devDependencies", "chalk")),
         &Observed::Resolved("4.1.0".to_string())
     );
@@ -486,8 +523,12 @@ fn equality_ignores_spacing_equals_and_build_metadata() -> eyre::Result<()> {
 /// guessing from the name's newest copy.
 #[test]
 fn unattributed_locks_protect_nothing() -> eyre::Result<()> {
-    let pins = protected(&[(".", r#"{ "devDependencies": { "chalk": "4.1.0" } }"#)])?;
+    let manifest = r#"{ "devDependencies": { "chalk": "4.1.0" } }"#;
+    let pins = protected(&[(".", manifest)])?;
     let none = AuthorizedPins::default();
+    // The root's own selector is `chalk@4.1.0`, which this lock records no entry under, so the
+    // `chalk@^4.1.0` entry another request resolves is no evidence for it, with or without the
+    // workspace manifests.
     let yarn = |version: &str| {
         formatdoc! {r#"
             chalk@^4.1.0:
@@ -495,19 +536,22 @@ fn unattributed_locks_protect_nothing() -> eyre::Result<()> {
               resolved "https://registry.yarnpkg.com/chalk/-/chalk-{version}.tgz"
         "#}
     };
-    assert_eq!(
-        violated::<Yarn>(&pins, Some(&yarn("4.1.0")), &yarn("4.1.2"), &none),
-        NO_VIOLATIONS
-    );
-    assert_eq!(
-        violated::<Yarn>(&pins, None, &yarn("4.1.2"), &none),
-        NO_VIOLATIONS
-    );
-    assert_eq!(
-        pins.observe::<Yarn>(Some(&yarn("4.1.2")))
-            .get(&key(".", "devDependencies", "chalk")),
-        &Observed::Unknown
-    );
+    for pins in [pins, protected_yarn(&[("package.json", manifest)])?] {
+        assert_eq!(
+            violated::<Yarn>(&pins, Some(&yarn("4.1.0")), &yarn("4.1.2"), &none),
+            NO_VIOLATIONS
+        );
+        assert_eq!(
+            violated::<Yarn>(&pins, None, &yarn("4.1.2"), &none),
+            NO_VIOLATIONS
+        );
+        assert_eq!(
+            pins.observe::<Yarn>(Some(&yarn("4.1.2")), &ManifestEdits::default())
+                .get(&key(".", "devDependencies", "chalk")),
+            &Observed::Unknown
+        );
+    }
+    let pins = protected(&[(".", manifest)])?;
     // A version 0 bun.lock resolves member dependencies through the workspace's package row, which
     // the reader does not model, so it attributes nothing either.
     let bun_v0 = |version: &str| {
@@ -576,7 +620,7 @@ fn bun_judges_the_copy_each_member_binds() -> eyre::Result<()> {
         |root: &str, nested: Option<&str>| bun_lock("devDependencies", "4.1.0", Some(root), nested);
     let baseline = lock("4.1.0", None);
     assert_eq!(
-        pins.observe::<Bun>(Some(&baseline))
+        pins.observe::<Bun>(Some(&baseline), &ManifestEdits::default())
             .get(&key("packages/a", "devDependencies", "chalk")),
         &Observed::Resolved("4.1.0".to_string())
     );
@@ -659,7 +703,7 @@ fn bun_absence_is_missing_only_where_the_lock_proves_it() -> eyre::Result<()> {
     )])?;
     let none = AuthorizedPins::default();
     let observed = |pins: &ProtectedPins, field: &'static str, lock: &str| {
-        pins.observe::<Bun>(Some(lock))
+        pins.observe::<Bun>(Some(lock), &ManifestEdits::default())
             .get(&key("packages/a", field, "chalk"))
             .clone()
     };
@@ -740,7 +784,7 @@ fn pins_are_read_from_the_baseline_manifests() -> eyre::Result<()> {
     // A later edit is not the baseline.
     std::fs::write(root.join("apps/a/package.json"), "{}")?;
 
-    let pins = ProtectedPins::from_baseline(&baseline)?;
+    let pins = ProtectedPins::from_baseline::<Pnpm>(&baseline)?;
 
     assert_eq!(
         declared(&pins),
@@ -792,7 +836,7 @@ fn linked_member_manifests_are_read_into_the_baseline() -> eyre::Result<()> {
             Utf8Path::new("apps/hardlinked").join("package.json"),
         ],
     )?;
-    let pins = ProtectedPins::from_baseline(&baseline)?;
+    let pins = ProtectedPins::from_baseline::<Pnpm>(&baseline)?;
 
     assert_eq!(
         declared(&pins),
@@ -867,7 +911,7 @@ fn only_a_dropped_binding_is_missing() -> eyre::Result<()> {
     let none = AuthorizedPins::default();
     let observed = |version: &str| {
         let lock = pnpm_lock(&[("apps/a", "^4.1.0", version)], &[]);
-        pins.observe::<Pnpm>(Some(&lock))
+        pins.observe::<Pnpm>(Some(&lock), &ManifestEdits::default())
             .get(&key("apps/a", "devDependencies", "chalk"))
             .clone()
     };
@@ -899,7 +943,7 @@ fn only_a_dropped_binding_is_missing() -> eyre::Result<()> {
     // A dropped binding
     let dropped = pnpm_lock(&[("apps/b", "^4.1.0", "4.1.0")], &["4.1.0"]);
     assert_eq!(
-        pins.observe::<Pnpm>(Some(&dropped))
+        pins.observe::<Pnpm>(Some(&dropped), &ManifestEdits::default())
             .get(&key("apps/a", "devDependencies", "chalk")),
         &Observed::Missing
     );
@@ -937,7 +981,7 @@ fn npm_entry(key: &str, name: Option<&str>, version: &str) -> String {
 
 /// What `lock` resolves the root's and `apps/a`'s `chalk` pins to.
 fn npm_observed(pins: &ProtectedPins, lock: &str) -> [Observed; 2] {
-    let observed = pins.observe::<Npm>(Some(lock));
+    let observed = pins.observe::<Npm>(Some(lock), &ManifestEdits::default());
     [
         observed.get(&key(".", "devDependencies", "chalk")).clone(),
         observed
@@ -1072,7 +1116,7 @@ fn an_npm_workspace_link_is_judged_by_its_targets_name() -> eyre::Result<()> {
         )
     };
     let observed = |lock: &str| {
-        pins.observe::<Npm>(Some(lock))
+        pins.observe::<Npm>(Some(lock), &ManifestEdits::default())
             .get(&key(".", "devDependencies", "chalk"))
             .clone()
     };
@@ -1090,6 +1134,180 @@ fn an_npm_workspace_link_is_judged_by_its_targets_name() -> eyre::Result<()> {
             &AuthorizedPins::default()
         ),
         NO_VIOLATIONS
+    );
+    Ok(())
+}
+
+/// A Yarn workspace whose root and `packages/b` hide a dev pin beside the caret Yarn normalizes
+/// them to, sharing that caret's entry, while `packages/a` pins its own.
+const YARN_HIDDEN_PINS: [(&str, &str); 3] = [
+    (
+        "package.json",
+        r#"{ "private": true, "workspaces": ["packages/*"], "dependencies": { "chalk": "^4.1.0" }, "devDependencies": { "chalk": "4.1.0" } }"#,
+    ),
+    (
+        "packages/a/package.json",
+        r#"{ "name": "pkg-a", "version": "1.0.0", "dependencies": { "chalk": "4.1.0" } }"#,
+    ),
+    (
+        "packages/b/package.json",
+        r#"{ "name": "pkg-b", "version": "1.0.0", "dependencies": { "chalk": "^4.1.0" }, "devDependencies": { "chalk": "4.1.0" } }"#,
+    ),
+];
+
+/// A Classic lock of `entries`, each `(descriptor line, version)`, in Yarn's shape.
+///
+/// Synthetic: hand-written to pin the versions each descriptor resolves to, which Yarn decides by
+/// its registry's contents.
+fn yarn_lock(entries: &[(&str, &str)]) -> String {
+    let entries = entries
+        .iter()
+        .map(|(descriptors, version)| {
+            formatdoc! {r#"
+                {descriptors}:
+                  version "{version}"
+                  resolved "https://registry.yarnpkg.com/chalk/-/chalk-{version}.tgz"
+            "#}
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("# yarn lockfile v1\n\n\n{entries}")
+}
+
+/// Yarn judges each member at the entry its own selector names: a sibling's resolve moving the
+/// shared caret entry breaks every hidden pin bound through it, while a member's own pinned entry
+/// and a newer duplicate under another selector move no pin.
+#[test]
+fn yarn_judges_each_member_through_its_selector() -> eyre::Result<()> {
+    let pins = protected_yarn(&YARN_HIDDEN_PINS)?;
+    let none = AuthorizedPins::default();
+    let baseline = yarn_lock(&[("chalk@4.1.0, chalk@^4.1.0", "4.1.0")]);
+    assert_eq!(
+        pins.observe::<Yarn>(Some(&baseline), &ManifestEdits::default())
+            .get(&key("packages/b", "devDependencies", "chalk")),
+        &Observed::Resolved("4.1.0".to_string())
+    );
+
+    // The shared caret moves under a sibling's resolve.
+    let moved = yarn_lock(&[("chalk@4.1.0", "4.1.0"), ("chalk@^4.1.0", "4.1.2")]);
+    assert_eq!(
+        violated::<Yarn>(&pins, Some(&baseline), &moved, &none),
+        [
+            ". devDependencies chalk",
+            "packages/b devDependencies chalk"
+        ]
+    );
+
+    // A newer copy another request resolves beside the unchanged entries
+    let duplicated = yarn_lock(&[
+        ("chalk@4.1.0, chalk@^4.1.0", "4.1.0"),
+        ("chalk@^4.1.2", "4.1.2"),
+    ]);
+    assert_eq!(
+        violated::<Yarn>(&pins, Some(&baseline), &duplicated, &none),
+        NO_VIOLATIONS
+    );
+    Ok(())
+}
+
+/// An old Yarn violation is grandfathered for its own member only: a member whose caret already
+/// resolved past its hidden pin keeps it, while another member's newly moved entry is a violation.
+#[test]
+fn yarn_grandfathers_each_member_on_its_own_entry() -> eyre::Result<()> {
+    let pins = protected_yarn(&[
+        YARN_HIDDEN_PINS[0],
+        (
+            "packages/b/package.json",
+            r#"{ "name": "pkg-b", "version": "1.0.0", "dependencies": { "chalk": "^4.1.1" }, "devDependencies": { "chalk": "4.1.1" } }"#,
+        ),
+    ])?;
+    let none = AuthorizedPins::default();
+    let baseline = yarn_lock(&[("chalk@^4.1.0", "4.1.2"), ("chalk@^4.1.1", "4.1.1")]);
+
+    // The root's old mismatch alone
+    assert_eq!(
+        violated::<Yarn>(&pins, Some(&baseline), &baseline, &none),
+        NO_VIOLATIONS
+    );
+
+    // Beside a new one in the member
+    let spread = yarn_lock(&[("chalk@^4.1.0, chalk@^4.1.1", "4.1.2")]);
+    assert_eq!(
+        violated::<Yarn>(&pins, Some(&baseline), &spread, &none),
+        ["packages/b devDependencies chalk"]
+    );
+    Ok(())
+}
+
+/// A Yarn lock is read under the selectors cooldown's own edits left: a rewritten selector is the
+/// one the settled lock records, so its replacement pin stays judged, for the candidate that wrote
+/// it and for every later one starting from its accepted state.
+#[test]
+fn yarn_selectors_follow_cooldowns_recorded_edits() -> eyre::Result<()> {
+    let pins = protected_yarn(&[(
+        "package.json",
+        r#"{ "dependencies": { "chalk": "^4.1.0" }, "devDependencies": { "chalk": "4.1.0" } }"#,
+    )])?;
+    // `--rewrite` rewrites both fields, and authorizes the dev pin's replacement.
+    let rewrite = ManifestRewrite {
+        modified: vec![Utf8PathBuf::from("package.json")],
+        rewritten: vec![
+            RewrittenDeclaration {
+                key: key(".", "dependencies", "chalk"),
+                replacement: "^4.1.2".to_string(),
+            },
+            RewrittenDeclaration {
+                key: key(".", "devDependencies", "chalk"),
+                replacement: "4.1.2".to_string(),
+            },
+        ],
+    };
+    let mut authorized = AuthorizedPins::default();
+    authorized.record(
+        &change("chalk", true, false),
+        RewriteMode::Always,
+        false,
+        &rewrite,
+    );
+    let mut edits = ManifestEdits::default();
+    edits.record(&rewrite);
+    let unedited = ManifestEdits::default();
+    let violated_under = |baseline: &str, settled: &str, edits: EditStates<'_>| {
+        pins.violations_between::<Yarn>(Some(baseline), settled, &authorized, edits)
+            .iter()
+            .map(|violation| violation.key.field)
+            .collect::<Vec<_>>()
+    };
+    let baseline = yarn_lock(&[("chalk@^4.1.0", "4.1.0")]);
+    let landed = yarn_lock(&[("chalk@^4.1.2", "4.1.2")]);
+    let overshot = yarn_lock(&[("chalk@^4.1.2", "4.1.3")]);
+    let candidate = EditStates {
+        baseline: &unedited,
+        settled: &edits,
+    };
+
+    // The rewritten selector lands at the replacement pin.
+    assert_eq!(violated_under(&baseline, &landed, candidate), NO_VIOLATIONS);
+
+    // An overshoot under the rewritten selector breaks the replacement, which the old selector
+    // would never have found.
+    assert_eq!(
+        violated_under(&baseline, &overshot, candidate),
+        ["devDependencies"]
+    );
+    assert_eq!(
+        violated_under(&baseline, &overshot, EditStates::NONE),
+        NO_VIOLATIONS
+    );
+
+    // A later candidate starting from the accepted rewrite cannot move it either.
+    let later = EditStates {
+        baseline: &edits,
+        settled: &edits,
+    };
+    assert_eq!(
+        violated_under(&landed, &overshot, later),
+        ["devDependencies"]
     );
     Ok(())
 }
