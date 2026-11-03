@@ -139,7 +139,8 @@ impl MemoFixture {
                             &self.project,
                             SeedGroup {
                                 moves: &moves,
-                                changes: &changes
+                                changes: &changes,
+                                plan: std::slice::from_ref(&self.change),
                             },
                             journal,
                             None,
@@ -156,6 +157,7 @@ impl MemoFixture {
                     .tentative_widen_logged(
                         WidenProbe {
                             project: &self.project,
+                            plan: std::slice::from_ref(&self.change),
                             rewrite: RewriteMode::Auto,
                             candidates: &[&self.change],
                             protected: &[],
@@ -184,10 +186,13 @@ impl MemoFixture {
         self.tool
             .pin_individually(
                 PinPass {
-                    project: &self.project,
+                    scope: PinScope {
+                        project: &self.project,
+                        plan: std::slice::from_ref(&self.change),
+                        journal,
+                        observer: None,
+                    },
                     batch: &[&self.change],
-                    journal,
-                    observer: None,
                 },
                 &[&self.change],
                 &mut rejections,
@@ -280,7 +285,8 @@ async fn failed_seed_repeats_without_cargo_or_per_member_diagnostics() -> eyre::
                     &fixture.project,
                     SeedGroup {
                         moves: &moves,
-                        changes: &changes
+                        changes: &changes,
+                        plan: std::slice::from_ref(&fixture.change),
                     },
                     &journal,
                     None,
@@ -329,6 +335,7 @@ async fn tentative_widen_hit_preserves_files_and_the_rejection_detail() -> eyre:
             .tentative_widen_logged(
                 WidenProbe {
                     project: &fixture.project,
+                    plan: std::slice::from_ref(&fixture.change),
                     rewrite: RewriteMode::Auto,
                     candidates: &[&fixture.change],
                     protected: &[],
@@ -615,6 +622,7 @@ async fn disabled_memo_repeats_every_native_attempt_and_preserves_details() -> e
                         .tentative_widen_logged(
                             WidenProbe {
                                 project: &fixture.project,
+                                plan: std::slice::from_ref(&fixture.change),
                                 rewrite: RewriteMode::Auto,
                                 candidates: &[&fixture.change],
                                 protected: &[],

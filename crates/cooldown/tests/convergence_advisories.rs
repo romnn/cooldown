@@ -14,6 +14,8 @@
 //! cannot turn it red.
 //! The exact `=` pin also keeps the row's *graph* verdict (`held`) independent of live registry
 //! state — the advisory annotations under test ride on top of it either way.
+//! The OSV feed itself cannot be frozen, so the assertions on what it reports say so when they
+//! fail: a withdrawn or rewritten advisory changes them.
 
 #![allow(
     clippy::unwrap_used,
@@ -25,7 +27,10 @@
 mod support;
 
 use indoc::indoc;
-use support::Fixture;
+use support::{CargoAsOf, Fixture};
+
+/// The note an assertion on what the live OSV feed reports carries in its failure message.
+const OSV_HISTORY: &str = "OSV advisory history changed (withdrawn or rewritten advisory?)";
 
 /// The advisory every test revolves around: `time < 0.2.23` (`localtime_r` UB), moderate
 /// severity, fixed in `0.2.23`.
@@ -51,10 +56,17 @@ const FIXED_MANIFEST: &str = indoc! {r#"
     time = "=0.2.23"
 "#};
 
+/// The instant the advisory scenarios were written: the seed resolves the exact `time` pins'
+/// transitive graph as of that day, and cooldown's runs only read the lock it left.
+const ADVISORIES_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2026-08-27T00:30:10Z",
+    run: "2026-08-27T00:30:10Z",
+};
+
 /// Seed a lock with the real cargo, then `cargo fetch` so cooldown's offline `cargo metadata`
 /// probes work regardless of what the local cargo cache happens to hold.
 fn fixture(manifest: &str, cooldown_toml: &str) -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(ADVISORIES_AS_OF);
     fixture
         .write("Cargo.toml", manifest)
         .write("src/lib.rs", "")
@@ -84,7 +96,7 @@ fn flag_mode_annotates_the_fixing_candidate() {
     let out = fixture.cooldown_json(&["outdated"]);
     let security = out
         .security_for("time")
-        .expect("the time row must carry a security block");
+        .unwrap_or_else(|| panic!("the time row must carry a security block; {OSV_HISTORY}"));
     let fixes: Vec<&str> = security["fixes"]
         .as_array()
         .expect("fixes array")
@@ -93,7 +105,7 @@ fn flag_mode_annotates_the_fixing_candidate() {
         .collect();
     assert!(
         fixes.contains(&GHSA),
-        "fixes must name the advisory, got {fixes:?}"
+        "fixes must name the advisory, got {fixes:?}; {OSV_HISTORY}"
     );
     assert_eq!(security["source"], "osv");
     assert_eq!(security["applied"], false, "flag mode never applies");
@@ -128,7 +140,7 @@ fn shorten_mode_makes_the_fix_adoptable_through_the_security_window() {
     let out = fixture.cooldown_json(&["outdated"]);
     let security = out
         .security_for("time")
-        .expect("the fixing candidate keeps its security block");
+        .unwrap_or_else(|| panic!("the fixing candidate keeps its security block; {OSV_HISTORY}"));
     assert_eq!(security["applied"], true, "the security window applied");
     assert!(
         out.item_field_str("time", "adoptableTarget").is_some(),
@@ -165,6 +177,6 @@ fn check_tallies_a_locked_fix_version() {
     assert_eq!(out.summary_violations(), 0);
     assert!(
         out.summary_security_relevant() >= 1,
-        "the locked 0.2.23 is {GHSA}'s fix version and must be tallied"
+        "the locked 0.2.23 is {GHSA}'s fix version and must be tallied; {OSV_HISTORY}"
     );
 }
