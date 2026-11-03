@@ -130,6 +130,8 @@ fn min_age_days_of(spec: &WindowSpec, now: Timestamp) -> f64 {
 /// rule `@corp/ui*` also beats the suffix rule `*-plugin`.
 /// The order depends only on the selectors, never on the order rules are declared in, and the
 /// first of several identical selectors wins.
+/// An exemption reports the highest-ranked matching `allow` under the same order, so reordering an
+/// `allow` list never changes the reported source.
 /// Each authority-first field is ranked among only the matching rules that set it, so a winner
 /// for one field decides nothing about another.
 ///
@@ -186,7 +188,8 @@ pub fn resolve(layers: &[PolicyLayer], query: &ResolveQuery<'_>, now: Timestamp)
         None => (None, None),
     };
     let advisory_floor = resolve_advisory_floor(layers, &allow.residual_floors, &mut trace);
-    // Provenance: when an allow applied, point at the highest-layer matching allow; else the pick.
+    // Provenance: when an allow applied, point at the highest-ranked matching allow (layer, then
+    // selector specificity and pattern), first wins on ties; else the pick.
     let (decided_by, decided_selector, exempt_origin) = match allow.provenance {
         Some((origin, selector)) => (origin.clone(), selector, Some(origin)),
         None => (pick.origin.clone(), pick.selector.clone(), None),
@@ -520,7 +523,9 @@ fn collect_floor_candidates(
 }
 
 /// The outcome of applying `allow` exemptions: whether any matched, the residual binding floor (if
-/// any), and the provenance (highest-layer matching allow) used to attribute the decision.
+/// any), and the provenance used to attribute the decision.
+/// The provenance is the highest-ranked matching allow (layer, then selector specificity and
+/// pattern); the first wins on ties.
 struct AllowOutcome {
     matched: bool,
     effective_floor: Option<FloorCandidate>,
@@ -610,10 +615,11 @@ fn resolve_allows(
         });
     }
 
-    let provenance = allows
-        .iter()
-        .max_by_key(|(layer_index, ..)| *layer_index)
-        .map(|(_, origin, selector)| (origin.clone(), selector.clone()));
+    // Reporting the highest-ranked matching allow keeps the source independent of list order.
+    // The bypass decision above already counted every matching allow, so ranking changes only the
+    // attribution.
+    let provenance = pick_ranked(layers, query, |rule| rule.allow.then_some(()))
+        .map(|pick| (pick.origin.clone(), pick.selector.clone()));
     AllowOutcome {
         matched: allow_matched,
         effective_floor,

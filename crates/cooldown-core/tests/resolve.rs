@@ -316,6 +316,118 @@ fn allow_vs_floor_security_rule() {
     assert!(st2.exempt, "CLI allow must always bypass a floor");
 }
 
+/// Which `allow` entry is reported does not depend on the list's order: the literal `@corp/ui`
+/// outranks its glob `@corp/*` in either order.
+/// The glob still names the packages the literal does not cover.
+#[test]
+fn allow_source_prefers_the_literal_in_either_list_order() {
+    let toml = "allow = [\"@corp/ui\", \"@corp/*\"]";
+    for layers in rule_orders(toml) {
+        let window = win(&layers, "@corp/ui", ResolveKind::CurrentPin);
+        assert!(window.exempt);
+        assert_eq!(
+            window.decided_selector.token().as_deref(),
+            Some("package=@corp/ui")
+        );
+        assert_eq!(
+            window.decided_by,
+            Origin::Repo(Utf8PathBuf::from("cooldown.toml"))
+        );
+        assert_eq!(
+            window.exempt_origin,
+            Some(Origin::Repo(Utf8PathBuf::from("cooldown.toml")))
+        );
+        assert_eq!(window.source(), "repo:cooldown.toml:package=@corp/ui");
+
+        let window = win(&layers, "@corp/other", ResolveKind::CurrentPin);
+        assert!(window.exempt);
+        assert_eq!(window.source(), "repo:cooldown.toml:package=@corp/*");
+    }
+}
+
+/// Layer authority comes before selector specificity and pattern, so a higher layer's glob `allow`
+/// is reported over a lower layer's literal `allow`.
+#[test]
+fn a_higher_layer_glob_allow_outranks_a_lower_layer_literal() {
+    let layers = vec![
+        config::builtin_default_layer(),
+        global("allow = [\"@corp/ui\"]"),
+        repo("allow = [\"@corp/*\"]"),
+    ];
+    let window = win(&layers, "@corp/ui", ResolveKind::CurrentPin);
+    assert!(window.exempt);
+    assert_eq!(
+        window.exempt_origin,
+        Some(Origin::Repo(Utf8PathBuf::from("cooldown.toml")))
+    );
+    assert_eq!(window.source(), "repo:cooldown.toml:package=@corp/*");
+}
+
+/// Between two globs of one layer, the longer literal prefix is reported in either list order.
+/// `@corp/ui*` is reported for `@corp/ui-kit`, while `@corp/*` still covers the other packages.
+#[test]
+fn allow_source_takes_the_longer_literal_prefix() {
+    let toml = "allow = [\"@corp/*\", \"@corp/ui*\"]";
+    for layers in rule_orders(toml) {
+        let window = win(&layers, "@corp/ui-kit", ResolveKind::CurrentPin);
+        assert!(window.exempt);
+        assert_eq!(window.source(), "repo:cooldown.toml:package=@corp/ui*");
+
+        let window = win(&layers, "@corp/other", ResolveKind::CurrentPin);
+        assert!(window.exempt);
+        assert_eq!(window.source(), "repo:cooldown.toml:package=@corp/*");
+    }
+}
+
+/// Globs with equally long literal prefixes are separated by their raw text, and the smaller text
+/// is reported.
+/// That comparison reads only the patterns, so the list order does not matter.
+#[test]
+fn allow_source_falls_back_to_the_smaller_raw_pattern() {
+    let toml = "allow = [\"@corp/*kit\", \"@corp/*-kit\"]";
+    for layers in rule_orders(toml) {
+        let window = win(&layers, "@corp/ui-kit", ResolveKind::CurrentPin);
+        assert!(window.exempt);
+        assert_eq!(window.source(), "repo:cooldown.toml:package=@corp/*-kit");
+    }
+}
+
+/// A higher layer's `allow` cannot bypass an org floor in a lower layer, in either list order.
+/// The floor still clamps the window, the reported source is the highest-ranked `allow`, and every
+/// matching `allow` is traced as applied.
+#[test]
+fn a_residual_floor_still_binds_under_a_higher_layer_allow() {
+    let toml = "allow = [\"@corp/ui\", \"@corp/*\"]";
+    for mut layers in rule_orders(toml) {
+        // The org floor sits between the built-in default and the repo layer.
+        layers.insert(1, global("floor = \"10d\""));
+
+        let window = win(&layers, "@corp/ui", ResolveKind::CurrentPin);
+        assert!(!window.exempt, "the lower-layer floor is not bypassed");
+        assert_eq!(window.floor, Some(days(10)));
+        assert_eq!(window.floor_origin, Some(Origin::Global));
+        assert!((window.effective_min_age_days(now()) - 10.0).abs() < 1e-9);
+        assert_eq!(window.source(), "repo:cooldown.toml:package=@corp/ui");
+
+        let resolution = resolve(
+            &layers,
+            &q("@corp/ui", Utf8Path::new("."), ResolveKind::CurrentPin),
+            now(),
+        );
+        let allows: Vec<_> = resolution
+            .trace
+            .iter()
+            .filter(|step| step.field == "allow")
+            .collect();
+        assert_eq!(allows.len(), 2, "{:#?}", resolution.trace);
+        assert!(
+            allows.iter().all(|step| step.applied),
+            "{:#?}",
+            resolution.trace
+        );
+    }
+}
+
 /// Per-kind fallthrough: a per-kind window wins for its kind; absent one, the bare `min-age`
 /// applies. `CurrentPin` always uses the bare `min-age`.
 #[test]
