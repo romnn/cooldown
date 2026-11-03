@@ -15,6 +15,15 @@ use tokio::process::Command;
 #[derive(Clone)]
 pub struct NodeCmd {
     bin: String,
+    /// The variables every invocation sets on top of the inherited environment.
+    env: Vec<EnvVar>,
+}
+
+/// One environment variable a [`NodeCmd`] sets for its driver.
+#[derive(Clone)]
+struct EnvVar {
+    name: &'static str,
+    value: &'static str,
 }
 
 impl NodeCmd {
@@ -24,7 +33,18 @@ impl NodeCmd {
         let env_key = format!("COOLDOWN_{}", bin.to_uppercase());
         NodeCmd {
             bin: std::env::var(&env_key).unwrap_or_else(|_| bin.to_string()),
+            env: Vec::new(),
         }
+    }
+
+    /// Sets `name` to `value` for every invocation of the driver, whatever the inherited
+    /// environment says.
+    ///
+    /// A later call for the same `name` wins.
+    #[must_use]
+    pub(crate) fn with_env(mut self, name: &'static str, value: &'static str) -> Self {
+        self.env.push(EnvVar { name, value });
+        self
     }
 
     /// A wrapper driving an explicit binary, so hermetic tests can substitute a scripted fake for
@@ -33,13 +53,17 @@ impl NodeCmd {
     /// consumers, which need a shell to run the fake.
     #[cfg(all(test, unix))]
     pub(crate) fn with_bin(bin: impl Into<String>) -> Self {
-        NodeCmd { bin: bin.into() }
+        NodeCmd {
+            bin: bin.into(),
+            env: Vec::new(),
+        }
     }
 
     async fn output(&self, dir: &Utf8Path, args: &[String]) -> Result<std::process::Output> {
         supervised_output(
             Command::new(resolve_program(&self.bin))
                 .args(args)
+                .envs(self.env.iter().map(|EnvVar { name, value }| (name, value)))
                 .current_dir(dir.as_std_path()),
             &self.bin,
             || format!("{} {}", self.bin, args.join(" ")),

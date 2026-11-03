@@ -45,7 +45,7 @@ filter = 'binary(/^convergence_go/)'
 test-group = 'go-registry'
 
 [[profile.integration.overrides]]
-filter = 'binary(/^(convergence_deno|convergence_npm|convergence_pnpm)/)'
+filter = 'binary(/^(convergence_deno|convergence_npm|convergence_pnpm|convergence_yarn)/)'
 test-group = 'npm-registry'
 
 [[profile.integration.overrides]]
@@ -69,7 +69,7 @@ filter = 'binary(/^convergence_go/)'
 test-group = 'go-registry'
 
 [[profile.ci.overrides]]
-filter = 'binary(/^(convergence_deno|convergence_npm|convergence_pnpm)/)'
+filter = 'binary(/^(convergence_deno|convergence_npm|convergence_pnpm|convergence_yarn)/)'
 test-group = 'npm-registry'
 
 [[profile.ci.overrides]]

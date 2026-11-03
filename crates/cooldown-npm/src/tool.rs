@@ -301,6 +301,14 @@ impl<L: NodeLock> NpmTool<L> {
         self.registry = self.registry.with_listing_revalidation(revalidate);
         self
     }
+
+    /// Drives the package manager through `cmd` instead of the default driver, so an adapter can
+    /// set its environment and a test can substitute a scripted fake.
+    #[must_use]
+    pub(crate) fn with_driver(mut self, cmd: NodeCmd) -> Self {
+        self.cmd = cmd;
+        self
+    }
 }
 
 pub(crate) fn classify_quality(v: &str) -> ReleaseQuality {

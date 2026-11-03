@@ -193,9 +193,9 @@ The same limitation applies to Deno's mixed JSR/npm graph.
 
 The mapping is necessary but not sufficient: a package is only queried when its origin is
 *proven* to be the ecosystem's public registry (see [Registry identity](#registry-identity)
-below). For `bun`, `yarn` (classic), `maven`, and `gradle` no resolution record or confirmable
-configuration proves per-package origin, so their packages are currently never queried — the
-mapping exists, the evidence does not.
+below). For `bun`, `yarn` (Classic and Berry), `maven`, and `gradle` no resolution record or
+confirmable configuration proves per-package origin, so their packages are currently never
+queried — the mapping exists, the evidence does not.
 
 ### Registry identity
 
@@ -223,7 +223,7 @@ What each tool can prove, from the records and configuration it reads:
 | `pip` | per tree, twice over: every requirements file (following `-r`/`-c` includes) and every `PIP_*` routing variable (the index options plus `PIP_REQUIREMENT`/`PIP_CONSTRAINT`, which splice in an unseen file) must be visibly clean, and when the feed runs, pip itself is asked for its effective configuration (`pip config list` — the only authority on the interpreter-prefix site file that shims relocate beyond any file walk); one directive, unreadable include, config hit, or failed query withholds every pin |
 | `npm` | per entry, twice over: the lock's `resolved` URL must name registry.npmjs.org (its integrity hash pins the artifact to what that registry served), and when the feed runs, npm itself is asked for its *effective* routing (`npm config list`, all layers merged — global and builtin included); a package that routing reroutes, or every package when the query fails, is withheld |
 | `pnpm` | per entry, twice over: the lock names no registry, but a `pnpm-lock.yaml` entry served from the configured registry by name carries only `resolution: {integrity: …}` — a `tarball`, `repo`/`commit`, or `directory` field marks anything else and withholds that entry — and when the feed runs, pnpm itself is asked for its *effective* routing (`pnpm config list`, all layers merged, `pnpm-workspace.yaml` included), which must *state* a `registry` of registry.npmjs.org: an unstated registry, a failing query, or an unreadable `.npmrc`/`pnpm-workspace.yaml` routing key withholds every package, and an `@scope:registry` override withholds only its scope |
-| `yarn` (classic), `bun` | never at feed time: bun's lock records no per-entry origin, and yarn classic merges `.yarnrc` files up the directory tree with no reliably parseable effective-config query — so no identity survives to the feed |
+| `yarn` (Classic and Berry), `bun` | never at feed time: bun's lock records no per-entry origin, yarn classic merges `.yarnrc` files up the directory tree with no reliably parseable effective-config query, and a Yarn Berry lock entry names no registry (its checksum and link type say nothing about origin) — so no identity survives to the feed |
 | `maven`, `gradle` | never: neither format records a per-artifact repository, and the routing that decides real origin — `settings.xml` mirrors, `settings.gradle` repository blocks, init scripts, parent-pom repositories — lives outside the files the adapter reads |
 | `bundler` | per section: the `Gemfile.lock` `GEM` remote must be rubygems.org (`GIT`/`PATH` sections never qualify) |
 | `hex` | per package: the `mix.lock` entry's repo element must be `hexpm` |

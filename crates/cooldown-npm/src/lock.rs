@@ -11,16 +11,21 @@
 //! ([`YarnBindings`]).
 //! Formats without either fall back to the root manifest's declared dependency names.
 
+mod yaml;
 mod yarn;
+mod yarn_berry;
 
 pub use crate::manifest::workspaces::WorkspaceManifests;
 pub use yarn::YarnBindings;
 
+pub(crate) use yarn_berry::YarnBerry;
+
 use crate::version::{CeilingHold, RangeMatch, is_exact_npm_specifier, range_match};
 use cooldown_core::{CoreError, Result, ToolId};
 use serde::Deserialize;
-use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
+use serde::de::{Deserializer, IgnoredAny, Visitor};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use yaml::{YamlEntries, parse_lock_yaml};
 
 /// The per-package-manager knobs the generic adapter needs: identity, the lockfile/driver it reads
 /// and shells out to, how to parse its lock, and how to refresh the lock after a manifest edit.
@@ -46,7 +51,7 @@ pub trait NodeLock: Send + Sync + 'static {
     /// layer merged — builtin, global, user, project, environment) contributes to advisory identity
     /// at feed time.
     /// See [`EffectiveRegistryQuery`]; the default is the manager with no reliably parseable query
-    /// (yarn classic, bun), whose identities never survive the feed.
+    /// (yarn classic, bun) or none wired yet (yarn Berry), whose identities never survive the feed.
     const EFFECTIVE_REGISTRY: EffectiveRegistryQuery = EffectiveRegistryQuery::Unavailable;
 
     /// Whether the peer gate can tell which copy a member's peer contract binds to.
@@ -56,7 +61,7 @@ pub trait NodeLock: Send + Sync + 'static {
     /// layout.
     /// A manager that hoists without recording its tree, or resolves peers by version rather than
     /// through the member's declaration, proves neither, so its peer evidence stays unavailable
-    /// rather than borrowing pnpm's rule: yarn classic and bun.
+    /// rather than borrowing pnpm's rule: yarn classic and Berry, and bun.
     const PEER_CONTEXTS_MODELED: bool = true;
 
     /// Whether the lock records no workspace member, so this manager's member evidence comes from
@@ -1034,58 +1039,6 @@ impl PnpmLockDocument {
     }
 }
 
-/// A YAML mapping read in document order with duplicate keys tolerated: entries surface exactly
-/// as the file lists them, and each occurrence of a duplicated key (which pnpm never writes)
-/// contributes its own entry instead of erroring out or collapsing.
-struct YamlEntries<V>(Vec<(String, V)>);
-
-impl<V> Default for YamlEntries<V> {
-    fn default() -> Self {
-        Self(Vec::new())
-    }
-}
-
-impl<V> YamlEntries<V> {
-    fn entries(&self) -> impl Iterator<Item = (&str, &V)> {
-        self.0.iter().map(|(key, value)| (key.as_str(), value))
-    }
-
-    fn keys(&self) -> impl Iterator<Item = &str> {
-        self.0.iter().map(|(key, _)| key.as_str())
-    }
-}
-
-impl<'de, V: Deserialize<'de>> Deserialize<'de> for YamlEntries<V> {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        struct EntriesVisitor<V>(std::marker::PhantomData<V>);
-        impl<'de, V: Deserialize<'de>> Visitor<'de> for EntriesVisitor<V> {
-            type Value = YamlEntries<V>;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a mapping")
-            }
-
-            fn visit_map<A: MapAccess<'de>>(
-                self,
-                mut access: A,
-            ) -> std::result::Result<Self::Value, A::Error> {
-                let mut entries = Vec::new();
-                while let Some(entry) = access.next_entry()? {
-                    entries.push(entry);
-                }
-                Ok(YamlEntries(entries))
-            }
-
-            // A section header with nothing under it (`packages:` at end of file) is a null
-            // value, not a mapping, and reads as an empty section.
-            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
-                Ok(YamlEntries(Vec::new()))
-            }
-        }
-        deserializer.deserialize_map(EntriesVisitor(std::marker::PhantomData))
-    }
-}
-
 /// A lock value kept fail-open per entry: a shape the typed model does not recognize (an old lock
 /// format's scalar dependency entry, a hand-edited file) degrades to `Other` — leaving its key
 /// readable and every sibling entry intact — instead of failing the whole document.
@@ -1231,29 +1184,10 @@ pub(crate) fn parse_pnpm_document_strict(content: &str) -> Result<PnpmLockDocume
 }
 
 /// Parses `pnpm-lock.yaml` into any typed view of it under the one set of parser options every
-/// reader shares: duplicate keys kept, the size-proportional budget lifted, the structural guards
-/// kept.
+/// lock reader shares ([`parse_lock_yaml`]).
 /// An empty or whitespace-only document is a legitimately empty lock and reads as the default.
 fn parse_pnpm_yaml<T: serde::de::DeserializeOwned + Default>(content: &str) -> Result<T> {
-    if content.trim().is_empty() {
-        return Ok(T::default());
-    }
-    let mut options = serde_saphyr::Options::default();
-    // pnpm never writes duplicate keys, but a hand-edited lock may carry them; `LastWins` passes
-    // duplicate pairs through to the map visitor, so [`YamlEntries`] keeps each of them (the
-    // default policy errors out instead).
-    options.duplicate_keys = serde_saphyr::options::DuplicateKeyPolicy::LastWins;
-    // The default budget caps events/nodes/scalar bytes at totals a large monorepo lock can
-    // legitimately exceed, and a breach would surface as a spurious parse failure.
-    // Lift the size-proportional caps — the input is a project-local file — while keeping the
-    // structural guards (nesting depth, alias amplification).
-    if let Some(budget) = options.budget.as_mut() {
-        budget.max_events = usize::MAX;
-        budget.max_nodes = usize::MAX;
-        budget.max_total_scalar_bytes = usize::MAX;
-    }
-    serde_saphyr::from_str_with_options(content, options)
-        .map_err(|error| CoreError::LockUnreadable(format!("pnpm-lock.yaml: {error}")))
+    parse_lock_yaml(content, Pnpm::LOCKFILE)
 }
 
 /// [`parse_pnpm_document_strict`] with the failure collapsed to `None`, for the auxiliary readers
@@ -1974,6 +1908,9 @@ pub struct Pnpm;
 /// from the workspace manifests ([`YarnBindings`]).
 /// Yarn hoists without recording its tree and binds peers by version, so the peer gate stays out
 /// of its locks ([`NodeLock::PEER_CONTEXTS_MODELED`]).
+///
+/// It reads only a Classic lock: a Yarn Berry lock shares the file name, and the `yarn` adapter
+/// ([`YarnTool`](crate::YarnTool)) routes it to the Berry reader instead.
 pub struct Yarn;
 /// The Bun package manager: `bun.lock` (text lockfile) backed by the npm registry.
 ///
@@ -2249,10 +2186,12 @@ impl NodeLock for Yarn {
         // A Berry lock shares the file name but none of the Classic grammar, so the Classic
         // reader would find no entries and `outdated` or `upgrade` would silently see an empty
         // graph.
+        // The adapter routes a Berry lock to its own reader, so reaching here means the lock
+        // changed format between the routing read and this one.
         if is_yarn_berry_lock(content) {
             return Err(CoreError::LockUnreadable(
-                "yarn.lock is a Yarn Berry (v2+) lockfile, which cooldown cannot read; only Yarn \
-                 Classic (v1) lockfiles are supported"
+                "yarn.lock is a Yarn Berry (v2+) lockfile, which the Yarn Classic (v1) reader \
+                 cannot read"
                     .into(),
             ));
         }
@@ -2297,42 +2236,88 @@ impl NodeLock for Yarn {
 /// Whether a `yarn.lock` was written by Yarn Berry (v2+), which carries a top-level
 /// `__metadata` key that no Classic lock has.
 ///
-/// Berry locks are YAML, so the key may be quoted or followed by a comment, and the file may start
-/// with a byte-order mark.
+/// Berry locks are YAML, so the key may be quoted, escaped, flow-mapped, or followed by a comment,
+/// and the file may start with a byte-order mark.
 /// A Classic entry for a package named `__metadata` is keyed by its selector
 /// (`__metadata@^1.0.0`), so it never matches.
-fn is_yarn_berry_lock(content: &str) -> bool {
+///
+/// The key alone decides the format, whatever its value, so a Berry lock that is otherwise
+/// malformed, `__metadata: null` included, still reads as Berry and fails on the Berry reader's
+/// error path instead of reading as an empty Classic graph.
+pub(crate) fn is_yarn_berry_lock(content: &str) -> bool {
     let content = content.trim_start_matches('\u{feff}');
-    // Every spelling of the key contains its name, which spares a Classic lock the YAML pass.
-    if !content.contains("__metadata") {
+    // The line reading answers the plain and quoted spellings without a YAML pass, and it still
+    // answers when the rest of the document is no valid YAML.
+    if content.lines().any(opens_berry_metadata) {
+        return true;
+    }
+    // Every other spelling is a key of the decoded document.
+    // A Classic lock is usually no valid YAML, and a Classic key always carries its range, so it
+    // is never the bare marker.
+    parse_lock_yaml::<TopLevelMetadata>(content, Yarn::LOCKFILE)
+        .is_ok_and(|TopLevelMetadata { present }| present)
+}
+
+/// The top-level key that marks a YAML document as a Berry `yarn.lock`.
+const BERRY_METADATA_KEY: &str = "__metadata";
+
+/// Whether a YAML document is a mapping with a top-level [`BERRY_METADATA_KEY`], whatever that
+/// key's value: a null or malformed one still marks the document as Berry.
+#[derive(Default)]
+struct TopLevelMetadata {
+    present: bool,
+}
+
+impl<'de> Deserialize<'de> for TopLevelMetadata {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct KeysVisitor;
+        impl<'de> Visitor<'de> for KeysVisitor {
+            type Value = TopLevelMetadata;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a mapping")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut access: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut present = false;
+                // A key that is no scalar, which YAML allows, decodes as a structure that can
+                // never be the marker.
+                while let Some(key) = access.next_key::<serde_json::Value>()? {
+                    access.next_value::<IgnoredAny>()?;
+                    present |= key.as_str() == Some(BERRY_METADATA_KEY);
+                }
+                Ok(TopLevelMetadata { present })
+            }
+        }
+        deserializer.deserialize_any(KeysVisitor)
+    }
+}
+
+/// Whether `line` opens the top-level [`BERRY_METADATA_KEY`], plain or quoted, whatever follows
+/// its colon: a nested block, a flow mapping, a scalar, `null`, or a comment.
+///
+/// An explicit `? __metadata` key line counts too, its value following on a line of its own.
+/// The line is never judged as YAML, so a malformed value or document still matches.
+/// No Classic lock has such a line: its top-level lines are comments and entry keys, which carry
+/// a selector (`__metadata@^1.0.0:`).
+fn opens_berry_metadata(line: &str) -> bool {
+    let (explicit, key) = match line.strip_prefix('?') {
+        Some(rest) if rest.is_empty() || rest.starts_with([' ', '\t']) => {
+            (true, rest.trim_start_matches([' ', '\t']))
+        }
+        _ => (false, line),
+    };
+    let Some(after) = ["\"__metadata\"", "'__metadata'", BERRY_METADATA_KEY]
+        .into_iter()
+        .find_map(|spelling| key.strip_prefix(spelling))
+    else {
         return false;
-    }
-    // The YAML reading covers every mapping spelling (flow maps, spaced colons, tab-led comments).
-    // A Classic lock is usually not valid YAML, so the line reading still runs when it fails.
-    let parsed =
-        parse_pnpm_yaml::<BerryMetadata>(content).is_ok_and(|document| document.metadata.is_some());
-    parsed
-        || content
-            .lines()
-            .any(|line| yaml_top_level_key(line) == Some("__metadata"))
-}
-
-/// The one top-level key of a YAML document that marks it as a Berry `yarn.lock`.
-#[derive(Default, serde::Deserialize)]
-struct BerryMetadata {
-    #[serde(rename = "__metadata")]
-    metadata: Option<serde::de::IgnoredAny>,
-}
-
-/// The key a top-level YAML mapping line opens, unquoted, or [`None`] for an indented, comment or
-/// non-key line.
-fn yaml_top_level_key(line: &str) -> Option<&str> {
-    if line.starts_with([' ', '\t', '#']) {
-        return None;
-    }
-    let without_comment = line.split(" #").next().unwrap_or(line).trim_end();
-    let key = without_comment.strip_suffix(':')?;
-    Some(key.trim_matches(['"', '\'']))
+    };
+    let after = after.trim_start_matches([' ', '\t']);
+    after.starts_with(':') || (explicit && (after.is_empty() || after.starts_with('#')))
 }
 
 impl NodeLock for Bun {
@@ -3956,6 +3941,9 @@ fn strip_trailing_commas(s: &str) -> String {
 #[cfg(test)]
 pub(crate) mod yarn_fixtures;
 
+#[cfg(test)]
+pub(crate) mod yarn_berry_fixtures;
+
 /// Real `bun.lock` files the Bun readers' tests share.
 ///
 /// Each was written by `bun install --lockfile-only` (Bun 1.4.4) in a scratch workspace whose
@@ -4831,8 +4819,9 @@ mod tests {
         assert_eq!(pnpm_lock_consistency_error("importers: [unclosed"), None);
     }
 
-    /// A Berry `yarn.lock` is refused as unreadable instead of parsing as an empty graph that
-    /// `outdated` and `upgrade` would silently accept.
+    /// The Classic reader refuses a Berry `yarn.lock` as unreadable instead of parsing it as an
+    /// empty graph that `outdated` and `upgrade` would silently accept, whatever spelling marks it
+    /// as Berry.
     #[test]
     fn a_yarn_berry_lock_is_unreadable_not_empty() {
         let berry = indoc! {r#"
