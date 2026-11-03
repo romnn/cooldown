@@ -3,7 +3,7 @@
 //! kind, and the compatibility-major used to gate `--major`.
 
 use cooldown_core::{MajorKey, UpdateKind};
-use semver::Version;
+use semver::{Prerelease, Version};
 use std::cmp::Ordering;
 
 /// Parses `v` as a [`semver::Version`], returning [`None`] when it is not valid `SemVer`.
@@ -32,9 +32,9 @@ pub fn parse(v: &str) -> Option<Version> {
 /// npm and the Rust `semver` parser disagree on bare tokens: npm reads a bare full version as an
 /// *equality* (`1.2.3` ⇔ `=1.2.3`) and a bare partial as an *X-range* (`1.2` ⇔ `1.2.x`), while the
 /// Rust parser would assume an implicit caret for both.
-/// `normalized_requirement` translates each clause accordingly before parsing;
-/// operator-led partials need no translation (the parser's `>I.J`-style desugarings
-/// already match node-semver's X-range rules).
+/// `normalized_requirement` translates each clause accordingly before parsing, and every partial
+/// is then expanded into node-semver's full-version bounds (`npm_requirement`), so a prerelease
+/// target is judged as node-semver judges it.
 /// A whole exact pin is read in every spelling node-semver accepts (`v1.2.3`, `=v1.2.3`,
 /// `= v1.2.3`), the `v` prefix nowhere else.
 ///
@@ -60,11 +60,7 @@ pub fn parse(v: &str) -> Option<Version> {
 /// ```
 #[must_use]
 pub fn version_in_range(spec: &str, target: &str) -> bool {
-    let Some(spec) = normalized_requirement(spec) else {
-        return false;
-    };
-    let (Ok(requirement), Ok(version)) = (semver::VersionReq::parse(&spec), Version::parse(target))
-    else {
+    let (Some(requirement), Ok(version)) = (npm_requirement(spec), Version::parse(target)) else {
         return false;
     };
     requirement.matches(&version)
@@ -96,6 +92,8 @@ pub enum RangeMatch {
 /// This is the matcher for *declared peer ranges*, which routinely union majors
 /// (`eslint: ^7.0.0 || ^8.0.0`); [`version_in_range`] deliberately stays union-free because its
 /// callers must fall back to a manifest rewrite for anything they cannot represent.
+/// The pnpm lock consistency check uses it too, so a recorded importer version is reported stale
+/// only when its specifier provably excludes it.
 ///
 /// # Examples
 ///
@@ -133,9 +131,127 @@ pub fn range_match(spec: &str, target: &str) -> RangeMatch {
 /// Whether one `||`-free branch admits `target`, or [`None`] when the branch is not representable
 /// (hyphen ranges, protocols, an empty branch — npm's "match anything" spelling).
 fn branch_admits(branch: &str, target: &Version) -> Option<bool> {
-    let normalized = normalized_requirement(branch)?;
+    Some(npm_requirement(branch)?.matches(target))
+}
+
+/// Reads one `||`-free npm range as a Rust requirement that matches like node-semver, or [`None`]
+/// for a form it cannot represent.
+///
+/// Every partial or wildcard comparator is expanded into the full-version bounds node-semver
+/// gives it, as `1.x` becomes `>=1.0.0, <2.0.0-0`.
+/// The Rust parser judges a partial's missing components differently for a prerelease target.
+/// It rejects `1.2.3-beta.2` for `1.x`, `1.2`, or `~1.2` even when another comparator of the
+/// set opts that prerelease in, as `>=1.2.3-beta.1` does, and it admits `1.0.0-beta` for `^1`,
+/// below npm's `>=1.0.0` floor.
+/// With full bounds, the parser's prerelease rule is node-semver's: a prerelease is admitted
+/// only when a comparator with the same `[major, minor, patch]` carries one.
+///
+/// A `>=0.0.0` floor, written or expanded, is dropped as node-semver drops it.
+/// node-semver treats it as `*`, which bounds nothing, so `^0.0 >=0.0.0-alpha` admits
+/// `0.0.0-beta`, while the Rust parser would hold the prerelease below the floor.
+fn npm_requirement(spec: &str) -> Option<semver::VersionReq> {
+    let normalized = normalized_requirement(spec)?;
     let requirement = semver::VersionReq::parse(&normalized).ok()?;
-    Some(requirement.matches(target))
+    let mut comparators = Vec::with_capacity(requirement.comparators.len());
+    for comparator in &requirement.comparators {
+        comparators.extend(full_bounds(comparator)?);
+    }
+    comparators.retain(|comparator| !is_zero_floor(comparator));
+    Some(semver::VersionReq { comparators })
+}
+
+/// Whether `comparator` is exactly `>=0.0.0`, the floor node-semver reads as `*`.
+fn is_zero_floor(comparator: &semver::Comparator) -> bool {
+    comparator.op == semver::Op::GreaterEq
+        && comparator.major == 0
+        && comparator.minor == Some(0)
+        && comparator.patch == Some(0)
+        && comparator.pre.is_empty()
+}
+
+/// The full-version comparators node-semver desugars `comparator` into, or [`None`] for an
+/// operator this mapping does not know.
+///
+/// A comparator naming every component is returned unchanged, since the Rust parser already
+/// matches it like node-semver.
+/// The exceptions are `^0.0.0` and `~0.0.0`, whose implied `>=0.0.0` floor the Rust parser keeps
+/// internally, so they are expanded for [`npm_requirement`] to drop that floor.
+/// The upper bounds carry node-semver's `-0` prerelease, so no prerelease of the excluded
+/// version slips under them.
+fn full_bounds(comparator: &semver::Comparator) -> Option<Vec<semver::Comparator>> {
+    use semver::Op;
+    let &semver::Comparator {
+        op,
+        major,
+        minor,
+        patch,
+        ref pre,
+    } = comparator;
+    if let (Some(minor), Some(patch)) = (minor, patch) {
+        let zero = major == 0 && minor == 0 && patch == 0 && pre.is_empty();
+        let bounds = match op {
+            Op::Caret if zero => vec![at_least(0, 0), below(0, 0, 1)?],
+            Op::Tilde if zero => vec![at_least(0, 0), below(0, 1, 0)?],
+            _ => vec![comparator.clone()],
+        };
+        return Some(bounds);
+    }
+    // Neither grammar attaches a prerelease to a partial, so one here is not understood.
+    if !pre.is_empty() {
+        return None;
+    }
+    let floor_minor = minor.unwrap_or(0);
+    // The first version past the partial: the next major for `1`, the next minor for `1.2`.
+    let (next_major, next_minor) = match minor {
+        None => (major.checked_add(1)?, 0),
+        Some(minor) => (major, minor.checked_add(1)?),
+    };
+    let bounds = match op {
+        Op::Exact | Op::Wildcard | Op::Tilde => {
+            vec![
+                at_least(major, floor_minor),
+                below(next_major, next_minor, 0)?,
+            ]
+        }
+        Op::Greater => vec![at_least(next_major, next_minor)],
+        Op::GreaterEq => vec![at_least(major, floor_minor)],
+        Op::Less => vec![below(major, floor_minor, 0)?],
+        Op::LessEq => vec![below(next_major, next_minor, 0)?],
+        Op::Caret => {
+            // `^1.2` stays below the next major, while `^0.2` stays on its minor line.
+            let ceiling = if major > 0 {
+                below(major.checked_add(1)?, 0, 0)?
+            } else {
+                below(next_major, next_minor, 0)?
+            };
+            vec![at_least(major, floor_minor), ceiling]
+        }
+        _ => return None,
+    };
+    Some(bounds)
+}
+
+/// The comparator `>=major.minor.0`.
+fn at_least(major: u64, minor: u64) -> semver::Comparator {
+    semver::Comparator {
+        op: semver::Op::GreaterEq,
+        major,
+        minor: Some(minor),
+        patch: Some(0),
+        pre: Prerelease::EMPTY,
+    }
+}
+
+/// The comparator `<major.minor.patch-0`, which also excludes every prerelease of that version.
+fn below(major: u64, minor: u64, patch: u64) -> Option<semver::Comparator> {
+    let pre = Prerelease::new("0").ok()?;
+    Some(semver::Comparator {
+        op: semver::Op::Less,
+        major,
+        minor: Some(minor),
+        patch: Some(patch),
+        pre,
+    })
 }
 
 /// Translates a whole `spec` into the Rust parser's comma-separated syntax, or [`None`] for a form
@@ -171,9 +287,9 @@ fn normalized_requirement(spec: &str) -> Option<String> {
 /// Translates one range clause into the Rust parser's syntax with **npm's** token semantics: a
 /// BARE version is an equality in npm (`1.2.3` ⇔ `=1.2.3`; a bare partial `1.2` ⇔ the X-range
 /// `1.2.x`, which `=1.2` desugars to identically), never the implicit caret the Rust parser would
-/// assume. Operator-led clauses and explicit X-ranges pass through unchanged — their parser
-/// desugarings already match node-semver's. A clause neither form can represent simply fails the
-/// downstream parse, keeping the callers' conservative fallbacks.
+/// assume. Operator-led clauses and explicit X-ranges pass through unchanged; `npm_requirement`
+/// expands their partials into node-semver's bounds after parsing. A clause neither form can
+/// represent simply fails the downstream parse, keeping the callers' conservative fallbacks.
 fn npm_clause(clause: &str) -> String {
     if clause.starts_with(['<', '>', '=', '~', '^']) || is_x_range(clause) {
         clause.to_string()
@@ -690,6 +806,104 @@ mod tests {
         assert_eq!(range_match("v1.2.3 || ^v2.0.0", "1.2.4"), Unknown);
         // The union-free matcher never reads a union, whatever its branches.
         assert!(!version_in_range("v1.2.3 || = v1.2.4", "1.2.4"));
+    }
+
+    /// A prerelease target is judged as node-semver judges it, partials and wildcards included.
+    ///
+    /// Each expectation was checked against npm's bundled node-semver `satisfies`.
+    /// A prerelease is admitted only where a comparator of the same `[major, minor, patch]` opts it
+    /// in and every bound, a partial's expanded bounds included, admits it.
+    #[test]
+    fn range_match_judges_prereleases_like_node_semver() {
+        use RangeMatch::{Excludes, Matches, Unknown};
+        let cases = [
+            // An explicit prerelease comparator opts its tuple in beside a partial
+            ("1.x >=1.2.3-beta.1", "1.2.3-beta.2", Matches),
+            ("1.2 >=1.2.3-beta.1", "1.2.3-beta.2", Matches),
+            ("~1 >=1.2.3-beta.1", "1.2.3-beta.2", Matches),
+            ("~1.2 >=1.2.3-beta.1", "1.2.3-beta.2", Matches),
+            (">=1.2 >=1.2.3-beta.1", "1.2.3-beta.2", Matches),
+            ("<=1.2 >=1.2.3-beta.1", "1.2.3-beta.2", Matches),
+            ("<1.3 >=1.2.3-beta.1", "1.2.3-beta.2", Matches),
+            (">1.1 >=1.2.3-beta.1", "1.2.3-beta.2", Matches),
+            ("^0.2 >=0.2.3-beta.1", "0.2.3-beta.2", Matches),
+            ("^0 >=0.2.3-beta.1", "0.2.3-beta.2", Matches),
+            ("1.x >=1.2.3-beta.1 || ^2", "1.2.3-beta.2", Matches),
+            // No comparator opts the prerelease's tuple in
+            ("1.x", "1.2.3-beta.2", Excludes),
+            ("*", "1.0.0-rc.1", Excludes),
+            ("1.x >=1.2.3-beta.1", "1.2.4-beta.1", Excludes),
+            ("1.x <2.0.0-rc.1", "2.0.0-beta", Excludes),
+            // The tuple is opted in, but a partial's floor lies above the prerelease
+            ("^1 >=1.0.0-alpha", "1.0.0-beta", Excludes),
+            ("1 >=1.0.0-alpha", "1.0.0-beta", Excludes),
+            ("^1.2 >=1.2.0-alpha", "1.2.0-beta", Excludes),
+            // Stable targets against partials
+            ("1.x", "2.0.0", Excludes),
+            ("1.x", "1.9.0", Matches),
+            ("1.2.x >=1.2.3-beta.1", "1.3.0", Excludes),
+            ("<=1.2", "1.2.9", Matches),
+            (">1.2", "1.2.9", Excludes),
+            ("^0.2", "0.3.0", Excludes),
+            // `*` beside another comparator is not representable here
+            ("* >=1.2.3-beta.1", "1.2.3-beta.2", Unknown),
+        ];
+        for (spec, target, expected) in cases {
+            assert_eq!(range_match(spec, target), expected, "{spec} at {target}");
+        }
+        // The union-free matcher shares the expansion.
+        assert!(version_in_range("1.x >=1.2.3-beta.1", "1.2.3-beta.2"));
+        assert!(version_in_range("^0.0 >=0.0.0-alpha", "0.0.0-beta"));
+        assert!(!version_in_range("^1 >=1.0.0-alpha", "1.0.0-beta"));
+    }
+
+    /// node-semver drops a `>=0.0.0` floor, written or implied, as the `*` it is equivalent to.
+    ///
+    /// Each expectation was checked against npm's bundled node-semver `satisfies`.
+    /// Without the floor, a `0.0.0` prerelease opted in by its own comparator is admitted, while
+    /// the remaining upper bounds still judge stable targets.
+    #[test]
+    fn range_match_drops_the_zero_floor_like_node_semver() {
+        use RangeMatch::{Excludes, Matches};
+        let cases = [
+            // Expanded, written, and implied zero floors beside an opted-in prerelease
+            ("^0.0 >=0.0.0-alpha", "0.0.0-beta", Matches),
+            ("^0 >=0.0.0-alpha", "0.0.0-beta", Matches),
+            ("0.x >=0.0.0-alpha", "0.0.0-beta", Matches),
+            ("0.0.x >=0.0.0-alpha", "0.0.0-beta", Matches),
+            ("~0 >=0.0.0-alpha", "0.0.0-beta", Matches),
+            ("~0.0 >=0.0.0-alpha", "0.0.0-beta", Matches),
+            (">=0 >=0.0.0-alpha", "0.0.0-beta", Matches),
+            (">=0.0.0 >=0.0.0-alpha", "0.0.0-beta", Matches),
+            ("^0.0.0 >=0.0.0-alpha", "0.0.0-beta", Matches),
+            ("~0.0.0 >=0.0.0-alpha", "0.0.0-beta", Matches),
+            // No comparator opts the prerelease in, or another bound rejects it
+            ("^0.0", "0.0.0-beta", Excludes),
+            ("0.x", "0.0.0-beta", Excludes),
+            (">=0.0.0", "0.0.0-beta", Excludes),
+            ("^0.0.0", "0.0.0-beta", Excludes),
+            ("~0.0.0", "0.0.0-beta", Excludes),
+            ("^0.0.0 >=0.0.0-gamma", "0.0.0-beta", Excludes),
+            (
+                "^0.0.0 >=0.0.0-alpha <0.0.0-alpha.5",
+                "0.0.0-beta",
+                Excludes,
+            ),
+            // Stable targets keep the upper bounds
+            ("^0.0.0 >=0.0.0-alpha", "0.0.0", Matches),
+            ("^0.0.0 >=0.0.0-alpha", "0.0.1", Excludes),
+            ("^0.0.0", "0.0.1", Excludes),
+            ("~0.0.0 >=0.0.0-alpha", "0.0.1", Matches),
+            ("~0.0.0 >=0.0.0-alpha", "0.1.0", Excludes),
+            ("^0.0 >=0.0.0-alpha", "0.1.0", Excludes),
+            ("0.x >=0.0.0-alpha", "0.1.0", Matches),
+            ("0.x >=0.0.0-alpha", "1.0.0", Excludes),
+            (">=0 >=0.0.0-alpha", "1.0.0", Matches),
+            (">=0.0.0", "1.0.0", Matches),
+        ];
+        for (spec, target, expected) in cases {
+            assert_eq!(range_match(spec, target), expected, "{spec} at {target}");
+        }
     }
 
     #[test]
