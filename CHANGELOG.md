@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **npm credits each locked copy only to the members whose own lookup reaches it.**
+  `package-lock.json` records a workspace member's declarations as ranges, and cooldown credited
+  every locked version of a declared name to each member declaring it. A copy another dependency
+  nests, such as `strip-ansi`'s own `ansi-regex@5.0.0` beside the root's `ansi-regex: "^4.1.0"`,
+  therefore became the root's direct dependency, and `upgrade` without `--major` planned its 5.x
+  patch against the root, rewriting `^4.1.0` to `^5.0.1`. cooldown now resolves each declaration
+  through the lock's install tree from the member's own directory, as Node does, so a member owns
+  only the copy its lookup reaches, hoisted or nested in its own `node_modules`. Every other copy
+  of the name is transitive, with no member, bound, or pin, and an alias's release stays unowned
+  even beside a genuine nested copy. Pins and declared bounds follow the same copy: an exact pin
+  holds its own copy whatever range binds another one, and never pins an unrelated nested copy.
+  A dependency a member installs from git or from a local or remote tarball stays that member's
+  direct dependency, so reports, `check`, exclusions, and the peer gate treat it as before, but it
+  takes no pin or bound and `upgrade` and `fix` skip it as not eligible, since npm's exact pin
+  would replace its source with a registry release; a remote tarball is recognized by the URL its
+  declaration names, and an alias installing a registry release of the same version no longer
+  hides such a copy. A linked workspace package owns no registry copy of its name, even when
+  another dependency nests one at the same version. The per-package apply of npm, Yarn, and Bun
+  now skips any transitive candidate as not eligible before reading a manifest, instead of falling
+  back to the root's declaration of the same name. A lockfile v1, which records no install tree,
+  keeps its root-manifest reading.
+
 - **Which `allow` entry is reported as the source no longer depends on list order.** When several
   `allow` entries matched one package, cooldown named the last matching entry of the highest layer,
   so `allow = ["@corp/ui", "@corp/*"]` reported `@corp/*` for `@corp/ui` while the reversed list

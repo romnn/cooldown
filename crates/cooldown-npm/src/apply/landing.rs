@@ -110,6 +110,8 @@ pub(crate) enum LandingPlan {
 /// Plans the manifest authorization and resolver command for one candidate.
 ///
 /// A candidate no manifest declares is not eligible, so adding a root dependency is not authorized.
+/// A candidate without members falls back to the root manifest ([`manifest::manifest_rels`]), which
+/// owns it only when the candidate is direct, so the caller rejects a transitive one first.
 /// One whose declaring manifests hold an exact install-field pin excluding the target is held on
 /// the pin, unless `mode` or `rewrite_pins` authorizes rewriting it ([`holds_exact_pins`]).
 /// Eligibility depends on declarations rather than the files widening happened to modify.

@@ -18,7 +18,7 @@ cooldown outdated
 | Column | Meaning |
 |---|---|
 | **Package** | The dependency name. |
-| **Used by** | The workspace member(s) that declare it (`first (+N others)` when several do). |
+| **Used by** | The workspace member(s) that declare it (`first (+N others)` when several do). On npm a member is credited only with the copy its own lookup in the lock's install tree reaches, so a copy of the name nested under another dependency is transitive. |
 | **Current** | The version currently locked. |
 | **Adoptable** | The newest version that has already cleared its cooldown — blank (`—`) if nothing new has matured. |
 | **Latest** | The newest version that exists, cooled down or not. |

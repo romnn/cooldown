@@ -2442,6 +2442,99 @@ pub(crate) mod tests {
         );
     }
 
+    /// npm credits a dependency a member installs from git to that member, whose own lookup
+    /// reaches it, so excluding the member drops the row with it instead of keeping it as an
+    /// unowned transitive row, while a registry row the member shares keeps its other owner.
+    /// An alias installing a registry release of the same version beside the git copy changes
+    /// none of that.
+    #[tokio::test]
+    async fn an_excluded_members_git_dependency_leaves_with_it() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::create_dir_all(root.join("apps/a"))?;
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "name": "root", "workspaces": ["apps/a"], "dependencies": { "lodash": "^4.17.0" } }"#,
+        )?;
+        std::fs::write(
+            root.join("apps/a/package.json"),
+            r#"{ "name": "a", "dependencies": { "lodash": "^4.17.0", "plugin": "github:user/plugin", "plugin-alias": "npm:plugin@2.0.0" } }"#,
+        )?;
+        std::fs::write(
+            root.join("package-lock.json"),
+            indoc::indoc! {r#"
+                {
+                  "name": "root",
+                  "lockfileVersion": 3,
+                  "packages": {
+                    "": { "name": "root", "workspaces": ["apps/a"], "dependencies": { "lodash": "^4.17.0" } },
+                    "apps/a": {
+                      "name": "a",
+                      "dependencies": { "lodash": "^4.17.0", "plugin": "github:user/plugin", "plugin-alias": "npm:plugin@2.0.0" }
+                    },
+                    "node_modules/a": { "resolved": "apps/a", "link": true },
+                    "node_modules/lodash": { "version": "4.17.21" },
+                    "node_modules/plugin": { "version": "2.0.0", "resolved": "git+ssh://git@github.com/user/plugin.git#0123abc" },
+                    "node_modules/plugin-alias": {
+                      "name": "plugin",
+                      "version": "2.0.0",
+                      "resolved": "https://registry.npmjs.org/plugin/-/plugin-2.0.0.tgz"
+                    }
+                  }
+                }
+            "#},
+        )?;
+        let mut pctx = project_ctx(ToolId("npm"), root.as_str());
+        pctx.project.manifest = root.join("package.json");
+        let ws = test_workspace(root.clone(), pctx);
+        let cache = tempfile::tempdir()?;
+        let reader = cooldown_npm::NpmCliTool::from_http(cooldown_registry::SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        let scoped_rows = |excluded: &[&str]| {
+            let opts = RunOpts {
+                scope: RunScope::new(&root, &root),
+                excludes: excludes(excluded, &[]),
+                ..RunOpts::default()
+            };
+            let ws = &ws;
+            let reader = &reader;
+            async move {
+                let scoped = ws
+                    .dependencies_in_scope(reader, &ws.projects()[0], DepScope::Graph, &opts)
+                    .await?;
+                let rows: Vec<(String, bool, Vec<String>)> = scoped
+                    .deps
+                    .into_iter()
+                    .map(|dep| {
+                        (
+                            dep.package.name,
+                            dep.direct,
+                            dep.members.into_iter().map(|member| member.path).collect(),
+                        )
+                    })
+                    .collect();
+                eyre::Ok(rows)
+            }
+        };
+        let row = |name: &str, members: &[&str]| {
+            (
+                name.to_string(),
+                true,
+                members.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            )
+        };
+
+        assert_eq!(
+            scoped_rows(&[]).await?,
+            [row("lodash", &[".", "apps/a"]), row("plugin", &["apps/a"])]
+        );
+        assert_eq!(scoped_rows(&["apps/a"]).await?, [row("lodash", &["."])]);
+        Ok(())
+    }
+
     /// Without a selection, or with one that does not land inside an excluded member, the
     /// excludes apply as usual.
     #[tokio::test]

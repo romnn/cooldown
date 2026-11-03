@@ -10,7 +10,7 @@
 
 mod support;
 
-use indoc::indoc;
+use indoc::{formatdoc, indoc};
 use support::{ChangeVersions, Fixture};
 
 const SEED_BEFORE: &str = "2025-05-20T00:00:00Z";
@@ -1622,6 +1622,158 @@ fn upgrade_never_moves_an_alias_target_through_an_ordinary_declaration() {
         root_range(&fixture, "ansi-five").as_deref(),
         Some("npm:ansi-regex@^5.0.0")
     );
+    assert_plain_npm_relock_is_noop(&fixture);
+
+    // Convergence: a second run moves nothing.
+    let manifest_after = fixture.read_bytes("package.json");
+    let lock_after = fixture.read_bytes("package-lock.json");
+    let second = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert!(second.ok(), "{second:#?}");
+    assert_eq!(second.summary_applied(), 0, "{second:#?}");
+    assert_eq!(fixture.read_bytes("package.json"), manifest_after);
+    assert_eq!(fixture.read_bytes("package-lock.json"), lock_after);
+}
+
+/// A root declaring `ansi-regex` at `^4.1.0` beside `strip-ansi@6.0.0`, whose own `^5.0.0` npm
+/// nests as `ansi-regex@5.0.0` under it, seeded before ansi-regex 4.1.1 and 5.0.1, so both lines
+/// have a matured in-range patch.
+/// With `alias`, the root also aliases `ansi-five` to `ansi-regex@^5.0.0`, so the alias's release
+/// has a genuine copy too, which keeps the alias safeguard from deciding anything.
+fn nested_duplicate_fixture(alias: bool) -> Fixture {
+    let fixture = Fixture::new().tag_independent();
+    let aliased = if alias {
+        r#", "ansi-five": "npm:ansi-regex@^5.0.0""#
+    } else {
+        ""
+    };
+    fixture.write(
+        "package.json",
+        &formatdoc! {r#"
+            {{
+              "name": "cooldown-npm-nested-duplicate",
+              "version": "0.1.0",
+              "private": true,
+              "dependencies": {{ "ansi-regex": "^4.1.0", "strip-ansi": "6.0.0"{aliased} }}
+            }}
+        "#},
+    );
+    fixture.write(".npmrc", NPMRC);
+    fixture
+        .run_tool(
+            "npm",
+            &[
+                "install",
+                "--package-lock-only",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+                "--before=2021-01-01T00:00:00Z",
+            ],
+            &[],
+        )
+        .expect_success();
+    fixture
+}
+
+/// The nested `ansi-regex@5.0.0` belongs to `strip-ansi`, not to the root's `^4.1.0`, which binds
+/// the hoisted `4.1.0`: `upgrade` without `--major` plans the root only its own `4.1.0 -> 4.1.1`,
+/// never a `5.x` move that would rewrite `^4.1.0` across a major, and the result is a plain-relock
+/// and second-run fixed point.
+#[test]
+fn upgrade_never_moves_a_nested_duplicate_through_the_roots_declaration() {
+    skip_if_missing!("npm");
+    assert_nested_duplicate_stays_transitive(false);
+}
+
+/// A genuine nested copy of an alias's release does not hand that release to the root's own
+/// declaration of the target's name either.
+#[test]
+fn upgrade_never_moves_a_nested_alias_release_through_the_roots_declaration() {
+    skip_if_missing!("npm");
+    assert_nested_duplicate_stays_transitive(true);
+}
+
+fn assert_nested_duplicate_stays_transitive(alias: bool) {
+    let fixture = nested_duplicate_fixture(alias);
+    let nested = "node_modules/strip-ansi/node_modules/ansi-regex";
+    let aliased = (Some("ansi-regex".to_string()), Some("5.0.0".to_string()));
+    // The topology must hold the duplicate, or nothing here can reproduce the attribution bug.
+    assert_eq!(
+        package_lock_version(&fixture, "ansi-regex").as_deref(),
+        Some("4.1.0")
+    );
+    assert_eq!(
+        lock_entry_identity(&fixture, nested),
+        (None, Some("5.0.0".to_string()))
+    );
+    if alias {
+        assert_eq!(
+            lock_entry_identity(&fixture, "node_modules/ansi-five"),
+            aliased
+        );
+    }
+
+    let planned = fixture.cooldown_json(&["upgrade", "--dry-run", "--freeze", FREEZE]);
+    assert!(planned.ok(), "{planned:#?}");
+    let rows = planned.changes_for("ansi-regex");
+    assert_eq!(
+        planned.direct_changes_for("ansi-regex"),
+        rows,
+        "every ansi-regex row is the root's own: {planned:#?}"
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row.from == "4.1.0" && !row.to.starts_with("5.")),
+        "no 5.x copy is planned through the root's declaration: {planned:#?}"
+    );
+    assert_eq!(
+        planned.applied_change_for("ansi-regex"),
+        Some(ChangeVersions::new("4.1.0", "4.1.1")),
+        "{planned:#?}"
+    );
+    assert_eq!(
+        planned.applied_names(),
+        std::collections::BTreeSet::from(["ansi-regex".to_string()]),
+        "{planned:#?}"
+    );
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert!(upgrade.ok(), "{upgrade:#?}");
+    assert_eq!(
+        upgrade.applied_change_for("ansi-regex"),
+        Some(ChangeVersions::new("4.1.0", "4.1.1")),
+        "{upgrade:#?}"
+    );
+    // A move of the nested copy may only ever surface as collateral, never as the root's change.
+    assert!(
+        upgrade
+            .direct_changes_for("ansi-regex")
+            .iter()
+            .all(|row| row.from == "4.1.0" && !row.to.starts_with("5.")),
+        "{upgrade:#?}"
+    );
+    assert_eq!(
+        package_lock_version(&fixture, "ansi-regex").as_deref(),
+        Some("4.1.1")
+    );
+    assert_eq!(
+        root_range(&fixture, "ansi-regex").as_deref(),
+        Some("^4.1.1")
+    );
+    assert_eq!(
+        lock_entry_identity(&fixture, nested).1.as_deref(),
+        Some("5.0.0")
+    );
+    if alias {
+        assert_eq!(
+            lock_entry_identity(&fixture, "node_modules/ansi-five"),
+            aliased
+        );
+        assert_eq!(
+            root_range(&fixture, "ansi-five").as_deref(),
+            Some("npm:ansi-regex@^5.0.0")
+        );
+    }
     assert_plain_npm_relock_is_noop(&fixture);
 
     // Convergence: a second run moves nothing.

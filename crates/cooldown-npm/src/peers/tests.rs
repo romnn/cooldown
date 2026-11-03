@@ -2235,3 +2235,135 @@ fn a_bun_members_peer_contract_holds_nothing() -> eyre::Result<()> {
     assert!(proven_peer_violations::<Bun>(COLLIDING_MEMBER, &evidence.workspace).is_empty());
     Ok(())
 }
+
+/// One way the root installs `plugin@3.0.0`, whose own peer contract is `host@^1.0.0`.
+struct PluginSource {
+    /// The root manifest's specifier.
+    specifier: &'static str,
+    /// The `packages` entries that install the plugin.
+    entries: &'static str,
+}
+
+/// The plugin installed from git, from a local tarball, and as a linked workspace package.
+const PLUGIN_SOURCES: [PluginSource; 3] = [
+    PluginSource {
+        specifier: "github:user/plugin#v3.0.0",
+        entries: r#""node_modules/plugin": {
+            "version": "3.0.0",
+            "resolved": "git+ssh://git@github.com/user/plugin.git#0123abc",
+            "peerDependencies": { "host": "^1.0.0" }
+        }"#,
+    },
+    PluginSource {
+        specifier: "file:vendor/plugin-3.0.0.tgz",
+        entries: r#""node_modules/plugin": {
+            "version": "3.0.0",
+            "resolved": "file:vendor/plugin-3.0.0.tgz",
+            "peerDependencies": { "host": "^1.0.0" }
+        }"#,
+    },
+    PluginSource {
+        specifier: "^3.0.0",
+        entries: r#""packages/plugin": {
+            "name": "plugin",
+            "version": "3.0.0",
+            "peerDependencies": { "host": "^1.0.0" }
+        },
+        "node_modules/plugin": { "resolved": "packages/plugin", "link": true }"#,
+    },
+];
+
+/// An npm root declaring `host`, at `host_version`, beside the plugin installed from `source`.
+fn sourced_plugin_lock(source: &PluginSource, host_version: &str) -> String {
+    let PluginSource { specifier, entries } = source;
+    formatdoc! {r#"
+        {{
+          "lockfileVersion": 3,
+          "packages": {{
+            "": {{
+              "name": "fixture",
+              "dependencies": {{ "host": "^1.0.0 || ^2.0.0", "plugin": "{specifier}" }}
+            }},
+            "node_modules/host": {{ "version": "{host_version}" }},
+            {entries}
+          }}
+        }}
+    "#}
+}
+
+/// A dependent the root declares from git, a local tarball, or a linked workspace package binds
+/// its peers like a registry one: its source makes it no editable copy, never a transitive one,
+/// so a cross-major move of the peer it pins is held before the resolve and caught after one
+/// under relaxed enforcement.
+#[test]
+fn a_directly_declared_non_registry_dependent_keeps_its_peer_contract() {
+    for source in &PLUGIN_SOURCES {
+        let specifier = source.specifier;
+        let before = sourced_plugin_lock(source, "1.0.0");
+        let mut moved = change("host", "1.0.0", "2.0.0");
+        moved.members = vec![MemberRef {
+            name: "fixture".to_string(),
+            path: ".".to_string(),
+        }];
+        let plan = plan_of(vec![moved]);
+
+        // Pre-apply gate
+        let PeerPartition { retained, skipped } =
+            peer_partition::<crate::lock::Npm>(&plan, Some(&before));
+        assert!(retained.changes.is_empty(), "{specifier}");
+        assert_eq!(
+            skipped
+                .first()
+                .and_then(|held| held.offending.as_ref())
+                .map(|package| package.name.as_str()),
+            Some("plugin"),
+            "{specifier}"
+        );
+
+        // Post-resolve verification
+        let after = sourced_plugin_lock(source, "2.0.0");
+        let violation = first_new_peer_violation::<crate::lock::Npm>(Some(&before), &after);
+        assert_eq!(
+            violation.map(|requirement| (requirement.dependent, requirement.range)),
+            Some(("plugin".to_string(), "^1.0.0".to_string())),
+            "{specifier}"
+        );
+    }
+}
+
+/// The same git-sourced plugin nested under a dependency the root declares is transitive: the
+/// resolver may float it, so its recorded contract gates nothing.
+#[test]
+fn a_nested_non_registry_dependent_stays_transitive_for_the_peer_gate() {
+    let lock = |host_version: &str| {
+        formatdoc! {r#"
+            {{
+              "lockfileVersion": 3,
+              "packages": {{
+                "": {{ "name": "fixture", "dependencies": {{ "host": "^1.0.0 || ^2.0.0", "x": "^1.0.0" }} }},
+                "node_modules/host": {{ "version": "{host_version}" }},
+                "node_modules/x": {{ "version": "1.0.0" }},
+                "node_modules/x/node_modules/plugin": {{
+                  "version": "3.0.0",
+                  "resolved": "git+ssh://git@github.com/user/plugin.git#0123abc",
+                  "peerDependencies": {{ "host": "^1.0.0" }}
+                }}
+              }}
+            }}
+        "#}
+    };
+    let mut moved = change("host", "1.0.0", "2.0.0");
+    moved.members = vec![MemberRef {
+        name: "fixture".to_string(),
+        path: ".".to_string(),
+    }];
+    let plan = plan_of(vec![moved]);
+    let before = lock("1.0.0");
+
+    let PeerPartition { retained, skipped } =
+        peer_partition::<crate::lock::Npm>(&plan, Some(&before));
+
+    assert_eq!(retained.changes.len(), 1);
+    assert!(skipped.is_empty());
+    assert!(first_new_peer_violation::<crate::lock::Npm>(Some(&before), &lock("2.0.0")).is_none());
+}

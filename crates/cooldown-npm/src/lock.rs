@@ -425,21 +425,37 @@ impl SplitHold {
 /// Maps a resolved dependency to the workspace member packages that declare it.
 ///
 /// pnpm records the resolved version per importer, so its entries are keyed exactly by
-/// `(name, version)`. npm records only version ranges per member, not the resolved version, so its
-/// entries are keyed by name and apply to every resolved version of that name.
+/// `(name, version)`.
+/// npm records only version ranges per member, so it attributes each declaration to the one copy
+/// the member's own install-tree lookup binds, as a declared copy, and keeps every declaration by
+/// name as well.
+/// A member owning a copy declares it directly whatever its source, but only one bound to a
+/// registry release may be moved by editing that declaration ([`Self::editable_members_for`]).
 /// Bun keys a registry binding by version like pnpm, and a declaration whose binding the lock
 /// leaves undetermined by the one copy its package key records, as a declared copy.
 #[derive(Debug, Default)]
 pub struct MemberIndex {
     by_version: HashMap<(String, String), Vec<String>>,
+    /// The members declaring each name, whatever copy they bind (npm): the inventory of
+    /// declarations, which owns no copy by itself.
     by_name: HashMap<String, Vec<String>>,
-    /// The members each copy is recorded for without proof that the member binds it (Bun's peer
-    /// declarations): they count as declaring that copy, but no member resolves to it.
+    /// The members each copy is attributed to without an importer record of the version they
+    /// resolve: they count as declaring and owning that copy, but no member resolves to it here,
+    /// so the copy gives no split evidence.
+    /// Bun records a peer declaration's copy here, since the lock leaves which copy the peer binds
+    /// uncertain.
+    /// npm records here the copy each member's own install-tree lookup binds: its per-package
+    /// apply lands one candidate at a time and judges every landing on the tree itself, so the
+    /// joint resolve's per-importer versions would only manufacture split evidence for it.
     declared_copies: HashMap<(String, String), Vec<String>>,
-    /// `(name, version)` pairs every declaring importer pins exactly (pnpm).
+    /// The owners in `declared_copies` whose binding is no registry release (npm): a git source,
+    /// a local or remote tarball.
+    /// They declare the copy directly, but no edit of their declaration can land a registry
+    /// release in its place, so they neither pin nor bound it.
+    non_registry_copies: HashMap<(String, String), Vec<String>>,
+    /// `(name, version)` pairs every registry declaration binding them pins exactly (pnpm, npm,
+    /// and Bun).
     exact_version: HashSet<(String, String)>,
-    /// Names pinned exactly by every declaring member manifest (npm, which records ranges per name).
-    exact_name: HashSet<String>,
     /// The distinct declared *range specifiers* per name across importers (pnpm records a
     /// `specifier:` per importer).
     /// Whether disagreeing ranges (`~7.3.0` vs `^7.0.0`, `<4` vs `^4`) split a name depends on the
@@ -470,21 +486,8 @@ impl MemberIndex {
         }
     }
 
-    fn name_only(by_name: HashMap<String, Vec<String>>) -> Self {
-        Self {
-            by_name,
-            authoritative: true,
-            ..Default::default()
-        }
-    }
-
     fn with_exact_versions(mut self, exact: HashSet<(String, String)>) -> Self {
         self.exact_version = exact;
-        self
-    }
-
-    fn with_exact_names(mut self, exact: HashSet<String>) -> Self {
-        self.exact_name = exact;
         self
     }
 
@@ -505,10 +508,8 @@ impl MemberIndex {
     /// cannot move without editing a manifest.
     #[must_use]
     pub fn is_exact_pinned(&self, name: &str, version: &str) -> bool {
-        self.exact_name.contains(name)
-            || self
-                .exact_version
-                .contains(&(name.to_string(), version.to_string()))
+        self.exact_version
+            .contains(&(name.to_string(), version.to_string()))
     }
 
     /// Whether this lock carries authoritative importer/member data for classifying direct deps.
@@ -566,8 +567,8 @@ impl MemberIndex {
     ///
     /// Derived from per-importer declarations only, so a direct dependency that merely shares a
     /// name with a transitive copy resolved at another version is single-declared and never splits.
-    /// Only the version-keyed (pnpm) index carries per-importer data; the name-only (npm) index has
-    /// none and never splits.
+    /// Only importer records (pnpm, Bun) carry per-importer data; npm's index keeps the copies its
+    /// members bind apart from them and never splits.
     /// The lock records one specifier per importer, so a [`SplitVerdict::CeilingWiden`] still needs
     /// every install declaration in the manifests confirmed before the widen may run.
     #[must_use]
@@ -601,8 +602,9 @@ impl MemberIndex {
     }
 
     /// The version `member` (an importer path) resolves `name` to, if this index carries per-importer
-    /// version data (pnpm) and the member declares the name. `None` for the name-only (npm) index,
-    /// which records no per-importer version, and for a member that does not declare the name.
+    /// version data (pnpm) and the member declares the name.
+    /// `None` for npm's index, whose install-tree owners record no per-importer version, and for a
+    /// member that does not declare the name.
     ///
     /// Each importer declares a name at exactly one version, so the first match is the answer. Used to
     /// tell whether a candidate actually landed at *its declaring member*, not merely at the name's
@@ -618,9 +620,9 @@ impl MemberIndex {
     }
 
     /// Whether `name`@`version` is attributed per exact resolved version (a pnpm importer
-    /// declaration), as opposed to npm's name-only attribution, which cannot single out one
-    /// resolved copy of a name. The peer-feasibility gate needs the distinction: name-only
-    /// attribution of a name resolved at several versions may be pointing at a nested transitive
+    /// declaration), as opposed to a declared copy, which no importer record resolves.
+    /// The peer-feasibility gate needs the distinction where no install tree can prove the binding:
+    /// a declared copy of a name resolved at several versions may stand beside a nested transitive
     /// copy, which must not gate.
     #[must_use]
     pub fn version_attributed(&self, name: &str, version: &str) -> bool {
@@ -629,8 +631,8 @@ impl MemberIndex {
     }
 
     /// Every distinct resolved version of `name` across the workspace's importer declarations,
-    /// ascending — the divergent lines a multi-version hold keeps apart. Empty for the name-only
-    /// (npm) index, which records no per-importer version.
+    /// ascending — the divergent lines a multi-version hold keeps apart.
+    /// Empty for npm's index, which records no per-importer version.
     /// A URL-resolved entry (a git or tarball dependency) is not a version line: it is no registry
     /// candidate, and counting it made a name with one registry line look split and hid the line
     /// from the resolver-introduced-split guard, which skips names already at several versions.
@@ -679,8 +681,8 @@ impl MemberIndex {
 
     /// Every distinct range specifier the workspace's importers declare for `name`, sorted — the
     /// divergent declarations behind a range-only split, where the lock resolves every copy to one
-    /// version but the ranges themselves disagree (`~7.3.0` vs `^7.0.0`). Empty for the name-only
-    /// (npm) index, which records no per-importer specifiers.
+    /// version but the ranges themselves disagree (`~7.3.0` vs `^7.0.0`).
+    /// Empty for npm's index, which records no per-importer specifiers.
     #[must_use]
     pub fn declared_specifiers_of(&self, name: &str) -> Vec<&str> {
         let mut specifiers: Vec<&str> = self
@@ -706,8 +708,13 @@ impl MemberIndex {
                 .any(|(entry, _)| entry == name)
     }
 
-    /// The member packages declaring `name` at `version`, sorted and deduplicated. Empty when the
-    /// lock carries no per-member attribution for this dependency.
+    /// The member packages owning `name` at `version`, sorted and deduplicated.
+    ///
+    /// Empty when the lock carries no per-member attribution for this dependency.
+    ///
+    /// A declaration of the name owns no copy by itself, so a copy no member binds, such as one
+    /// nested under an unrelated dependency, has no members even where some member declares the
+    /// name ([`declares`](Self::declares)).
     #[must_use]
     pub fn members_for(&self, name: &str, version: &str) -> Vec<String> {
         let key = (name.to_string(), version.to_string());
@@ -716,8 +723,64 @@ impl MemberIndex {
             .get(&key)
             .into_iter()
             .flatten()
-            .chain(self.by_name.get(name).into_iter().flatten())
             .chain(self.declared_copies.get(&key).into_iter().flatten())
+            .cloned()
+            .collect();
+        members.sort();
+        members.dedup();
+        members
+    }
+
+    /// The members among [`members_for`](Self::members_for) whose own binding of `name` at
+    /// `version` is a registry release, sorted: the declarations an edit may move that copy
+    /// through, and the ones its pin and declared bound come from.
+    ///
+    /// Outside npm every owner qualifies, since those indexes attribute registry bindings only.
+    #[must_use]
+    pub fn editable_members_for(&self, name: &str, version: &str) -> Vec<String> {
+        let non_registry = self.non_registry_owners(name, version);
+        self.members_for(name, version)
+            .into_iter()
+            .filter(|member| !non_registry.contains(member))
+            .collect()
+    }
+
+    /// The members owning `name` at `version` through a binding that is no registry release, a
+    /// git source or a local or remote tarball, sorted; empty outside npm.
+    ///
+    /// Such a member declares the copy directly, yet no registry release can replace it through
+    /// that declaration.
+    #[must_use]
+    pub fn non_registry_owners(&self, name: &str, version: &str) -> Vec<String> {
+        let mut members = self
+            .non_registry_copies
+            .get(&(name.to_string(), version.to_string()))
+            .cloned()
+            .unwrap_or_default();
+        members.sort();
+        members.dedup();
+        members
+    }
+
+    /// Every member declaring `name`, whatever copy it binds, sorted and deduplicated.
+    ///
+    /// npm's inventory lists a member even when its lookup binds no copy the index attributes,
+    /// such as a link to a workspace package, so a caller holding the install tree can judge the
+    /// physical binding itself.
+    #[must_use]
+    pub fn declaring_members(&self, name: &str) -> Vec<String> {
+        let mut members: Vec<String> = self
+            .by_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            .chain(
+                self.by_version
+                    .iter()
+                    .chain(&self.declared_copies)
+                    .filter(|((entry, _), _)| entry == name)
+                    .flat_map(|(_, members)| members),
+            )
             .cloned()
             .collect();
         members.sort();
@@ -1356,6 +1419,24 @@ struct InstalledPackage {
     name: Option<String>,
     /// The version installed there.
     version: Option<String>,
+    /// Where the package comes from, as the entry records it.
+    source: SlotSource,
+}
+
+/// Where the package at one `package-lock.json` entry comes from, as the entry records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotSource {
+    /// An install slot recording an `http(s)` `resolved`, or none at all.
+    /// That is a registry release unless a declaration binding the slot names a source of its own
+    /// ([`is_registry_specifier`]): npm records a remote tarball's `resolved` exactly like a
+    /// registry tarball's.
+    Registry,
+    /// A link to a workspace or other local directory, which the lock lists as no resolved
+    /// package of its own.
+    Link,
+    /// A git, local, or other non-registry source ([`is_local_source`]), or a workspace member's
+    /// own entry.
+    NonRegistry,
 }
 
 /// What a lookup on the [`InstallPaths`] finds for one name.
@@ -1395,13 +1476,36 @@ impl InstallPaths {
     /// The instance a workspace member's own directory resolves `name` to: its version and its
     /// install directory (the context that instance's peers then resolve from). This is what makes
     /// a member's *direct* copy identifiable even when other versions of the name exist nested
-    /// elsewhere — declaration attribution is name-only in npm's lock, but the physical lookup is
-    /// exact.
+    /// elsewhere — npm's lock records each member's declarations as ranges only, but the physical
+    /// lookup is exact.
     #[must_use]
     pub fn member_resolution(&self, member: &str, name: &str) -> InstallLookup<'_> {
         // The root project's member path is `.`; its install-tree directory is the empty key.
         let dir = if member == "." { "" } else { member };
         self.resolve_from(dir, name)
+    }
+
+    /// The version of `name` that `member`'s own lookup binds
+    /// ([`member_resolution`](Self::member_resolution)), when its entry records a registry source.
+    ///
+    /// It is judged at the one slot the lookup stops at: a link, a git source, a local tarball, or
+    /// an npm alias there yields `None`, even when a registry copy of the same name and version
+    /// sits elsewhere in the tree.
+    /// A remote tarball's entry records an `https` URL like a registry release's, so only the
+    /// member's declaration tells it apart ([`MemberIndex::non_registry_owners`]).
+    #[must_use]
+    pub fn member_registry_version(&self, member: &str, name: &str) -> Option<&str> {
+        let ResolvedInstance { version, directory } =
+            self.member_resolution(member, name).resolved()?;
+        (self.slot_source(directory) == Some(SlotSource::Registry)).then_some(version)
+    }
+
+    /// Where the package installed at `directory` comes from, `None` for a directory the lock
+    /// records no entry at.
+    fn slot_source(&self, directory: &str) -> Option<SlotSource> {
+        self.installed
+            .get(directory)
+            .map(|installed| installed.source)
     }
 
     /// The instance `name` resolves to from `dir` — the nearest enclosing `node_modules/<name>`,
@@ -1499,6 +1603,11 @@ fn parse_npm_member_paths(content: &str) -> HashSet<String> {
 fn parse_npm_install_paths(content: &str) -> Option<InstallPaths> {
     let doc = serde_json::from_str::<serde_json::Value>(content).ok()?;
     let packages = doc.get("packages")?.as_object()?;
+    Some(npm_install_paths(packages))
+}
+
+/// The [`InstallPaths`] of a `package-lock.json` `packages` map ([`parse_npm_install_paths`]).
+fn npm_install_paths(packages: &serde_json::Map<String, serde_json::Value>) -> InstallPaths {
     let mut installed: HashMap<String, InstalledPackage> = HashMap::new();
     let mut instances: HashMap<String, Vec<(String, String)>> = HashMap::new();
     let mut alias_targets: HashSet<(String, String)> = HashSet::new();
@@ -1512,6 +1621,13 @@ fn parse_npm_install_paths(content: &str) -> Option<InstallPaths> {
         // and the name is read in the target's own context, so a link at one name's slot to a
         // member of another name is an alias like any other.
         let link = entry.get("link").and_then(serde_json::Value::as_bool) == Some(true);
+        let source = if link {
+            SlotSource::Link
+        } else if npm_slot_name(key).is_none() || is_local_source(entry) {
+            SlotSource::NonRegistry
+        } else {
+            SlotSource::Registry
+        };
         let target = if link {
             entry
                 .get("resolved")
@@ -1533,6 +1649,7 @@ fn parse_npm_install_paths(content: &str) -> Option<InstallPaths> {
                 InstalledPackage {
                     name: None,
                     version: None,
+                    source,
                 },
             );
             continue;
@@ -1543,6 +1660,7 @@ fn parse_npm_install_paths(content: &str) -> Option<InstallPaths> {
             InstalledPackage {
                 name: Some(name.to_string()),
                 version: Some(version.to_string()),
+                source,
             },
         );
         let identity = (name.to_string(), version.to_string());
@@ -1550,7 +1668,7 @@ fn parse_npm_install_paths(content: &str) -> Option<InstallPaths> {
             alias_targets.insert(identity);
             continue;
         }
-        if npm_slot_name(key).is_some() && !link && !is_local_source(entry) {
+        if source == SlotSource::Registry {
             registry_copies.insert(identity);
         }
         instances
@@ -1558,12 +1676,12 @@ fn parse_npm_install_paths(content: &str) -> Option<InstallPaths> {
             .or_default()
             .push((version.to_string(), key.clone()));
     }
-    Some(InstallPaths {
+    InstallPaths {
         installed,
         instances,
         alias_targets,
         registry_copies,
-    })
+    }
 }
 
 /// Whether a `package-lock.json` install entry came from a local or non-registry source, which npm
@@ -1761,12 +1879,7 @@ impl NodeLock for Npm {
     }
 
     fn member_sources_excluding(content: &str, excluded: &HashSet<String>) -> MemberIndex {
-        parse_npm_member_sources(content, excluded)
-            .map(|by_name| {
-                MemberIndex::name_only(by_name)
-                    .with_exact_names(parse_npm_exact_pins(content, excluded))
-            })
-            .unwrap_or_default()
+        parse_npm_member_index(content, excluded).unwrap_or_default()
     }
 
     fn peer_requirements(content: &str) -> Vec<PeerRequirement> {
@@ -2884,41 +2997,183 @@ fn pnpm_importer_entry_error(
     ))
 }
 
-/// Maps each dependency name to the workspace member packages that declare it, read from
-/// `package-lock.json`'s `packages` map.
-/// Member entries — the root `""` and any key not under `node_modules/` — list their direct deps as
-/// ranges, not resolved versions, so attribution is by name (applied to every resolved version of
-/// that name).
-/// Members are keyed by their workspace path (the root as `.`), matching pnpm's importer paths;
-/// those in `excluded` are left out.
-fn parse_npm_member_sources(
-    content: &str,
-    excluded: &HashSet<String>,
-) -> Option<HashMap<String, Vec<String>>> {
+/// The [`MemberIndex`] of `package-lock.json` (v2/v3), with the members at `excluded` paths left
+/// out, or `None` for a lock without a `packages` map (v1), which attributes nothing per member.
+///
+/// A member entry lists its declarations as ranges, never the copy each binds, so one walk derives
+/// everything per copy from the install tree: directness, pins, and declared bounds all follow the
+/// same owners.
+/// A member owns only the copy its own lookup binds ([`InstallPaths::member_resolution`]), so a
+/// copy nested under an unrelated dependency stays transitive however many members declare its
+/// name.
+/// The copy is judged at the one slot the lookup stops at, and a link there owns nothing: it binds
+/// a workspace or other local directory, never the resolved package of the same name and version
+/// that may sit elsewhere in the tree.
+///
+/// Owning a copy makes the member declare it directly whatever its source, but only a registry
+/// binding may be moved by editing the declaration ([`MemberIndex::editable_members_for`]).
+/// A git source or a local tarball is told apart by its entry, while a remote tarball records an
+/// `https` URL like a registry release, so the declarations decide: a slot any member binds
+/// through a source of its own ([`is_registry_specifier`]) holds no registry release.
+/// A remote tarball only a dependency's own requirement names is therefore read as a registry
+/// release when a member's registry range binds it.
+///
+/// A copy is exact-pinned when every registry declaration of a member owning it is exact, in every
+/// field that declares it: a range binding another copy neither releases its pin nor gains one.
+/// Every declaration enters the name inventory whatever it binds, so a member whose lookup finds no
+/// copy, or another package at the slot, still declares the name.
+/// The tree and the declarations naming a slot's source are read whole, since excluding a member
+/// changes neither the copy another member binds nor where that copy comes from.
+fn parse_npm_member_index(content: &str, excluded: &HashSet<String>) -> Option<MemberIndex> {
     let doc = serde_json::from_str::<serde_json::Value>(content).ok()?;
     let packages = doc.get("packages")?.as_object()?;
-    let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    for (key, entry) in packages {
-        if key.contains("node_modules/") {
-            continue;
-        }
-        let member = if key.is_empty() { "." } else { key.as_str() };
-        // Member keys are workspace paths that consumers join onto the project root; reject a
-        // crafted or stale key that could address a manifest outside the workspace.
-        if !is_workspace_relative(member) || excluded.contains(member) {
-            continue;
-        }
-        for field in DIRECT_GROUPS {
-            if let Some(obj) = entry.get(field).and_then(serde_json::Value::as_object) {
-                for name in obj.keys() {
-                    map.entry(name.clone())
-                        .or_default()
-                        .push(member.to_string());
-                }
+    let install = npm_install_paths(packages);
+    let members = npm_member_entries(packages);
+    let non_registry_slots = non_registry_slots(&install, &members);
+    let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
+    let mut owners: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut non_registry: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut declared: HashMap<(String, String), usize> = HashMap::new();
+    let mut exact: HashMap<(String, String), usize> = HashMap::new();
+    for NpmMemberEntry { path, declarations } in members
+        .iter()
+        .filter(|member| !excluded.contains(member.path))
+    {
+        for (name, specifiers) in declarations {
+            by_name
+                .entry((*name).to_string())
+                .or_default()
+                .push((*path).to_string());
+            let Some(ResolvedInstance { version, directory }) =
+                install.member_resolution(path, name).resolved()
+            else {
+                continue;
+            };
+            let registry = match install.slot_source(directory) {
+                Some(SlotSource::Registry) => !non_registry_slots.contains(directory),
+                Some(SlotSource::NonRegistry) => false,
+                Some(SlotSource::Link) | None => continue,
+            };
+            let copy = ((*name).to_string(), version.to_string());
+            owners
+                .entry(copy.clone())
+                .or_default()
+                .push((*path).to_string());
+            if !registry {
+                non_registry
+                    .entry(copy)
+                    .or_default()
+                    .push((*path).to_string());
+                continue;
             }
+            *declared.entry(copy.clone()).or_default() += specifiers.len();
+            *exact.entry(copy).or_default() += specifiers
+                .iter()
+                .filter(|specifier| specifier.is_some_and(is_exact_npm_specifier))
+                .count();
         }
     }
-    Some(map)
+    let exact_version = declared
+        .into_iter()
+        .filter(|(copy, count)| exact.get(copy) == Some(count))
+        .map(|(copy, _)| copy)
+        .collect();
+    Some(MemberIndex {
+        by_name,
+        declared_copies: owners,
+        non_registry_copies: non_registry,
+        exact_version,
+        authoritative: true,
+        ..MemberIndex::default()
+    })
+}
+
+/// One workspace member entry of a `package-lock.json`: the root `""`, keyed `.`, or any other key
+/// not under `node_modules/`.
+struct NpmMemberEntry<'a> {
+    /// The member's workspace path.
+    path: &'a str,
+    /// Its declarations ([`npm_member_declarations`]).
+    declarations: BTreeMap<&'a str, Vec<Option<&'a str>>>,
+}
+
+/// Every member entry of a `package-lock.json` `packages` map.
+///
+/// Member keys are workspace paths that consumers join onto the project root, so a crafted or
+/// stale key that could address a manifest outside the workspace is rejected here.
+fn npm_member_entries(
+    packages: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<NpmMemberEntry<'_>> {
+    packages
+        .iter()
+        .filter(|(key, _)| !key.contains("node_modules/"))
+        .filter_map(|(key, entry)| {
+            let path = if key.is_empty() { "." } else { key.as_str() };
+            is_workspace_relative(path).then(|| NpmMemberEntry {
+                path,
+                declarations: npm_member_declarations(entry),
+            })
+        })
+        .collect()
+}
+
+/// The install slots some member binds through a declaration naming a source of its own
+/// ([`is_registry_specifier`]), which therefore hold no registry release whatever their entries
+/// record.
+fn non_registry_slots<'i>(
+    install: &'i InstallPaths,
+    members: &[NpmMemberEntry<'_>],
+) -> HashSet<&'i str> {
+    members
+        .iter()
+        .flat_map(|NpmMemberEntry { path, declarations }| {
+            declarations
+                .iter()
+                .filter(|(_, specifiers)| {
+                    specifiers
+                        .iter()
+                        .flatten()
+                        .any(|specifier| !is_registry_specifier(specifier))
+                })
+                .filter_map(|(name, _)| install.member_resolution(path, name).resolved())
+                .map(|instance| instance.directory)
+        })
+        .collect()
+}
+
+/// Whether a manifest specifier asks the registry for a release: a version, a range, a dist-tag,
+/// or an npm alias of a registry release.
+///
+/// A URL, a git reference (`github:user/repo` or the `user/repo` shorthand), a local path or
+/// tarball, and a link each name a source of their own.
+/// None of those spellings fits the registry forms, which never contain `:` or `/` and never end
+/// in a tarball extension.
+fn is_registry_specifier(specifier: &str) -> bool {
+    if specifier.starts_with("npm:") {
+        return true;
+    }
+    let tarball = [".tgz", ".tar.gz", ".tar"]
+        .iter()
+        .any(|extension| specifier.ends_with(extension));
+    !tarball && !specifier.contains(':') && !specifier.contains('/')
+}
+
+/// Every dependency one `package-lock.json` member entry declares, with the specifier of each
+/// field declaring it in [`DIRECT_GROUPS`] order, `None` for a specifier that is no string.
+fn npm_member_declarations(entry: &serde_json::Value) -> BTreeMap<&str, Vec<Option<&str>>> {
+    let mut declarations: BTreeMap<&str, Vec<Option<&str>>> = BTreeMap::new();
+    for field in DIRECT_GROUPS {
+        let Some(group) = entry.get(field).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        for (name, specifier) in group {
+            declarations
+                .entry(name.as_str())
+                .or_default()
+                .push(specifier.as_str());
+        }
+    }
+    declarations
 }
 
 /// The `(name, version)` pairs every declaring importer (outside `excluded`) pins exactly in
@@ -2951,45 +3206,6 @@ fn parse_pnpm_exact_pins(content: &str, excluded: &HashSet<String>) -> HashSet<(
         .into_iter()
         .filter(|(key, count)| exact.get(key) == Some(count))
         .map(|(key, _)| key)
-        .collect()
-}
-
-/// The dependency names every declaring member (outside `excluded`) pins exactly in
-/// `package-lock.json`.
-/// npm records a range (not a resolved version) per member, so this is name-keyed: a name is pinned
-/// only when every member entry that declares it used an exact specifier.
-fn parse_npm_exact_pins(content: &str, excluded: &HashSet<String>) -> HashSet<String> {
-    let Ok(doc) = serde_json::from_str::<serde_json::Value>(content) else {
-        return HashSet::new();
-    };
-    let Some(packages) = doc.get("packages").and_then(serde_json::Value::as_object) else {
-        return HashSet::new();
-    };
-    let mut total: HashMap<String, usize> = HashMap::new();
-    let mut exact: HashMap<String, usize> = HashMap::new();
-    for (key, entry) in packages {
-        if key.contains("node_modules/") {
-            continue;
-        }
-        let member = if key.is_empty() { "." } else { key.as_str() };
-        if excluded.contains(member) {
-            continue;
-        }
-        for field in DIRECT_GROUPS {
-            if let Some(obj) = entry.get(field).and_then(serde_json::Value::as_object) {
-                for (name, range) in obj {
-                    *total.entry(name.clone()).or_insert(0) += 1;
-                    if range.as_str().is_some_and(is_exact_npm_specifier) {
-                        *exact.entry(name.clone()).or_insert(0) += 1;
-                    }
-                }
-            }
-        }
-    }
-    total
-        .into_iter()
-        .filter(|(name, count)| exact.get(name) == Some(count))
-        .map(|(name, _)| name)
         .collect()
 }
 
@@ -5285,24 +5501,523 @@ packages:
         );
     }
 
+    /// A `package-lock.json` of `lockfile_version` whose `packages` map holds `packages`.
+    /// A v2 lock also carries the legacy `dependencies` tree, here contradicting every copy the
+    /// map records, so a reader that consulted it would attribute the wrong ones.
+    fn npm_tree_lock(lockfile_version: u8, packages: &str) -> String {
+        let legacy = if lockfile_version == 2 {
+            indoc! {r#"
+                "dependencies": {
+                  "other": { "version": "9.0.0" },
+                  "unrelated": { "version": "9.0.0" }
+                },
+            "#}
+        } else {
+            ""
+        };
+        formatdoc! {r#"
+            {{
+              "name": "root",
+              "lockfileVersion": {lockfile_version},
+              {legacy}
+              "packages": {{
+                {packages}
+              }}
+            }}
+        "#}
+    }
+
+    /// The members owning `other@version` in `index`.
+    fn owners_of(index: &MemberIndex, version: &str) -> Vec<String> {
+        index.members_for("other", version)
+    }
+
+    /// A member owns only the copy its own lookup binds: the root's `^1.0.0` owns its hoisted
+    /// `1.0.0`, while the `2.0.0` an unrelated dependency nests has no owner, though the root
+    /// declares the name, and a declaration with no reachable copy owns nothing.
+    /// The root is keyed as `.`, a member by its workspace path.
     #[test]
-    fn npm_member_sources_attributes_by_name() {
-        let lock = indoc! {r#"
-            {
-                "lockfileVersion": 3,
-                "packages": {
-                    "": { "devDependencies": { "turbo": "^2" } },
-                    "packages/api": { "dependencies": { "zod": "^3" } },
-                    "node_modules/zod": { "version": "3.22.0" }
-                }
-            }"#};
-        let index = MemberIndex::name_only(
-            parse_npm_member_sources(lock, &HashSet::new()).expect("v3 lock has members"),
+    fn npm_attributes_only_the_copy_a_members_lookup_binds() {
+        for lockfile_version in [2, 3] {
+            let lock = npm_tree_lock(
+                lockfile_version,
+                indoc! {r#"
+                    "": {
+                      "name": "root",
+                      "dependencies": { "other": "^1.0.0", "unrelated": "^1.0.0" },
+                      "devDependencies": { "turbo": "^2.0.0" }
+                    },
+                    "packages/api": { "name": "api", "dependencies": { "unrelated": "^1.0.0" } },
+                    "node_modules/other": { "version": "1.0.0" },
+                    "node_modules/unrelated": {
+                      "version": "1.0.0",
+                      "dependencies": { "other": "^2.0.0" }
+                    },
+                    "node_modules/unrelated/node_modules/other": { "version": "2.0.0" }
+                "#},
+            );
+            let index = Npm::member_sources(&lock);
+
+            assert!(index.is_authoritative(), "v{lockfile_version}");
+            assert_eq!(owners_of(&index, "1.0.0"), ["."], "v{lockfile_version}");
+            assert_eq!(
+                owners_of(&index, "2.0.0"),
+                [] as [String; 0],
+                "v{lockfile_version}: the nested duplicate is transitive"
+            );
+            assert_eq!(
+                index.members_for("unrelated", "1.0.0"),
+                [".", "packages/api"],
+                "v{lockfile_version}: a member without a node_modules binds the hoisted copy"
+            );
+            assert_eq!(
+                index.members_for("turbo", "2.9.16"),
+                [] as [String; 0],
+                "v{lockfile_version}: a declaration with no reachable copy owns none"
+            );
+            // The declarations themselves stay in the inventory.
+            assert!(index.declares("turbo") && index.declares("other"));
+            assert!(index.declared_names().contains("turbo"));
+            assert_eq!(
+                index.all_paths(),
+                HashSet::from([".".to_string(), "packages/api".to_string()])
+            );
+            // npm's owners are no importer records, so they give no split evidence.
+            assert_eq!(index.resolved_versions_of("other"), [] as [&str; 0]);
+            assert_eq!(index.resolved_version(".", "other"), None);
+            assert_eq!(index.split_verdict("other", "2.1.0"), SplitVerdict::Joint);
+        }
+    }
+
+    /// Members binding different copies each own their own: a hoisted one, one nested in the
+    /// member's own `node_modules`, and one a parent member hoists for a member nested inside it,
+    /// while a copy nested under a dependency belongs to none of them.
+    #[test]
+    fn npm_members_on_different_copies_each_own_theirs() {
+        for lockfile_version in [2, 3] {
+            let lock = npm_tree_lock(
+                lockfile_version,
+                indoc! {r#"
+                    "": { "name": "root", "workspaces": ["apps/a", "apps/b", "apps/b/plugin", "apps/c"] },
+                    "apps/a": { "name": "a", "version": "0.1.0", "dependencies": { "other": "^1.0.0" } },
+                    "apps/b": { "name": "b", "version": "0.1.0", "dependencies": { "other": "^2.0.0" } },
+                    "apps/b/plugin": { "name": "plugin", "version": "0.1.0", "dependencies": { "other": "^2.0.0" } },
+                    "apps/c": { "name": "c", "version": "0.1.0", "dependencies": { "other": "^1.0.0" } },
+                    "node_modules/other": { "version": "1.0.0" },
+                    "apps/b/node_modules/other": { "version": "2.0.0" },
+                    "apps/a/node_modules/x": { "version": "1.0.0" },
+                    "apps/a/node_modules/x/node_modules/other": { "version": "3.0.0" }
+                "#},
+            );
+            let index = Npm::member_sources(&lock);
+
+            assert_eq!(
+                owners_of(&index, "1.0.0"),
+                ["apps/a", "apps/c"],
+                "v{lockfile_version}"
+            );
+            assert_eq!(
+                owners_of(&index, "2.0.0"),
+                ["apps/b", "apps/b/plugin"],
+                "v{lockfile_version}"
+            );
+            assert_eq!(
+                owners_of(&index, "3.0.0"),
+                [] as [String; 0],
+                "v{lockfile_version}"
+            );
+        }
+    }
+
+    /// An alias grants no ownership of its target's release, even beside a genuine nested copy of
+    /// that release, and an alias at a member's own slot hides the farther genuine copy from that
+    /// member, which then owns no copy of the name at all.
+    #[test]
+    fn npm_aliases_own_nothing_beside_genuine_copies() {
+        for lockfile_version in [2, 3] {
+            let lock = npm_tree_lock(
+                lockfile_version,
+                indoc! {r#"
+                    "": {
+                      "name": "root",
+                      "workspaces": ["apps/a"],
+                      "dependencies": { "alias": "npm:other@2.0.0", "other": "^1.0.0", "foo": "^1.0.0" }
+                    },
+                    "apps/a": { "name": "a", "version": "0.1.0", "dependencies": { "foo": "npm:other@1.0.0" } },
+                    "node_modules/alias": { "name": "other", "version": "2.0.0" },
+                    "node_modules/other": { "version": "1.0.0" },
+                    "node_modules/x": { "version": "1.0.0" },
+                    "node_modules/x/node_modules/other": { "version": "2.0.0" },
+                    "node_modules/foo": { "version": "1.0.0" },
+                    "apps/a/node_modules/foo": { "name": "other", "version": "1.0.0" }
+                "#},
+            );
+            let index = Npm::member_sources(&lock);
+
+            assert_eq!(owners_of(&index, "1.0.0"), ["."], "v{lockfile_version}");
+            assert_eq!(
+                owners_of(&index, "2.0.0"),
+                [] as [String; 0],
+                "v{lockfile_version}: neither the alias nor the nested copy is the root's"
+            );
+            assert_eq!(
+                index.members_for("alias", "2.0.0"),
+                [] as [String; 0],
+                "v{lockfile_version}"
+            );
+            assert_eq!(
+                index.members_for("foo", "1.0.0"),
+                ["."],
+                "v{lockfile_version}: the alias at apps/a's slot hides the hoisted foo"
+            );
+            assert!(index.declares("foo"), "v{lockfile_version}");
+        }
+    }
+
+    /// A git source or a local or remote tarball at the member's own slot makes the member declare
+    /// that copy directly, but binds no registry release, so the member neither pins nor bounds
+    /// it and no edit of its declaration may move it.
+    /// A remote tarball records an `https` URL like a registry release, so the declaration naming
+    /// the URL is what marks its slot, for every member binding it.
+    /// A link to a workspace package owns nothing, so a registry copy of the same name and version
+    /// nested elsewhere stays transitive, while the inventory still lists the link's declarer.
+    #[test]
+    fn npm_non_registry_sources_are_direct_but_not_editable() {
+        for lockfile_version in [2, 3] {
+            let lock = npm_tree_lock(
+                lockfile_version,
+                indoc! {r#"
+                    "": {
+                      "name": "root",
+                      "workspaces": ["packages/lib", "apps/a"],
+                      "dependencies": {
+                        "lib": "^2.0.0",
+                        "vendored": "file:vendor/vendored-1.0.0.tgz",
+                        "repo": "github:user/repo#v3.0.0",
+                        "remote": "https://example.org/remote-1.0.0.tgz",
+                        "x": "1.0.0"
+                      }
+                    },
+                    "packages/lib": { "name": "lib", "version": "2.0.0" },
+                    "apps/a": { "name": "a", "version": "0.1.0", "dependencies": { "remote": "^1.0.0" } },
+                    "node_modules/lib": { "resolved": "packages/lib", "link": true },
+                    "node_modules/vendored": { "version": "1.0.0", "resolved": "file:vendor/vendored-1.0.0.tgz" },
+                    "node_modules/repo": { "version": "3.0.0", "resolved": "git+ssh://git@github.com/user/repo.git#0123abc" },
+                    "node_modules/remote": { "version": "1.0.0", "resolved": "https://example.org/remote-1.0.0.tgz" },
+                    "node_modules/x": { "version": "1.0.0", "resolved": "https://registry.npmjs.org/x/-/x-1.0.0.tgz" },
+                    "node_modules/x/node_modules/lib": { "version": "2.0.0", "resolved": "https://registry.npmjs.org/lib/-/lib-2.0.0.tgz" }
+                "#},
+            );
+            let index = Npm::member_sources(&lock);
+
+            // Sources of their own: direct owners, none of them editable or pinning
+            for (name, version, owners) in [
+                ("vendored", "1.0.0", vec!["."]),
+                ("repo", "3.0.0", vec!["."]),
+                ("remote", "1.0.0", vec![".", "apps/a"]),
+            ] {
+                assert_eq!(
+                    index.members_for(name, version),
+                    owners,
+                    "v{lockfile_version} {name}"
+                );
+                assert_eq!(
+                    index.non_registry_owners(name, version),
+                    owners,
+                    "v{lockfile_version} {name}"
+                );
+                assert_eq!(
+                    index.editable_members_for(name, version),
+                    [] as [String; 0],
+                    "v{lockfile_version} {name}"
+                );
+                assert!(
+                    !index.is_exact_pinned(name, version),
+                    "v{lockfile_version} {name}"
+                );
+            }
+            // A workspace link owns no row, yet its declarer stays in the inventory
+            assert_eq!(
+                index.members_for("lib", "2.0.0"),
+                [] as [String; 0],
+                "v{lockfile_version}"
+            );
+            assert_eq!(index.declaring_members("lib"), ["."], "v{lockfile_version}");
+            // A registry release is direct and editable
+            assert_eq!(
+                index.members_for("x", "1.0.0"),
+                ["."],
+                "v{lockfile_version}"
+            );
+            assert_eq!(
+                index.editable_members_for("x", "1.0.0"),
+                ["."],
+                "v{lockfile_version}"
+            );
+            assert!(index.is_exact_pinned("x", "1.0.0"), "v{lockfile_version}");
+        }
+    }
+
+    /// A specifier that asks the registry for a release is told from one naming a source of its
+    /// own by its spelling alone.
+    #[test]
+    fn registry_specifiers_are_told_from_sources_of_their_own() {
+        for registry in [
+            "1.0.0",
+            "^1.0.0",
+            "~1.2.3",
+            ">=1.0.0 <2.0.0",
+            "1.x",
+            "*",
+            "",
+            "latest",
+            "next",
+            "1.0.0 - 2.0.0",
+            "^1 || ^2",
+            "npm:other@^1.0.0",
+            "npm:@scope/other@1.0.0",
+        ] {
+            assert!(is_registry_specifier(registry), "{registry:?}");
+        }
+        for source in [
+            "https://example.org/plugin-1.0.0.tgz",
+            "http://example.org/plugin.tgz",
+            "git+ssh://git@github.com/user/repo.git#0123abc",
+            "git://github.com/user/repo.git",
+            "github:user/repo",
+            "gitlab:user/repo#v1.0.0",
+            "user/repo",
+            "user/repo#semver:^1.0.0",
+            "file:../plugin",
+            "file:vendor/plugin-1.0.0.tgz",
+            "../plugin",
+            "./vendor/plugin-1.0.0.tgz",
+            "plugin-1.0.0.tgz",
+            "plugin.tar.gz",
+            "link:../plugin",
+            "workspace:^1.0.0",
+        ] {
+            assert!(!is_registry_specifier(source), "{source:?}");
+        }
+    }
+
+    /// A declaration whose lookup finds no slot, optional or required, or an unidentified one owns
+    /// no copy, even when another dependency nests a copy of the name.
+    #[test]
+    fn npm_missing_and_unknown_slots_own_nothing() {
+        for lockfile_version in [2, 3] {
+            let lock = npm_tree_lock(
+                lockfile_version,
+                indoc! {r#"
+                    "": {
+                      "name": "root",
+                      "dependencies": { "gone": "^1.0.0", "odd": "^1.0.0", "x": "^1.0.0" },
+                      "optionalDependencies": { "fsevents": "^2.0.0" }
+                    },
+                    "node_modules/odd": { "resolved": "packages/absent", "link": true },
+                    "node_modules/x": { "version": "1.0.0" },
+                    "node_modules/x/node_modules/gone": { "version": "1.0.0" },
+                    "node_modules/x/node_modules/odd": { "version": "1.0.0" },
+                    "node_modules/x/node_modules/fsevents": { "version": "2.3.0", "optional": true }
+                "#},
+            );
+            let index = Npm::member_sources(&lock);
+
+            for (name, version) in [("gone", "1.0.0"), ("odd", "1.0.0"), ("fsevents", "2.3.0")] {
+                assert_eq!(
+                    index.members_for(name, version),
+                    [] as [String; 0],
+                    "v{lockfile_version} {name}"
+                );
+                assert!(!index.is_exact_pinned(name, version));
+                assert!(index.declares(name), "v{lockfile_version} {name}");
+            }
+        }
+    }
+
+    /// A copy is pinned when every declaration of a member owning it is exact: an exact pin on one
+    /// copy holds beside a range on another, never pins an unrelated nested copy, and is released
+    /// by a range on the same copy, in another member or another field of its own.
+    #[test]
+    fn npm_pins_are_judged_per_copy() {
+        for lockfile_version in [2, 3] {
+            let lock =
+                |packages: &str| Npm::member_sources(&npm_tree_lock(lockfile_version, packages));
+
+            let split = lock(indoc! {r#"
+                "": { "name": "root", "workspaces": ["apps/a", "apps/b"] },
+                "apps/a": { "name": "a", "dependencies": { "other": "1.0.0" } },
+                "apps/b": { "name": "b", "dependencies": { "other": "^2.0.0" } },
+                "node_modules/other": { "version": "1.0.0" },
+                "apps/b/node_modules/other": { "version": "2.0.0" }
+            "#});
+            assert!(
+                split.is_exact_pinned("other", "1.0.0"),
+                "v{lockfile_version}"
+            );
+            assert!(
+                !split.is_exact_pinned("other", "2.0.0"),
+                "v{lockfile_version}"
+            );
+
+            let nested = lock(indoc! {r#"
+                "": { "name": "root", "dependencies": { "other": "1.0.0", "x": "^1.0.0" } },
+                "node_modules/other": { "version": "1.0.0" },
+                "node_modules/x": { "version": "1.0.0" },
+                "node_modules/x/node_modules/other": { "version": "2.0.0" }
+            "#});
+            assert!(
+                nested.is_exact_pinned("other", "1.0.0"),
+                "v{lockfile_version}"
+            );
+            assert!(
+                !nested.is_exact_pinned("other", "2.0.0"),
+                "v{lockfile_version}"
+            );
+
+            let shared = lock(indoc! {r#"
+                "": { "name": "root", "workspaces": ["apps/a", "apps/c"] },
+                "apps/a": { "name": "a", "dependencies": { "other": "1.0.0" } },
+                "apps/c": { "name": "c", "dependencies": { "other": "^1.0.0" } },
+                "node_modules/other": { "version": "1.0.0" }
+            "#});
+            assert!(
+                !shared.is_exact_pinned("other", "1.0.0"),
+                "v{lockfile_version}"
+            );
+
+            let both_exact = lock(indoc! {r#"
+                "": { "name": "root", "workspaces": ["apps/a", "apps/c"] },
+                "apps/a": { "name": "a", "dependencies": { "other": "1.0.0" } },
+                "apps/c": { "name": "c", "dependencies": { "other": "=v1.0.0" } },
+                "node_modules/other": { "version": "1.0.0" }
+            "#});
+            assert!(
+                both_exact.is_exact_pinned("other", "1.0.0"),
+                "v{lockfile_version}"
+            );
+
+            let fields = lock(indoc! {r#"
+                "": {
+                  "name": "root",
+                  "dependencies": { "other": "1.0.0" },
+                  "devDependencies": { "other": "^1.0.0" }
+                },
+                "node_modules/other": { "version": "1.0.0" }
+            "#});
+            assert!(
+                !fields.is_exact_pinned("other", "1.0.0"),
+                "v{lockfile_version}"
+            );
+        }
+    }
+
+    /// Excluding a member removes its declarations from ownership and pins alike, while the tree
+    /// is still read whole: an excluded member's range no longer releases a sibling's pin, and
+    /// excluding the member a copy is hoisted beside leaves it owned by the member that binds it.
+    #[test]
+    fn npm_exclusions_recompute_owners_and_pins() {
+        for lockfile_version in [2, 3] {
+            let lock = npm_tree_lock(
+                lockfile_version,
+                indoc! {r#"
+                    "": { "name": "root", "workspaces": ["apps/a", "apps/c"], "dependencies": { "other": "^1.0.0" } },
+                    "apps/a": { "name": "a", "dependencies": { "other": "1.0.0" } },
+                    "apps/c": { "name": "c", "dependencies": { "other": "^1.0.0" } },
+                    "node_modules/other": { "version": "1.0.0" }
+                "#},
+            );
+            let excluding = |paths: &[&str]| {
+                let excluded: HashSet<String> = paths.iter().map(ToString::to_string).collect();
+                Npm::member_sources_excluding(&lock, &excluded)
+            };
+
+            let whole = excluding(&[]);
+            assert_eq!(owners_of(&whole, "1.0.0"), [".", "apps/a", "apps/c"]);
+            assert!(!whole.is_exact_pinned("other", "1.0.0"));
+
+            let pinned = excluding(&[".", "apps/c"]);
+            assert_eq!(owners_of(&pinned, "1.0.0"), ["apps/a"]);
+            assert!(
+                pinned.is_exact_pinned("other", "1.0.0"),
+                "v{lockfile_version}"
+            );
+
+            let without_root = excluding(&["."]);
+            assert_eq!(owners_of(&without_root, "1.0.0"), ["apps/a", "apps/c"]);
+            assert!(!without_root.is_exact_pinned("other", "1.0.0"));
+        }
+    }
+
+    /// A peer-only declaration owns the copy its lookup binds, like an install declaration, and
+    /// joins every other field's declaration of the name in the pin judgment; one npm left
+    /// uninstalled owns nothing but is still declared.
+    #[test]
+    fn npm_peer_declarations_own_the_copy_they_bind() {
+        for lockfile_version in [2, 3] {
+            let lock = npm_tree_lock(
+                lockfile_version,
+                indoc! {r#"
+                    "": { "name": "root", "workspaces": ["apps/a", "apps/b"] },
+                    "apps/a": { "name": "a", "peerDependencies": { "react": "^18.0.0", "absent": "^1.0.0" } },
+                    "apps/b": {
+                      "name": "b",
+                      "devDependencies": { "react": "^18.0.0" },
+                      "peerDependencies": { "react": "18.2.0" }
+                    },
+                    "node_modules/react": { "version": "18.2.0", "peer": true },
+                    "node_modules/x": { "version": "1.0.0" },
+                    "node_modules/x/node_modules/react": { "version": "17.0.2" }
+                "#},
+            );
+            let index = Npm::member_sources(&lock);
+
+            assert_eq!(
+                index.members_for("react", "18.2.0"),
+                ["apps/a", "apps/b"],
+                "v{lockfile_version}"
+            );
+            assert_eq!(
+                index.members_for("react", "17.0.2"),
+                [] as [String; 0],
+                "v{lockfile_version}"
+            );
+            assert!(
+                !index.is_exact_pinned("react", "18.2.0"),
+                "v{lockfile_version}"
+            );
+            assert!(index.declares("absent"), "v{lockfile_version}");
+            assert_eq!(index.members_for("absent", "1.0.0"), [] as [String; 0]);
+        }
+    }
+
+    /// The owned copy is the one the member's own lookup stops at, never one farther away or
+    /// elsewhere in the tree: a member's link hides the hoisted registry copy from it, and its own
+    /// nested registry copy outranks the hoisted one.
+    #[test]
+    fn npm_ownership_is_judged_at_the_nearest_slot() {
+        let lock = npm_tree_lock(
+            3,
+            indoc! {r#"
+                "": {
+                  "name": "root",
+                  "workspaces": ["apps/a", "packages/lib"],
+                  "dependencies": { "lib": "^2.0.0", "other": "^1.0.0" }
+                },
+                "apps/a": { "name": "a", "dependencies": { "lib": "^2.0.0", "other": "^2.0.0" } },
+                "packages/lib": { "name": "lib", "version": "2.0.0" },
+                "node_modules/lib": { "version": "2.0.0" },
+                "apps/a/node_modules/lib": { "resolved": "packages/lib", "link": true },
+                "node_modules/other": { "version": "1.0.0" },
+                "apps/a/node_modules/other": { "version": "2.0.0", "resolved": "http://registry.example/other-2.0.0.tgz" }
+            "#},
         );
-        // The root is keyed as `.`; a member by its workspace path. Range-only locks attribute by
-        // name, so any resolved version of `zod` maps to its declaring member.
-        assert_eq!(index.members_for("turbo", "2.9.16"), vec!["."]);
-        assert_eq!(index.members_for("zod", "3.22.0"), vec!["packages/api"]);
+        let index = Npm::member_sources(&lock);
+
+        assert_eq!(index.editable_members_for("lib", "2.0.0"), ["."]);
+        assert_eq!(index.declaring_members("lib"), [".", "apps/a"]);
+        assert_eq!(index.editable_members_for("other", "1.0.0"), ["."]);
+        assert_eq!(index.editable_members_for("other", "2.0.0"), ["apps/a"]);
     }
 
     #[test]
@@ -5310,8 +6025,12 @@ packages:
         // A v1 lock has no `packages` map, so direct-ness falls back to the root manifest.
         let lock =
             r#"{ "lockfileVersion": 1, "dependencies": { "lodash": { "version": "4.17.15" } } }"#;
-        assert!(parse_npm_member_sources(lock, &HashSet::new()).is_none());
+        assert!(parse_npm_member_index(lock, &HashSet::new()).is_none());
         assert!(!Npm::member_sources(lock).is_authoritative());
+        assert_eq!(
+            Npm::member_sources(lock).members_for("lodash", "4.17.15"),
+            [] as [String; 0]
+        );
     }
 
     #[test]
@@ -5384,11 +6103,9 @@ packages:
                 }
             })
             .to_string();
-            assert_eq!(
-                parse_npm_exact_pins(&npm, &HashSet::new()),
-                HashSet::from(["pinned".to_string()]),
-                "{pin}"
-            );
+            let index = Npm::member_sources(&npm);
+            assert!(index.is_exact_pinned("pinned", "2.11.0"), "{pin}");
+            assert!(!index.is_exact_pinned("loose", "1.0.0"), "{pin}");
         }
     }
 
