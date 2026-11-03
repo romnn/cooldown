@@ -76,7 +76,12 @@ fn triple(version: &str) -> Option<SemverTriple> {
 /// tests remain the regression proof.
 fn live_latest_tag(fixture: &Fixture) -> Option<String> {
     let tag = fixture
-        .run_tool("pnpm", &["view", "fumadocs-core", "dist-tags.latest"], &[])
+        .run_unbounded(
+            "the probe compares cooldown's target with the registry's live dist-tag",
+            "pnpm",
+            &["view", "fumadocs-core", "dist-tags.latest"],
+            &[],
+        )
         .expect_success()
         .stdout_str()
         .trim()
@@ -94,7 +99,12 @@ fn outdated_caps_the_adoptable_target_at_the_live_latest_dist_tag() {
     let fixture = Fixture::new();
     fixture.write("package.json", PACKAGE_JSON);
     fixture
-        .run_tool("pnpm", &["install", "--lockfile-only"], &[])
+        .run_unbounded(
+            "the dist-tag probe resolves against the live registry it compares with",
+            "pnpm",
+            &["install", "--lockfile-only"],
+            &[],
+        )
         .expect_success();
 
     let Some(tag) = live_latest_tag(&fixture) else {

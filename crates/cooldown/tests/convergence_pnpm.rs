@@ -840,9 +840,8 @@ const PERPKG_PROJECT_FREEZE: &str = "2024-07-01T00:00:00Z";
 
 /// The stricter per-package cutoff for `eslint`. It is earlier than the project default, so eslint's
 /// own window admits only up to 9.4.0 (2024-05-31) — strictly older than the 9.5.0 the project-default
-/// window admits. Expressed in the config as a `min-age` (the per-package window knob), computed at
-/// run time as the day-count reproducing this absolute instant, so the matured target is deterministic
-/// regardless of when the test runs.
+/// window admits. Expressed in the config as an absolute per-package `freeze`, so the matured target
+/// is deterministic regardless of when the test runs.
 const PERPKG_STRICT_FREEZE: &str = "2024-06-05T00:00:00Z";
 
 /// The eslint version the stricter per-package window admits (newest matured on or before
@@ -854,18 +853,8 @@ const PERPKG_STRICT_TARGET: &str = "9.4.0";
 /// per-package target. The fix is correct only if the resolve does NOT overshoot onto this version.
 const PERPKG_PROJECT_NEWEST: &str = "9.5.0";
 
-/// Whole days (rounded down) from `cutoff` to now — the `min-age` value that reproduces an absolute
-/// cutoff as a rolling window. eslint's releases are ~2 weeks apart and `cutoff` sits mid-gap, so the
-/// day-granularity rounding never drifts the matured set across a release boundary.
-fn min_age_days(cutoff: &str) -> i64 {
-    let cutoff: jiff::Timestamp = cutoff.parse().expect("cutoff parses");
-    let days = jiff::Timestamp::now().duration_since(cutoff).as_secs() / (24 * 60 * 60);
-    assert!(days > 0, "cutoff {cutoff} must be in the past");
-    days
-}
-
 /// A pnpm project with a `cooldown.toml` that sets the project-default window (a `freeze`) and gives
-/// `eslint` a *stricter* per-package `min-age`. Both rules live in the same config layer, so the
+/// `eslint` a *stricter* per-package `freeze`. Both rules live in the same config layer, so the
 /// eslint-specific selector beats the bare default by specificity — eslint resolves under its stricter
 /// window while everything else uses the project default. (The project default is a config `freeze`,
 /// not a CLI `--freeze`: a CLI flag is the highest-authority layer and would override the per-package
@@ -874,10 +863,12 @@ fn perpkg_fixture() -> Fixture {
     let fixture = Fixture::new().tag_independent();
     fixture.write("package.json", PERPKG_PACKAGE_JSON);
     fixture.write(".npmrc", NPMRC);
-    let config = format!(
-        "freeze = \"{PERPKG_PROJECT_FREEZE}\"\n\n[package.\"eslint\"]\nmin-age = \"{}d\"\n",
-        min_age_days(PERPKG_STRICT_FREEZE),
-    );
+    let config = indoc::formatdoc! {r#"
+        freeze = "{PERPKG_PROJECT_FREEZE}"
+
+        [package."eslint"]
+        freeze = "{PERPKG_STRICT_FREEZE}"
+    "#};
     fixture.write("cooldown.toml", &config);
     seed_lock(&fixture, PERPKG_SEED);
     fixture
