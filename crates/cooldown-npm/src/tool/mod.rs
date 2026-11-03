@@ -12,8 +12,9 @@ use crate::apply::landing::{
     target_in_declared_range, window_minutes_from_cutoff,
 };
 use crate::lock::{
-    AliasOnlyVersions, EffectiveRegistryQuery, MemberAttribution, MemberIndex, MemberResolution,
-    NameVersion, NodeLock, SplitHold, SplitVerdict,
+    AliasOnlyVersions, EffectiveRegistryQuery, FixedBinding, FixedOwner, MemberAttribution,
+    MemberIndex, MemberResolution, NameVersion, NodeLock, SplitHold, SplitVerdict,
+    WorkspaceManifests,
 };
 use crate::manifest;
 use crate::native::{
@@ -27,7 +28,7 @@ use crate::peers::{
     journaled_lock, partition_peer_held, peer_conflict_blocker, peer_held_skip,
     plan_peer_rejections, proven_peer_violations, settle_landed_candidate,
 };
-use crate::pins::{AuthorizedPins, ProtectedPins};
+use crate::pins::{AuthorizedPins, EditStates, ManifestEdits, ProtectedPins};
 use crate::registry::{NPM, NpmRegistry};
 use crate::version;
 use async_trait::async_trait;
@@ -125,7 +126,8 @@ fn newest_versions(entries: impl IntoIterator<Item = NameVersion>) -> HashMap<St
 }
 
 /// The root manifest's declared names, the direct set of a lock without per-member attribution
-/// (npm v1, yarn classic, an unsupported `bun.lock`).
+/// (npm v1, an unsupported `bun.lock`, or a yarn classic lock that Yarn's own reader refuses or
+/// whose workspace members cannot all be discovered).
 struct ManifestDirect {
     /// Every name the root manifest declares.
     names: HashSet<String>,
@@ -221,9 +223,10 @@ fn pnpm_location_filter(path: &str) -> String {
 /// An apply never commits a lock that newly moves a dependency off an exact pin some manifest
 /// declares in an install field, whether or not the plan names that package, unless the pin is the
 /// active change's own and `--rewrite` or `fix --downgrade-pinned` authorized rewriting it.
-/// The guarantee needs a lock that records each member's resolution, as pnpm's importers and npm's
-/// v2/v3 install tree do; yarn classic, bun, and npm v1 locks record none, so this guard protects
-/// none of their exact pins.
+/// The guarantee needs per-member resolution evidence: pnpm's importers, npm's v2/v3 install tree,
+/// a supported `bun.lock`'s package keys, or a yarn classic lock's selector keys read through its
+/// workspace manifests.
+/// An npm v1 lock records none, so this guard protects none of its exact pins.
 ///
 /// [`native_policy`]: ToolRead::native_policy
 pub struct NpmTool<L> {
@@ -377,6 +380,9 @@ fn journal<L: NodeLock>(project: &Project, plan: &Plan) -> Result<ProjectMutatio
 /// Reads the root manifest, every manifest this plan could rewrite, and every other manifest the
 /// lock names, the baseline exact pins the settled resolve must leave in place
 /// ([`ProtectedPins`]) whatever the plan names.
+/// A manager whose lock records no member ([`NodeLock::READS_WORKSPACE_MANIFESTS`]) adds every
+/// manifest its root `workspaces` field names, whether or not a lock exists yet, and records which
+/// members discovery found, so no trial re-derives them from a project it may have changed.
 ///
 /// The manifests are read, not journaled: cooldown writes none of the extra ones, so a member
 /// manifest that is a symbolic or hard link must not block the mutation the way it blocks a
@@ -394,7 +400,22 @@ fn baseline<L: NodeLock>(project: &Project, plan: &Plan) -> Result<MutationBasel
         })
         .collect();
     rels.extend(manifest::manifest_rels(&members));
-    MutationBaseline::read(&project.root, rels)
+    let discovery = L::READS_WORKSPACE_MANIFESTS
+        .then(|| manifest::workspaces::BaselineDiscovery::run(&project.root));
+    if let Some(discovery) = &discovery {
+        rels.extend(discovery.manifests.iter().cloned());
+    }
+    let mut baseline = MutationBaseline::read(&project.root, rels)?;
+    if let Some(discovery) = discovery {
+        discovery.record(&mut baseline);
+    }
+    Ok(baseline)
+}
+
+/// The workspace manifests `L`'s member evidence reads, from disk, or `None` for a manager whose
+/// lock records its members itself ([`NodeLock::READS_WORKSPACE_MANIFESTS`]).
+fn workspace_manifests<L: NodeLock>(project: &Project) -> Option<WorkspaceManifests> {
+    L::READS_WORKSPACE_MANIFESTS.then(|| WorkspaceManifests::read(&project.root))
 }
 
 /// Every workspace member path the on-disk lock names, sorted; empty without a lock.
@@ -439,11 +460,21 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
 
     async fn declarations(&self, project: &Project, name: &str) -> Result<Vec<Declaration>> {
         let content = read_lock::<L>(project)?;
-        let index = L::member_sources(&content);
-        // Every importer the lock lists, whatever it declares, so a manifest-only declaration (a
-        // peer pnpm did not auto-install) is still found; a single-package lock lists no
-        // importers, and its one manifest is the root's.
-        let mut paths: BTreeSet<String> = L::member_paths(&content).into_iter().collect();
+        let workspace = workspace_manifests::<L>(project);
+        let index = L::member_sources_in(&content, workspace.as_ref(), &HashSet::new());
+        // Yarn classic records no importer entry, so a member's resolved copy is the one its
+        // selector identifies, fixed in place or not; every other lock's declarations keep their
+        // importer entries alone.
+        let selectors = match L::member_attribution_in(&content, workspace.as_ref()) {
+            MemberAttribution::Selectors(bindings) => Some(bindings),
+            _ => None,
+        };
+        // Every importer the lock lists, or for yarn classic every workspace member, whatever it
+        // declares, so a manifest-only declaration (a peer pnpm did not auto-install) is still
+        // found; a single-package lock lists no importers, and its one manifest is the root's.
+        let mut paths: BTreeSet<String> = L::member_paths_in(&content, workspace.as_ref())
+            .into_iter()
+            .collect();
         paths.extend(index.all_paths());
         if paths.is_empty() {
             paths.insert(".".to_string());
@@ -466,7 +497,12 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
                 // the lock records a single specifier per importer, so a caret in `dependencies`
                 // beside an exact pin in `devDependencies` would otherwise show as the caret alone.
                 (Some(declared), entry) => {
-                    let resolved = entry.map(|entry| entry.version);
+                    let resolved = entry.map(|entry| entry.version).or_else(|| {
+                        selectors
+                            .as_ref()?
+                            .bound_version(&member.path, name)
+                            .map(str::to_string)
+                    });
                     for manifest::RangeFields { range, fields } in declared.by_range() {
                         declarations.push(Declaration {
                             member: member.clone(),
@@ -499,7 +535,8 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
         // the run manages.
         let content = read_lock::<L>(project)?;
         let excluded: HashSet<String> = excluded.iter().map(|member| member.path.clone()).collect();
-        let index = L::member_sources_excluding(&content, &excluded);
+        let workspace = workspace_manifests::<L>(project);
+        let index = L::member_sources_in(&content, workspace.as_ref(), &excluded);
         for dep in deps
             .iter_mut()
             .filter(|dep| dep.direct && !dep.members.is_empty())
@@ -574,12 +611,15 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
         let content = read_lock::<L>(project)?;
         let entries = L::parse(&content)?;
         // Which workspace member(s) own each resolved copy, for source attribution; empty for lock
-        // formats without per-member data (yarn classic, npm v1, an unsupported bun.lock).
+        // formats without per-member data (npm v1, an unsupported bun.lock, a yarn classic lock
+        // Yarn refuses or whose workspace members cannot all be discovered).
         // npm's index attributes a copy only to the members whose own install-tree lookup binds
-        // it, so a nested duplicate of a declared name stays transitive.
+        // it, so a nested duplicate of a declared name stays transitive, and yarn classic's only
+        // to the members whose selector identifies it, a copy no edit may move included.
         // Member paths are resolved to package names once, by reading each member's
         // `package.json`.
-        let member_index = L::member_sources(&content);
+        let workspace = workspace_manifests::<L>(project);
+        let member_index = L::member_sources_in(&content, workspace.as_ref(), &HashSet::new());
         let member_names = member_names(&project.root, &member_index.all_paths());
         // Direct-ness comes from the same importer data as attribution: a dependency is direct iff an
         // importer declares it. For pnpm this is version-exact, so a name declared at one version but
@@ -668,6 +708,42 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
             });
         }
         Ok(deps)
+    }
+
+    /// A manager whose members are attributed only through the workspace manifests
+    /// ([`NodeLock::READS_WORKSPACE_MANIFESTS`]) warns when that evidence is lost: when discovery
+    /// cannot establish every member, or the lock is one the manager's own reader would refuse.
+    /// Its rows then fall back to the root manifest's names, so the warning names what is lost:
+    /// no member owns a copy, a landing is judged by the name's newest locked copy, and no exact
+    /// manifest pin is protected from another candidate's resolve.
+    async fn manifest_notices(&self, project: &Project) -> Result<Vec<Diagnostic>> {
+        let Some(workspace) = workspace_manifests::<L>(project) else {
+            return Ok(Vec::new());
+        };
+        let (kind, cause) = if let Some(reason) = workspace.unavailable_reason() {
+            (
+                DiagnosticKind::Config,
+                format!("its workspace members could not all be discovered ({reason})"),
+            )
+        } else {
+            let content = read_lock::<L>(project)?;
+            match L::member_attribution_in(&content, Some(&workspace)) {
+                MemberAttribution::Unknown => (
+                    DiagnosticKind::LockfileUnreadable,
+                    format!("{} is no lock {} itself would read", L::LOCKFILE, L::BIN),
+                ),
+                _ => return Ok(Vec::new()),
+            }
+        };
+        Ok(vec![
+            Diagnostic::new(
+                kind,
+                format!(
+                    "{cause}, so cooldown attributes no dependency to a workspace member: the rows follow the root package.json alone, a landing is judged by the name's newest locked copy, and no member's exact manifest pin is protected from another candidate's resolve"
+                ),
+            )
+            .with_path("package.json"),
+        ])
     }
 
     async fn native_policy(&self, _project: &Project) -> Result<Option<NativePolicyLayer>> {
@@ -774,10 +850,18 @@ fn candidate_moved(
 }
 
 /// Whether the re-locked graph resolves `change` at exactly its target, judged per declaring
-/// member on its package-key binding (bun), on its member-scoped entry (pnpm), or on its physical
-/// install-tree instance when the lock records layout (npm), and by the name's newest copy only as
-/// the last resort, for a change without declaring members, a lock without any such record, or a
-/// bun member that declares the name itself while the lock leaves its copy undetermined.
+/// member on its selector's binding (yarn classic, read through `workspace`, the manifests
+/// cooldown's edits left), its package-key binding (bun), its member-scoped entry (pnpm), or its
+/// physical install-tree instance when the lock records layout (npm), and by the name's newest
+/// copy only as the last resort, for a change without declaring members, a lock without any such
+/// record, or a bun member that declares the name itself while the lock leaves its copy
+/// undetermined.
+///
+/// Yarn classic has no such fallback: every declaring member must bind the target through its
+/// own selector, so a member whose binding the lock does not prove, or one left behind while a
+/// sibling's copy moved, never lands the change, and neither does any member when the selectors
+/// cannot be read at all, without `workspace`, with its members undiscovered, or with a lock
+/// Yarn's own reader would refuse.
 ///
 /// A recorded install tree is authoritative for every declaring member: each must bind a registry
 /// copy of the name itself at the target
@@ -792,7 +876,11 @@ fn candidate_moved(
 /// A successful install command is not proof: `npm install <name>@<version> --before=<cutoff>`
 /// exits 0 yet lands the newest pre-cutoff version when the requested one is newer than the
 /// cutoff, so the landing must be read back from the lock.
-fn exact_target_reached<L: NodeLock>(project: &Project, change: &Change) -> Result<bool> {
+fn exact_target_reached<L: NodeLock>(
+    project: &Project,
+    change: &Change,
+    workspace: Option<&WorkspaceManifests>,
+) -> Result<bool> {
     let content = read_lock::<L>(project)?;
     let newest = landing_versions::<L>(&content)?;
     let target = change.to.as_str();
@@ -802,23 +890,37 @@ fn exact_target_reached<L: NodeLock>(project: &Project, change: &Change) -> Resu
     if change.members.is_empty() {
         return Ok(newest_reached);
     }
-    // Bun's attribution judges every member with a known binding on that binding, so another
-    // member's newer copy never stands in for it.
-    // Only a member that declares the name itself while the lock leaves its copy undetermined,
-    // such as one that also declares the name as a peer, falls back to the name's newest copy, the
-    // one evidence there is for it.
-    // A foreign or local binding is no copy of the name, so no copy elsewhere lands it.
-    if let MemberAttribution::PackageKeys(bindings) = L::member_attribution(&content) {
-        let name = change.package.name.as_str();
-        return Ok(change.members.iter().all(|member| {
-            match bindings.resolution(&member.path, name) {
-                MemberResolution::Resolved(version) => version == target,
-                MemberResolution::Missing => false,
-                MemberResolution::Unknown => {
-                    newest_reached && bindings.is_uncertain(&member.path, name)
+    let name = change.package.name.as_str();
+    match L::member_attribution_in(&content, workspace) {
+        // A yarn classic member lands only through the copy its own selector binds.
+        MemberAttribution::Selectors(bindings) => {
+            return Ok(change.members.iter().all(|member| {
+                bindings.resolution(&member.path, name) == MemberResolution::Resolved(target)
+            }));
+        }
+        // Bun's attribution judges every member with a known binding on that binding, so another
+        // member's newer copy never stands in for it.
+        // Only a member that declares the name itself while the lock leaves its copy
+        // undetermined, such as one that also declares the name as a peer, falls back to the
+        // name's newest copy, the one evidence there is for it.
+        // A foreign or local binding is no copy of the name, so no copy elsewhere lands it.
+        MemberAttribution::PackageKeys(bindings) => {
+            return Ok(change.members.iter().all(|member| {
+                match bindings.resolution(&member.path, name) {
+                    MemberResolution::Resolved(version) => version == target,
+                    MemberResolution::Missing => false,
+                    MemberResolution::Unknown => {
+                        newest_reached && bindings.is_uncertain(&member.path, name)
+                    }
                 }
-            }
-        }));
+            }));
+        }
+        // A manager whose members are attributed only through their manifests' selectors has no
+        // other evidence for a named member, so without it no landing is proven.
+        MemberAttribution::Unknown if L::READS_WORKSPACE_MANIFESTS => return Ok(false),
+        MemberAttribution::Importers(_)
+        | MemberAttribution::InstallTree(_)
+        | MemberAttribution::Unknown => {}
     }
     let members = L::member_sources(&content);
     let member_versions: Vec<Option<&str>> = change
@@ -838,7 +940,6 @@ fn exact_target_reached<L: NodeLock>(project: &Project, change: &Change) -> Resu
     // The newest-copy fallback below would read the duplicate, roll the genuine landing back as a
     // conflict, and do so again on every future run.
     if let Some(paths) = L::install_paths(&content) {
-        let name = change.package.name.as_str();
         let non_registry = members.non_registry_owners(name, target);
         return Ok(change.members.iter().all(|member| {
             paths.member_registry_version(&member.path, name) == Some(target)
@@ -850,10 +951,12 @@ fn exact_target_reached<L: NodeLock>(project: &Project, change: &Change) -> Resu
 
 /// What the per-package apply does with one candidate, decided before anything is written.
 enum CandidateDecision {
-    /// Land it through this transaction, judging the settled lock against these pin rewrites.
+    /// Land it through this transaction, judging the settled lock against these pin rewrites and
+    /// reading its selectors through these manifest edits.
     Land {
         landing: CandidateLanding,
         authorized: AuthorizedPins,
+        edits: ManifestEdits,
     },
     /// Skip it with this row.
     Skip(Skipped),
@@ -865,6 +968,19 @@ struct LandingBaseline {
     alias_only: AliasOnlyVersions,
     /// The members owning each copy, and which of them bind it through a source of their own.
     members: MemberIndex,
+}
+
+impl LandingBaseline {
+    /// The baseline of `lock`, read through the baseline `workspace` manifests where `L` needs
+    /// them; an absent lock records no copy.
+    fn of<L: NodeLock>(lock: Option<&str>, workspace: Option<&WorkspaceManifests>) -> Self {
+        LandingBaseline {
+            alias_only: lock.map(L::alias_only_versions).unwrap_or_default(),
+            members: lock
+                .map(|lock| L::member_sources_in(lock, workspace, &HashSet::new()))
+                .unwrap_or_default(),
+        }
+    }
 }
 
 /// Plans one per-package candidate's landing ([`candidate_landing`]), or the row that skips it.
@@ -882,10 +998,14 @@ struct LandingBaseline {
 /// A direct candidate without members, which a lock without per-member attribution plans, keeps
 /// the root manifest as its owner.
 ///
-/// A direct candidate is not eligible either when a member binds its copy through a source of its
-/// own, a git dependency or a local or remote tarball ([`MemberIndex::non_registry_owners`]).
+/// A direct candidate is not eligible either when a member binds its copy in a way no edit of its
+/// declaration is proven to move ([`MemberIndex::fixed_owners`]): a source of its own, a git
+/// dependency or a local or remote tarball, and for yarn classic a local path, a selector the root
+/// `resolutions` can rewrite, a name a workspace package carries, or an origin that is no registry
+/// tarball.
 /// The member declares it directly, but npm's exact pin would replace that source with a registry
-/// release, and no range the widen writes could land one either.
+/// release, and no range the widen writes is proven to land one either.
+/// The row names each such member with its reason.
 /// That check runs first: an alias can install a registry release of the same version beside
 /// such a copy, and the copy still has its owner, so the row names the source rather than the
 /// alias.
@@ -904,21 +1024,20 @@ fn decide_candidate<L: NodeLock>(
         })
     };
     let name = &change.package.name;
-    let non_registry = baseline
-        .members
-        .non_registry_owners(name, change.from.as_str());
-    let sourced: Vec<String> = change
-        .members
-        .iter()
-        .filter(|member| non_registry.contains(&member.path))
-        .map(|member| member.name.clone())
-        .collect();
-    if !sourced.is_empty() {
-        let detail = format!(
-            "{name}@{} is installed for {} from a source of its own (git, or a local or remote tarball), so no registry release may replace it through that declaration",
-            change.from,
-            list_members(&sourced),
-        );
+    let fixed = baseline.members.fixed_owners(name, change.from.as_str());
+    let mut held: BTreeMap<FixedBinding, Vec<String>> = BTreeMap::new();
+    for member in &change.members {
+        for FixedOwner { reason, .. } in fixed.iter().filter(|owner| owner.member == member.path) {
+            held.entry(*reason).or_default().push(member.name.clone());
+        }
+    }
+    if !held.is_empty() {
+        let copy = format!("{name}@{}", change.from);
+        let detail = held
+            .iter()
+            .map(|(reason, members)| fixed_binding_detail(*reason, &copy, name, members))
+            .collect::<Vec<_>>()
+            .join("; ");
         return Ok(skip(SkipReason::NotEligible, Some(detail)));
     }
     if baseline.alias_only.contains(name, change.from.as_str()) {
@@ -940,14 +1059,43 @@ fn decide_candidate<L: NodeLock>(
             LandingPlan::Land {
                 landing,
                 authorized,
+                edits,
             } => CandidateDecision::Land {
                 landing,
                 authorized,
+                edits,
             },
             LandingPlan::NotEligible => skip(SkipReason::NotEligible, None),
             LandingPlan::PinHeld { detail } => skip(SkipReason::PinHeld, Some(detail)),
         },
     )
+}
+
+/// Why `copy` (`name@version`) is not eligible for `members`, which bind it as `reason` says.
+fn fixed_binding_detail(
+    reason: FixedBinding,
+    copy: &str,
+    name: &str,
+    members: &[String],
+) -> String {
+    let members = list_members(members);
+    match reason {
+        FixedBinding::OwnSource => format!(
+            "{copy} is installed for {members} from a source of its own (git, or a local or remote tarball), so no registry release may replace it through that declaration"
+        ),
+        FixedBinding::LocalPath => format!(
+            "{copy} is installed for {members} from a local path (`file:` or `link:`), so no registry release may replace it through that declaration"
+        ),
+        FixedBinding::Resolutions => format!(
+            "{copy} is resolved for {members} under the root `resolutions` field, which overrides any range a manifest edit writes; edit the resolution to move it"
+        ),
+        FixedBinding::WorkspaceName => format!(
+            "{name} is also a workspace package's name, which Yarn links in place of a registry release whenever its version satisfies the range, so no manifest edit is proven to move {copy} for {members}"
+        ),
+        FixedBinding::UnrecognizedOrigin => format!(
+            "{copy} is locked for {members} from a URL that is no registry tarball of it, so no manifest edit is proven to land a registry release in its place"
+        ),
+    }
 }
 
 /// A net version change `apply` derived from the before/after lock diff for a package the plan did not
@@ -1800,12 +1948,13 @@ fn report_excluded_moves(
     Ok(())
 }
 
-/// The exact manifest pins a settled lock must leave in place, and the rewrites the user
-/// authorized for the accepted round.
+/// The exact manifest pins a settled lock must leave in place, the rewrites the user authorized
+/// for the accepted round, and the manifest edits each judged lock was resolved under.
 #[derive(Clone, Copy)]
 struct PinGuard<'a> {
     protected: &'a ProtectedPins,
     authorized: &'a AuthorizedPins,
+    edits: EditStates<'a>,
 }
 
 /// The whole-lock guards on the settled resolve, before any candidate is reported applied: no
@@ -1826,8 +1975,12 @@ fn guard_settled_lock<L: NodeLock>(
 ) -> Result<()> {
     let (before_lock, after_lock) = lock;
     let (before_members, after_members) = members;
-    pins.protected
-        .refuse_new_violations::<L>(before_lock, after_lock, pins.authorized)?;
+    pins.protected.refuse_new_violations::<L>(
+        before_lock,
+        after_lock,
+        pins.authorized,
+        pins.edits,
+    )?;
     let (Some(before_content), Some(before_members)) = (before_lock, before_members) else {
         return Ok(());
     };
@@ -1857,6 +2010,7 @@ struct LandedCandidate<'a> {
 /// The pins are judged against the candidate's own baseline, the state the earlier accepted
 /// landings left, so neither an older violation nor an earlier candidate's authorized rewrite is
 /// charged to it, yet it cannot undo either.
+/// Each lock is read through the manifest edits it was resolved under ([`PinGuard::edits`]).
 /// A pin violation restores the candidate and reports a resolver conflict naming the pin; the peer
 /// contracts are then verified by [`settle_landed_candidate`].
 fn settle_sequential_landing<L: NodeLock>(
@@ -1877,6 +2031,7 @@ fn settle_sequential_landing<L: NodeLock>(
         journaled_lock::<L>(journal),
         &settled,
         pins.authorized,
+        pins.edits,
     );
     if !violations.is_empty() {
         restore_after_owned_step(journal, postimage)?;
@@ -1933,7 +2088,7 @@ impl<L: NodeLock> NpmTool<L> {
         project: &Project,
         plan: &Plan,
         baseline_journal: &ProjectMutationJournal,
-        workspace: &[WorkspacePeer],
+        peer_workspace: &[WorkspacePeer],
         protected_pins: &ProtectedPins,
     ) -> Result<ApplyReport> {
         // A project without a journaled lock diffs from an empty baseline; a present but
@@ -1942,19 +2097,17 @@ impl<L: NodeLock> NpmTool<L> {
             .map(locked_versions::<L>)
             .transpose()?
             .unwrap_or_default();
-        let landing_baseline = LandingBaseline {
-            alias_only: journaled_lock::<L>(baseline_journal)
-                .map(L::alias_only_versions)
-                .unwrap_or_default(),
-            members: journaled_lock::<L>(baseline_journal)
-                .map(L::member_sources)
-                .unwrap_or_default(),
-        };
+        let workspace = protected_pins.workspace();
+        let landing_baseline =
+            LandingBaseline::of::<L>(journaled_lock::<L>(baseline_journal), workspace);
         let mut report = ApplyReport::default();
         let mut violation_baseline: Option<PeerViolations> = None;
         // The pin rewrites of every accepted candidate, which later candidates are judged against
         // instead of the baseline pins they replaced.
         let mut accepted_pins = AuthorizedPins::default();
+        // Every manifest edit of the accepted candidates, the selectors each later candidate's
+        // starting lock was resolved under; a rolled-back candidate's edits never join them.
+        let mut accepted_edits = ManifestEdits::default();
         for change in &plan.changes {
             // A failed later candidate must not leak its widened manifest when an earlier sibling
             // succeeded and makes the outer batch committable.
@@ -1965,12 +2118,13 @@ impl<L: NodeLock> NpmTool<L> {
                 ..plan.clone()
             };
             let candidate_journal = journal::<L>(project, &candidate_plan)?;
-            let (landing, candidate_pins) =
+            let (landing, candidate_pins, candidate_edits) =
                 match decide_candidate::<L>(project, plan, change, &landing_baseline)? {
                     CandidateDecision::Land {
                         landing,
                         authorized,
-                    } => (landing, authorized),
+                        edits,
+                    } => (landing, authorized, edits),
                     CandidateDecision::Skip(skipped) => {
                         report.skipped.push(skipped);
                         continue;
@@ -1979,8 +2133,12 @@ impl<L: NodeLock> NpmTool<L> {
             let attempt = self
                 .run_candidate_landing(project, &candidate_journal, &landing)
                 .await?;
+            let settled_edits = accepted_edits.union(&candidate_edits);
+            let landed_workspace = workspace.map(|workspace| settled_edits.apply_to(workspace));
             match attempt.result {
-                Ok(()) if exact_target_reached::<L>(project, change)? => {
+                Ok(())
+                    if exact_target_reached::<L>(project, change, landed_workspace.as_ref())? =>
+                {
                     let authorized = accepted_pins.union(&candidate_pins);
                     let landed = LandedCandidate {
                         change,
@@ -1990,16 +2148,21 @@ impl<L: NodeLock> NpmTool<L> {
                     let pins = PinGuard {
                         protected: protected_pins,
                         authorized: &authorized,
+                        edits: EditStates {
+                            baseline: &accepted_edits,
+                            settled: &settled_edits,
+                        },
                     };
                     if settle_sequential_landing::<L>(
                         project,
                         &landed,
                         pins,
-                        workspace,
+                        peer_workspace,
                         &mut violation_baseline,
                         &mut report,
                     )? {
                         accepted_pins = authorized;
+                        accepted_edits = settled_edits;
                     }
                 }
                 Ok(()) => {
@@ -2170,6 +2333,7 @@ impl<L: NodeLock> NpmTool<L> {
             PinGuard {
                 protected: protected_pins,
                 authorized: &authorized,
+                edits: EditStates::NONE,
             },
         )?;
         let before_members = before_members.unwrap_or_default();
@@ -2428,6 +2592,7 @@ impl<L: NodeLock> NpmTool<L> {
                     before_content,
                     &after_content,
                     &authorized,
+                    EditStates::NONE,
                 )?;
                 return Err(CoreError::StaleLock(detail));
             }
@@ -3661,7 +3826,7 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         // The others (npm/yarn/bun) lack a joint pin-set resolve, so they keep the per-package relock
         // path.
         // A recovery subset shares its operation's baseline, so every trial judges the same pins.
-        let protected_pins = ProtectedPins::from_baseline(mutation.baseline())?;
+        let protected_pins = ProtectedPins::from_baseline::<L>(mutation.baseline())?;
         let mut report = if L::supports_whole_graph_resolve() {
             self.apply_whole_graph(project, &plan, journal, &evidence, &protected_pins)
                 .await?
@@ -3848,6 +4013,9 @@ fn omitted_selector_warnings(omitted: &[String]) -> Vec<Diagnostic> {
 
 #[cfg(test)]
 mod npm_attribution_tests;
+
+#[cfg(test)]
+mod yarn_attribution_tests;
 
 #[cfg(test)]
 mod tests {
@@ -6458,13 +6626,13 @@ packages:
         }];
 
         assert!(
-            exact_target_reached::<Npm>(&project, &landed)?,
+            exact_target_reached::<Npm>(&project, &landed, None)?,
             "the root instance sits at the target; the nested 5.6.0 duplicate must not mask it"
         );
         let mut short = change("chalk", "4.1.1", "4.1.3");
         short.members.clone_from(&landed.members);
         assert!(
-            !exact_target_reached::<Npm>(&project, &short)?,
+            !exact_target_reached::<Npm>(&project, &short, None)?,
             "an instance short of its target is still short"
         );
         Ok(())
@@ -6514,11 +6682,11 @@ packages:
             root.join("package-lock.json"),
             lock(r#""node_modules/chalk": { "name": "other", "version": "4.1.2" },"#),
         )?;
-        assert!(!exact_target_reached::<Npm>(&project, &landed)?);
+        assert!(!exact_target_reached::<Npm>(&project, &landed, None)?);
 
         // A member bound to nothing proves nothing either, though the newest copy is at the target.
         std::fs::write(root.join("package-lock.json"), lock(""))?;
-        assert!(!exact_target_reached::<Npm>(&project, &landed)?);
+        assert!(!exact_target_reached::<Npm>(&project, &landed, None)?);
 
         // One member reaches a genuine copy, the other only an alias.
         std::fs::write(
@@ -6530,8 +6698,8 @@ packages:
         )?;
         let mut both = landed.clone();
         both.members.push(member("apps/b"));
-        assert!(exact_target_reached::<Npm>(&project, &landed)?);
-        assert!(!exact_target_reached::<Npm>(&project, &both)?);
+        assert!(exact_target_reached::<Npm>(&project, &landed, None)?);
+        assert!(!exact_target_reached::<Npm>(&project, &both, None)?);
         Ok(())
     }
 
@@ -6589,7 +6757,7 @@ packages:
                     root.join("package-lock.json"),
                     genuine_and_alias_lock(lockfile_version, genuine, aliased),
                 )?;
-                Ok(exact_target_reached::<Npm>(&project, &planned)?)
+                Ok(exact_target_reached::<Npm>(&project, &planned, None)?)
             };
 
             // The genuine copy stayed behind while the alias sits at the target.
@@ -6696,7 +6864,7 @@ packages:
         };
         let landed = change("chalk", "4.1.1", "4.1.2");
 
-        let error = exact_target_reached::<Npm>(&project, &landed)
+        let error = exact_target_reached::<Npm>(&project, &landed, None)
             .expect_err("an unparsable lock is an error, not an unreached target");
         assert!(
             matches!(error, CoreError::Parse(_)),
@@ -7906,18 +8074,18 @@ packages:
         // The member keeps its nested copy below the root's newer one.
         let nested = r#""pkg-b/chalk": ["chalk@4.1.0", "", {}, "sha512-x"],"#;
         std::fs::write(root.join("bun.lock"), lock("4.1.0", nested))?;
-        assert!(!exact_target_reached::<Bun>(&project, &to("4.1.2"))?);
-        assert!(exact_target_reached::<Bun>(&project, &to("4.1.0"))?);
+        assert!(!exact_target_reached::<Bun>(&project, &to("4.1.2"), None)?);
+        assert!(exact_target_reached::<Bun>(&project, &to("4.1.0"), None)?);
 
         // The member binds the root copy once its nested one is gone.
         std::fs::write(root.join("bun.lock"), lock("^4.1.0", ""))?;
-        assert!(exact_target_reached::<Bun>(&project, &to("4.1.2"))?);
+        assert!(exact_target_reached::<Bun>(&project, &to("4.1.2"), None)?);
 
         // An alias is no copy of the name, so the root's copy at the target never lands it.
         let aliased = r#""pkg-b/chalk": ["other@4.1.0", "", {}, "sha512-x"],"#;
         std::fs::write(root.join("bun.lock"), lock("npm:other@4.1.0", aliased))?;
-        assert!(!exact_target_reached::<Bun>(&project, &to("4.1.2"))?);
-        assert!(!exact_target_reached::<Bun>(&project, &to("4.1.0"))?);
+        assert!(!exact_target_reached::<Bun>(&project, &to("4.1.2"), None)?);
+        assert!(!exact_target_reached::<Bun>(&project, &to("4.1.0"), None)?);
 
         // A member that also declares the name as a peer binds a copy the lock leaves
         // undetermined, so the name's newest copy is the evidence, as before Bun members were
@@ -7928,8 +8096,8 @@ packages:
         );
         assert!(peer.contains("peerDependencies"), "{peer}");
         std::fs::write(root.join("bun.lock"), &peer)?;
-        assert!(exact_target_reached::<Bun>(&project, &to("4.1.2"))?);
-        assert!(!exact_target_reached::<Bun>(&project, &to("4.1.0"))?);
+        assert!(exact_target_reached::<Bun>(&project, &to("4.1.2"), None)?);
+        assert!(!exact_target_reached::<Bun>(&project, &to("4.1.0"), None)?);
 
         // A member with a known binding beside it is still judged on its own copy.
         let both = Change {
@@ -7962,7 +8130,7 @@ packages:
             Bun::member_attribution(&mixed).resolution("packages/c", "chalk"),
             MemberResolution::Resolved("4.1.0")
         );
-        assert!(!exact_target_reached::<Bun>(&project, &both)?);
+        assert!(!exact_target_reached::<Bun>(&project, &both, None)?);
         Ok(())
     }
 
@@ -11413,7 +11581,7 @@ mod whole_graph_tests {
             r#"{ "name": "app", "devDependencies": { "lodash": "4.17.20" } }"#,
         )?;
         let baseline = MutationBaseline::read(&root, [Utf8PathBuf::from("package.json")])?;
-        let protected = ProtectedPins::from_baseline(&baseline)?;
+        let protected = ProtectedPins::from_baseline::<Pnpm>(&baseline)?;
         let after_members = Pnpm::member_sources(&settled);
         let guard = |content: &str| {
             guard_settled_lock::<Pnpm>(
@@ -11425,6 +11593,7 @@ mod whole_graph_tests {
                 PinGuard {
                     protected: &protected,
                     authorized: &AuthorizedPins::default(),
+                    edits: EditStates::NONE,
                 },
             )
         };

@@ -12,16 +12,28 @@
 //! candidate whose resolve did it.
 //!
 //! Only locks that attribute a resolution to each member can be judged: pnpm's importers, npm's
-//! v2/v3 install tree, and the package keys of a `bun.lock` its reader supports.
-//! Yarn classic and npm v1 locks attribute nothing per member, so their pins are reported
-//! [`Observed::Unknown`] and protected by nothing here; the name's newest copy is never a stand-in,
-//! since a transitive duplicate beside an unchanged member copy would read as a moved pin.
+//! v2/v3 install tree, the package keys of a `bun.lock` its reader supports, and a Yarn classic
+//! lock's selector keys read through the workspace manifests.
+//! npm v1 locks attribute nothing per member, so their pins are reported [`Observed::Unknown`]
+//! and protected by nothing here; the name's newest copy is never a stand-in, since a transitive
+//! duplicate beside an unchanged member copy would read as a moved pin.
 //! Neither is a Bun member whose keys the lock does not prove, nor a Bun peer declaration, which
 //! Bun binds by version rather than by key.
 //! Within an npm install tree, an alias occupying the owner's slot (`"foo": "npm:other@1.0.0"`)
 //! installs another package, so it is unknown too rather than a version of the pinned name.
+//!
+//! Yarn classic is judged through each member's selector, the one Yarn's manifest normalization
+//! keeps for the name, so a pin hidden in a second install field is judged against the copy the
+//! first field's range binds.
+//! The members and their selectors are the baseline's, rebuilt from the capture alone, with
+//! cooldown's own recorded edits applied ([`ManifestEdits`]), never what a resolver or a lifecycle
+//! script later writes, while the pins judged stay the baseline's.
+//! A Yarn binding the lock does not prove a registry copy, such as a git or local source, a name
+//! the root `resolutions` can rewrite, a workspace sibling's name, or a descriptor that vanished,
+//! is unknown and protects nothing, and so is every Yarn pin when the captured workspace or the
+//! lock cannot be read.
 
-use crate::lock::{MemberResolution, NodeLock};
+use crate::lock::{MemberResolution, NodeLock, WorkspaceManifests};
 use crate::manifest::{self, DeclarationKey, ExactDeclaration, ManifestRewrite};
 use cooldown_core::{Change, CoreError, MutationBaseline, Result, RewriteMode};
 use std::collections::BTreeMap;
@@ -35,6 +47,9 @@ const REQUIRED_FIELDS: [&str; 2] = ["dependencies", "devDependencies"];
 pub(crate) struct ProtectedPins {
     /// Sorted by key, so a refusal names its violations in a stable order.
     declarations: Vec<ExactDeclaration>,
+    /// The baseline workspace manifests the lock's member attribution reads selectors from, for a
+    /// manager that needs them ([`NodeLock::READS_WORKSPACE_MANIFESTS`]).
+    workspace: Option<WorkspaceManifests>,
 }
 
 /// What one settled lock resolves each protected declaration to.
@@ -125,6 +140,71 @@ impl AuthorizedPins {
     }
 }
 
+/// The specifiers cooldown itself wrote, by declaration, whether or not they rewrote a pin.
+///
+/// A Yarn classic lock keys each entry by the selector a manifest requests, so after a widen the
+/// lock names the member's copy under the replacement rather than the baseline specifier.
+/// They are recorded at the write, so a resolver's later manifest edit never redefines a selector.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ManifestEdits {
+    replacements: BTreeMap<DeclarationKey, String>,
+}
+
+/// No manifest edit, the state a lock no cooldown write preceded was resolved under.
+const NO_EDITS: ManifestEdits = ManifestEdits {
+    replacements: BTreeMap::new(),
+};
+
+impl ManifestEdits {
+    /// Records every declaration `rewrite` wrote.
+    pub(crate) fn record(&mut self, rewrite: &ManifestRewrite) {
+        for declaration in &rewrite.rewritten {
+            self.replacements
+                .insert(declaration.key.clone(), declaration.replacement.clone());
+        }
+    }
+
+    /// These edits together with every one `other` recorded, `other`'s winning where both
+    /// rewrote one declaration.
+    pub(crate) fn union(&self, other: &ManifestEdits) -> ManifestEdits {
+        let mut replacements = self.replacements.clone();
+        replacements.extend(
+            other
+                .replacements
+                .iter()
+                .map(|(key, replacement)| (key.clone(), replacement.clone())),
+        );
+        ManifestEdits { replacements }
+    }
+
+    /// `workspace` with these edits written into it.
+    pub(crate) fn apply_to(&self, workspace: &WorkspaceManifests) -> WorkspaceManifests {
+        workspace.with_replacements(
+            self.replacements
+                .iter()
+                .map(|(key, replacement)| (key, replacement.as_str())),
+        )
+    }
+}
+
+/// The manifest edits each lock of a pin judgement was resolved under.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EditStates<'a> {
+    /// The edits behind the baseline lock: the earlier accepted landings'.
+    pub(crate) baseline: &'a ManifestEdits,
+    /// The edits behind the settled lock: the baseline's and the judged candidate's.
+    pub(crate) settled: &'a ManifestEdits,
+}
+
+impl EditStates<'_> {
+    /// Both locks resolved under the baseline manifests, as for a manager whose attribution reads
+    /// no manifest.
+    pub(crate) const NONE: EditStates<'static> = EditStates {
+        baseline: &NO_EDITS,
+        settled: &NO_EDITS,
+    };
+}
+
 /// A protected declaration the settled lock newly violates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PinViolation {
@@ -154,7 +234,8 @@ impl PinViolation {
 
 impl ProtectedPins {
     /// Reads the exact install pins of every `package.json` in `baseline`, from the bytes read
-    /// before any mutation.
+    /// before any mutation, and for a manager whose attribution reads the workspace manifests
+    /// ([`NodeLock::READS_WORKSPACE_MANIFESTS`]), their snapshot, rebuilt from the capture alone.
     ///
     /// A recovery subset shares its operation's baseline, so every trial judges the same pins.
     ///
@@ -162,7 +243,7 @@ impl ProtectedPins {
     ///
     /// Returns [`CoreError::Parse`] when a captured manifest is not UTF-8 JSON, since an unread pin
     /// cannot be ruled out.
-    pub(crate) fn from_baseline(baseline: &MutationBaseline) -> Result<Self> {
+    pub(crate) fn from_baseline<L: NodeLock>(baseline: &MutationBaseline) -> Result<Self> {
         let mut declarations = Vec::new();
         for file in baseline.files() {
             if file.path().file_name() != Some("package.json") {
@@ -178,7 +259,17 @@ impl ProtectedPins {
             declarations.extend(manifest::exact_install_declarations(&member, content)?);
         }
         declarations.sort_by(|left, right| left.key.cmp(&right.key));
-        Ok(ProtectedPins { declarations })
+        let workspace =
+            L::READS_WORKSPACE_MANIFESTS.then(|| WorkspaceManifests::from_baseline(baseline));
+        Ok(ProtectedPins {
+            declarations,
+            workspace,
+        })
+    }
+
+    /// The baseline workspace manifests, when the manager's attribution reads them.
+    pub(crate) fn workspace(&self) -> Option<&WorkspaceManifests> {
+        self.workspace.as_ref()
     }
 
     /// Whether no manifest declares an exact install pin.
@@ -186,11 +277,20 @@ impl ProtectedPins {
         self.declarations.is_empty()
     }
 
-    /// What `lock` resolves each protected declaration to, judged at its owning member.
+    /// What `lock`, resolved under the manifests cooldown's `edits` left, resolves each protected
+    /// declaration to, judged at its owning member.
     ///
     /// An absent lock binds nothing, so every declaration is [`Observed::Missing`].
-    pub(crate) fn observe<L: NodeLock>(&self, lock: Option<&str>) -> PinObservations {
-        let attribution = lock.map(L::member_attribution);
+    pub(crate) fn observe<L: NodeLock>(
+        &self,
+        lock: Option<&str>,
+        edits: &ManifestEdits,
+    ) -> PinObservations {
+        let workspace = self
+            .workspace
+            .as_ref()
+            .map(|workspace| edits.apply_to(workspace));
+        let attribution = lock.map(|lock| L::member_attribution_in(lock, workspace.as_ref()));
         let observed = self
             .declarations
             .iter()
@@ -248,18 +348,20 @@ impl ProtectedPins {
         violations
     }
 
-    /// The [`new_violations`](Self::new_violations) of `settled_lock` relative to `baseline_lock`.
+    /// The [`new_violations`](Self::new_violations) of `settled_lock` relative to `baseline_lock`,
+    /// each observed under the manifest edits `edits` records for it.
     pub(crate) fn violations_between<L: NodeLock>(
         &self,
         baseline_lock: Option<&str>,
         settled_lock: &str,
         authorized: &AuthorizedPins,
+        edits: EditStates<'_>,
     ) -> Vec<PinViolation> {
         if self.is_empty() {
             return Vec::new();
         }
-        let baseline = self.observe::<L>(baseline_lock);
-        let settled = self.observe::<L>(Some(settled_lock));
+        let baseline = self.observe::<L>(baseline_lock, edits.baseline);
+        let settled = self.observe::<L>(Some(settled_lock), edits.settled);
         self.new_violations(&baseline, &settled, authorized)
     }
 
@@ -274,8 +376,10 @@ impl ProtectedPins {
         baseline_lock: Option<&str>,
         settled_lock: &str,
         authorized: &AuthorizedPins,
+        edits: EditStates<'_>,
     ) -> Result<()> {
-        let violations = self.violations_between::<L>(baseline_lock, settled_lock, authorized);
+        let violations =
+            self.violations_between::<L>(baseline_lock, settled_lock, authorized, edits);
         if violations.is_empty() {
             return Ok(());
         }

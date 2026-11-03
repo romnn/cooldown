@@ -23,6 +23,7 @@ tokio.workspace = true
 async-trait.workspace = true
 camino.workspace = true
 semver.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 color-eyre.workspace = true

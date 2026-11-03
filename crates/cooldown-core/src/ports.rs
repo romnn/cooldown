@@ -953,7 +953,8 @@ pub trait ToolWrite: Send + Sync {
     ) -> Result<ProjectMutationJournal>;
 
     /// Captures the read-only files every trial of this mutation is judged against, such as
-    /// manifests the adapter must not write but whose declarations bind the resolve.
+    /// manifests the adapter must not write but whose declarations bind the resolve, and any fact
+    /// the adapter [records](MutationBaseline::record) beside them.
     ///
     /// [`PreparedMutation::prepare`] captures it once, after the journal, and every recovery
     /// subset shares it, so a trial never judges against state an earlier trial left.
