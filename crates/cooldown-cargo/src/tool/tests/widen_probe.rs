@@ -181,6 +181,7 @@ impl WidenFixture {
             .joint_widen_probe(
                 WidenProbe {
                     project: &self.project,
+                    plan: &self.changes,
                     rewrite: RewriteMode::Auto,
                     candidates: &candidates,
                     protected: &[],
@@ -456,6 +457,7 @@ async fn protected_member_reach_cannot_be_replaced_by_a_disconnected_target_copy
             .joint_widen_probe(
                 WidenProbe {
                     project: &fixture.project,
+                    plan: &fixture.changes,
                     rewrite: RewriteMode::Auto,
                     candidates: &candidates,
                     protected: &protected,
@@ -577,6 +579,7 @@ async fn rejected_metadata_restores_removed_and_renamed_follower_entries_and_loc
             .joint_widen_probe(
                 WidenProbe {
                     project: &fixture.project,
+                    plan: &fixture.changes,
                     rewrite: RewriteMode::Auto,
                     candidates: &candidates,
                     protected: &[],
@@ -1146,6 +1149,7 @@ async fn rejected_singleton_restores_bytes_permissions_and_absent_member_manifes
         .tentative_widen_logged(
             WidenProbe {
                 project: &fixture.project,
+                plan: &fixture.changes,
                 rewrite: RewriteMode::Auto,
                 candidates: &[planned],
                 protected: &[],
@@ -1248,6 +1252,7 @@ async fn protected_displacement_does_not_memoize_a_candidate_only_widen_rejectio
         .tentative_widen_logged(
             WidenProbe {
                 project: &fixture.project,
+                plan: &fixture.changes,
                 rewrite: RewriteMode::Auto,
                 candidates: &[candidate],
                 protected: &[protected],
@@ -1271,12 +1276,14 @@ async fn protected_displacement_does_not_memoize_a_candidate_only_widen_rejectio
         original_lock
     );
 
-    // The exact same inputs are viable when retaining A is no longer an obligation.
+    // The exact same inputs are viable when retaining A is no longer an obligation: neither
+    // protected nor planned.
     let second = fixture
         .tool
         .tentative_widen_logged(
             WidenProbe {
                 project: &fixture.project,
+                plan: std::slice::from_ref(candidate),
                 rewrite: RewriteMode::Auto,
                 candidates: &[candidate],
                 protected: &[],
@@ -1351,6 +1358,7 @@ async fn transitive_widen_memo_does_not_skip_a_later_member_metadata_mode() -> e
             .tentative_widen_logged(
                 WidenProbe {
                     project: &fixture.project,
+                    plan: &fixture.changes,
                     rewrite: RewriteMode::Auto,
                     candidates: &[candidate],
                     protected,
@@ -1446,6 +1454,7 @@ async fn composite_widen_transport_failures_disqualify_the_outer_rejection() -> 
                 .tentative_widen_logged(
                     WidenProbe {
                         project: &fixture.project,
+                        plan: &fixture.changes,
                         rewrite: RewriteMode::Auto,
                         candidates: &[candidate],
                         protected: &[],

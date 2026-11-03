@@ -12,6 +12,12 @@
 //! other, which frozen suites decouple via [`Fixture::tag_independent`]. Tests assert invariants
 //! (convergence, no-silent-change, cross-command agreement), never hard-coded versions.
 //!
+//! Cargo has no publish-date cutoff of its own, so `--freeze` bounds only what cooldown adopts:
+//! a precise pin still lets cargo float a dependency to whatever crates.io published since.
+//! A cargo fixture therefore carries a [`CargoAsOf`], which bounds every cargo process it starts
+//! and every cargo process cooldown starts for it to the releases published by a fixed instant.
+//! A command that must see the live registry says so through [`Fixture::run_unbounded`].
+//!
 //! Everything here is ecosystem-agnostic. [`Fixture`] only knows how to write files, run an
 //! arbitrary tool (so each ecosystem can seed its own lock — `uv lock`, `cargo generate-lockfile`,
 //! `go mod tidy`, `pnpm install --lockfile-only`, …), drive `cooldown`, and parse the returned
@@ -36,13 +42,78 @@ use cooldown_adapter_util::{program_on_path, resolve_program};
 
 const TOOL_ATTEMPTS: usize = 3;
 
+/// The note an assertion on registry state that neither a horizon nor `--freeze` can pin carries
+/// in its failure message: a yank or an unpublish rewrites the history a fixture replays.
+pub const REGISTRY_HISTORY: &str = "registry history changed (yank/unpublish?)";
+
+/// The crates.io horizons of a cargo fixture: the instants whose published releases cargo may see.
+///
+/// Both are distinct from the `--freeze` policy a test hands cooldown, which decides what cooldown
+/// may adopt, while a horizon decides what cargo can resolve at all.
+/// The run horizon must not precede any release cooldown pins, since cargo refuses a precise pin
+/// to a version newer than its horizon.
+#[derive(Debug, Clone, Copy)]
+pub struct CargoAsOf {
+    /// The horizon of the cargo commands the fixture runs itself, which seed its starting lock.
+    pub seed: &'static str,
+    /// The horizon of the cargo commands cooldown runs against the fixture.
+    pub run: &'static str,
+}
+
+/// The environment that bounds a cargo process to the crates.io releases published by `as_of`.
+///
+/// Cargo's unstable `min-publish-age` takes an age, not an instant, so the age is recomputed for
+/// every process and rounded up to whole minutes, which keeps the horizon at or before `as_of`
+/// when the process starts.
+/// Every cargo process cooldown starts inherits the age, so its horizon trails `as_of` by the time
+/// the run has taken.
+/// Cargo exempts the versions a lock already carries.
+fn cargo_as_of_env(as_of: &str) -> Vec<(&'static str, String)> {
+    let instant: jiff::Timestamp = as_of
+        .parse()
+        .unwrap_or_else(|err| panic!("cargo as-of `{as_of}` is not an RFC 3339 instant: {err}"));
+    let age = jiff::Timestamp::now().duration_since(instant).as_secs();
+    assert!(age >= 0, "cargo as-of `{as_of}` lies in the future");
+    let minutes = (age + 59) / 60;
+    vec![
+        ("RUSTC_BOOTSTRAP", "1".to_owned()),
+        ("CARGO_UNSTABLE_MIN_PUBLISH_AGE", "true".to_owned()),
+        (
+            "CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE",
+            format!("{minutes} minutes"),
+        ),
+        ("CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE", "deny".to_owned()),
+    ]
+}
+
+/// Which registry horizon a command a fixture runs itself resolves against.
+#[derive(Debug, Clone, Copy)]
+enum Horizon {
+    /// The fixture's seed horizon, when it has one.
+    Seed,
+    /// The live registry.
+    Unbounded,
+}
+
 /// A throwaway project tree under a temp dir, plus the means to run `cooldown` against it.
 pub struct Fixture {
     dir: tempfile::TempDir,
     tag_independent: bool,
+    cargo_as_of: Option<CargoAsOf>,
 }
 
 impl Fixture {
+    /// Creates an empty cargo fixture whose cargo processes resolve against `as_of`, rather than
+    /// the live crates.io index.
+    ///
+    /// A cargo fixture has to be built here: [`run_tool`](Self::run_tool) refuses to run `cargo`
+    /// in a fixture without a horizon.
+    pub fn cargo(as_of: CargoAsOf) -> Self {
+        let mut fixture = Self::new();
+        fixture.cargo_as_of = Some(as_of);
+        fixture
+    }
+
     /// Create an empty fixture rooted at a fresh temp dir.
     pub fn new() -> Self {
         let fixture = Self::new_non_git();
@@ -71,6 +142,7 @@ impl Fixture {
         Self {
             dir,
             tag_independent: false,
+            cargo_as_of: None,
         }
     }
 
@@ -105,8 +177,26 @@ impl Fixture {
 
     /// Run a raw command in the project root, returning its captured output. Used to drive the real
     /// package manager when seeding a starting lock (e.g. `uv lock --exclude-newer …`).
+    ///
+    /// In a cargo fixture the command resolves against the seed horizon of its [`CargoAsOf`].
     pub fn run_tool(&self, program: &str, args: &[&str], envs: &[(&str, &str)]) -> CapturedOutput {
-        self.run_tool_result(program, args, envs, None)
+        self.run_tool_result(program, args, envs, None, Horizon::Seed)
+            .unwrap_or_else(|error| panic!("spawn {program}: {error}"))
+    }
+
+    /// Runs a raw command against the live registry, deliberately outside any fixture horizon.
+    ///
+    /// `reason` says why the command must see the live registry, such as a relock that verifies a
+    /// lock against what the registry serves today; it is echoed to the test log.
+    pub fn run_unbounded(
+        &self,
+        reason: &str,
+        program: &str,
+        args: &[&str],
+        envs: &[(&str, &str)],
+    ) -> CapturedOutput {
+        eprintln!("running {program} {} unbounded: {reason}", args.join(" "));
+        self.run_tool_result(program, args, envs, None, Horizon::Unbounded)
             .unwrap_or_else(|error| panic!("spawn {program}: {error}"))
     }
 
@@ -116,12 +206,28 @@ impl Fixture {
         args: &[&str],
         envs: &[(&str, &str)],
         phase: Option<&str>,
+        horizon: Horizon,
     ) -> eyre::Result<CapturedOutput> {
+        let bound = match (horizon, self.cargo_as_of) {
+            (Horizon::Seed, Some(as_of)) => cargo_as_of_env(as_of.seed),
+            (Horizon::Seed, None) => {
+                assert!(
+                    program != "cargo",
+                    "a cargo fixture must be built with `Fixture::cargo` so its seed resolves as of \
+                     a fixed instant; use `run_unbounded` for a deliberate live command"
+                );
+                Vec::new()
+            }
+            (Horizon::Unbounded, _) => Vec::new(),
+        };
         let executable = resolve_program(program);
         let mut attempt = 1;
         loop {
             let mut command = Command::new(&executable);
             command.current_dir(self.dir.path()).args(args);
+            for (key, value) in &bound {
+                command.env(key, value);
+            }
             for (key, value) in envs {
                 command.env(key, value);
             }
@@ -161,7 +267,7 @@ impl Fixture {
             args.join(" ")
         );
         let started = Instant::now();
-        let captured = self.run_tool_result(program, args, envs, Some(phase))?;
+        let captured = self.run_tool_result(program, args, envs, Some(phase), Horizon::Seed)?;
         trace_captured_phase(phase, started, &captured);
         Ok(captured)
     }
@@ -183,6 +289,9 @@ impl Fixture {
 
     /// [`cooldown_in`](Self::cooldown_in) with `envs` added to the binary's environment, for a
     /// setting the caller's own environment may or may not carry.
+    ///
+    /// In a cargo fixture the cargo processes cooldown starts resolve against the run horizon of
+    /// its [`CargoAsOf`].
     pub fn cooldown_in_env(
         &self,
         dir: Option<&str>,
@@ -196,6 +305,7 @@ impl Fixture {
         );
         let output = Command::new(exe)
             .current_dir(self.dir.path())
+            .envs(self.run_horizon())
             .envs(envs.iter().copied())
             .args(args)
             .args(self.tag_independent.then_some("--no-respect-dist-tags"))
@@ -217,6 +327,7 @@ impl Fixture {
         let mut command = Command::new(exe);
         command
             .current_dir(self.dir.path())
+            .envs(self.run_horizon())
             .args(args)
             .args(self.tag_independent.then_some("--no-respect-dist-tags"))
             .arg("--dir")
@@ -277,6 +388,13 @@ impl Fixture {
             )
         })?;
         Ok(Envelope { value })
+    }
+
+    /// The environment that bounds the cargo processes cooldown starts to the run horizon.
+    fn run_horizon(&self) -> Vec<(&'static str, String)> {
+        self.cargo_as_of
+            .map(|as_of| cargo_as_of_env(as_of.run))
+            .unwrap_or_default()
     }
 }
 

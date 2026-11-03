@@ -27,11 +27,18 @@
 mod support;
 
 use indoc::indoc;
-use support::Fixture;
+use support::{CargoAsOf, Fixture};
 
 /// The absolute resolution cutoff (same instant as `convergence_cargo.rs`): crates.io history
 /// before it is immutable, so the matured `uuid 1.x` target reproduces forever.
 const FREEZE: &str = "2024-06-01T00:00:00Z";
+
+/// The instant the edge scenarios were written: the seed resolves diesel 2.3.11 (2026-07-10) and
+/// the "newest" `uuid 1.x` line of that day, and the run sees the same registry.
+const EDGES_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2026-08-10T15:19:20Z",
+    run: "2026-08-10T15:19:20Z",
+};
 
 /// The seeded `uuid 1.x` version, far below anything the freeze admits, so the fixture always
 /// plans a real `uuid` upgrade (the edge policy runs inside `apply`, which needs a planned change).
@@ -117,11 +124,13 @@ fn seed_edge_binding(fixture: &Fixture, dependent: &str, dep: &str, to: &str) {
     fixture.write("Cargo.lock", &text);
 }
 
-/// Seeds the fixture: resolve at "newest now", roll the `uuid 1.x` line down to [`SEED_UUID`]
-/// (so an upgrade is always planned under the freeze), then rebind diesel's wide-range edge onto
-/// the coexisting `0.8.2` — the bad binding a from-scratch resolve never produces.
+/// Seeds the fixture: resolve at the "newest" of [`EDGES_AS_OF`], roll the `uuid 1.x` line down to
+/// [`SEED_UUID`] (so an upgrade is always planned under the freeze), then rebind diesel's
+/// wide-range edge onto the coexisting `0.8.2` — the bad binding a from-scratch resolve never
+/// produces.
+/// diesel 2.3.11 needs a far younger graph than `uuid` 1.2.2, so no single horizon seeds both.
 fn edge_fixture() -> Fixture {
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(EDGES_AS_OF);
     fixture
         .write("Cargo.toml", EDGE_MANIFEST)
         .write("src/lib.rs", "")
@@ -374,7 +383,7 @@ fn edge_policy_none_reports_without_correcting() {
 #[test]
 fn canonicalize_heals_without_any_planned_change() {
     skip_if_missing!("cargo");
-    let fixture = Fixture::new();
+    let fixture = Fixture::cargo(EDGES_AS_OF);
     fixture
         .write("Cargo.toml", EDGE_MANIFEST)
         .write("src/lib.rs", "")
@@ -382,8 +391,8 @@ fn canonicalize_heals_without_any_planned_change() {
     fixture
         .run_tool("cargo", &["generate-lockfile"], &[])
         .expect_success();
-    // Without the seeded UUID downgrade, the 1.x line stays at newest-now, so under the past freeze
-    // nothing is adoptable and the plan is empty.
+    // Without the seeded UUID downgrade, the 1.x line stays at the seed's newest, so under the past
+    // freeze nothing is adoptable and the plan is empty.
     // Only the bad binding is seeded.
     seed_edge_binding(&fixture, "diesel", "uuid", "0.8.2");
 

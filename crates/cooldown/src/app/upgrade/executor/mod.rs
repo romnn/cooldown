@@ -3138,11 +3138,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             deps.extend(constraints);
         }
         let mut report = verify_applied_targets(report, planned, &deps);
-        // Adapter collateral rows (a transitive the joint resolve floated) carry no member
-        // attribution — the adapter diffs lockfiles, not the graph. The post-apply graph read
-        // above knows which members reach every landed slot, so fill the gap here; without it a
-        // transitive applied row renders an empty "Used by" while its reconcile siblings say
-        // "via …".
+        // Adapter collateral rows (a transitive the joint resolve floated, or a declared crate it
+        // moved) carry no member attribution — the adapter diffs lockfiles, not the graph. The
+        // post-apply graph read above knows which members reach every landed slot, so fill the
+        // gap here; without it a collateral applied row renders an empty "Used by" while its
+        // reconcile siblings say "via …".
         let members_by_slot: HashMap<(&str, &str), &Vec<cooldown_core::MemberRef>> = deps
             .iter()
             .filter(|dep| !dep.members.is_empty())
@@ -3153,9 +3153,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 )
             })
             .collect();
+        // A planned direct row keeps the attribution it was planned with.
         for change in &mut report.applied {
             if change.members.is_empty()
-                && !change.direct
+                && (!change.direct || !planned.contains(change))
                 && let Some(members) =
                     members_by_slot.get(&(change.package.name.as_str(), change.to.as_str()))
             {

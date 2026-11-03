@@ -235,10 +235,13 @@ async fn two_hundred_independent_targets_use_at_most_three_resolves() -> eyre::R
         .tool
         .pin_individually(
             PinPass {
-                project: &fixture.project,
+                scope: PinScope {
+                    project: &fixture.project,
+                    plan: &fixture.changes,
+                    journal: &journal,
+                    observer: None,
+                },
                 batch: &worklist,
-                journal: &journal,
-                observer: None,
             },
             &worklist,
             &mut rejections,
@@ -454,8 +457,9 @@ async fn an_unseeded_dependency_move_is_kept_and_reported() -> eyre::Result<()> 
     let after = read_lock(&fixture.project)?;
     let mut report = fixture.report(&rejections)?;
     add_collateral_changes(
-        &CargoLock::parse(&original)?.locked_versions_by_source(),
-        &after.locked_versions_by_source(),
+        Some(&CargoLock::parse(&original)?),
+        &after,
+        &fixture.project.generated_members,
         &mut report,
     );
     assert_eq!(report.applied.len(), 9);
@@ -772,10 +776,20 @@ async fn an_existing_from_and_target_converge_through_one_precise_pin() -> eyre:
     Ok(())
 }
 
-/// A leftover pin can displace an earlier seed, so the original worklist needs another pass.
+/// Whether any recorded `cargo` invocation re-pinned `pkg000` from a displaced 1.2.0.
+fn repinned_displaced_seed(invocations: &[Vec<String>]) -> bool {
+    invocations.iter().any(|arguments| {
+        arguments
+            .iter()
+            .any(|argument| argument.ends_with("#pkg000@1.2.0"))
+    })
+}
+
+/// A leftover pin that would displace an earlier seed's reached target is refused and restored
+/// instead of being kept for a later pass to repair; the leftover lands once its pin no longer
+/// moves the seeded crate.
 #[tokio::test]
-async fn a_leftover_pin_revisits_a_previously_seeded_target_after_displacement() -> eyre::Result<()>
-{
+async fn a_leftover_pin_that_displaces_a_seeded_target_is_refused() -> eyre::Result<()> {
     let fixture = SeedFixture::new(2)?;
     std::fs::write(fixture.project.root.join("leave-name"), "pkg001")?;
     std::fs::write(fixture.project.root.join("displace-trigger"), "pkg001")?;
@@ -791,25 +805,28 @@ async fn a_leftover_pin_revisits_a_previously_seeded_target_after_displacement()
             &mut rejections,
         )
         .await?;
+
+    // The displaced lock was never kept, so nothing had to pin pkg000 back from 1.2.0.
     let invocations = fixture.invocations()?;
-    assert!(
-        invocations.iter().any(|arguments| arguments
-            .iter()
-            .any(|argument| argument.ends_with("#pkg000@1.2.0"))),
-        "{invocations:?}"
-    );
+    assert!(!repinned_displaced_seed(&invocations), "{invocations:?}");
+    // The refusal names the target the pin would have displaced.
+    let detail = rejections
+        .get(&("pkg001".to_owned(), "1.0.0".to_owned(), "1.1.0".to_owned()))
+        .ok_or_else(|| eyre::eyre!("the refused leftover records why: {rejections:?}"))?;
+    assert!(detail.contains("pkg000 off its target 1.1.0"), "{detail}");
+    // The script displaces only once, so the fixed point's next pass lands the leftover cleanly.
     let settled = read_lock(&fixture.project)?;
     assert!(settled.has_crates_io_package("pkg000", "1.1.0"));
     assert!(settled.has_crates_io_package("pkg001", "1.1.0"));
     assert!(!settled.has_crates_io_package("pkg000", "1.2.0"));
-    assert!(rejections.is_empty());
     assert_eq!(fixture.report(&rejections)?.applied.len(), 2);
     Ok(())
 }
 
-/// A later bisected group's leftover cannot leave an earlier accepted group off its target.
+/// A later bisected group's leftover cannot leave an earlier accepted group off its target: its
+/// displacing pin is refused, and the earlier seed keeps its landing.
 #[tokio::test]
-async fn a_bisected_right_group_revisits_an_earlier_seed_after_displacement() -> eyre::Result<()> {
+async fn a_bisected_right_group_cannot_displace_an_earlier_seed() -> eyre::Result<()> {
     let fixture = SeedFixture::new(8)?;
     std::fs::write(fixture.project.root.join("bad-name"), "pkg007")?;
     std::fs::write(fixture.project.root.join("leave-name"), "pkg006")?;
@@ -826,13 +843,10 @@ async fn a_bisected_right_group_revisits_an_earlier_seed_after_displacement() ->
             &mut rejections,
         )
         .await?;
+
     let invocations = fixture.invocations()?;
-    assert!(
-        invocations.iter().any(|arguments| arguments
-            .iter()
-            .any(|argument| argument.ends_with("#pkg000@1.2.0"))),
-        "{invocations:?}"
-    );
+    assert!(!repinned_displaced_seed(&invocations), "{invocations:?}");
+    // Every target but the resolver-refused pkg007 landed, the displaced pkg000 included.
     let settled = read_lock(&fixture.project)?;
     for planned in &fixture.changes {
         assert!(
@@ -847,7 +861,11 @@ async fn a_bisected_right_group_revisits_an_earlier_seed_after_displacement() ->
             "{planned:?}"
         );
     }
-    assert_eq!(rejections.len(), 1);
+    assert!(!settled.has_crates_io_package("pkg000", "1.2.0"));
+    assert!(
+        rejections.contains_key(&("pkg007".to_owned(), "1.0.0".to_owned(), "1.1.0".to_owned())),
+        "{rejections:?}"
+    );
     assert_eq!(fixture.report(&rejections)?.applied.len(), 7);
     Ok(())
 }
