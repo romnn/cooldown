@@ -1,4 +1,7 @@
-//! Yarn Classic member attribution through the workspace manifests' selectors.
+//! Yarn member attribution through the workspace manifests' declarations.
+//!
+//! [`YarnBindings`] holds what each workspace member's declarations bind, for Yarn Classic, read
+//! here, and for Yarn Berry, read by the Berry lock's own attribution.
 //!
 //! A Classic `yarn.lock` records no workspace member: it keys each resolved entry by every
 //! selector (`name@range`) that resolves to it.
@@ -28,8 +31,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// Yarn wrote, and the bound keeps a crafted one from exhausting the stack.
 const MAX_DEPTH: usize = 16;
 
-/// What a Yarn Classic lock binds each workspace member's declared dependencies to, through the
-/// selector Yarn requests for each.
+/// What a Yarn lock binds each workspace member's declared dependencies to.
+///
+/// A Yarn Berry lock is read through each member's descriptors, joined to the lock's own record of
+/// the member (see the Berry reader's attribution).
+/// A Yarn Classic lock is read through the selector Yarn requests for each declaration, as follows.
 ///
 /// A member's selector for a name is the one Yarn's manifest normalization keeps: the first
 /// declaration in `optionalDependencies`, `dependencies`, `devDependencies` order whose specifier
@@ -51,15 +57,17 @@ pub struct YarnBindings {
 }
 
 /// One dependency a member's manifest declares.
-struct YarnDependency {
-    /// The specifier of each install field declaring it, `None` for one that is no string.
-    install: Vec<Option<String>>,
-    binding: YarnBinding,
+pub(super) struct YarnDependency {
+    /// The constraint of each install field declaring it, `None` for one that is no string, as
+    /// the exact-pin check reads it: Classic's specifier, or Berry's specifier with a same-name
+    /// `npm:` reference unwrapped.
+    pub(super) install: Vec<Option<String>>,
+    pub(super) binding: YarnBinding,
 }
 
 /// What a member's declared dependency binds to.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum YarnBinding {
+pub(super) enum YarnBinding {
     /// A registry copy of the dependency itself, at this version, which an edit of the declaration
     /// moves.
     Registry(String),
@@ -71,14 +79,97 @@ enum YarnBinding {
     },
     /// The descriptor names another package, an npm alias, so no copy of the name is bound.
     Foreign,
-    /// The member declares the name only as a peer, which Yarn Classic never installs for it.
+    /// The descriptor binds a workspace or a package from a source of its own, which a Berry lock
+    /// records as no registry release, so no copy of the name is bound.
+    Local,
+    /// The member declares the name only as a peer, which Yarn never installs for it.
     PeerOnly,
     /// The lock identifies no copy for the member's selector: a descriptor it records ambiguously,
     /// malformed, or not at all, or a selector Yarn spells from a value that is no string.
+    ///
+    /// Only Yarn Classic binds this: the declaration owns nothing, and other copies of the name
+    /// keep their owners.
     Unresolved,
+    /// A Berry declaration whose binding cannot be proven, so no copy of the name may be credited
+    /// to any member ([`MemberIndex`]'s unattributed names).
+    Unproven(Unproven),
+}
+
+/// Why a Yarn Berry declaration's binding cannot be proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Unproven {
+    /// A specifier is no string, or the dependency's name is no package name.
+    Malformed,
+    /// The member's install fields declare the name with different specifiers.
+    ConflictingFields,
+    /// A `catalog:` reference, which Yarn resolves through the catalogs of its configuration.
+    Catalog,
+    /// A `patch:` reference, which binds a patched package rather than the release it wraps.
+    Patch,
+    /// The root `resolutions` field may rewrite the name's descriptor.
+    Resolutions,
+    /// The lock records the declaration without a protocol and Yarn's `defaultProtocol` is not
+    /// established as `npm:`, so the descriptor it resolved cannot be told.
+    DefaultProtocol,
+    /// The lock records another descriptor for the member's declaration, or none, or records one
+    /// the manifest no longer declares.
+    Stale,
+    /// No entry of the lock lists the member's descriptor.
+    Unjoined,
+    /// The lock records no workspace at the member's path.
+    NotLocked,
+    /// The lock records a workspace whose manifest the snapshot holds none of.
+    Unlisted,
+}
+
+impl Unproven {
+    /// Why the binding cannot be proven, as a diagnostic phrases it.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Unproven::Malformed => "its declaration is malformed",
+            Unproven::ConflictingFields => "its install fields declare different ranges",
+            Unproven::Catalog => "it is a `catalog:` reference",
+            Unproven::Patch => "it is a `patch:` reference",
+            Unproven::Resolutions => "the root `resolutions` field may rewrite it",
+            Unproven::DefaultProtocol => {
+                "the lock omits its protocol and Yarn's `defaultProtocol` is not established as `npm:`"
+            }
+            Unproven::Stale => "yarn.lock records another declaration of it",
+            Unproven::Unjoined => "yarn.lock resolves no entry for it",
+            Unproven::NotLocked => "yarn.lock records no workspace for the member",
+            Unproven::Unlisted => "the member's manifest could not be read",
+        }
+    }
+}
+
+/// The members whose declarations of one name cannot be proven, each with why
+/// ([`YarnBindings::unattributed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnattributedName {
+    /// The dependency name.
+    pub name: String,
+    /// Each unproven declaration, sorted by member.
+    pub declarations: Vec<UnprovenDeclaration>,
+}
+
+/// One member's unproven declaration of a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnprovenDeclaration {
+    /// The member's path (`.` for the root).
+    pub member: String,
+    /// Why its binding cannot be proven.
+    pub reason: Unproven,
 }
 
 impl YarnBindings {
+    /// The bindings of every member's declared dependencies, by member path and name.
+    pub(super) fn from_members(
+        members: BTreeMap<String, BTreeMap<String, YarnDependency>>,
+    ) -> Self {
+        YarnBindings { members }
+    }
+
     /// Reads the bindings of `content` through `workspace`, or `None` when the snapshot is not
     /// complete or the body is no Classic lock Yarn would read.
     pub(crate) fn read(content: &str, workspace: &WorkspaceManifests) -> Option<Self> {
@@ -119,9 +210,11 @@ impl YarnBindings {
     ///
     /// [`MemberResolution::Missing`] means the member's manifest declares no such dependency in
     /// any field.
-    /// Only a registry copy resolves; a member the workspace does not list, a peer-only
-    /// declaration, an alias, a copy fixed in place, and an unidentified one are
-    /// [`MemberResolution::Unknown`].
+    /// Only a registry copy resolves.
+    /// A Berry declaration whose binding cannot be proven is [`MemberResolution::Unproven`].
+    /// A member the workspace does not list, a peer-only declaration, an alias, a local or
+    /// workspace binding, a copy fixed in place, and a Classic selector the lock does not identify
+    /// are [`MemberResolution::Unknown`].
     #[must_use]
     pub fn resolution(&self, member: &str, name: &str) -> MemberResolution<'_> {
         let Some(dependencies) = self.members.get(member) else {
@@ -130,9 +223,11 @@ impl YarnBindings {
         match dependencies.get(name).map(|dependency| &dependency.binding) {
             None => MemberResolution::Missing,
             Some(YarnBinding::Registry(version)) => MemberResolution::Resolved(version),
+            Some(YarnBinding::Unproven(_)) => MemberResolution::Unproven,
             Some(
                 YarnBinding::Fixed { .. }
                 | YarnBinding::Foreign
+                | YarnBinding::Local
                 | YarnBinding::PeerOnly
                 | YarnBinding::Unresolved,
             ) => MemberResolution::Unknown,
@@ -145,8 +240,38 @@ impl YarnBindings {
     pub fn bound_version(&self, member: &str, name: &str) -> Option<&str> {
         match &self.members.get(member)?.get(name)?.binding {
             YarnBinding::Registry(version) | YarnBinding::Fixed { version, .. } => Some(version),
-            YarnBinding::Foreign | YarnBinding::PeerOnly | YarnBinding::Unresolved => None,
+            YarnBinding::Foreign
+            | YarnBinding::Local
+            | YarnBinding::PeerOnly
+            | YarnBinding::Unresolved
+            | YarnBinding::Unproven(_) => None,
         }
+    }
+
+    /// Every name some member declares with a binding that cannot be proven, sorted, each with
+    /// those members and why.
+    ///
+    /// Only a Berry lock yields any.
+    #[must_use]
+    pub fn unattributed(&self) -> Vec<UnattributedName> {
+        let mut names: BTreeMap<&str, Vec<UnprovenDeclaration>> = BTreeMap::new();
+        for (member, dependencies) in &self.members {
+            for (name, dependency) in dependencies {
+                if let YarnBinding::Unproven(reason) = dependency.binding {
+                    names.entry(name).or_default().push(UnprovenDeclaration {
+                        member: member.clone(),
+                        reason,
+                    });
+                }
+            }
+        }
+        names
+            .into_iter()
+            .map(|(name, declarations)| UnattributedName {
+                name: name.to_string(),
+                declarations,
+            })
+            .collect()
     }
 
     /// The [`MemberIndex`] of every member's declarations, the members at `excluded` paths left
@@ -157,20 +282,41 @@ impl YarnBindings {
     /// A copy fixed in place keeps its member as a direct owner that may not edit it
     /// ([`MemberIndex::fixed_owners`]), so it neither pins nor bounds the copy.
     /// A copy is exact-pinned when every install declaration of every registry owner is exact.
-    /// An alias, a peer-only declaration, and an unidentified copy own nothing, though the
-    /// declaration still enters the name inventory, so no other copy of the name is credited to it.
+    /// An alias, a local or workspace binding, a peer-only declaration, and an unidentified copy
+    /// own nothing, though the declaration still enters the name inventory, so no other copy of
+    /// the name is credited to it.
+    ///
+    /// A name any included member declares with an unproven binding is unattributed: no copy of it
+    /// is credited to any member, its proven owners included, since the unproven declaration may
+    /// bind any of them.
     pub(crate) fn member_index(&self, excluded: &HashSet<String>) -> MemberIndex {
+        let included = || {
+            self.members
+                .iter()
+                .filter(|(path, _)| !excluded.contains(*path))
+        };
+        let mut unattributed: HashMap<String, Vec<String>> = HashMap::new();
+        for (path, dependencies) in included() {
+            for (name, dependency) in dependencies {
+                if matches!(dependency.binding, YarnBinding::Unproven(_)) {
+                    unattributed
+                        .entry(name.clone())
+                        .or_default()
+                        .push(path.clone());
+                }
+            }
+        }
         let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
         let mut declared_copies: HashMap<(String, String), Vec<String>> = HashMap::new();
         let mut fixed_copies: HashMap<(String, String), Vec<FixedOwner>> = HashMap::new();
         let mut declared: HashMap<(String, String), usize> = HashMap::new();
         let mut exact: HashMap<(String, String), usize> = HashMap::new();
-        for (path, dependencies) in &self.members {
-            if excluded.contains(path) {
-                continue;
-            }
+        for (path, dependencies) in included() {
             for (name, YarnDependency { install, binding }) in dependencies {
                 by_name.entry(name.clone()).or_default().push(path.clone());
+                if unattributed.contains_key(name) {
+                    continue;
+                }
                 let version = match binding {
                     YarnBinding::Registry(version) => version,
                     YarnBinding::Fixed { version, reason } => {
@@ -185,7 +331,11 @@ impl YarnBindings {
                         });
                         continue;
                     }
-                    YarnBinding::Foreign | YarnBinding::PeerOnly | YarnBinding::Unresolved => {
+                    YarnBinding::Foreign
+                    | YarnBinding::Local
+                    | YarnBinding::PeerOnly
+                    | YarnBinding::Unresolved
+                    | YarnBinding::Unproven(_) => {
                         continue;
                     }
                 };
@@ -211,6 +361,7 @@ impl YarnBindings {
             declared_copies,
             fixed_copies,
             exact_version,
+            unattributed,
             authoritative: true,
             ..MemberIndex::default()
         }

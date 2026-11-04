@@ -18,13 +18,16 @@
 //!
 //! [project]: https://github.com/yarnpkg/berry/blob/%40yarnpkg/cli/4.18.1/packages/yarnpkg-core/sources/Project.ts
 
+mod attribution;
+
 use super::yaml::{YamlEntries, parse_lock_yaml};
 use super::{
-    AliasOnlyVersions, LockOrigin, NameVersion, NodeLock, RegistryRelease, is_yarn_berry_lock,
+    AliasOnlyVersions, LockOrigin, MemberAttribution, MemberIndex, NameVersion, NodeLock,
+    RegistryRelease, WorkspaceDialect, WorkspaceManifests, is_yarn_berry_lock,
 };
 use cooldown_core::{CoreError, Result, ToolId};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// The lockfile Berry shares with Yarn Classic.
 const LOCKFILE: &str = "yarn.lock";
@@ -45,8 +48,9 @@ const LAST_PROTOCOL_LESS_SCHEMA: u64 = 6;
 
 /// The Yarn Berry (v2+) package manager: the YAML `yarn.lock` backed by the npm registry.
 ///
-/// It reads the registry releases the lock resolves; member attribution, lock verification,
-/// native `sync`, and mutation are not supported yet, so the `yarn` adapter
+/// It reads the registry releases the lock resolves, and attributes each to the workspace members
+/// whose own manifest declarations the lock binds to it ([`attribution`]).
+/// Lock verification, native `sync`, and mutation are not supported yet, so the `yarn` adapter
 /// ([`YarnTool`](crate::YarnTool)) runs no resolver for a Berry project.
 /// Berry binds peers through virtual packages its lock does not record, so the peer gate stays out
 /// of its locks ([`NodeLock::PEER_CONTEXTS_MODELED`]).
@@ -57,6 +61,7 @@ impl NodeLock for YarnBerry {
     const LOCKFILE: &'static str = LOCKFILE;
     const BIN: &'static str = "yarn";
     const PEER_CONTEXTS_MODELED: bool = false;
+    const WORKSPACE_MANIFESTS: Option<WorkspaceDialect> = Some(WorkspaceDialect::Berry);
 
     fn parse(content: &str) -> Result<Vec<NameVersion>> {
         Ok(BerryLock::read(content)?.registry_releases())
@@ -66,6 +71,36 @@ impl NodeLock for YarnBerry {
         BerryLock::read(content)
             .map(|lock| lock.workspace_paths().map(str::to_string).collect())
             .unwrap_or_default()
+    }
+
+    fn member_sources_in(
+        content: &str,
+        workspace: Option<&WorkspaceManifests>,
+        excluded: &HashSet<String>,
+    ) -> MemberIndex {
+        let Ok(lock) = BerryLock::read(content) else {
+            return MemberIndex::default();
+        };
+        match workspace.and_then(|workspace| attribution::bindings(&lock, workspace)) {
+            Some(bindings) => bindings.member_index(excluded),
+            None => attribution::declared_names_index(&lock, excluded),
+        }
+    }
+
+    fn member_attribution_in(
+        content: &str,
+        workspace: Option<&WorkspaceManifests>,
+    ) -> MemberAttribution {
+        BerryLock::read(content)
+            .ok()
+            .zip(workspace)
+            .and_then(|(lock, workspace)| attribution::bindings(&lock, workspace))
+            .map_or(MemberAttribution::Unknown, MemberAttribution::Selectors)
+    }
+
+    fn install_pin<'a>(dependency: &str, specifier: &'a str) -> Option<&'a str> {
+        attribution::same_name_constraint(dependency, specifier)
+            .filter(|constraint| crate::version::exact_pin_version(constraint).is_some())
     }
 
     fn alias_only_versions(content: &str) -> AliasOnlyVersions {
@@ -90,6 +125,11 @@ impl NodeLock for YarnBerry {
 pub(crate) struct BerryLock {
     /// Each package entry once, in document order.
     packages: Vec<BerryPackage>,
+    /// The `__metadata.version` schema.
+    schema: u64,
+    /// Every descriptor the entries' keys list, by the position of the entry it resolves to in
+    /// [`Self::packages`].
+    index: HashMap<Descriptor, usize>,
 }
 
 /// One package entry: the locator it resolves to, what that locator is, and the descriptors bound
@@ -102,6 +142,12 @@ struct BerryPackage {
     locator: Locator,
     /// What the locator's reference says about where the package comes from.
     source: BerrySource,
+    /// The entry's `dependencies`, each range as the lock records it, `None` for a name listed
+    /// twice with different ranges.
+    ///
+    /// A workspace's entry records the descriptors Yarn derived from its manifest, before any
+    /// `resolutions` or plugin rewrote them.
+    dependencies: BTreeMap<String, Option<String>>,
 }
 
 /// Where a locator's package comes from, as its reference says.
@@ -140,23 +186,28 @@ impl BerryLock {
         let schema = schema_of(&entries)?;
         let mut packages: Vec<BerryPackage> = Vec::new();
         let mut recorded: HashMap<Locator, RecordedEntry<'_>> = HashMap::new();
-        let mut bindings: HashMap<Descriptor, Locator> = HashMap::new();
+        let mut index: HashMap<Descriptor, usize> = HashMap::new();
         for (key, entry) in entries.entries() {
             if key == METADATA_KEY {
                 continue;
             }
             let package = decode_package(key, entry, schema)?;
+            let position = match recorded.get(&package.locator) {
+                Some(RecordedEntry { index, .. }) => *index,
+                None => packages.len(),
+            };
             for descriptor in &package.descriptors {
-                match bindings.get(descriptor) {
-                    Some(bound) if *bound != package.locator => {
+                match index.get(descriptor).and_then(|bound| packages.get(*bound)) {
+                    Some(bound) if bound.locator != package.locator => {
                         return Err(unreadable(&format!(
                             "{descriptor} resolves to both {bound} and {locator}",
+                            bound = bound.locator,
                             locator = package.locator
                         )));
                     }
                     Some(_) => {}
                     None => {
-                        bindings.insert(descriptor.clone(), package.locator.clone());
+                        index.insert(descriptor.clone(), position);
                     }
                 }
             }
@@ -180,14 +231,18 @@ impl BerryLock {
                 recorded.insert(
                     package.locator.clone(),
                     RecordedEntry {
-                        index: packages.len(),
+                        index: position,
                         fields: entry,
                     },
                 );
                 packages.push(package);
             }
         }
-        Ok(BerryLock { packages })
+        Ok(BerryLock {
+            packages,
+            schema,
+            index,
+        })
     }
 
     /// Every registry release the lock resolves, named by the package the locator resolved, an
@@ -209,37 +264,82 @@ impl BerryLock {
     }
 
     /// The registry releases that only npm aliases resolve to: no descriptor of the release's own
-    /// package binds them.
+    /// package binds any locator of them.
+    ///
+    /// One release can have several locators, told apart by a binding such as `__archiveUrl`, so
+    /// a release one of them binds through its own name is no alias-only release, whatever the
+    /// others bind.
     pub(crate) fn alias_only_versions(&self) -> AliasOnlyVersions {
-        let releases = self
-            .packages
-            .iter()
-            .filter_map(|package| {
-                let BerrySource::Registry { version } = &package.source else {
-                    return None;
-                };
-                let aliased_only = package
-                    .descriptors
-                    .iter()
-                    .all(|descriptor| descriptor.ident != package.locator.ident);
-                aliased_only.then(|| RegistryRelease {
-                    name: package.locator.ident.full_name(),
-                    version: version.clone(),
-                })
-            })
+        let mut own_name_bound: HashMap<RegistryRelease, bool> = HashMap::new();
+        for package in &self.packages {
+            let BerrySource::Registry { version } = &package.source else {
+                continue;
+            };
+            let release = RegistryRelease {
+                name: package.locator.ident.full_name(),
+                version: version.clone(),
+            };
+            let bound = package
+                .descriptors
+                .iter()
+                .any(|descriptor| descriptor.ident == package.locator.ident);
+            *own_name_bound.entry(release).or_default() |= bound;
+        }
+        let releases = own_name_bound
+            .into_iter()
+            .filter_map(|(release, bound)| (!bound).then_some(release))
             .collect();
         AliasOnlyVersions { releases }
     }
 
     /// The path of every workspace the lock records, the root as `.`.
     pub(crate) fn workspace_paths(&self) -> impl Iterator<Item = &str> {
+        self.workspaces().map(|WorkspaceEntry { path, .. }| path)
+    }
+
+    /// Every workspace the lock records, with the dependencies its entry records.
+    fn workspaces(&self) -> impl Iterator<Item = WorkspaceEntry<'_>> {
         self.packages
             .iter()
             .filter_map(|package| match &package.source {
-                BerrySource::Workspace { path } => Some(path.as_str()),
+                BerrySource::Workspace { path } => Some(WorkspaceEntry {
+                    path,
+                    ident: &package.locator.ident,
+                    dependencies: &package.dependencies,
+                }),
                 BerrySource::Registry { .. } | BerrySource::Unregistered => None,
             })
     }
+
+    /// The entry `descriptor` resolves to, when a key of the lock lists it.
+    fn package_for(&self, descriptor: &Descriptor) -> Option<&BerryPackage> {
+        self.index
+            .get(descriptor)
+            .and_then(|position| self.packages.get(*position))
+    }
+}
+
+/// One workspace the lock records.
+struct WorkspaceEntry<'a> {
+    /// The project-relative, `/`-separated path, `.` for the root.
+    path: &'a str,
+    /// The workspace's package identity, a hashed one for a workspace whose manifest names none.
+    ident: &'a Ident,
+    /// The dependencies its entry records ([`BerryPackage::dependencies`]).
+    dependencies: &'a BTreeMap<String, Option<String>>,
+}
+
+/// The path of every workspace a Berry lock body records, the root as `.`.
+///
+/// # Errors
+///
+/// Returns [`CoreError::LockUnreadable`] for a body the Berry reader refuses
+/// ([`BerryLock::read`]).
+pub(crate) fn berry_workspace_paths(content: &str) -> Result<Vec<String>> {
+    Ok(BerryLock::read(content)?
+        .workspace_paths()
+        .map(str::to_string)
+        .collect())
 }
 
 /// Where [`BerryLock::read`] keeps the first entry for a locator, so a second entry for it is
@@ -300,12 +400,21 @@ fn decode_package(key: &str, entry: &RawEntry, schema: u64) -> Result<BerryPacka
     {
         return Err(malformed(&format!("records the checksum `{checksum}`")));
     }
+    let mut dependencies: BTreeMap<String, Option<String>> = BTreeMap::new();
     for (name, range) in entry.dependencies.iter().flat_map(YamlEntries::entries) {
         if Ident::parse(name).is_none() || range.is_empty() {
             return Err(malformed(&format!(
                 "records the dependency `{name}: {range}`"
             )));
         }
+        dependencies
+            .entry(name.to_string())
+            .and_modify(|recorded| {
+                if recorded.as_deref() != Some(range.as_str()) {
+                    *recorded = None;
+                }
+            })
+            .or_insert_with(|| Some(range.clone()));
     }
     let descriptors = combined_key_descriptors(key)
         .map(|spelled| {
@@ -350,6 +459,7 @@ fn decode_package(key: &str, entry: &RawEntry, schema: u64) -> Result<BerryPacka
         descriptors,
         locator,
         source,
+        dependencies,
     })
 }
 
@@ -505,11 +615,7 @@ impl Descriptor {
     /// inserting the protocol after it; cooldown reproduces it, so a lookup answers what Yarn's
     /// own descriptor index answers.
     fn with_protocol_restored(self) -> Self {
-        let range = if is_semver_range(&self.range) || is_tag(&self.range) {
-            format!("npm:{range}", range = self.range)
-        } else {
-            self.range
-        };
+        let range = with_default_protocol(&self.range);
         let range = match legacy_patch_inner(&range) {
             Some(inner) => format!("npm%3A{inner}"),
             None => range,
@@ -526,6 +632,29 @@ impl std::fmt::Display for Descriptor {
         write!(f, "{}@{}", self.ident.full_name(), self.range)
     }
 }
+
+/// Whether Yarn's `normalizeDependency` prefixes `range` with the default protocol: a semver range
+/// or a dist-tag.
+fn takes_default_protocol(range: &str) -> bool {
+    is_semver_range(range) || is_tag(range)
+}
+
+/// `range` as Yarn's `normalizeDependency` spells it under the default `npm:` protocol: a semver
+/// range or a dist-tag gains the protocol, and any other range is kept.
+///
+/// See [Configuration.ts][configuration] (`normalizeDependency`).
+///
+/// [configuration]: https://github.com/yarnpkg/berry/blob/%40yarnpkg/cli/4.18.1/packages/yarnpkg-core/sources/Configuration.ts
+fn with_default_protocol(range: &str) -> String {
+    if takes_default_protocol(range) {
+        format!("{NPM_PROTOCOL}{range}")
+    } else {
+        range.to_string()
+    }
+}
+
+/// The protocol of an npm registry reference, Yarn's default protocol.
+const NPM_PROTOCOL: &str = "npm:";
 
 /// The text after `patch:<name>@` in a builtin-patch range whose inner range lacks the `npm:`
 /// protocol (spelled `npm:` or `npm%3A`), or `None` for any other range.

@@ -40,7 +40,7 @@ fn root_with(workspaces: &str) -> String {
 
 /// The sorted member paths of the snapshot read under `root`, or its unavailability reason.
 fn discovered(root: &Utf8Path) -> Result<Vec<String>, String> {
-    let manifests = WorkspaceManifests::read(root);
+    let manifests = WorkspaceManifests::read(root, WorkspaceDialect::Classic);
     if let Some(reason) = manifests.unavailable_reason() {
         return Err(reason.to_string());
     }
@@ -157,7 +157,7 @@ fn only_named_and_versioned_matches_are_members() -> eyre::Result<()> {
         Ok(vec![".".to_string(), "packages/named".to_string()])
     );
     // The skipped matches are still captured, so a baseline can tell them apart from members.
-    let mut rels: Vec<String> = BaselineDiscovery::run(&root)
+    let mut rels: Vec<String> = BaselineDiscovery::run(&root, WorkspaceDialect::Classic)
         .manifests
         .iter()
         .map(|rel| display_rel(rel))
@@ -345,7 +345,7 @@ fn the_snapshot_keeps_each_members_raw_declarations() -> eyre::Result<()> {
         ),
         ("packages/a/package.json", &member("pkg-a")),
     ])?;
-    let manifests = WorkspaceManifests::read(&root);
+    let manifests = WorkspaceManifests::read(&root, WorkspaceDialect::Classic);
 
     let (_, root_manifest) = manifests
         .members()
@@ -383,7 +383,7 @@ fn resolutions_taint_the_package_each_key_targets() -> eyre::Result<()> {
             "package.json",
             &format!(r#"{{ "name": "root", "resolutions": {resolutions} }}"#),
         )])?;
-        Ok(WorkspaceManifests::read(&root).resolution_may_rewrite(name))
+        Ok(WorkspaceManifests::read(&root, WorkspaceDialect::Classic).resolution_may_rewrite(name))
     };
 
     // Bare, nested, and scoped keys
@@ -413,7 +413,7 @@ fn resolutions_taint_the_package_each_key_targets() -> eyre::Result<()> {
 /// The baseline `paths` of `root` with the workspace discovery recorded beside them, as the
 /// adapter captures a mutation baseline.
 fn captured_baseline(root: &Utf8Path, paths: &[&str]) -> eyre::Result<MutationBaseline> {
-    let discovery = BaselineDiscovery::run(root);
+    let discovery = BaselineDiscovery::run(root, WorkspaceDialect::Classic);
     let mut rels: Vec<Utf8PathBuf> = paths.iter().map(Utf8PathBuf::from).collect();
     rels.extend(discovery.manifests.iter().cloned());
     let mut baseline = MutationBaseline::read(root, rels)?;
@@ -463,7 +463,10 @@ fn the_baseline_snapshot_ignores_later_project_changes() -> eyre::Result<()> {
         "packages/b 4.1.2".to_string(),
     ]);
     assert_eq!(
-        chalk_by_member(&WorkspaceManifests::from_baseline(&baseline)),
+        chalk_by_member(&WorkspaceManifests::from_baseline(
+            &baseline,
+            WorkspaceDialect::Classic
+        )),
         captured
     );
 
@@ -482,7 +485,10 @@ fn the_baseline_snapshot_ignores_later_project_changes() -> eyre::Result<()> {
     std::fs::write(root.join("package.json"), r#"{ "name": "root" }"#)?;
 
     assert_eq!(
-        chalk_by_member(&WorkspaceManifests::from_baseline(&baseline)),
+        chalk_by_member(&WorkspaceManifests::from_baseline(
+            &baseline,
+            WorkspaceDialect::Classic
+        )),
         captured
     );
     Ok(())
@@ -498,12 +504,14 @@ fn an_incomplete_baseline_capture_is_unavailable() -> eyre::Result<()> {
     ])?;
     // Without the record
     let unrecorded = MutationBaseline::read(&root, ["package.json", "packages/a/package.json"])?;
-    assert!(!WorkspaceManifests::from_baseline(&unrecorded).is_complete());
+    assert!(
+        !WorkspaceManifests::from_baseline(&unrecorded, WorkspaceDialect::Classic).is_complete()
+    );
 
     // With the record but without the member's manifest
     let mut partial = MutationBaseline::read(&root, ["package.json"])?;
-    BaselineDiscovery::run(&root).record(&mut partial);
-    assert!(!WorkspaceManifests::from_baseline(&partial).is_complete());
+    BaselineDiscovery::run(&root, WorkspaceDialect::Classic).record(&mut partial);
+    assert!(!WorkspaceManifests::from_baseline(&partial, WorkspaceDialect::Classic).is_complete());
 
     // With discovery unavailable at capture
     std::fs::write(
@@ -511,7 +519,9 @@ fn an_incomplete_baseline_capture_is_unavailable() -> eyre::Result<()> {
         root_with(r#"["packages/{a,b}"]"#),
     )?;
     let unavailable = captured_baseline(&root, &["package.json"])?;
-    assert!(!WorkspaceManifests::from_baseline(&unavailable).is_complete());
+    assert!(
+        !WorkspaceManifests::from_baseline(&unavailable, WorkspaceDialect::Classic).is_complete()
+    );
     Ok(())
 }
 
@@ -523,7 +533,7 @@ fn a_root_changed_during_capture_records_discovery_unavailable() -> eyre::Result
         ("package.json", &root_with(r#"["packages/*"]"#)),
         ("packages/a/package.json", &member("pkg-a")),
     ])?;
-    let discovery = BaselineDiscovery::run(&root);
+    let discovery = BaselineDiscovery::run(&root, WorkspaceDialect::Classic);
     std::fs::write(root.join("package.json"), root_with(r#"["apps/*"]"#))?;
     let mut rels = vec![Utf8PathBuf::from("package.json")];
     rels.extend(discovery.manifests.iter().cloned());
@@ -531,7 +541,8 @@ fn a_root_changed_during_capture_records_discovery_unavailable() -> eyre::Result
     discovery.record(&mut baseline);
 
     assert_eq!(
-        WorkspaceManifests::from_baseline(&baseline).unavailable_reason(),
+        WorkspaceManifests::from_baseline(&baseline, WorkspaceDialect::Classic)
+            .unavailable_reason(),
         Some("package.json changed while the mutation baseline was captured")
     );
     Ok(())
@@ -545,7 +556,7 @@ fn replacements_rewrite_only_their_own_declaration() -> eyre::Result<()> {
         "package.json",
         r#"{ "dependencies": { "chalk": "^4.1.0" }, "devDependencies": { "chalk": "4.1.0" } }"#,
     )])?;
-    let manifests = WorkspaceManifests::read(&root);
+    let manifests = WorkspaceManifests::read(&root, WorkspaceDialect::Classic);
     let key = |member: &str, field: &'static str, dependency: &str| DeclarationKey {
         member: member.to_string(),
         field,

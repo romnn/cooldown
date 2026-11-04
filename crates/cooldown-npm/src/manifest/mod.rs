@@ -200,7 +200,8 @@ pub fn manifest_of_member(member: &str) -> String {
 pub struct ExactDeclaration {
     /// Where the pin is declared.
     pub key: DeclarationKey,
-    /// The pinned version as written (`1.2.3`, `=1.2.3`).
+    /// The pinned version as written (`1.2.3`, `=1.2.3`), or as the manager reads it from a
+    /// protocol reference (Yarn Berry's `npm:1.2.3` pins `1.2.3`).
     pub pin: String,
 }
 
@@ -211,10 +212,20 @@ pub struct ExactDeclaration {
 /// in a second install field beside a caret is visible only here.
 /// Peer contracts are not install pins and stay with the peer checks.
 ///
+/// `pin_of` reads each declaration as its manager does ([`NodeLock::install_pin`]): given the
+/// dependency's name and its specifier, it returns the exact version the declaration pins, or
+/// `None` for one that pins none.
+///
+/// [`NodeLock::install_pin`]: crate::lock::NodeLock::install_pin
+///
 /// # Errors
 ///
 /// Returns [`CoreError::Parse`] when `content` is not a JSON manifest.
-pub fn exact_install_declarations(member: &str, content: &str) -> Result<Vec<ExactDeclaration>> {
+pub(crate) fn exact_install_declarations(
+    member: &str,
+    content: &str,
+    pin_of: impl for<'a> Fn(&str, &'a str) -> Option<&'a str>,
+) -> Result<Vec<ExactDeclaration>> {
     let doc: Value = serde_json::from_str(content)
         .map_err(|err| CoreError::Parse(format!("{}: {err}", manifest_of_member(member))))?;
     let mut declarations = Vec::new();
@@ -226,14 +237,14 @@ pub fn exact_install_declarations(member: &str, content: &str) -> Result<Vec<Exa
             let Some(specifier) = specifier.as_str() else {
                 continue;
             };
-            if crate::version::exact_pin_version(specifier).is_some() {
+            if let Some(pin) = pin_of(dependency, specifier) {
                 declarations.push(ExactDeclaration {
                     key: DeclarationKey {
                         member: member.to_string(),
                         field,
                         dependency: dependency.clone(),
                     },
-                    pin: specifier.to_string(),
+                    pin: pin.to_string(),
                 });
             }
         }
@@ -1337,10 +1348,14 @@ mod tests {
                 None,
                 "{spelling}: a pin at the target excludes nothing"
             );
-            let declared: Vec<(&str, String, String)> = exact_install_declarations(".", &content)?
-                .into_iter()
-                .map(|ExactDeclaration { key, pin }| (key.field, key.dependency, pin))
-                .collect();
+            let declared: Vec<(&str, String, String)> = exact_install_declarations(
+                ".",
+                &content,
+                <crate::lock::Npm as crate::lock::NodeLock>::install_pin,
+            )?
+            .into_iter()
+            .map(|ExactDeclaration { key, pin }| (key.field, key.dependency, pin))
+            .collect();
             assert_eq!(
                 declared,
                 [

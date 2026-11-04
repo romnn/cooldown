@@ -1,10 +1,15 @@
 //! End-to-end tests that drive the REAL Yarn Berry (the `yarn = "4.18.1"` pin in `mise.toml`)
 //! against fixtures generated on the fly in temp dirs.
 //!
-//! cooldown reads a Berry `yarn.lock` for its registry releases but does not mutate a Berry
-//! project yet, so these tests check three invariants against Yarn itself:
+//! cooldown reads a Berry `yarn.lock` for its registry releases and attributes each to the
+//! workspace members whose own declarations bind it, but does not mutate a Berry project yet, so
+//! these tests check these invariants against Yarn itself:
 //!
 //! - the rows cooldown reads are exactly the npm releases Yarn's own `yarn info` reports;
+//! - each row's members are exactly the workspaces `yarn why` binds it for through a declaration
+//!   of its own name, and a declaration a rewrite or a plugin may have moved leaves its name
+//!   direct but owned by no member;
+//! - excluding a member drops exactly the rows only it owns;
 //! - `upgrade` refuses a Berry project without touching any of its files;
 //! - a Berry `yarn` never runs on a Classic lock, which it would silently migrate.
 //!
@@ -23,7 +28,7 @@ mod support;
 
 use color_eyre::eyre;
 use indoc::indoc;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use support::Fixture;
 
 /// The Yarn release the fixtures declare and require.
@@ -226,11 +231,11 @@ fn berry_inventory_matches_yarns_own_registry_releases() -> eyre::Result<()> {
 
     assert_eq!(outdated.code, Some(0), "{:#}", outdated.envelope);
     assert_eq!(item_releases(&outdated.envelope), yarns);
-    // The workspace's members are not attributed, which the run says.
+    // The lock proves every member's binding, so the run warns of no lost attribution.
     assert!(
         messages(&outdated.envelope, "warnings")
             .iter()
-            .any(|message| message.contains("workspace members cooldown does not attribute yet")),
+            .all(|message| !message.contains("cannot prove") && !message.contains("attributes no")),
         "{:#}",
         outdated.envelope
     );
@@ -347,5 +352,515 @@ fn a_berry_yarn_never_migrates_a_classic_lock() -> eyre::Result<()> {
         );
         assert_eq!(fixture.read_bytes("yarn.lock"), classic.as_bytes());
     }
+    Ok(())
+}
+
+/// A Berry workspace whose members bind every kind of declaration a Berry lock records per
+/// workspace: three `chalk` lines (the root's exact pin shared with `packages/a`'s caret,
+/// `packages/old`'s own pin, and `packages/b`'s major), `debug`'s newer `ms` copies beside
+/// `packages/b`'s pin, an optional dependency, a same-name alias, an alias of another package, a
+/// `file:` package, a `workspace:` range, a range a workspace satisfies beside the registry's
+/// release of that name, Yarn's builtin `typescript` patch, an unnamed nested workspace, and the
+/// root's `semver` declared at two ranges.
+fn berry_members() -> Fixture {
+    let fixture = Fixture::new().tag_independent();
+    fixture
+        .write(
+            "package.json",
+            &indoc::formatdoc! {r#"
+                {{
+                  "name": "berry-members",
+                  "private": true,
+                  "packageManager": "yarn@{YARN}",
+                  "workspaces": ["packages/*"],
+                  "dependencies": {{ "chalk": "4.1.2", "semver": "^7.5.0" }},
+                  "devDependencies": {{ "semver": "7.5.4", "typescript": "^5.4.0" }}
+                }}
+            "#},
+        )
+        .write(
+            "packages/a/package.json",
+            indoc! {r#"
+                {
+                  "name": "a",
+                  "version": "1.0.0",
+                  "dependencies": {
+                    "chalk": "^4.1.0",
+                    "debug": "^4.3.0",
+                    "has-flag": "npm:has-flag@^4.0.0",
+                    "is-odd": "^1.0.0",
+                    "loc": "file:../../vendor/loc",
+                    "my-alias": "npm:ms@^2.1.0"
+                  },
+                  "optionalDependencies": { "is-number": "^7.0.0" },
+                  "peerDependencies": { "react": "^18.0.0" }
+                }
+            "#},
+        )
+        .write(
+            "packages/b/package.json",
+            indoc! {r#"
+                {
+                  "name": "b",
+                  "version": "1.2.0",
+                  "workspaces": ["nested/*"],
+                  "dependencies": {
+                    "a": "workspace:^",
+                    "chalk": "^5.3.0",
+                    "is-odd": "^3.0.1",
+                    "ms": "2.0.0"
+                  },
+                  "devDependencies": { "debug": "4.3.4" }
+                }
+            "#},
+        )
+        .write(
+            "packages/b/nested/c/package.json",
+            r#"{ "dependencies": { "is-number": "^6.0.0" } }"#,
+        )
+        .write(
+            "packages/is-odd/package.json",
+            r#"{ "name": "is-odd", "version": "1.0.0" }"#,
+        )
+        .write(
+            "packages/old/package.json",
+            r#"{ "name": "old", "version": "1.0.0", "dependencies": { "chalk": "4.1.0" } }"#,
+        )
+        .write(
+            "vendor/loc/package.json",
+            r#"{ "name": "loc", "version": "1.0.0" }"#,
+        )
+        .write(".yarnrc.yml", "enableTelemetry: false\n");
+    fixture
+}
+
+/// One reported row: its release, whether it is direct, and the paths of its members.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Row {
+    name: String,
+    current: String,
+    direct: bool,
+    members: BTreeSet<String>,
+}
+
+/// Every reported row; an item without `members` belongs to no member.
+fn rows(envelope: &serde_json::Value) -> eyre::Result<Vec<Row>> {
+    let items = envelope
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| eyre::eyre!("the envelope lists no items: {envelope:#}"))?;
+    items
+        .iter()
+        .map(|item| {
+            let row = || -> Option<Row> {
+                Some(Row {
+                    name: item.get("name")?.as_str()?.to_string(),
+                    current: item.get("current")?.as_str()?.to_string(),
+                    direct: item.get("direct")?.as_bool()?,
+                    members: item
+                        .get("members")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|member| Some(member.get("path")?.as_str()?.to_string()))
+                        .collect(),
+                })
+            };
+            row().ok_or_else(|| {
+                eyre::eyre!("an item lacks its name, release or directness: {item:#}")
+            })
+        })
+        .collect()
+}
+
+/// Every reported row by its `name@current`, which names one row only.
+fn rows_by_release(rows: Vec<Row>) -> eyre::Result<BTreeMap<String, Row>> {
+    let mut by_release = BTreeMap::new();
+    for row in rows {
+        let release = format!("{}@{}", row.name, row.current);
+        if let Some(earlier) = by_release.insert(release, row) {
+            eyre::bail!("two rows report {}@{}", earlier.name, earlier.current);
+        }
+    }
+    Ok(by_release)
+}
+
+/// The row of `release`, as `name@current`.
+fn row<'a>(rows: &'a BTreeMap<String, Row>, release: &str) -> eyre::Result<&'a Row> {
+    rows.get(release)
+        .ok_or_else(|| eyre::eyre!("no row reports {release}: {rows:?}"))
+}
+
+/// The `heldBy` of the row `name@current`, if any.
+fn held_by(envelope: &serde_json::Value, name: &str, current: &str) -> Option<String> {
+    envelope
+        .get("items")?
+        .as_array()?
+        .iter()
+        .find(|item| {
+            item.get("name").and_then(serde_json::Value::as_str) == Some(name)
+                && item.get("current").and_then(serde_json::Value::as_str) == Some(current)
+        })?
+        .get("heldBy")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// A locator or descriptor split after its package name: the name and what follows its `@`.
+fn split_after_name(text: &str) -> Option<(&str, &str)> {
+    // A scope's leading `@` belongs to the name.
+    let name_end = text.get(1..)?.find('@')? + 1;
+    let (name, rest) = text.split_at(name_end);
+    Some((name, rest.get(1..)?))
+}
+
+/// The registry version of `name` a locator Yarn reports resolves, through Yarn's builtin patch
+/// and a peer-dependency virtual instance too, or `None` for a locator of any other package or
+/// source.
+fn locator_version(name: &str, locator: &str) -> Option<String> {
+    let (locator_name, reference) = split_after_name(locator)?;
+    if locator_name != name {
+        return None;
+    }
+    // `virtual:<hash>#<reference>` is one peer context of the release `<reference>` locates.
+    let reference = match reference.strip_prefix("virtual:") {
+        Some(virtual_reference) => virtual_reference.split_once('#')?.1,
+        None => reference,
+    };
+    if let Some(version) = reference.strip_prefix("npm:") {
+        return Some(version.to_string());
+    }
+    // `patch:<name>@npm%3A<version>#<patch>::<parameters>`
+    let source = reference.strip_prefix("patch:")?.split('#').next()?;
+    let source = source.replace("%3A", ":");
+    let (inner, version) = split_after_name(&source)?;
+    (inner == name)
+        .then(|| version.strip_prefix("npm:").map(str::to_string))
+        .flatten()
+}
+
+/// For each version of `name`, the path of every workspace Yarn's own `yarn why` binds it for
+/// through a declaration of `name` itself, a builtin patch's inner release included.
+///
+/// A virtual instance of a workspace is the workspace seen from a dependent and is left out, and
+/// so is a dependency an alias of another name binds.
+fn yarns_owners(fixture: &Fixture, name: &str) -> eyre::Result<BTreeMap<String, BTreeSet<String>>> {
+    let output = fixture
+        .run_tool_traced(
+            "ask Yarn why the package is installed",
+            "yarn",
+            &["why", name, "--json"],
+            &[],
+        )?
+        .require_success()?;
+    let mut owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for line in output.stdout_str().lines() {
+        let entry: serde_json::Value = serde_json::from_str(line)?;
+        let Some(dependent) = entry.get("value").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some((_, reference)) = split_after_name(dependent) else {
+            continue;
+        };
+        let Some(path) = reference.strip_prefix("workspace:") else {
+            continue;
+        };
+        let children = entry
+            .get("children")
+            .and_then(serde_json::Value::as_object)
+            .into_iter()
+            .flatten();
+        for (_, child) in children {
+            let field = |key: &str| child.get(key).and_then(serde_json::Value::as_str);
+            let (Some(descriptor), Some(locator)) = (field("descriptor"), field("locator")) else {
+                continue;
+            };
+            if split_after_name(descriptor).map(|(declared, _)| declared) != Some(name) {
+                continue;
+            }
+            if let Some(version) = locator_version(name, locator) {
+                owners.entry(version).or_default().insert(path.to_string());
+            }
+        }
+    }
+    Ok(owners)
+}
+
+/// cooldown reports exactly the releases Yarn's own inventory lists, and each one's members are
+/// exactly the workspaces `yarn why` binds it for through a declaration of its own name, a row
+/// being direct exactly when it has a member.
+/// The root's `semver`, declared at two ranges, is the one name the lock does not prove: its row
+/// is direct but owned by no member, and the run names it.
+#[test]
+fn berry_members_match_yarns_own_bindings() -> eyre::Result<()> {
+    let fixture = berry_members();
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock(&fixture)?;
+
+    let outdated = cooldown(
+        &fixture,
+        &["outdated", "--offline", "--transitive", "--all"],
+    )?;
+    assert_eq!(outdated.code, Some(0), "{:#}", outdated.envelope);
+    let rows = rows_by_release(rows(&outdated.envelope)?)?;
+    let yarns = yarns_registry_releases(&fixture)?;
+    assert_eq!(rows.keys().cloned().collect::<BTreeSet<_>>(), yarns);
+
+    // Ownership, release by release over Yarn's own inventory
+    let names: BTreeSet<&str> = yarns
+        .iter()
+        .filter_map(|release| split_after_name(release).map(|(name, _)| name))
+        .collect();
+    for name in names {
+        let owners = yarns_owners(&fixture, name)?;
+        for (release, row) in rows.iter().filter(|(_, row)| row.name == name) {
+            if name == "semver" {
+                assert!(row.direct && row.members.is_empty(), "{row:?}");
+                continue;
+            }
+            let expected = owners.get(&row.current).cloned().unwrap_or_default();
+            assert_eq!(
+                row.members, expected,
+                "{release} against yarn why {owners:?}"
+            );
+            assert_eq!(row.direct, !row.members.is_empty(), "{row:?}");
+        }
+    }
+
+    // The rows each kind of declaration owns are among them.
+    let members = |release: &str| -> eyre::Result<BTreeSet<String>> {
+        Ok(row(&rows, release)?.members.clone())
+    };
+    let paths = |paths: &[&str]| -> BTreeSet<String> {
+        paths.iter().map(|path| (*path).to_string()).collect()
+    };
+    assert_eq!(members("chalk@4.1.2")?, paths(&[".", "packages/a"]));
+    assert_eq!(members("chalk@4.1.0")?, paths(&["packages/old"]));
+    assert_eq!(members("is-number@6.0.0")?, paths(&["packages/b/nested/c"]));
+    assert_eq!(members("ms@2.0.0")?, paths(&["packages/b"]));
+    assert_eq!(members("semver@7.5.4")?, paths(&[]));
+
+    let warnings = messages(&outdated.envelope, "warnings");
+    assert!(
+        warnings
+            .iter()
+            .any(|message| message
+                .contains("semver in . (its install fields declare different ranges)")),
+        "{warnings:?}"
+    );
+    Ok(())
+}
+
+/// Root `resolutions` and a catalog rewrite declarations the lock still records as written: Yarn
+/// binds `packages/a`'s `chalk` caret to another copy than the root's same caret, whose lock key
+/// survives.
+/// cooldown credits neither `chalk` copy nor the catalog's `react` to any member, keeps them
+/// direct, and names both, while `has-flag`, which nothing rewrites, stays `packages/a`'s.
+#[test]
+fn berry_rewritten_names_stay_unattributed() -> eyre::Result<()> {
+    let fixture = Fixture::new().tag_independent();
+    fixture
+        .write(
+            "package.json",
+            &indoc::formatdoc! {r#"
+                {{
+                  "name": "berry-rewrites",
+                  "private": true,
+                  "packageManager": "yarn@{YARN}",
+                  "workspaces": ["packages/*"],
+                  "dependencies": {{ "chalk": "^4.1.0", "react": "catalog:" }},
+                  "resolutions": {{ "a/chalk": "4.1.0" }}
+                }}
+            "#},
+        )
+        .write(
+            "packages/a/package.json",
+            r#"{ "name": "a", "version": "1.0.0", "dependencies": { "chalk": "^4.1.0", "has-flag": "^4.0.0" } }"#,
+        )
+        .write(
+            ".yarnrc.yml",
+            "enableTelemetry: false\ncatalog:\n  react: ^18.2.0\n",
+        );
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock(&fixture)?;
+
+    // The hazard is real: Yarn binds the two members' identical carets to different copies.
+    let chalk = yarns_owners(&fixture, "chalk")?;
+    let copy_of = |member: &str| {
+        chalk
+            .iter()
+            .find(|(_, members)| members.contains(member))
+            .map(|(version, _)| version.clone())
+    };
+    assert_eq!(copy_of("packages/a").as_deref(), Some("4.1.0"), "{chalk:?}");
+    assert!(
+        copy_of(".").is_some_and(|version| version != "4.1.0"),
+        "{chalk:?}"
+    );
+
+    let outdated = cooldown(
+        &fixture,
+        &["outdated", "--offline", "--transitive", "--all"],
+    )?;
+    assert_eq!(outdated.code, Some(0), "{:#}", outdated.envelope);
+    let rows = rows_by_release(rows(&outdated.envelope)?)?;
+    assert_eq!(
+        rows.keys().cloned().collect::<BTreeSet<_>>(),
+        yarns_registry_releases(&fixture)?
+    );
+
+    // Both `chalk` copies Yarn binds and the catalog's `react` are direct but owned by no member.
+    let mut unattributed: Vec<&Row> = chalk
+        .keys()
+        .map(|version| row(&rows, &format!("chalk@{version}")))
+        .collect::<eyre::Result<_>>()?;
+    unattributed.extend(rows.values().filter(|row| row.name == "react"));
+    assert_eq!(unattributed.len(), 3, "{rows:?}");
+    for row in unattributed {
+        assert!(row.direct && row.members.is_empty(), "{row:?}");
+    }
+
+    // `has-flag`, which nothing rewrites, is `packages/a`'s, as Yarn binds it.
+    let has_flag = row(&rows, "has-flag@4.0.0")?;
+    assert_eq!(has_flag.members, BTreeSet::from(["packages/a".to_string()]));
+    assert_eq!(
+        Some(&has_flag.members),
+        yarns_owners(&fixture, "has-flag")?.get("4.0.0")
+    );
+
+    let warnings = messages(&outdated.envelope, "warnings");
+    assert!(
+        warnings.iter().any(|message| {
+            message.contains("chalk in ., packages/a (the root `resolutions` field may rewrite it)")
+                && message.contains("react in . (it is a `catalog:` reference)")
+        }),
+        "{warnings:?}"
+    );
+    Ok(())
+}
+
+/// Excluding a member drops exactly the rows only it owns and recomputes the rest from the
+/// members left: the root's exact `chalk` pin, which `packages/a`'s caret shares, holds the copy
+/// once `packages/a` is excluded.
+#[test]
+fn berry_excluded_member_drops_only_its_copies() -> eyre::Result<()> {
+    let fixture = berry_members();
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock(&fixture)?;
+    let read = |args: &[&str]| -> eyre::Result<serde_json::Value> {
+        let run = cooldown(&fixture, args)?;
+        assert_eq!(run.code, Some(0), "{args:?}: {:#}", run.envelope);
+        Ok(run.envelope)
+    };
+    let offline = ["outdated", "--offline", "--transitive", "--all"];
+    let online = ["outdated", "--transitive", "--all"];
+    let shared = rows(&read(&offline)?)?
+        .into_iter()
+        .find(|row| row.name == "chalk" && row.members.contains("packages/a"))
+        .ok_or_else(|| eyre::eyre!("packages/a shares a chalk copy"))?;
+    assert_eq!(
+        shared.members,
+        BTreeSet::from([".".to_string(), "packages/a".to_string()])
+    );
+    let unexcluded = read(&online)?;
+    assert_ne!(
+        held_by(&unexcluded, "chalk", &shared.current).as_deref(),
+        Some("pinned"),
+        "the caret sharing the copy leaves it unpinned: {unexcluded:#}"
+    );
+    let before = rows(&read(&offline)?)?;
+
+    fixture.write(
+        "cooldown.toml",
+        "[global]\nexclude-folders = [\"packages/a\"]\n",
+    );
+    let after = rows(&read(&offline)?)?;
+
+    // Every row `packages/a` owns alone is gone, and every other row keeps its other members.
+    let mut expected: Vec<Row> = before
+        .iter()
+        .filter(|row| row.members != BTreeSet::from(["packages/a".to_string()]))
+        .cloned()
+        .map(|mut row| {
+            row.members.remove("packages/a");
+            row
+        })
+        .collect();
+    expected.sort_by(|left, right| (&left.name, &left.current).cmp(&(&right.name, &right.current)));
+    let mut after_sorted = after.clone();
+    after_sorted
+        .sort_by(|left, right| (&left.name, &left.current).cmp(&(&right.name, &right.current)));
+    assert_eq!(after_sorted, expected);
+    assert!(
+        before.len() > after.len(),
+        "packages/a owns rows of its own: {before:?}"
+    );
+
+    // The root's exact pin now holds the shared copy alone.
+    let excluded = read(&online)?;
+    assert_eq!(
+        held_by(&excluded, "chalk", &shared.current).as_deref(),
+        Some("pinned"),
+        "{excluded:#}"
+    );
+    Ok(())
+}
+
+/// A configured plugin may rewrite any declaration, so the run warns that it attributes no
+/// dependency to a member: every row of a name a workspace declares is direct but owned by no
+/// member, while purely transitive rows stay transitive.
+#[test]
+fn a_berry_plugin_makes_every_binding_unproven() -> eyre::Result<()> {
+    let fixture = berry_members();
+    fixture
+        .write(
+            ".yarn/plugins/noop.cjs",
+            "module.exports = { name: `noop`, factory: () => ({}) };\n",
+        )
+        .write(
+            ".yarnrc.yml",
+            "enableTelemetry: false\nplugins:\n  - path: .yarn/plugins/noop.cjs\n    spec: noop\n",
+        );
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock(&fixture)?;
+
+    let outdated = cooldown(
+        &fixture,
+        &["outdated", "--offline", "--transitive", "--all"],
+    )?;
+    assert_eq!(outdated.code, Some(0), "{:#}", outdated.envelope);
+    let rows = rows(&outdated.envelope)?;
+    assert!(rows.iter().all(|row| row.members.is_empty()), "{rows:?}");
+    for name in ["chalk", "debug", "ms", "semver", "typescript", "is-number"] {
+        let copies: Vec<&Row> = rows.iter().filter(|row| row.name == name).collect();
+        assert!(
+            !copies.is_empty() && copies.iter().all(|row| row.direct),
+            "{name}: {rows:?}"
+        );
+    }
+    let transitive: Vec<&Row> = rows
+        .iter()
+        .filter(|row| row.name == "ansi-styles")
+        .collect();
+    assert!(
+        !transitive.is_empty() && transitive.iter().all(|row| !row.direct),
+        "{rows:?}"
+    );
+    let warnings = messages(&outdated.envelope, "warnings");
+    assert!(
+        warnings.iter().any(
+            |message| message.contains(".yarnrc.yml configures Yarn plugins")
+                && message.contains("so cooldown attributes no dependency to a workspace member")
+        ),
+        "{warnings:?}"
+    );
     Ok(())
 }

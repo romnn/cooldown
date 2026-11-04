@@ -1,5 +1,9 @@
-//! The members of a Yarn Classic workspace, discovered from the root `package.json` the way Yarn 1
-//! discovers them, and the snapshot of their manifests that the lock's selectors are read through.
+//! The members of a Yarn workspace and the snapshot of their manifests that the lock is read
+//! through.
+//!
+//! A Yarn Berry lock records every workspace it installed, so its members are the workspaces the
+//! lock lists ([`berry`]), read beside the Yarn configuration that decides how their declarations
+//! resolve ([`yarnrc`]).
 //!
 //! A Classic `yarn.lock` records no workspace member, so the member set comes from the root
 //! manifest's `workspaces` field, read as [Yarn 1.22.22's `resolveWorkspaces`][resolve] reads it.
@@ -15,11 +19,27 @@
 //!
 //! [resolve]: https://github.com/yarnpkg/yarn/blob/v1.22.22/src/config.js#L747-L839
 
+mod berry;
+mod yarnrc;
+
+pub(crate) use yarnrc::YarnEnvironment;
+
 use super::{DeclarationKey, display_rel};
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::MutationBaseline;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+/// Which Yarn's workspace a snapshot reads, which decides how its members are discovered and how
+/// its root `resolutions` are read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceDialect {
+    /// Yarn Classic (v1): the members the root manifest's `workspaces` patterns match, each named
+    /// and versioned.
+    Classic,
+    /// Yarn Berry (v2+): the workspaces the lock records, named or not.
+    Berry,
+}
 
 /// The manifest fields a declaration of a dependency can sit in, in the order Yarn's manifest
 /// normalization ranks duplicate install declarations, the peer contract last.
@@ -30,9 +50,9 @@ const DECLARATION_FIELDS: [&str; 4] = [
     "peerDependencies",
 ];
 
-/// The parsed manifests of every member of a Yarn Classic workspace: the evidence a Classic lock's
-/// member attribution reads each member's selectors from ([`NodeLock`](crate::lock::NodeLock)'s
-/// `*_in` hooks).
+/// The parsed manifests of every member of a Yarn workspace: the evidence a Yarn lock's member
+/// attribution reads each member's declarations from ([`NodeLock`](crate::lock::NodeLock)'s `*_in`
+/// hooks).
 ///
 /// The snapshot is either complete, with every member Yarn would install, or unavailable, in which
 /// case it attributes nothing.
@@ -48,6 +68,9 @@ enum Inventory {
     Complete {
         members: BTreeMap<String, MemberManifest>,
         resolutions: Resolutions,
+        /// Whether Yarn's effective `defaultProtocol` is established as `npm:`.
+        /// Yarn Classic has no such setting, so it always is.
+        npm_default_protocol: bool,
     },
     /// Discovery could not establish the complete member set, for the given reason.
     Unavailable { reason: String },
@@ -72,7 +95,7 @@ pub(crate) struct FieldSpecifier {
 }
 
 /// Which packages the root `resolutions` field can rewrite.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Resolutions {
     /// The package each key targets, the last package of its path (`a/**/@scope/b` →
     /// `@scope/b`).
@@ -82,35 +105,71 @@ enum Resolutions {
 }
 
 impl WorkspaceManifests {
-    /// Reads the snapshot from disk under `root`.
+    /// Reads the snapshot of a `dialect` workspace from disk under `root`, and Yarn's
+    /// configuration from the process environment.
     ///
     /// Anything that keeps discovery from establishing every member, an unreadable manifest
     /// included, makes the snapshot unavailable rather than failing the read.
-    pub(crate) fn read(root: &Utf8Path) -> Self {
-        match discover_live(root) {
+    pub(crate) fn read(root: &Utf8Path, dialect: WorkspaceDialect) -> Self {
+        Self::read_in(root, dialect, &YarnEnvironment::from_process())
+    }
+
+    /// [`read`](Self::read) under the process environment `environment`.
+    pub(crate) fn read_in(
+        root: &Utf8Path,
+        dialect: WorkspaceDialect,
+        environment: &YarnEnvironment,
+    ) -> Self {
+        match discover_live(root, dialect, environment) {
             Ok(LiveDiscovery {
                 root_document,
                 directories,
+                npm_default_protocol,
                 ..
-            }) => Self::assemble(&root_document, &directories, |rel| read_text(root, rel)),
+            }) => Self::assemble(
+                Assembly {
+                    root_document: &root_document,
+                    directories: &directories,
+                    dialect,
+                    npm_default_protocol,
+                },
+                |rel| read_text(root, rel),
+            ),
             Err(reason) => Self::unavailable(reason),
         }
     }
 
-    /// Builds the snapshot entirely from what `baseline` captured: the member directories its
-    /// discovery record names ([`BaselineDiscovery`]) and the manifest bytes read beside them.
+    /// Builds the snapshot of a `dialect` workspace entirely from what `baseline` captured: the
+    /// member directories and configuration its discovery record names ([`BaselineDiscovery`]),
+    /// and the manifest bytes read beside them.
     ///
     /// Nothing is read from the project, so a directory a trial creates or removes after the
-    /// capture changes neither the members nor their declarations.
+    /// capture changes neither the members nor their declarations, and a configuration change
+    /// after it changes no binding.
     /// A baseline without the record, one recording that discovery was unavailable, or one missing
     /// a member's manifest makes the snapshot unavailable.
-    pub(crate) fn from_baseline(baseline: &MutationBaseline) -> Self {
-        let directories = match DiscoveryRecord::read(baseline) {
-            Ok(DiscoveryRecord::Members(directories)) => directories,
-            Ok(DiscoveryRecord::Unavailable(reason)) | Err(reason) => {
-                return Self::unavailable(reason);
-            }
-        };
+    pub(crate) fn from_baseline(baseline: &MutationBaseline, dialect: WorkspaceDialect) -> Self {
+        let (directories, npm_default_protocol) =
+            match (dialect, DiscoveryRecord::read(baseline, dialect)) {
+                (WorkspaceDialect::Classic, Ok(DiscoveryRecord::Members(directories))) => {
+                    (directories, true)
+                }
+                (
+                    WorkspaceDialect::Berry,
+                    Ok(DiscoveryRecord::BerryMembers {
+                        directories,
+                        npm_default_protocol,
+                    }),
+                ) => (directories, npm_default_protocol),
+                (_, Ok(DiscoveryRecord::Unavailable(reason)) | Err(reason)) => {
+                    return Self::unavailable(reason);
+                }
+                (_, Ok(DiscoveryRecord::Members(_) | DiscoveryRecord::BerryMembers { .. })) => {
+                    return Self::unavailable(
+                        "the workspace discovery record is of another Yarn's workspace",
+                    );
+                }
+            };
         let directories: Vec<Utf8PathBuf> = directories
             .iter()
             .map(|directory| directory.split('/').collect())
@@ -132,16 +191,28 @@ impl WorkspaceManifests {
             Err(reason) => return Self::unavailable(reason),
         };
         match serde_json::from_str::<Value>(&root_manifest) {
-            Ok(root_document) => Self::assemble(&root_document, &directories, captured),
+            Ok(root_document) => Self::assemble(
+                Assembly {
+                    root_document: &root_document,
+                    directories: &directories,
+                    dialect,
+                    npm_default_protocol,
+                },
+                captured,
+            ),
             Err(err) => Self::unavailable(format!("package.json: {err}")),
         }
     }
 
-    /// The snapshot of the workspace whose root manifest is `root_document` and whose patterns
-    /// matched `directories`, reading each one's manifest through `manifest_at`.
+    /// The snapshot of the workspace `assembly` describes, reading each member's manifest through
+    /// `manifest_at`.
     fn assemble(
-        root_document: &Value,
-        directories: &[Utf8PathBuf],
+        Assembly {
+            root_document,
+            directories,
+            dialect,
+            npm_default_protocol,
+        }: Assembly<'_>,
         manifest_at: impl Fn(&Utf8Path) -> Result<Option<String>, String>,
     ) -> Self {
         let mut candidates = Vec::with_capacity(directories.len());
@@ -158,7 +229,7 @@ impl WorkspaceManifests {
                 Err(reason) => return Self::unavailable(reason),
             }
         }
-        match build(root_document, candidates) {
+        match build(root_document, candidates, dialect, npm_default_protocol) {
             Ok(inventory) => WorkspaceManifests { inventory },
             Err(reason) => Self::unavailable(reason),
         }
@@ -213,10 +284,24 @@ impl WorkspaceManifests {
             .collect()
     }
 
-    /// Whether the root `resolutions` field could rewrite a selector of `name`.
+    /// Whether Yarn's effective `defaultProtocol` is established as `npm:`, the protocol a Berry
+    /// lock of a protocol-less schema omits; `false` for an unavailable snapshot.
+    pub(crate) fn npm_default_protocol(&self) -> bool {
+        match &self.inventory {
+            Inventory::Complete {
+                npm_default_protocol,
+                ..
+            } => *npm_default_protocol,
+            Inventory::Unavailable { .. } => false,
+        }
+    }
+
+    /// Whether the root `resolutions` field could rewrite a selector or descriptor of `name`.
     ///
-    /// Yarn keeps every selector a resolution rewrites under one global descriptor, so a
-    /// resolution reaching the name anywhere in the graph taints every member's declaration of it.
+    /// Yarn Classic keeps every selector a resolution rewrites under one global descriptor, and a
+    /// Yarn Berry resolution reaches every descriptor of its target name, its parent qualifier
+    /// aside, so a resolution reaching the name anywhere in the graph taints every member's
+    /// declaration of it.
     pub(crate) fn resolution_may_rewrite(&self, name: &str) -> bool {
         match &self.inventory {
             Inventory::Complete { resolutions, .. } => match resolutions {
@@ -251,8 +336,20 @@ impl WorkspaceManifests {
     }
 }
 
-/// The name a [`MutationBaseline`] records workspace discovery under.
+/// What [`WorkspaceManifests::assemble`] builds a snapshot from.
+struct Assembly<'a> {
+    root_document: &'a Value,
+    /// The project-relative member directories, the root's excluded.
+    directories: &'a [Utf8PathBuf],
+    dialect: WorkspaceDialect,
+    npm_default_protocol: bool,
+}
+
+/// The name a [`MutationBaseline`] records a Yarn Classic workspace's discovery under.
 const DISCOVERY_RECORD: &str = "cooldown-npm/yarn-workspaces";
+
+/// The name a [`MutationBaseline`] records a Yarn Berry workspace's discovery under.
+const BERRY_DISCOVERY_RECORD: &str = "cooldown-npm/yarn-berry-workspaces";
 
 /// Workspace discovery as a mutation baseline captures it: the manifests to read and the outcome
 /// to record beside them, so every trial rebuilds the members from the capture alone
@@ -260,16 +357,27 @@ const DISCOVERY_RECORD: &str = "cooldown-npm/yarn-workspaces";
 pub(crate) struct BaselineDiscovery {
     /// The project-relative manifest of every matched directory, the root's excluded.
     ///
-    /// A match Yarn would skip, one without a name or a version, is listed as well, since only its
-    /// manifest can tell.
+    /// A match Yarn Classic would skip, one without a name or a version, is listed as well, since
+    /// only its manifest can tell.
     pub(crate) manifests: Vec<Utf8PathBuf>,
     outcome: Result<LiveDiscovery, String>,
+    dialect: WorkspaceDialect,
 }
 
 impl BaselineDiscovery {
-    /// Discovers the members under `root` for a baseline about to be captured.
-    pub(crate) fn run(root: &Utf8Path) -> Self {
-        let outcome = discover_live(root);
+    /// Discovers the members of a `dialect` workspace under `root` for a baseline about to be
+    /// captured, reading Yarn's configuration from the process environment.
+    pub(crate) fn run(root: &Utf8Path, dialect: WorkspaceDialect) -> Self {
+        Self::run_in(root, dialect, &YarnEnvironment::from_process())
+    }
+
+    /// [`run`](Self::run) under the process environment `environment`.
+    pub(crate) fn run_in(
+        root: &Utf8Path,
+        dialect: WorkspaceDialect,
+        environment: &YarnEnvironment,
+    ) -> Self {
+        let outcome = discover_live(root, dialect, environment);
         let manifests = outcome
             .as_ref()
             .map(|LiveDiscovery { directories, .. }| {
@@ -279,7 +387,11 @@ impl BaselineDiscovery {
                     .collect()
             })
             .unwrap_or_default();
-        BaselineDiscovery { manifests, outcome }
+        BaselineDiscovery {
+            manifests,
+            outcome,
+            dialect,
+        }
     }
 
     /// Records the outcome in `baseline`, which captured the root manifest and [`Self::manifests`].
@@ -296,13 +408,21 @@ impl BaselineDiscovery {
             Ok(LiveDiscovery {
                 root_manifest,
                 directories,
+                npm_default_protocol,
                 ..
-            }) if captured_root == Some(root_manifest.as_bytes()) => DiscoveryRecord::Members(
-                directories
+            }) if captured_root == Some(root_manifest.as_bytes()) => {
+                let directories = directories
                     .iter()
                     .map(|directory| display_rel(directory))
-                    .collect(),
-            ),
+                    .collect();
+                match self.dialect {
+                    WorkspaceDialect::Classic => DiscoveryRecord::Members(directories),
+                    WorkspaceDialect::Berry => DiscoveryRecord::BerryMembers {
+                        directories,
+                        npm_default_protocol,
+                    },
+                }
+            }
             Ok(_) => DiscoveryRecord::Unavailable(
                 "package.json changed while the mutation baseline was captured".to_string(),
             ),
@@ -310,7 +430,7 @@ impl BaselineDiscovery {
         };
         // A record that cannot be written is left out, which reads as unavailable discovery.
         if let Ok(fact) = serde_json::to_string(&record) {
-            baseline.record(DISCOVERY_RECORD, fact);
+            baseline.record(DiscoveryRecord::name(self.dialect), fact);
         }
     }
 }
@@ -321,39 +441,69 @@ impl BaselineDiscovery {
 enum DiscoveryRecord {
     /// Every directory the root's patterns matched, `/`-separated and project-relative.
     Members(Vec<String>),
+    /// Every directory of a workspace a Yarn Berry lock records, the root's excluded, and whether
+    /// Yarn's `defaultProtocol` was established as `npm:` at the capture.
+    BerryMembers {
+        directories: Vec<String>,
+        npm_default_protocol: bool,
+    },
     /// Why discovery could not establish every member.
     Unavailable(String),
 }
 
 impl DiscoveryRecord {
-    /// The record `baseline` carries, or why it carries none that can be read.
-    fn read(baseline: &MutationBaseline) -> Result<Self, String> {
+    /// The name a `dialect` workspace's record is kept under.
+    fn name(dialect: WorkspaceDialect) -> &'static str {
+        match dialect {
+            WorkspaceDialect::Classic => DISCOVERY_RECORD,
+            WorkspaceDialect::Berry => BERRY_DISCOVERY_RECORD,
+        }
+    }
+
+    /// The record of a `dialect` workspace `baseline` carries, or why it carries none that can be
+    /// read.
+    fn read(baseline: &MutationBaseline, dialect: WorkspaceDialect) -> Result<Self, String> {
         let fact = baseline
-            .recorded(DISCOVERY_RECORD)
+            .recorded(Self::name(dialect))
             .ok_or_else(|| "the mutation baseline recorded no workspace discovery".to_string())?;
         serde_json::from_str(fact).map_err(|err| format!("the workspace discovery record: {err}"))
     }
 }
 
-/// What discovery found on disk under a root: the root manifest it read and the directories its
-/// patterns matched.
+/// What discovery found on disk under a root: the root manifest it read, the member directories,
+/// and whether Yarn's `defaultProtocol` is established as `npm:`.
 struct LiveDiscovery {
     root_manifest: String,
     root_document: Value,
     directories: Vec<Utf8PathBuf>,
+    npm_default_protocol: bool,
 }
 
-/// Discovers the members under `root` from the root manifest on disk.
-fn discover_live(root: &Utf8Path) -> Result<LiveDiscovery, String> {
+/// Discovers the members of a `dialect` workspace under `root` from the files on disk.
+fn discover_live(
+    root: &Utf8Path,
+    dialect: WorkspaceDialect,
+    environment: &YarnEnvironment,
+) -> Result<LiveDiscovery, String> {
     let root_manifest = read_text(root, Utf8Path::new("package.json"))?
         .ok_or_else(|| "package.json does not exist".to_string())?;
     let root_document: Value =
         serde_json::from_str(&root_manifest).map_err(|err| format!("package.json: {err}"))?;
-    let directories = discover(root, &root_document)?;
+    let (directories, npm_default_protocol) = match dialect {
+        WorkspaceDialect::Classic => (discover(root, &root_document)?, true),
+        WorkspaceDialect::Berry => {
+            let configuration = yarnrc::YarnConfiguration::read(root, environment)?;
+            (
+                berry::locked_directories(root)?,
+                configuration.npm_default_protocol,
+            )
+        }
+    };
     Ok(LiveDiscovery {
         root_manifest,
         root_document,
         directories,
+        npm_default_protocol,
     })
 }
 
@@ -373,9 +523,14 @@ struct Candidate {
     content: String,
 }
 
-/// The complete inventory of the workspace whose root manifest is `root_document` and whose
-/// pattern matches are `candidates`, or why Yarn would not install it as such.
-fn build(root_document: &Value, candidates: Vec<Candidate>) -> Result<Inventory, String> {
+/// The complete inventory of the `dialect` workspace whose root manifest is `root_document` and
+/// whose members are `candidates`, or why Yarn would not install it as such.
+fn build(
+    root_document: &Value,
+    candidates: Vec<Candidate>,
+    dialect: WorkspaceDialect,
+    npm_default_protocol: bool,
+) -> Result<Inventory, String> {
     let mut members = BTreeMap::new();
     members.insert(
         ".".to_string(),
@@ -386,23 +541,31 @@ fn build(root_document: &Value, candidates: Vec<Candidate>) -> Result<Inventory,
         let rel = display_rel(&directory.join("package.json"));
         let document: Value =
             serde_json::from_str(&content).map_err(|err| format!("{rel}: {err}"))?;
-        // Yarn skips a match without a name or a version, with a warning, so it installs none of
-        // its declarations.
-        let (Some(name), Some(_)) = (
-            truthy_string(&document, "name").map_err(|field| format!("{rel}: {field}"))?,
-            truthy_string(&document, "version").map_err(|field| format!("{rel}: {field}"))?,
-        ) else {
+        let name = truthy_string(&document, "name").map_err(|field| format!("{rel}: {field}"))?;
+        let version =
+            truthy_string(&document, "version").map_err(|field| format!("{rel}: {field}"))?;
+        // Yarn Classic skips a match without a name or a version, with a warning, so it installs
+        // none of its declarations.
+        // A Yarn Berry workspace needs neither: Yarn names an unnamed one after its directory.
+        if dialect == WorkspaceDialect::Classic && (name.is_none() || version.is_none()) {
             continue;
-        };
-        if !names.insert(name.to_string()) {
+        }
+        if let Some(name) = name
+            && !names.insert(name.to_string())
+        {
             return Err(format!("two workspace members are named {name}"));
         }
         let manifest = member_manifest(&document).map_err(|field| format!("{rel}: {field}"))?;
         members.insert(display_rel(&directory), manifest);
     }
+    let resolutions = match dialect {
+        WorkspaceDialect::Classic => resolutions(root_document),
+        WorkspaceDialect::Berry => berry::resolutions(root_document),
+    };
     Ok(Inventory::Complete {
         members,
-        resolutions: resolutions(root_document),
+        resolutions,
+        npm_default_protocol,
     })
 }
 

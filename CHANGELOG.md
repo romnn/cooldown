@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Yarn Berry workspace members are attributed through the lock's own workspace entries.** A
+  Berry run credited nothing per member: the rows followed the root `package.json`, so a
+  dependency only a member declares read as transitive, and the run warned about it. A Berry lock
+  records every workspace Yarn installed with the dependencies its manifest declared, so cooldown
+  now takes the members from the lock and credits each one the registry release its own current
+  declaration of a name resolves to, through an `npm:` range, a same-name `npm:` alias, or Yarn's
+  builtin `typescript`, `fsevents`, and `resolve` patches, never a copy that merely satisfies the
+  range. A row is direct exactly when some member owns it, `exclude-folders` drops the rows only an
+  excluded member owns, and an exact pin, `npm:4.1.0` and `npm:chalk@4.1.0` spellings included,
+  holds the copy it binds. A declaration whose binding cooldown cannot prove leaves its whole name
+  unattributed, every copy direct for no member and named in a warning with the reason: a name the
+  root `resolutions` can rewrite, a `catalog:` or `patch:` reference, a name declared at different
+  ranges across one manifest's install fields, a declaration the lock records under another range
+  or not at all, a member the lock does not list, and, in a lock of version 6 or older, a bare
+  range unless every `.yarnrc.yml` Yarn reads and `YARN_DEFAULT_PROTOCOL` leave `defaultProtocol`
+  at `npm:`. A configured Yarn plugin, in any `.yarnrc.yml` or `YARN_PLUGINS`, can rewrite any
+  declaration, so it turns attribution off with a warning. The attribution reads the lock through
+  the manifests and configuration as they are now, so a lock stale against them can be
+  misattributed; it does not reproduce the bindings Yarn last installed.
 - **Yarn Classic workspace pins are protected from a sibling's resolve.** A Classic `yarn.lock`
   records no workspace member, so cooldown attributed nothing per member: every locked copy of a
   name the root manifest declares was a direct dependency without members, and the guard that
@@ -134,10 +153,8 @@
   left out, whatever version, checksum, or link type they record. A malformed lock, a descriptor
   bound to two different packages, and a lockfile version no released Yarn wrote, such as the 7
   of Yarn 4's release candidates, are reported as `lockfile_unreadable`, never read as a smaller
-  graph. Berry support is read-only for now: workspace members are not attributed, so the rows
-  follow the root `package.json` and a run on a Berry workspace warns that a member's own
-  dependencies read as transitive; advisory identity is not established, and `sync` writes
-  nothing. `upgrade`, `fix`, and `--build` refuse a Berry project before running Yarn, and
+  graph. Berry support is read-only for now: advisory identity is not established, and `sync`
+  writes nothing. `upgrade`, `fix`, and `--build` refuse a Berry project before running Yarn, and
   `outdated` warns that its adoptable rows were not verified against `upgrade`. cooldown also no
   longer runs a Yarn Berry executable on a Classic lock, which its first install would migrate to
   the Berry format: before running Yarn on a Classic lock it checks the root `packageManager` and

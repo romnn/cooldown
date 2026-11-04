@@ -410,7 +410,7 @@ async fn yarn_warns_when_the_selector_evidence_is_lost() -> eyre::Result<()> {
         project.root.join("package.json"),
         r#"{ "name": "root", "private": true, "workspaces": ["packages/{a,b}"] }"#,
     )?;
-    let reason = WorkspaceManifests::read(&project.root)
+    let reason = WorkspaceManifests::read(&project.root, WorkspaceDialect::Classic)
         .unavailable_reason()
         .map(str::to_string)
         .ok_or_else(|| eyre::eyre!("a brace pattern is undiscoverable"))?;
@@ -732,7 +732,7 @@ fn yarn_landing_is_verified_at_each_members_selector() -> eyre::Result<()> {
             r#"{ "name": "pkg-b", "version": "1.0.0", "dependencies": { "chalk": "^4.1.0", "pkg-a": "^1.0.0" } }"#,
         ),
     ])?;
-    let workspace = WorkspaceManifests::read(&project.root);
+    let workspace = WorkspaceManifests::read(&project.root, WorkspaceDialect::Classic);
     assert!(
         workspace.is_complete(),
         "{:?}",
@@ -827,7 +827,7 @@ fn yarn_landing_without_selector_evidence_is_never_proven() -> eyre::Result<()> 
             r#"{ "name": "pkg-a", "version": "1.0.0" }"#,
         ),
     ])?;
-    let complete = WorkspaceManifests::read(&project.root);
+    let complete = WorkspaceManifests::read(&project.root, WorkspaceDialect::Classic);
     assert!(
         complete.is_complete(),
         "{:?}",
@@ -860,7 +860,7 @@ fn yarn_landing_without_selector_evidence_is_never_proven() -> eyre::Result<()> 
         project.root.join("package.json"),
         r#"{ "name": "root", "private": true, "workspaces": ["packages/{a,b}"], "dependencies": { "chalk": "^4.1.0" } }"#,
     )?;
-    let undiscovered = WorkspaceManifests::read(&project.root);
+    let undiscovered = WorkspaceManifests::read(&project.root, WorkspaceDialect::Classic);
     assert!(!undiscovered.is_complete());
     assert!(!exact_target_reached::<Yarn>(
         &project,

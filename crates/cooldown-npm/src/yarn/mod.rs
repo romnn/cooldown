@@ -24,8 +24,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::fs::{ManifestFamily, ProjectCoordination};
 use cooldown_core::{
     ApplyAttempt, ApplyObserver, ApplyReport, CandidateScope, Capabilities, CoreError, Declaration,
-    DepScope, Dependency, Diagnostic, DiagnosticKind, EdgeNormalizationReport, EdgePolicy,
-    EdgeRebind, FetchContext, LockVerifyReport, MemberRef, MutationBaseline, MutationExecution,
+    DepScope, Dependency, Diagnostic, EdgeNormalizationReport, EdgePolicy, EdgeRebind,
+    FetchContext, LockVerifyReport, MemberRef, MutationBaseline, MutationExecution,
     MutationRecovery, NativePolicyLayer, NestedOwnership, Plan, PreparedMutation, Project,
     ProjectMarker, ProjectMutationJournal, Release, ReleaseFetcher, ResolveInputs, ResolvedPolicy,
     Result, SyncReport, SyncScope, TargetFallback, Tool, ToolId, ToolRead, ToolWrite, UpdateKind,
@@ -100,8 +100,9 @@ fn yarn_driver(cmd: NodeCmd) -> NodeCmd {
 /// field and each member's direct dependencies are attributed through the lock entry its own
 /// manifest selector names, which protects its exact manifest pins like npm's (see [`Yarn`]).
 ///
-/// A Berry lock is read for its registry releases only.
-/// Its workspace members are not attributed yet, so its rows follow the root manifest alone, and
+/// A Berry lock records its workspaces, so each member's direct dependencies are attributed
+/// through the lock's own record of the member, joined to the member's manifest, and read through
+/// the current manifests and Yarn configuration (see `YarnBerry`).
 /// `upgrade`, `fix`, and `--build` refuse a Berry project before running any resolver.
 ///
 /// Either way, a resolver runs only under a Yarn that reads the lock in its own format: a Berry
@@ -232,27 +233,6 @@ fn berry_mutation_unsupported() -> CoreError {
     )
 }
 
-/// The warning that a Berry workspace's members are not attributed, or `None` for a lock that
-/// records only the root workspace.
-///
-/// The rows follow the root manifest alone, so a dependency only a member declares reads as
-/// transitive, without the member that declares it.
-fn berry_workspace_notice(project: &Project) -> Result<Option<Diagnostic>> {
-    let path = project.root.join(YarnBerry::LOCKFILE);
-    let content = std::fs::read_to_string(&path)
-        .map_err(|err| CoreError::Filesystem(format!("{path}: {err}")))?;
-    if YarnBerry::member_paths(&content).len() <= 1 {
-        return Ok(None);
-    }
-    Ok(Some(
-        Diagnostic::new(
-            DiagnosticKind::Config,
-            "yarn.lock is a Yarn Berry (v2+) lockfile, whose workspace members cooldown does not attribute yet: the rows follow the root package.json alone, so a dependency only a member declares reads as transitive and names no member",
-        )
-        .with_path("package.json"),
-    ))
-}
-
 #[async_trait]
 impl ToolRead for YarnTool {
     fn id(&self) -> ToolId {
@@ -300,12 +280,7 @@ impl ToolRead for YarnTool {
     }
 
     async fn manifest_notices(&self, project: &Project) -> Result<Vec<Diagnostic>> {
-        let format = LockFormat::on_disk(&project.root)?;
-        let mut notices = self.backend(format).manifest_notices(project).await?;
-        if format == LockFormat::Berry {
-            notices.extend(berry_workspace_notice(project)?);
-        }
-        Ok(notices)
+        self.backend_for(project)?.manifest_notices(project).await
     }
 
     async fn declarations(&self, project: &Project, name: &str) -> Result<Vec<Declaration>> {

@@ -1,8 +1,9 @@
 //! Real Yarn Berry locks the Berry readers' tests share, one per lockfile schema.
 //!
 //! Each lock was written by `yarn install --mode=update-lockfile` against registry.yarnpkg.com
-//! in a scratch directory holding exactly the files listed beside it and a `.yarnrc.yml` of
-//! `enableTelemetry: false` and `nodeLinker: node-modules`.
+//! in a scratch directory holding exactly the files listed beside it and, unless the fixture lists
+//! a `.yarnrc.yml` of its own, a `.yarnrc.yml` of `enableTelemetry: false` and
+//! `nodeLinker: node-modules`.
 //! Yarn ran as `node .../yarn.js` from mise's `yarn@<version>` install, under Node 22.23.1 for
 //! Yarn 2 and 3, whose bundles call APIs Node 23 removed, and Node 26.3.1 for Yarn 4.
 //! Yarn 2.4.3 has no `--mode` flag, so it ran a plain `yarn install`.
@@ -1831,3 +1832,608 @@ pub(crate) const SCHEMAS: &[SchemaLock] = &[
         "#},
     },
 ];
+
+/// A Yarn 4.18.1 workspace (lockfile schema 10) whose members bind every kind of declaration a
+/// Berry lock records per workspace.
+///
+/// The root declares `chalk ^4.1.0`, `typescript`, which Yarn wraps in its builtin patch, and
+/// `semver` twice: `^7.5.0` in `dependencies` and `7.5.4` in `devDependencies`, which wins.
+/// `packages/a` pins `chalk@4.1.0`, declares `debug ^4.3.0`, a same-name alias
+/// `has-flag: npm:has-flag@^4.0.0`, an alias `my-alias` of `ms`, a `file:` package, an optional
+/// `is-number ^7.0.0`, a peer `react` nothing installs, and `is-odd ^1.0.0`, which the workspace
+/// `packages/is-odd` (`is-odd@1.0.0`) satisfies, so Yarn links it.
+/// `packages/b` declares its own `workspaces`, `a` through `workspace:^`, `chalk ^5.3.0`, the
+/// registry's `is-odd ^3.0.1`, `ms 2.0.0`, and a dev pin `debug 4.3.4`; `debug`'s own `ms`
+/// ranges resolve newer copies beside `b`'s.
+/// The nested `packages/b/nested/c` has no name and declares `is-number ^6.0.0`.
+/// Its `.yarnrc.yml` sets `enableTelemetry: false` alone.
+pub(crate) const MEMBERS: BerryProject = BerryProject {
+    files: &[
+        ProjectFile {
+            path: "package.json",
+            contents: indoc! {r#"
+                {
+                  "name": "berry-members",
+                  "private": true,
+                  "packageManager": "yarn@4.18.1",
+                  "workspaces": [
+                    "packages/*"
+                  ],
+                  "dependencies": {
+                    "chalk": "^4.1.0",
+                    "semver": "^7.5.0"
+                  },
+                  "devDependencies": {
+                    "semver": "7.5.4",
+                    "typescript": "^5.4.0"
+                  }
+                }
+            "#},
+        },
+        ProjectFile {
+            path: "packages/a/package.json",
+            contents: indoc! {r#"
+                {
+                  "name": "a",
+                  "version": "1.0.0",
+                  "dependencies": {
+                    "chalk": "4.1.0",
+                    "debug": "^4.3.0",
+                    "has-flag": "npm:has-flag@^4.0.0",
+                    "is-odd": "^1.0.0",
+                    "loc": "file:../../vendor/loc",
+                    "my-alias": "npm:ms@^2.1.0"
+                  },
+                  "optionalDependencies": {
+                    "is-number": "^7.0.0"
+                  },
+                  "peerDependencies": {
+                    "react": "^18.0.0"
+                  }
+                }
+            "#},
+        },
+        ProjectFile {
+            path: "packages/b/package.json",
+            contents: indoc! {r#"
+                {
+                  "name": "b",
+                  "version": "1.2.0",
+                  "workspaces": [
+                    "nested/*"
+                  ],
+                  "dependencies": {
+                    "a": "workspace:^",
+                    "chalk": "^5.3.0",
+                    "is-odd": "^3.0.1",
+                    "ms": "2.0.0"
+                  },
+                  "devDependencies": {
+                    "debug": "4.3.4"
+                  }
+                }
+            "#},
+        },
+        ProjectFile {
+            path: "packages/b/nested/c/package.json",
+            contents: indoc! {r#"
+                {
+                  "dependencies": {
+                    "is-number": "^6.0.0"
+                  }
+                }
+            "#},
+        },
+        ProjectFile {
+            path: "packages/is-odd/package.json",
+            contents: indoc! {r#"
+                {
+                  "name": "is-odd",
+                  "version": "1.0.0"
+                }
+            "#},
+        },
+        ProjectFile {
+            path: "vendor/loc/package.json",
+            contents: indoc! {r#"
+                { "name": "loc", "version": "1.0.0" }
+            "#},
+        },
+        ProjectFile {
+            path: ".yarnrc.yml",
+            contents: indoc! {"
+                enableTelemetry: false
+            "},
+        },
+    ],
+    lock: indoc! {r#"
+        # This file is generated by running "yarn install" inside your project.
+        # Manual changes might be lost - proceed with caution!
+
+        __metadata:
+          version: 10
+          cacheKey: 10c0
+
+        "a@workspace:^, a@workspace:packages/a":
+          version: 0.0.0-use.local
+          resolution: "a@workspace:packages/a"
+          dependencies:
+            chalk: "npm:4.1.0"
+            debug: "npm:^4.3.0"
+            has-flag: "npm:has-flag@^4.0.0"
+            is-number: "npm:^7.0.0"
+            is-odd: "npm:^1.0.0"
+            loc: "file:../../vendor/loc"
+            my-alias: "npm:ms@^2.1.0"
+          peerDependencies:
+            react: ^18.0.0
+          dependenciesMeta:
+            is-number:
+              optional: true
+          languageName: unknown
+          linkType: soft
+
+        "ansi-styles@npm:^4.1.0":
+          version: 4.3.0
+          resolution: "ansi-styles@npm:4.3.0"
+          dependencies:
+            color-convert: "npm:^2.0.1"
+          checksum: 10c0/895a23929da416f2bd3de7e9cb4eabd340949328ab85ddd6e484a637d8f6820d485f53933446f5291c3b760cbc488beb8e88573dd0f9c7daf83dccc8fe81b041
+          languageName: node
+          linkType: hard
+
+        "b@workspace:packages/b":
+          version: 0.0.0-use.local
+          resolution: "b@workspace:packages/b"
+          dependencies:
+            a: "workspace:^"
+            chalk: "npm:^5.3.0"
+            debug: "npm:4.3.4"
+            is-odd: "npm:^3.0.1"
+            ms: "npm:2.0.0"
+          languageName: unknown
+          linkType: soft
+
+        "berry-members@workspace:.":
+          version: 0.0.0-use.local
+          resolution: "berry-members@workspace:."
+          dependencies:
+            chalk: "npm:^4.1.0"
+            semver: "npm:7.5.4"
+            typescript: "npm:^5.4.0"
+          languageName: unknown
+          linkType: soft
+
+        "c-6c62a5@workspace:packages/b/nested/c":
+          version: 0.0.0-use.local
+          resolution: "c-6c62a5@workspace:packages/b/nested/c"
+          dependencies:
+            is-number: "npm:^6.0.0"
+          languageName: unknown
+          linkType: soft
+
+        "chalk@npm:4.1.0":
+          version: 4.1.0
+          resolution: "chalk@npm:4.1.0"
+          dependencies:
+            ansi-styles: "npm:^4.1.0"
+            supports-color: "npm:^7.1.0"
+          checksum: 10c0/3787bd65ecd98ab3a1acc3b4f71d006268a675875e49ee6ea75fb54ba73d268b97544368358c18c42445e408e076ae8ad5cec8fbad36942a2c7ac654883dc61e
+          languageName: node
+          linkType: hard
+
+        "chalk@npm:^4.1.0":
+          version: 4.1.2
+          resolution: "chalk@npm:4.1.2"
+          dependencies:
+            ansi-styles: "npm:^4.1.0"
+            supports-color: "npm:^7.1.0"
+          checksum: 10c0/4a3fef5cc34975c898ffe77141450f679721df9dde00f6c304353fa9c8b571929123b26a0e4617bde5018977eb655b31970c297b91b63ee83bb82aeb04666880
+          languageName: node
+          linkType: hard
+
+        "chalk@npm:^5.3.0":
+          version: 5.6.2
+          resolution: "chalk@npm:5.6.2"
+          checksum: 10c0/99a4b0f0e7991796b1e7e3f52dceb9137cae2a9dfc8fc0784a550dc4c558e15ab32ed70b14b21b52beb2679b4892b41a0aa44249bcb996f01e125d58477c6976
+          languageName: node
+          linkType: hard
+
+        "color-convert@npm:^2.0.1":
+          version: 2.0.1
+          resolution: "color-convert@npm:2.0.1"
+          dependencies:
+            color-name: "npm:~1.1.4"
+          checksum: 10c0/37e1150172f2e311fe1b2df62c6293a342ee7380da7b9cfdba67ea539909afbd74da27033208d01d6d5cfc65ee7868a22e18d7e7648e004425441c0f8a15a7d7
+          languageName: node
+          linkType: hard
+
+        "color-name@npm:~1.1.4":
+          version: 1.1.4
+          resolution: "color-name@npm:1.1.4"
+          checksum: 10c0/a1a3f914156960902f46f7f56bc62effc6c94e84b2cae157a526b1c1f74b677a47ec602bf68a61abfa2b42d15b7c5651c6dbe72a43af720bc588dff885b10f95
+          languageName: node
+          linkType: hard
+
+        "debug@npm:4.3.4":
+          version: 4.3.4
+          resolution: "debug@npm:4.3.4"
+          dependencies:
+            ms: "npm:2.1.2"
+          peerDependenciesMeta:
+            supports-color:
+              optional: true
+          checksum: 10c0/cedbec45298dd5c501d01b92b119cd3faebe5438c3917ff11ae1bff86a6c722930ac9c8659792824013168ba6db7c4668225d845c633fbdafbbf902a6389f736
+          languageName: node
+          linkType: hard
+
+        "debug@npm:^4.3.0":
+          version: 4.4.3
+          resolution: "debug@npm:4.4.3"
+          dependencies:
+            ms: "npm:^2.1.3"
+          peerDependenciesMeta:
+            supports-color:
+              optional: true
+          checksum: 10c0/d79136ec6c83ecbefd0f6a5593da6a9c91ec4d7ddc4b54c883d6e71ec9accb5f67a1a5e96d00a328196b5b5c86d365e98d8a3a70856aaf16b4e7b1985e67f5a6
+          languageName: node
+          linkType: hard
+
+        "has-flag@npm:^4.0.0, has-flag@npm:has-flag@^4.0.0":
+          version: 4.0.0
+          resolution: "has-flag@npm:4.0.0"
+          checksum: 10c0/2e789c61b7888d66993e14e8331449e525ef42aac53c627cc53d1c3334e768bcb6abdc4f5f0de1478a25beec6f0bd62c7549058b7ac53e924040d4f301f02fd1
+          languageName: node
+          linkType: hard
+
+        "is-number@npm:^6.0.0":
+          version: 6.0.0
+          resolution: "is-number@npm:6.0.0"
+          checksum: 10c0/5da4c68401529675c575878d2760d66f18eaef4b014858577f6003daf66488d7fe4eae684b1e8574e3fa1bb447c6c6c56b8491d2b4b3239da2d32e5f6f218008
+          languageName: node
+          linkType: hard
+
+        "is-number@npm:^7.0.0":
+          version: 7.0.0
+          resolution: "is-number@npm:7.0.0"
+          checksum: 10c0/b4686d0d3053146095ccd45346461bc8e53b80aeb7671cc52a4de02dbbf7dc0d1d2a986e2fe4ae206984b4d34ef37e8b795ebc4f4295c978373e6575e295d811
+          languageName: node
+          linkType: hard
+
+        "is-odd@npm:^1.0.0, is-odd@workspace:packages/is-odd":
+          version: 0.0.0-use.local
+          resolution: "is-odd@workspace:packages/is-odd"
+          languageName: unknown
+          linkType: soft
+
+        "is-odd@npm:^3.0.1":
+          version: 3.0.1
+          resolution: "is-odd@npm:3.0.1"
+          dependencies:
+            is-number: "npm:^6.0.0"
+          checksum: 10c0/89ee2e353c5a3f3bd400c79db1c307a5b3506198ee8169d521e533a9b1d8a08fc95f21a919c084e98845b4286d7ffe309778da03744dfe66c3c1763ab1a030c6
+          languageName: node
+          linkType: hard
+
+        "loc@file:../../vendor/loc::locator=a%40workspace%3Apackages%2Fa":
+          version: 1.0.0
+          resolution: "loc@file:../../vendor/loc#../../vendor/loc::hash=42102a&locator=a%40workspace%3Apackages%2Fa"
+          checksum: 10c0/3a701f6410ed637a997f01bb64ff5e1cfddc5e4bafdf89e543fa0e01f0e95b9cde7f3496735669501af6230b63deec55e743c89bda18fa7eacd40fb2b8def8a5
+          languageName: node
+          linkType: hard
+
+        "lru-cache@npm:^6.0.0":
+          version: 6.0.0
+          resolution: "lru-cache@npm:6.0.0"
+          dependencies:
+            yallist: "npm:^4.0.0"
+          checksum: 10c0/cb53e582785c48187d7a188d3379c181b5ca2a9c78d2bce3e7dee36f32761d1c42983da3fe12b55cb74e1779fa94cdc2e5367c028a9b35317184ede0c07a30a9
+          languageName: node
+          linkType: hard
+
+        "ms@npm:2.0.0":
+          version: 2.0.0
+          resolution: "ms@npm:2.0.0"
+          checksum: 10c0/f8fda810b39fd7255bbdc451c46286e549794fcc700dc9cd1d25658bbc4dc2563a5de6fe7c60f798a16a60c6ceb53f033cb353f493f0cf63e5199b702943159d
+          languageName: node
+          linkType: hard
+
+        "ms@npm:2.1.2":
+          version: 2.1.2
+          resolution: "ms@npm:2.1.2"
+          checksum: 10c0/a437714e2f90dbf881b5191d35a6db792efbca5badf112f87b9e1c712aace4b4b9b742dd6537f3edf90fd6f684de897cec230abde57e87883766712ddda297cc
+          languageName: node
+          linkType: hard
+
+        "ms@npm:^2.1.3, my-alias@npm:ms@^2.1.0":
+          version: 2.1.3
+          resolution: "ms@npm:2.1.3"
+          checksum: 10c0/d924b57e7312b3b63ad21fc5b3dc0af5e78d61a1fc7cfb5457edaf26326bf62be5307cc87ffb6862ef1c2b33b0233cdb5d4f01c4c958cc0d660948b65a287a48
+          languageName: node
+          linkType: hard
+
+        "semver@npm:7.5.4":
+          version: 7.5.4
+          resolution: "semver@npm:7.5.4"
+          dependencies:
+            lru-cache: "npm:^6.0.0"
+          bin:
+            semver: bin/semver.js
+          checksum: 10c0/5160b06975a38b11c1ab55950cb5b8a23db78df88275d3d8a42ccf1f29e55112ac995b3a26a522c36e3b5f76b0445f1eef70d696b8c7862a2b4303d7b0e7609e
+          languageName: node
+          linkType: hard
+
+        "supports-color@npm:^7.1.0":
+          version: 7.2.0
+          resolution: "supports-color@npm:7.2.0"
+          dependencies:
+            has-flag: "npm:^4.0.0"
+          checksum: 10c0/afb4c88521b8b136b5f5f95160c98dee7243dc79d5432db7efc27efb219385bbc7d9427398e43dd6cc730a0f87d5085ce1652af7efbe391327bc0a7d0f7fc124
+          languageName: node
+          linkType: hard
+
+        "typescript@npm:^5.4.0":
+          version: 5.9.3
+          resolution: "typescript@npm:5.9.3"
+          bin:
+            tsc: bin/tsc
+            tsserver: bin/tsserver
+          checksum: 10c0/6bd7552ce39f97e711db5aa048f6f9995b53f1c52f7d8667c1abdc1700c68a76a308f579cd309ce6b53646deb4e9a1be7c813a93baaf0a28ccd536a30270e1c5
+          languageName: node
+          linkType: hard
+
+        "typescript@patch:typescript@npm%3A^5.4.0#optional!builtin<compat/typescript>":
+          version: 5.9.3
+          resolution: "typescript@patch:typescript@npm%3A5.9.3#optional!builtin<compat/typescript>::version=5.9.3&hash=5786d5"
+          bin:
+            tsc: bin/tsc
+            tsserver: bin/tsserver
+          checksum: 10c0/ad09fdf7a756814dce65bc60c1657b40d44451346858eea230e10f2e95a289d9183b6e32e5c11e95acc0ccc214b4f36289dcad4bf1886b0adb84d711d336a430
+          languageName: node
+          linkType: hard
+
+        "yallist@npm:^4.0.0":
+          version: 4.0.0
+          resolution: "yallist@npm:4.0.0"
+          checksum: 10c0/2286b5e8dbfe22204ab66e2ef5cc9bbb1e55dfc873bbe0d568aa943eb255d131890dfd5bf243637273d31119b870f49c18fcde2c6ffbb7a7a092b870dc90625a
+          languageName: node
+          linkType: hard
+    "#},
+};
+
+/// A Yarn 4.18.1 workspace (lockfile schema 10) whose configuration rewrites declarations the
+/// lock still records as written.
+///
+/// The root declares `chalk ^4.1.0` and `react` through `catalog:`, whose `^18.2.0` comes from
+/// `.yarnrc.yml`.
+/// Its `resolutions` rewrite only `packages/a`'s `chalk ^4.1.0` to `4.1.0`, so `a` binds
+/// `chalk@4.1.0` while the lock keeps its `chalk@npm:^4.1.0` key, bound to `4.1.2`, for the root.
+/// `packages/a` also declares `has-flag ^4.0.0`, which nothing rewrites.
+pub(crate) const REWRITES: BerryProject = BerryProject {
+    files: &[
+        ProjectFile {
+            path: "package.json",
+            contents: indoc! {r#"
+                {
+                  "name": "berry-rewrites",
+                  "private": true,
+                  "packageManager": "yarn@4.18.1",
+                  "workspaces": [
+                    "packages/*"
+                  ],
+                  "dependencies": {
+                    "chalk": "^4.1.0",
+                    "react": "catalog:"
+                  },
+                  "resolutions": {
+                    "a/chalk": "4.1.0"
+                  }
+                }
+            "#},
+        },
+        ProjectFile {
+            path: "packages/a/package.json",
+            contents: indoc! {r#"
+                {
+                  "name": "a",
+                  "version": "1.0.0",
+                  "dependencies": {
+                    "chalk": "^4.1.0",
+                    "has-flag": "^4.0.0"
+                  }
+                }
+            "#},
+        },
+        ProjectFile {
+            path: ".yarnrc.yml",
+            contents: indoc! {"
+                enableTelemetry: false
+                catalog:
+                  react: ^18.2.0
+            "},
+        },
+    ],
+    lock: indoc! {r#"
+        # This file is generated by running "yarn install" inside your project.
+        # Manual changes might be lost - proceed with caution!
+
+        __metadata:
+          version: 10
+          cacheKey: 10c0
+
+        "a@workspace:packages/a":
+          version: 0.0.0-use.local
+          resolution: "a@workspace:packages/a"
+          dependencies:
+            chalk: "npm:^4.1.0"
+            has-flag: "npm:^4.0.0"
+          languageName: unknown
+          linkType: soft
+
+        "ansi-styles@npm:^4.1.0":
+          version: 4.3.0
+          resolution: "ansi-styles@npm:4.3.0"
+          dependencies:
+            color-convert: "npm:^2.0.1"
+          checksum: 10c0/895a23929da416f2bd3de7e9cb4eabd340949328ab85ddd6e484a637d8f6820d485f53933446f5291c3b760cbc488beb8e88573dd0f9c7daf83dccc8fe81b041
+          languageName: node
+          linkType: hard
+
+        "berry-rewrites@workspace:.":
+          version: 0.0.0-use.local
+          resolution: "berry-rewrites@workspace:."
+          dependencies:
+            chalk: "npm:^4.1.0"
+            react: "catalog:"
+          languageName: unknown
+          linkType: soft
+
+        "chalk@npm:4.1.0":
+          version: 4.1.0
+          resolution: "chalk@npm:4.1.0"
+          dependencies:
+            ansi-styles: "npm:^4.1.0"
+            supports-color: "npm:^7.1.0"
+          checksum: 10c0/3787bd65ecd98ab3a1acc3b4f71d006268a675875e49ee6ea75fb54ba73d268b97544368358c18c42445e408e076ae8ad5cec8fbad36942a2c7ac654883dc61e
+          languageName: node
+          linkType: hard
+
+        "chalk@npm:^4.1.0":
+          version: 4.1.2
+          resolution: "chalk@npm:4.1.2"
+          dependencies:
+            ansi-styles: "npm:^4.1.0"
+            supports-color: "npm:^7.1.0"
+          checksum: 10c0/4a3fef5cc34975c898ffe77141450f679721df9dde00f6c304353fa9c8b571929123b26a0e4617bde5018977eb655b31970c297b91b63ee83bb82aeb04666880
+          languageName: node
+          linkType: hard
+
+        "color-convert@npm:^2.0.1":
+          version: 2.0.1
+          resolution: "color-convert@npm:2.0.1"
+          dependencies:
+            color-name: "npm:~1.1.4"
+          checksum: 10c0/37e1150172f2e311fe1b2df62c6293a342ee7380da7b9cfdba67ea539909afbd74da27033208d01d6d5cfc65ee7868a22e18d7e7648e004425441c0f8a15a7d7
+          languageName: node
+          linkType: hard
+
+        "color-name@npm:~1.1.4":
+          version: 1.1.4
+          resolution: "color-name@npm:1.1.4"
+          checksum: 10c0/a1a3f914156960902f46f7f56bc62effc6c94e84b2cae157a526b1c1f74b677a47ec602bf68a61abfa2b42d15b7c5651c6dbe72a43af720bc588dff885b10f95
+          languageName: node
+          linkType: hard
+
+        "has-flag@npm:^4.0.0":
+          version: 4.0.0
+          resolution: "has-flag@npm:4.0.0"
+          checksum: 10c0/2e789c61b7888d66993e14e8331449e525ef42aac53c627cc53d1c3334e768bcb6abdc4f5f0de1478a25beec6f0bd62c7549058b7ac53e924040d4f301f02fd1
+          languageName: node
+          linkType: hard
+
+        "js-tokens@npm:^3.0.0 || ^4.0.0":
+          version: 4.0.0
+          resolution: "js-tokens@npm:4.0.0"
+          checksum: 10c0/e248708d377aa058eacf2037b07ded847790e6de892bbad3dac0abba2e759cb9f121b00099a65195616badcb6eca8d14d975cb3e89eb1cfda644756402c8aeed
+          languageName: node
+          linkType: hard
+
+        "loose-envify@npm:^1.1.0":
+          version: 1.4.0
+          resolution: "loose-envify@npm:1.4.0"
+          dependencies:
+            js-tokens: "npm:^3.0.0 || ^4.0.0"
+          bin:
+            loose-envify: cli.js
+          checksum: 10c0/655d110220983c1a4b9c0c679a2e8016d4b67f6e9c7b5435ff5979ecdb20d0813f4dec0a08674fcbdd4846a3f07edbb50a36811fd37930b94aaa0d9daceb017e
+          languageName: node
+          linkType: hard
+
+        "react@npm:^18.2.0":
+          version: 18.3.1
+          resolution: "react@npm:18.3.1"
+          dependencies:
+            loose-envify: "npm:^1.1.0"
+          checksum: 10c0/283e8c5efcf37802c9d1ce767f302dd569dd97a70d9bb8c7be79a789b9902451e0d16334b05d73299b20f048cbc3c7d288bbbde10b701fa194e2089c237dbea3
+          languageName: node
+          linkType: hard
+
+        "supports-color@npm:^7.1.0":
+          version: 7.2.0
+          resolution: "supports-color@npm:7.2.0"
+          dependencies:
+            has-flag: "npm:^4.0.0"
+          checksum: 10c0/afb4c88521b8b136b5f5f95160c98dee7243dc79d5432db7efc27efb219385bbc7d9427398e43dd6cc730a0f87d5085ce1652af7efbe391327bc0a7d0f7fc124
+          languageName: node
+          linkType: hard
+    "#},
+};
+
+/// A Yarn 4.18.1 project (lockfile schema 10) pinning registry releases through the `npm:`
+/// protocol: `ms` as `npm:2.1.3`, `is-number` as the same-name alias `npm:is-number@7.0.0`, and
+/// `flag-alias` as an alias of `has-flag@4.0.0`.
+/// Its `.yarnrc.yml` sets `enableTelemetry: false` alone.
+pub(crate) const NPM_PINS: BerryProject = BerryProject {
+    files: &[
+        ProjectFile {
+            path: "package.json",
+            contents: indoc! {r#"
+                {
+                  "name": "berry-npm-pins",
+                  "private": true,
+                  "packageManager": "yarn@4.18.1",
+                  "dependencies": {
+                    "flag-alias": "npm:has-flag@4.0.0",
+                    "is-number": "npm:is-number@7.0.0",
+                    "ms": "npm:2.1.3"
+                  }
+                }
+            "#},
+        },
+        ProjectFile {
+            path: ".yarnrc.yml",
+            contents: indoc! {"
+                enableTelemetry: false
+            "},
+        },
+    ],
+    lock: indoc! {r#"
+        # This file is generated by running "yarn install" inside your project.
+        # Manual changes might be lost - proceed with caution!
+
+        __metadata:
+          version: 10
+          cacheKey: 10c0
+
+        "berry-npm-pins@workspace:.":
+          version: 0.0.0-use.local
+          resolution: "berry-npm-pins@workspace:."
+          dependencies:
+            flag-alias: "npm:has-flag@4.0.0"
+            is-number: "npm:is-number@7.0.0"
+            ms: "npm:2.1.3"
+          languageName: unknown
+          linkType: soft
+
+        "flag-alias@npm:has-flag@4.0.0":
+          version: 4.0.0
+          resolution: "has-flag@npm:4.0.0"
+          checksum: 10c0/2e789c61b7888d66993e14e8331449e525ef42aac53c627cc53d1c3334e768bcb6abdc4f5f0de1478a25beec6f0bd62c7549058b7ac53e924040d4f301f02fd1
+          languageName: node
+          linkType: hard
+
+        "is-number@npm:is-number@7.0.0":
+          version: 7.0.0
+          resolution: "is-number@npm:7.0.0"
+          checksum: 10c0/b4686d0d3053146095ccd45346461bc8e53b80aeb7671cc52a4de02dbbf7dc0d1d2a986e2fe4ae206984b4d34ef37e8b795ebc4f4295c978373e6575e295d811
+          languageName: node
+          linkType: hard
+
+        "ms@npm:2.1.3":
+          version: 2.1.3
+          resolution: "ms@npm:2.1.3"
+          checksum: 10c0/d924b57e7312b3b63ad21fc5b3dc0af5e78d61a1fc7cfb5457edaf26326bf62be5307cc87ffb6862ef1c2b33b0233cdb5d4f01c4c958cc0d660948b65a287a48
+          languageName: node
+          linkType: hard
+    "#},
+};
