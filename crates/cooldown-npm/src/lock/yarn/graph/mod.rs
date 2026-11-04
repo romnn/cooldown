@@ -178,7 +178,10 @@ impl Selector {
     /// installs the release under there.
     fn decode(key: &str, recorded: Option<&str>) -> Option<Self> {
         let Pattern { name, range } = Pattern::split(key);
-        if let Some(target) = registry_target(range) {
+        if let Some(RegistryReference {
+            package: target, ..
+        }) = registry_reference(range)
+        {
             return (!target.is_empty()).then(|| Selector {
                 package: target.to_string(),
                 aliased: target != name,
@@ -221,12 +224,24 @@ impl<'a> Pattern<'a> {
     }
 }
 
-/// The package a registry-protocol range names, or `None` for any other range.
+/// A registry-protocol range: the package Yarn's registry resolver requests and the range it asks
+/// of that package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RegistryReference<'a> {
+    /// The package the reference names.
+    pub(super) package: &'a str,
+    /// The range requested of the package, `latest` where the reference spells none.
+    pub(super) range: &'a str,
+}
+
+/// The package and range a registry-protocol range names, or `None` for any other range.
 ///
 /// Yarn's registry resolver matches the range against `^(\S+):(@?.*?)(@(.*?)|)$`.
-/// The protocol run therefore ends at the last `:` before any whitespace, and the package is an
-/// optional leading `@` and everything up to the next `@`.
-fn registry_target(range: &str) -> Option<&str> {
+/// The protocol run therefore ends at the last `:` before any whitespace, the package is an
+/// optional leading `@` and everything up to the next `@`, and the range is everything after that
+/// `@`, or `latest` where it is empty or absent.
+/// So `npm:4.0.0` names a package `4.0.0`, never a range of the declaring name.
+pub(super) fn registry_reference(range: &str) -> Option<RegistryReference<'_>> {
     if !REGISTRY_PROTOCOLS
         .iter()
         .any(|protocol| range.starts_with(protocol))
@@ -243,7 +258,14 @@ fn registry_target(range: &str) -> Option<&str> {
         .get(scope..)
         .and_then(|body| body.find('@'))
         .map_or(reference.len(), |at| at + scope);
-    reference.get(..end)
+    let requested = reference
+        .get(end + 1..)
+        .filter(|requested| !requested.is_empty())
+        .unwrap_or("latest");
+    Some(RegistryReference {
+        package: reference.get(..end)?,
+        range: requested,
+    })
 }
 
 #[cfg(test)]
