@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.28
+
 - **The HTTP cache no longer lands in the working directory when `HOME` is unset.** Without
   `XDG_CACHE_HOME` and `HOME`, as in a Windows PowerShell or cmd session, cooldown fell back to a
   relative `.cache/cooldown` and wrote its registry responses into the project it ran in. The
