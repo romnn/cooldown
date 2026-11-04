@@ -5104,6 +5104,8 @@ async fn upgrade_stops_before_build_when_final_lock_verification_errors() -> eyr
     assert_eq!(outcome.exit, Exit::Environment);
     assert_eq!(outcome.summary.errors, 1);
     assert!(!root.join("build-invoked").exists());
+    // A verification that failed proves nothing about the lock, so it is not reported stale.
+    assert_eq!(outcome.meta.lock_status, Some(LockStatus::Unknown));
     Ok(())
 }
 

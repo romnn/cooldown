@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **`--allow-stale-lock` waives only pnpm's own stale-lock refusal.** Every nonzero exit of
+  pnpm's frozen lock verification counted as a stale lock, so `--allow-stale-lock` also waived a
+  registry or network failure, an authentication error, an invalid `.npmrc` or
+  `pnpm-workspace.yaml`, an unsupported flag, or a corrupted store, and `check` then evaluated a
+  lock pnpm never confirmed and passed with a stale-lock warning. cooldown now reads the error
+  code pnpm 9, 10, and 11 print: only `ERR_PNPM_OUTDATED_LOCKFILE`,
+  `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`, `ERR_PNPM_NO_LOCKFILE`, and
+  `ERR_PNPM_FROZEN_LOCKFILE_WITH_OUTDATED_LOCKFILE`, alone and from a run that was not
+  interrupted, are a stale lock. Any other failure is a `tool_failed` error that no flag waives,
+  and a mutating command that hits one after its apply reports the lock's status as unknown rather
+  than stale. The verification pins pnpm's reporter, log level, and JSON output, so a `reporter`,
+  `loglevel`, `json`, or `parseable` setting cannot hide the code.
+
 - **Reported paths are relative and `/`-separated instead of absolute.** A diagnostic about a
   project's lock or manifest from `check`, `outdated`, `upgrade`, or `fix`, such as `lock_unknown`,
   `stale_lock`, or `lockfile_unreadable`, named the manifest by its absolute path, so a JSON
