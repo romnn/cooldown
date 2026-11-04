@@ -1031,7 +1031,8 @@ fn check_proves_a_seeded_lock_current_without_touching_the_project() -> eyre::Re
     let control = tempfile::tempdir()?;
     copy_tree(fixture.root(), control.path())?;
     let copied = snapshot(control.path())?;
-    let output = std::process::Command::new("yarn")
+    // Resolve `yarn` as the harness does, since Windows installs it as `yarn.cmd`.
+    let output = std::process::Command::new(cooldown_adapter_util::resolve_program("yarn"))
         .args(["install", "--immutable", "--mode=skip-build"])
         .current_dir(control.path())
         .output()?;
@@ -1229,7 +1230,8 @@ fn an_ancestor_rc_file_decides_the_verdict() -> eyre::Result<()> {
     if !runs_pinned_yarn(&fixture) {
         return Ok(());
     }
-    let seeded = std::process::Command::new("yarn")
+    // Resolve `yarn` as the harness does, since Windows installs it as `yarn.cmd`.
+    let seeded = std::process::Command::new(cooldown_adapter_util::resolve_program("yarn"))
         .args(["install", "--mode=update-lockfile"])
         .current_dir(fixture.root().join("nested/project"))
         .output()?;
