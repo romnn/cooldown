@@ -817,7 +817,12 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
             return Ok(verify_current_unknown(L::LOCKFILE));
         };
         self.cmd
-            .lock_report(&project.root, &args, L::LOCKFILE)
+            .lock_report(
+                &project.root,
+                &args,
+                L::LOCKFILE,
+                L::verify_refusal_is_stale,
+            )
             .await
     }
 }
@@ -3995,7 +4000,7 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         }
     }
 
-    fn requires_sync_admission_evaluation(&self) -> bool {
+    fn requires_sync_admission_evaluation(&self, _project: &Project) -> bool {
         L::NATIVE_MIN_AGE_FILE.is_some()
     }
 
@@ -4123,6 +4128,9 @@ mod berry_attribution_tests;
 
 #[cfg(test)]
 mod npm_attribution_tests;
+
+#[cfg(all(test, unix))]
+mod pnpm_verify_tests;
 
 #[cfg(test)]
 mod yarn_attribution_tests;

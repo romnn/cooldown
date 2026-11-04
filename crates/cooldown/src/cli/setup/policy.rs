@@ -61,7 +61,7 @@ pub(super) fn repo_layers(
     shared: &SharedLayers,
     repo_root: &Utf8Path,
 ) -> Result<Vec<PolicyLayer>, CoreError> {
-    let project_config = configs.project_config(repo_root, repo_root)?;
+    let project_config = configs.project_config(repo_root)?;
     let mut layers: Vec<PolicyLayer> = vec![builtin_default_layer()];
     if let Some(layer) = &shared.global {
         layers.push(layer.clone());
@@ -115,9 +115,7 @@ async fn assemble_ctx(
             }
         }
     };
-    let project_config = assembly
-        .configs
-        .project_config(assembly.repo_root, &project.root)?;
+    let project_config = assembly.configs.project_config(&project.root)?;
     let edge_policy = assembly
         .invocation
         .edge_policy_override()

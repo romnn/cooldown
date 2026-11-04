@@ -79,9 +79,13 @@ impl<M: Serialize, S: Serialize, I: Serialize> Envelope<M, S, I> {
 pub struct Window {
     /// The resolved minimum age in (fractional) days the dependency must reach.
     pub min_age_days: f64,
-    /// Which config layer decided the window, e.g. `"default"` or a rule selector.
+    /// Which config layer decided the window: its origin token, followed by `:<selector>` when a
+    /// rule decided it, such as `"default"` or `"repo:cooldown.toml:package=left-pad"`.
+    ///
+    /// [`Origin::token`](cooldown_core::Origin::token) defines the token, including how it names
+    /// a file inside and outside the repository.
     pub source: String,
-    /// The selector of a stricter native/registry policy that clamped the window, if any.
+    /// The origin token of the layer whose `floor` tightened the window, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clamped_by: Option<String>,
     /// The advisory whose security window replaced the ordinary one (`[advisories]` shorten
@@ -654,7 +658,8 @@ pub struct UpgradeMeta {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExplainStep {
-    /// The config layer, e.g. `"default"`, `"workspace"`, or `"project"`.
+    /// The origin token of the config layer, such as `"default"` or `"repo:cooldown.toml"` (see
+    /// [`Origin::token`](cooldown_core::Origin::token)).
     pub layer: String,
     /// The field within the layer that set the value, e.g. `"minAge"`.
     pub field: String,
@@ -676,7 +681,8 @@ pub struct ExplainStep {
 pub struct EffectiveInfo {
     /// The effective minimum age in (fractional) days.
     pub min_age_days: f64,
-    /// A description of which layer/field decided the effective value.
+    /// Which layer decided the effective value, spelled like a window's
+    /// [`source`](Window::source).
     pub decided_by: String,
 }
 
@@ -746,11 +752,13 @@ pub struct ConfigItem {
     pub tool: String,
     /// The resolved default cooldown window in fractional days.
     pub effective_default_min_age_days: f64,
-    /// Which layer/field decided the resolved default window.
+    /// Which layer decided the resolved default window, spelled like a window's
+    /// [`source`](Window::source).
     pub source: String,
     /// Whether `strict-native` is enabled for this project's policy stack.
     pub strict_native: bool,
-    /// The project policy layers, lowest authority first.
+    /// The origin tokens of the project policy layers, lowest authority first (see
+    /// [`Origin::token`](cooldown_core::Origin::token)).
     pub layers: Vec<String>,
     /// The resolved `[advisories]` policy and this tool's feed coverage.
     pub advisories: AdvisoryConfigInfo,
@@ -767,9 +775,10 @@ pub struct ConfigItem {
 pub struct GeneratedMembersInfo {
     /// The declared member package names; empty when none is declared.
     pub names: Vec<String>,
-    /// The config layer that made the declaration (`repo:<path>`, `config:<path>`, `global`),
-    /// or `None` when no config file declares the key at all — the default, under which every
-    /// member is authored and a member that looks generated earns a hint.
+    /// The origin token of the config layer that made the declaration (`repo:<path>`,
+    /// `config:<path>`, `global`; see [`Origin::token`](cooldown_core::Origin::token)), or `None`
+    /// when no config file declares the key at all — the default, under which every member is
+    /// authored and a member that looks generated earns a hint.
     pub origin: Option<String>,
 }
 

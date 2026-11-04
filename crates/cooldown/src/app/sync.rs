@@ -320,7 +320,7 @@ impl Workspace {
                 .await
                 .map_err(|err| diag_from_error(&err, tool, &project, None))?;
             warnings.extend(access.recovery);
-            if writer.requires_sync_admission_evaluation() {
+            if writer.requires_sync_admission_evaluation(&pctx.project) {
                 policy.admitted_versions = match self
                     .sync_admitted_versions(pctx, opts, &window, warnings)
                     .await
@@ -779,7 +779,7 @@ mod tests {
             cooldown_core::SyncScope::Project
         }
 
-        fn requires_sync_admission_evaluation(&self) -> bool {
+        fn requires_sync_admission_evaluation(&self, _project: &cooldown_core::Project) -> bool {
             true
         }
 

@@ -1301,7 +1301,7 @@ mod tests {
     fn generated_members_info() -> GeneratedMembersInfo {
         GeneratedMembersInfo {
             names: vec!["workspace-hack".to_string()],
-            origin: Some("repo:/repo/cooldown.toml".to_string()),
+            origin: Some("repo:cooldown.toml".to_string()),
         }
     }
 

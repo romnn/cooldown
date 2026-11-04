@@ -33,12 +33,15 @@
 )]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use color_eyre::eyre;
 use cooldown_adapter_util::{program_on_path, resolve_program};
+use pnpm_pool::PnpmPool;
+
+mod pnpm_pool;
 
 const TOOL_ATTEMPTS: usize = 3;
 
@@ -96,8 +99,23 @@ enum Horizon {
 }
 
 /// A throwaway project tree under a temp dir, plus the means to run `cooldown` against it.
+///
+/// Every fixture also owns a private pnpm cache and store, which every process it starts resolves
+/// through, so concurrent tests never share pnpm's mutable metadata cache.
+/// A fixture built with [`Fixture::pnpm`] also starts its cache seeded from a [`PnpmPool`] of the
+/// metadata earlier fixtures fetched.
 pub struct Fixture {
     dir: tempfile::TempDir,
+    /// The fixture's private pnpm cache and store.
+    ///
+    /// It is a sibling of the project tree rather than inside it, so cooldown's project discovery
+    /// never walks into the cache or the store.
+    /// It lives in the system temp dir beside the machine-wide pool, so the two can share hard
+    /// links.
+    pnpm_home: tempfile::TempDir,
+    /// The pool that seeds the private pnpm cache and collects its new entries, for a fixture
+    /// that drives pnpm.
+    pnpm_pool: Option<PnpmPool>,
     tag_independent: bool,
     cargo_as_of: Option<CargoAsOf>,
 }
@@ -116,7 +134,26 @@ impl Fixture {
 
     /// Create an empty fixture rooted at a fresh temp dir.
     pub fn new() -> Self {
-        let fixture = Self::new_non_git();
+        Self::stamp_git(Self::new_non_git())
+    }
+
+    /// Creates an empty fixture like [`new`](Self::new) for a test that drives pnpm.
+    ///
+    /// Its private pnpm cache starts with every entry of the machine-wide [`PnpmPool`], and each
+    /// command it runs adds the entries it fetched, so later fixtures need not fetch them again.
+    /// A pnpm test built with [`new`](Self::new) is just as isolated but fetches all of its
+    /// metadata, which for the larger graphs takes minutes.
+    pub fn pnpm() -> Self {
+        Self::stamp_git(Self::create(Some(PnpmPool::shared())))
+    }
+
+    /// Creates a fixture like [`pnpm`](Self::pnpm) that uses the pool at `pool` instead of the
+    /// machine-wide one, for a test that observes the pool itself.
+    pub fn pnpm_with_pool(pool: &Path) -> Self {
+        Self::stamp_git(Self::create(Some(PnpmPool::at(pool))))
+    }
+
+    fn stamp_git(fixture: Self) -> Self {
         // Anchor discovery when an ambient ancestor belongs to another Git repository.
         std::fs::create_dir(fixture.dir.path().join(".git")).expect("create fixture Git anchor");
         // The valid Git metadata gives mutation fixtures an external recovery trust domain.
@@ -135,15 +172,29 @@ impl Fixture {
     /// there, which is exactly what [`Fixture::new`]'s stamp defends against. Tests that model a
     /// Git checkout (or run `git init` themselves) keep using [`Fixture::new`].
     pub fn new_non_git() -> Self {
+        Self::create(None)
+    }
+
+    fn create(pnpm_pool: Option<PnpmPool>) -> Self {
         let dir = tempfile::Builder::new()
             .prefix("cooldown-it-")
             .tempdir()
             .expect("create temp dir");
-        Self {
+        let pnpm_home = tempfile::Builder::new()
+            .prefix("cooldown-it-pnpm-")
+            .tempdir()
+            .expect("create pnpm temp dir");
+        let fixture = Self {
             dir,
+            pnpm_home,
+            pnpm_pool,
             tag_independent: false,
             cargo_as_of: None,
+        };
+        if let Some(pool) = &fixture.pnpm_pool {
+            pool.seed(&fixture.pnpm_cache_dir());
         }
+        fixture
     }
 
     /// Decouple every `cooldown` run from the registry's mutable `latest` dist-tag by passing
@@ -158,6 +209,38 @@ impl Fixture {
     /// The project root.
     pub fn root(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// The pnpm cache directory every process of this fixture uses.
+    pub fn pnpm_cache_dir(&self) -> PathBuf {
+        self.pnpm_home.path().join("cache")
+    }
+
+    /// The pnpm store directory every process of this fixture uses.
+    pub fn pnpm_store_dir(&self) -> PathBuf {
+        self.pnpm_home.path().join("store")
+    }
+
+    /// The environment that points every pnpm a fixture process starts at the fixture's own cache
+    /// and store.
+    ///
+    /// Concurrent pnpm processes sharing one metadata cache race on its entries, which surfaces as
+    /// `ERR_PNPM_CACHE_MISSING_AFTER_304`, and a damaged entry fails every later test resolving
+    /// that package.
+    /// pnpm 11 reads its settings from `pnpm_config_*` variables and ignores `npm_config_*` ones.
+    /// The variables are inert for every other tool, so each fixture sets them whatever it drives.
+    fn pnpm_env(&self) -> [(&'static str, PathBuf); 2] {
+        [
+            ("pnpm_config_cache_dir", self.pnpm_cache_dir()),
+            ("pnpm_config_store_dir", self.pnpm_store_dir()),
+        ]
+    }
+
+    /// Publishes the private pnpm cache's new entries to the pool once a command has exited.
+    fn harvest_pnpm_cache(&self) {
+        if let Some(pool) = &self.pnpm_pool {
+            pool.harvest(&self.pnpm_cache_dir());
+        }
     }
 
     /// Write a file (creating parent dirs) relative to the project root.
@@ -208,6 +291,19 @@ impl Fixture {
         phase: Option<&str>,
         horizon: Horizon,
     ) -> eyre::Result<CapturedOutput> {
+        let captured = self.run_tool_attempts(program, args, envs, phase, horizon);
+        self.harvest_pnpm_cache();
+        captured
+    }
+
+    fn run_tool_attempts(
+        &self,
+        program: &str,
+        args: &[&str],
+        envs: &[(&str, &str)],
+        phase: Option<&str>,
+        horizon: Horizon,
+    ) -> eyre::Result<CapturedOutput> {
         let bound = match (horizon, self.cargo_as_of) {
             (Horizon::Seed, Some(as_of)) => cargo_as_of_env(as_of.seed),
             (Horizon::Seed, None) => {
@@ -224,7 +320,10 @@ impl Fixture {
         let mut attempt = 1;
         loop {
             let mut command = Command::new(&executable);
-            command.current_dir(self.dir.path()).args(args);
+            command
+                .current_dir(self.dir.path())
+                .args(args)
+                .envs(self.pnpm_env());
             for (key, value) in &bound {
                 command.env(key, value);
             }
@@ -305,6 +404,7 @@ impl Fixture {
         );
         let output = Command::new(exe)
             .current_dir(self.dir.path())
+            .envs(self.pnpm_env())
             .envs(self.run_horizon())
             .envs(envs.iter().copied())
             .args(args)
@@ -313,6 +413,7 @@ impl Fixture {
             .arg(pinned)
             .output()
             .expect("spawn cooldown binary");
+        self.harvest_pnpm_cache();
         CapturedOutput::from("cooldown", args, output)
     }
 
@@ -327,12 +428,15 @@ impl Fixture {
         let mut command = Command::new(exe);
         command
             .current_dir(self.dir.path())
+            .envs(self.pnpm_env())
             .envs(self.run_horizon())
             .args(args)
             .args(self.tag_independent.then_some("--no-respect-dist-tags"))
             .arg("--dir")
             .arg(self.dir.path());
-        let captured = CapturedOutput::from("cooldown", args, traced_output(&mut command, phase)?);
+        let output = traced_output(&mut command, phase);
+        self.harvest_pnpm_cache();
+        let captured = CapturedOutput::from("cooldown", args, output?);
         trace_captured_phase(phase, started, &captured);
         Ok(captured)
     }
