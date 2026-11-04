@@ -16,8 +16,15 @@ use std::sync::{Arc, Mutex};
 pub const CONFIG_FILE: &str = "cooldown.toml";
 
 /// Resolve the repo root from `start`, walking up.
+///
+/// The `$HOME` fallback is canonicalized when it resolves, so a canonical `start` and the root
+/// it falls back to are spelled alike.
 #[must_use]
 pub fn find_repo_root(start: &Utf8Path) -> Utf8PathBuf {
+    repo_root_from(start, home_dir())
+}
+
+fn repo_root_from(start: &Utf8Path, home: Option<Utf8PathBuf>) -> Utf8PathBuf {
     let mut nearest_with_config: Option<Utf8PathBuf> = None;
     let mut dir = Some(start.to_owned());
     while let Some(d) = dir {
@@ -33,7 +40,13 @@ pub fn find_repo_root(start: &Utf8Path) -> Utf8PathBuf {
     if let Some(c) = nearest_with_config {
         return c;
     }
-    home_dir().unwrap_or_else(|| start.to_owned())
+    // The walk climbs a canonical workdir, so its markers are canonical; `HOME` is spelled however
+    // the environment spells it, through a symlink or, on Windows, without the verbatim prefix.
+    // Every consumer compares the root against canonical paths, so the fallback must match them.
+    home.map_or_else(
+        || start.to_owned(),
+        |home| canonical_dir(&home).unwrap_or(home),
+    )
 }
 
 /// The global config path: `${XDG_CONFIG_HOME:-~/.config}/cooldown/config.toml`.
@@ -83,12 +96,6 @@ struct OriginSpelling {
 }
 
 impl OriginSpelling {
-    fn new(repo_root: &Utf8Path) -> Self {
-        Self {
-            root: canonical_dir(repo_root).unwrap_or_else(|| repo_root.to_owned()),
-        }
-    }
-
     fn repo(&self, path: &Utf8Path) -> Origin {
         Origin::Repo(self.spell(path))
     }
@@ -141,7 +148,8 @@ fn canonical_dir(dir: &Utf8Path) -> Option<Utf8PathBuf> {
 /// policy or scan/runtime settings.
 #[derive(Debug, Clone)]
 pub struct ConfigSources {
-    /// The repository root the cascade walks down from.
+    /// The repository root the cascade walks down from, canonical when it resolves, so the walk
+    /// recognizes it whichever spelling it and the project directory arrive in.
     root: Utf8PathBuf,
     spelling: OriginSpelling,
     global: Option<LoadedConfigFile>,
@@ -216,7 +224,8 @@ impl ConfigSources {
                 None => None,
             }
         };
-        let spelling = OriginSpelling::new(repo_root);
+        let root = canonical_dir(repo_root).unwrap_or_else(|| repo_root.to_owned());
+        let spelling = OriginSpelling { root: root.clone() };
         let repo_root_config = repo_root.join(CONFIG_FILE);
         let repo_root_doc = read_document(&repo_root_config, spelling.repo(&repo_root_config))?;
         let explicit = match explicit {
@@ -231,7 +240,7 @@ impl ConfigSources {
             None => None,
         };
         Ok(ConfigSources {
-            root: repo_root.to_owned(),
+            root,
             spelling,
             global,
             repo_root: repo_root_doc,
@@ -288,33 +297,35 @@ impl ConfigSources {
     /// and explicit config.
     ///
     /// Directories without a `cooldown.toml` contribute no layer.
-    /// Both the repository root the sources were loaded for and `project_dir` are expected to be
-    /// absolute and to share a common root.
+    /// The walk compares the canonical forms of the root and `project_dir`, so a symlinked
+    /// checkout, a `$HOME` fallback or a Windows verbatim or 8.3 spelling collects every layer
+    /// between them exactly once and reads nothing above the root.
+    /// A project outside the root layers only its own file over the root's, and one whose
+    /// directory cannot be resolved gets the root layer alone.
     ///
     /// # Errors
     ///
     /// Returns [`CoreError::Filesystem`] if a discovered `cooldown.toml` cannot be read, or
     /// [`CoreError::Config`] if one does not parse as valid config.
     pub fn project_config(&self, project_dir: &Utf8Path) -> Result<ProjectConfig, CoreError> {
-        let repo_root = self.root.as_path();
-        let mut dirs: Vec<Utf8PathBuf> = Vec::new();
-        let mut cur = Some(project_dir.to_owned());
-        while let Some(d) = cur {
-            dirs.push(d.clone());
-            if d == repo_root {
-                break;
+        let root = self.root.as_path();
+        let dirs: Vec<Utf8PathBuf> = match canonical_dir(project_dir) {
+            Some(project) if project.starts_with(root) => {
+                let mut dirs: Vec<Utf8PathBuf> = project
+                    .ancestors()
+                    .take_while(|dir| dir.starts_with(root))
+                    .map(Utf8Path::to_path_buf)
+                    .collect();
+                dirs.reverse();
+                dirs
             }
-            match d.parent() {
-                Some(p) if p.starts_with(repo_root) || p == repo_root => cur = Some(p.to_owned()),
-                Some(p) if repo_root.starts_with(&d) => cur = Some(p.to_owned()),
-                _ => break,
-            }
-        }
-        if !dirs.iter().any(|d| d == repo_root) {
-            dirs.push(repo_root.to_owned());
-        }
-        dirs.reverse();
-        dirs.dedup();
+            // A project outside the root, such as one beside a `$HOME` fallback, has no ancestry
+            // inside the repository to walk.
+            Some(project) => vec![root.to_owned(), project],
+            // A directory that does not resolve holds no config file, and its raw spelling, such
+            // as one through `..`, could climb above the root.
+            None => vec![root.to_owned()],
+        };
 
         let mut policy_layers = Vec::new();
         let mut cargo_edge_policy = self
@@ -330,13 +341,13 @@ impl ConfigSources {
             .global
             .as_ref()
             .and_then(|config| declared_generated_members(&config.document, config.origin.clone()));
-        let repo_root_config = repo_root.join(CONFIG_FILE);
         for dir in dirs {
-            let path = dir.join(CONFIG_FILE);
-            let maybe_doc = if path == repo_root_config {
+            // The root file was read when the sources were loaded, through whichever spelling the
+            // root arrived in.
+            let maybe_doc = if dir == root {
                 self.repo_root.clone()
             } else {
-                self.nested_document(&path)?
+                self.nested_document(&dir.join(CONFIG_FILE))?
             };
             if let Some(config) = maybe_doc {
                 cargo_edge_policy = config.document.cargo_edge_policy().or(cargo_edge_policy);
@@ -750,6 +761,184 @@ mod tests {
                 .expect("explicit layer")
                 .map(|layer| layer.origin.token()),
             Some("config:linked.toml".to_string())
+        );
+    }
+
+    /// Writes a root, an intermediate `apps` and a project `apps/web` config below `root`.
+    ///
+    /// The root file sets a scan list, which a nested file may not, so reading it a second time as
+    /// a nested layer fails the projection instead of passing unnoticed.
+    fn layered_tree(root: &Utf8Path) {
+        let project = root.join("apps").join("web");
+        std::fs::create_dir_all(&project).expect("project dir");
+        std::fs::write(
+            root.join(CONFIG_FILE),
+            indoc! {r#"
+                min-age = "14d"
+
+                [global]
+                exclude-folders = ["vendor"]
+            "#},
+        )
+        .expect("root config");
+        std::fs::write(root.join("apps").join(CONFIG_FILE), "min-age = \"18d\"\n")
+            .expect("intermediate config");
+        std::fs::write(project.join(CONFIG_FILE), "min-age = \"21d\"\n").expect("project config");
+    }
+
+    /// The origin tokens of the policy layers `configs` collects for `project_dir`.
+    fn layer_tokens(configs: &ConfigSources, project_dir: &Utf8Path) -> Vec<String> {
+        configs
+            .project_config(project_dir)
+            .expect("project config")
+            .policy_layers
+            .iter()
+            .map(|layer| layer.origin.token())
+            .collect()
+    }
+
+    const ALL_LAYERS: [&str; 3] = [
+        "repo:cooldown.toml",
+        "repo:apps/cooldown.toml",
+        "repo:apps/web/cooldown.toml",
+    ];
+
+    /// A root spelled through a symlinked checkout still bounds the walk of a canonical project
+    /// directory, so the intermediate layer is collected and the root file is read once.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_collects_every_layer_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base =
+            Utf8PathBuf::from_path_buf(std::fs::canonicalize(tmp.path()).expect("canonical"))
+                .expect("utf8 base");
+        let real = base.join("real");
+        layered_tree(&real);
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).expect("root symlink");
+
+        let configs = ConfigSources::load(&alias, None, true).expect("config sources");
+
+        // Detection hands over canonical project directories, while the root keeps the alias.
+        assert_eq!(
+            layer_tokens(&configs, &real.join("apps").join("web")),
+            ALL_LAYERS
+        );
+        // The root itself, in either spelling, is one layer rather than a root and a nested one.
+        assert_eq!(layer_tokens(&configs, &real), ["repo:cooldown.toml"]);
+        assert_eq!(layer_tokens(&configs, &alias), ["repo:cooldown.toml"]);
+    }
+
+    /// A project directory reached through a symlink from outside the checkout walks the
+    /// repository directories its target sits in.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_reached_through_a_symlink_collects_every_layer_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base =
+            Utf8PathBuf::from_path_buf(std::fs::canonicalize(tmp.path()).expect("canonical"))
+                .expect("utf8 base");
+        let root = base.join("repo");
+        layered_tree(&root);
+        let link = base.join("web");
+        std::os::unix::fs::symlink(root.join("apps").join("web"), &link).expect("project symlink");
+
+        let configs = ConfigSources::load(&root, None, true).expect("config sources");
+
+        assert_eq!(layer_tokens(&configs, &link), ALL_LAYERS);
+    }
+
+    /// A root spelled with a `..` component, which a project directory can be a lexical prefix
+    /// of, still bounds the walk, so no config above the root is read.
+    #[test]
+    fn a_root_spelled_through_a_parent_component_reads_nothing_above_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = Utf8Path::from_path(tmp.path()).expect("utf8 base");
+        // This file sits above the repository, so collecting it would apply a foreign layer.
+        std::fs::write(base.join(CONFIG_FILE), "min-age = \"1d\"\n").expect("outside config");
+        let root = base.join("repo");
+        layered_tree(&root);
+
+        let configs =
+            ConfigSources::load(&root.join("apps").join(".."), None, true).expect("config sources");
+
+        assert_eq!(
+            layer_tokens(&configs, &root.join("apps")),
+            ["repo:cooldown.toml", "repo:apps/cooldown.toml"]
+        );
+    }
+
+    /// A project directory that does not resolve gets the root layer alone, so a raw spelling
+    /// through `..` cannot reach a config above the root, and a root that does not exist at all,
+    /// as a `$HOME` fallback can be, yields no layer rather than an error.
+    #[test]
+    fn an_unresolvable_project_directory_gets_the_root_layer_alone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = Utf8Path::from_path(tmp.path()).expect("utf8 base");
+        std::fs::write(base.join(CONFIG_FILE), "min-age = \"1d\"\n").expect("outside config");
+        let root = base.join("repo");
+        layered_tree(&root);
+
+        let configs = ConfigSources::load(&root, None, true).expect("config sources");
+        assert_eq!(
+            layer_tokens(&configs, &root.join("..").join("missing")),
+            ["repo:cooldown.toml"]
+        );
+
+        let missing = base.join("missing");
+        let configs = ConfigSources::load(&missing, None, true).expect("config sources");
+        assert_eq!(layer_tokens(&configs, &missing), Vec::<String>::new());
+    }
+
+    /// A root spelled the way the temporary directory is handed out, which is not the verbatim
+    /// (and possibly an 8.3 short) form that canonical project directories take, still bounds the
+    /// walk.
+    #[cfg(windows)]
+    #[test]
+    fn a_root_without_the_verbatim_prefix_collects_every_layer_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(tmp.path()).expect("utf8 root");
+        layered_tree(root);
+        let canonical = |path: &Utf8Path| {
+            Utf8PathBuf::from_path_buf(std::fs::canonicalize(path).expect("canonical"))
+                .expect("utf8 path")
+        };
+        let canonical_root = canonical(root);
+        assert!(
+            canonical_root.as_str().starts_with(r"\\?\"),
+            "{canonical_root} is verbatim"
+        );
+
+        let configs = ConfigSources::load(root, None, true).expect("config sources");
+
+        assert_eq!(
+            layer_tokens(&configs, &canonical(&root.join("apps").join("web"))),
+            ALL_LAYERS
+        );
+        assert_eq!(
+            layer_tokens(&configs, &canonical_root),
+            ["repo:cooldown.toml"]
+        );
+    }
+
+    /// The `$HOME` fallback resolves to the canonical directory the environment's spelling names,
+    /// the form the workdir the walk starts from takes.
+    #[test]
+    fn the_home_fallback_root_is_canonical() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = Utf8Path::from_path(tmp.path()).expect("utf8 base");
+        let workdir = base.join("home").join("work");
+        std::fs::create_dir_all(&workdir).expect("workdir");
+        std::fs::create_dir_all(base.join("other")).expect("other dir");
+        let home = base.join("other").join("..").join("home");
+
+        // Nothing above the temporary directory marks a repository, so the walk falls back.
+        assert_eq!(
+            repo_root_from(&workdir, Some(home)),
+            Utf8PathBuf::from_path_buf(
+                std::fs::canonicalize(base.join("home")).expect("canonical home")
+            )
+            .expect("utf8 home")
         );
     }
 
