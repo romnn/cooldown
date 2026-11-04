@@ -82,7 +82,10 @@ const YARN_4: Fake<'static> = Fake {
 };
 
 impl Fixture {
-    /// Writes the fake and returns its driver.
+    /// Writes the fake and returns the driver the adapter would run it with.
+    ///
+    /// The fake starts from Corepack's auto-pin switched on, so only the adapter's own driver
+    /// settings can turn it off for the run, whatever the developer's shell exports.
     fn fake(&self, fake: &Fake<'_>) -> eyre::Result<NodeCmd> {
         use std::os::unix::fs::PermissionsExt as _;
         let report = self.top.join("report.ndjson");
@@ -112,7 +115,9 @@ impl Fixture {
             },
         )?;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
-        Ok(NodeCmd::with_bin(script.as_str()))
+        Ok(crate::yarn::yarn_driver(
+            NodeCmd::with_bin(script.as_str()).with_env("COREPACK_ENABLE_AUTO_PIN", "1"),
+        ))
     }
 
     fn log_path(&self) -> Utf8PathBuf {
@@ -238,7 +243,7 @@ async fn no_verdict_is_unknown_and_names_the_project() -> eyre::Result<()> {
     assert!(detail.contains("reached no verdict offline"), "{detail}");
     assert!(detail.contains("YN0080"), "{detail}");
 
-    // The usage error names the copy's rc file, which the diagnostic relabels.
+    // The usage error names the copy's rc file, which the diagnostic names from the project.
     let fixture = new_fixture()?;
     let refused = fixture
         .verify(&Fake {
@@ -250,8 +255,10 @@ async fn no_verdict_is_unknown_and_names_the_project() -> eyre::Result<()> {
     assert_eq!(refused.report.status, LockStatus::Unknown);
     let detail = &refused.report.detail;
     assert!(detail.contains("printed no install report"), "{detail}");
-    let named = format!("{}/.yarnrc.yml", fixture.project.root);
-    assert!(detail.contains(&named), "{detail}");
+    assert!(
+        detail.contains("Parse error when loading .yarnrc.yml"),
+        "{detail}"
+    );
     assert!(detail.contains("Usage Error"), "{detail}");
     assert!(!detail.contains('\u{1b}'), "{detail}");
     assert!(

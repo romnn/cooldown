@@ -342,7 +342,7 @@ impl Plan {
                 }
                 Entry::Screened { source, bytes } => {
                     if read_optional(source)?.as_ref() != Some(bytes) {
-                        return Ok(Copied::Changed(changed(source)));
+                        return Ok(Copied::Changed(changed(&self.root, source)));
                     }
                     let permissions = permissions(source)?;
                     if let Some(destination) = &destination {
@@ -371,7 +371,7 @@ impl Plan {
             if let InPlace::Screened(screened) = in_place
                 && *screened != bytes
             {
-                return Ok(Copied::Changed(changed(path)));
+                return Ok(Copied::Changed(changed(&self.root, path)));
             }
             match bytes {
                 Some(bytes) => digest.record(Record::InPlace, path, &bytes),
@@ -481,8 +481,11 @@ fn read_optional(path: &Utf8Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
-fn changed(path: &Utf8Path) -> String {
-    format!("{path} changed while cooldown copied the project, so no screened copy of it exists")
+fn changed(root: &Utf8Path, path: &Utf8Path) -> String {
+    format!(
+        "{} changed while cooldown copied the project, so no screened copy of it exists",
+        planner::shown(root, path)
+    )
 }
 
 fn filesystem(path: &Utf8Path, err: &std::io::Error) -> CoreError {

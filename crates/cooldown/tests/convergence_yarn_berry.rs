@@ -941,6 +941,28 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> eyre::Result<()> {
     Ok(())
 }
 
+/// `lock` with its `__metadata` schema changed from `from` to `to`, whatever line ending Yarn
+/// wrote, which is CRLF on Windows.
+fn with_schema(lock: &str, from: &str, to: &str) -> String {
+    let mut in_metadata = false;
+    let mut changed = false;
+    lock.split_inclusive('\n')
+        .map(|line| {
+            let content = line.trim_end_matches(['\r', '\n']);
+            let ending = &line[content.len()..];
+            if content == "__metadata:" {
+                in_metadata = true;
+            } else if in_metadata && !changed && content == format!("  version: {from}") {
+                changed = true;
+                return format!("  version: {to}{ending}");
+            } else if !content.starts_with(' ') {
+                in_metadata = false;
+            }
+            line.to_string()
+        })
+        .collect()
+}
+
 /// Runs `cooldown check --offline` with `extra`.
 fn check(fixture: &Fixture, extra: &[&str]) -> eyre::Result<Run> {
     let mut args = vec!["check", "--offline"];
@@ -988,7 +1010,7 @@ fn check_proves_a_seeded_lock_current_without_touching_the_project() -> eyre::Re
 
     // The schema Yarn 4.0 through 4.13 wrote, which Yarn 4.18.1 migrates the rc file for.
     let lock = String::from_utf8(fixture.read_bytes("yarn.lock"))?;
-    let older = lock.replacen("  version: 10\n", "  version: 8\n", 1);
+    let older = with_schema(&lock, "10", "8");
     assert_ne!(older, lock);
     fixture.write("yarn.lock", &older);
     let before = snapshot(fixture.root())?;
