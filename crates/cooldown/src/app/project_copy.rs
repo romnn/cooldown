@@ -83,13 +83,20 @@ impl ProjectCopy {
             ))
         })?;
 
-        // External roots arrive canonical (the adapter resolves `../` references through the real
-        // tree), so ancestor computation must compare against the equally-canonical project root
-        // or a symlinked component would push the ancestor to `/`.
-        let canonical_root = std::fs::canonicalize(project.root.as_std_path())
-            .ok()
-            .and_then(|path| camino::Utf8PathBuf::from_path_buf(path).ok())
-            .unwrap_or_else(|| project.root.clone());
+        // Ancestor computation compares every root with the project root, so both are spelled the
+        // one way this canonicalization spells them: an adapter may hand a root through a link,
+        // or on Windows without the verbatim `\\?\` prefix this adds, and a root spelled
+        // otherwise would match no prefix and be silently left out of the copy.
+        let canonical = |path: &camino::Utf8Path| {
+            std::fs::canonicalize(path.as_std_path())
+                .ok()
+                .and_then(|path| camino::Utf8PathBuf::from_path_buf(path).ok())
+                .unwrap_or_else(|| path.to_owned())
+        };
+        let canonical_root = canonical(&project.root);
+        let external_roots: Vec<camino::Utf8PathBuf> =
+            external_roots.iter().map(|root| canonical(root)).collect();
+        let external_roots = external_roots.as_slice();
         // Without external roots — or when they share no prefix with the project — the project
         // root itself anchors the rebase: nothing extra is staged, but the walk still needs the
         // mapping to recreate an in-tree symlink whose canonical target is also in-tree at that
@@ -584,6 +591,61 @@ mod tests {
             "archive-bytes",
             "the in-tree archive's bytes are staged at its project-relative position"
         );
+    }
+
+    /// An in-tree root is staged however the adapter spells it: through a link, or on Windows
+    /// without the verbatim prefix canonicalization adds, as the Yarn Berry adapter names the
+    /// files of a `file:` folder.
+    #[test]
+    fn copy_stages_a_root_whatever_its_spelling() {
+        let repo = tempfile::tempdir().expect("repo");
+        let base = repo.path();
+        std::fs::create_dir_all(base.join("app/local")).expect("mkdir");
+        std::fs::write(base.join("app/package.json"), "{}").expect("write");
+        std::fs::write(base.join("app/local/index.js"), "module.exports = 1;").expect("write");
+        let canonical = std::fs::canonicalize(base.join("app")).expect("canonicalize fixture path");
+        let root =
+            camino::Utf8PathBuf::from_path_buf(canonical.clone()).expect("UTF-8 fixture path");
+        let spelled = other_spelling(base, &canonical).join("local/index.js");
+        let project = Project {
+            root: root.clone(),
+            kind: ToolId("test"),
+            manifest: root.join("package.json"),
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        };
+
+        let copy = ProjectCopy::create(
+            &project,
+            &ResolveInputs::DEFAULT,
+            std::slice::from_ref(&spelled),
+        )
+        .expect("copy project");
+
+        assert_ne!(spelled, root.join("local/index.js"));
+        assert_eq!(
+            std::fs::read_to_string(copy.project.root.join("local/index.js")).expect("staged root"),
+            "module.exports = 1;"
+        );
+    }
+
+    /// `canonical`, the canonical form of `base/app`, spelled another way that leads to it: through
+    /// a link on Unix, without the verbatim prefix on Windows.
+    #[cfg(unix)]
+    fn other_spelling(base: &std::path::Path, canonical: &std::path::Path) -> camino::Utf8PathBuf {
+        let link = base.join("link");
+        std::os::unix::fs::symlink(canonical, &link).expect("link the project");
+        camino::Utf8PathBuf::from_path_buf(link).expect("UTF-8 link path")
+    }
+
+    #[cfg(windows)]
+    fn other_spelling(_base: &std::path::Path, canonical: &std::path::Path) -> camino::Utf8PathBuf {
+        let canonical = canonical.to_str().expect("UTF-8 fixture path");
+        let plain = canonical
+            .strip_prefix(r"\\?\")
+            .expect("canonicalization adds the verbatim prefix");
+        camino::Utf8PathBuf::from(plain)
     }
 
     /// An in-tree symlink whose target lives outside the project (`libs/shared` linking to a

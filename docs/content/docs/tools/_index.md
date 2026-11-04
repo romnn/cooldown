@@ -20,7 +20,7 @@ bookCollapseSection: false
 | npm | `npm` | npm registry | `package.json` / `package-lock.json` |
 | pnpm | `pnpm` | npm registry | `pnpm-lock.yaml` |
 | Yarn (Classic v1) | `yarn` | npm registry | `yarn.lock` |
-| Yarn (Berry v2+, read-only) | `yarn` | npm registry | `yarn.lock` |
+| Yarn (Berry v2+) | `yarn` | npm registry | `yarn.lock` |
 | Bun | `bun` | npm registry | `bun.lock` |
 | Deno | `deno` | npm + JSR | `deno.json` / `deno.lock` |
 | Ruby | `bundler` | rubygems.org | `Gemfile` / `Gemfile.lock` |
@@ -78,16 +78,42 @@ cannot reproduce faithfully (a configured plugin, an `exec:` dependency, a works
 outside the home directory, a symbolic link whose copy would resolve outside the copy, injected
 environment files other than `.env.yarn`, a lockfile name other than `yarn.lock`,
 `networkSettings` or an enabled `enableNetwork`, hardened mode set to anything but off, an output
-folder outside the copy, or an rc file using Yarn's `onConflict` form), an input that changes
+folder outside the copy, or an rc file using Yarn's `onConflict` form at its top level or for one
+of those settings, `packageExtensions`, or `yarnPath`), an input that changes
 while the copy is written, or a Yarn without a supported version.
 Should any input change while `check` reads the dependencies after the verdict, the run reports
 `lock_conflict` instead of evaluating a graph Yarn never verified. A change undone before that
 second read goes unnoticed, the same window pnpm's verify-then-read check leaves.
 
-Not yet supported for Berry:
+`upgrade` and `fix` land each candidate of a Berry project run by Yarn 4 at exactly its target.
+The run first has Yarn prove the lock current, as `check` does, and refuses a stale lock or one
+Yarn cannot judge before changing anything. Each candidate then resolves in a throwaway copy of the
+project in two lock-only installs (`yarn install --mode=update-lockfile`): the first with every
+declaration of the package pinned to the target, the second with the declarations restored and
+the lock binding each declared range to the target's entry, which Yarn would otherwise keep bound
+to the old copy or resolve afresh to the range's newest release. Yarn then proves the settled lock
+current in the copy, and only the lock is written back, once every input the copy holds is
+unchanged in the project; manifests, install state, and caches stay as they were. A candidate
+that fails is skipped `resolver_conflict` with Yarn's error and leaves the lock as it was, and
+`--build` runs `yarn install --immutable` in the project once the run has landed.
 
-- every mutation: `upgrade`, `fix`, and `--build` refuse a Berry project before running Yarn, and
-  `outdated` warns that its adoptable rows were not verified against `upgrade`.
+A Yarn with the native age gate (4.10 or later) resolves each landing under an approval of
+exactly the target, beside the approvals Yarn's configuration already holds, and under cooldown's
+window when that is stricter than Yarn's own gate, so a new transitive the gate quarantines fails
+the candidate. Yarn 4.17 and later gate each configured `npmScopes` entry by that scope's own gate
+instead, so a landing that newly resolves another release in a scope gated below the window fails
+too. The installs keep Yarn's own network settings and global folder, whose metadata cache and
+mirror serve an `--offline` landing; a global folder inside the project, or inside any directory
+holding a `package.json`, is replaced by one in the copy.
+
+A candidate is held `not_eligible`, naming the declaration, when one of its declarations is no
+registry range admitting the target (an `npm:` alias, a `patch:`, or a local source), when
+a member declares it at several ranges, or when binding the declared ranges would move a copy the
+candidate does not own: a range the lock binds to another copy, or one a member excluded from the
+run declares too. `upgrade` and `fix` refuse a Berry project run by any Yarn but Yarn 4, which
+the other commands still read. A `--dry-run` copy recreates in-tree symbolic links as absolute links and drops
+directory permissions, so a project relying on them reports the preview as an error and writes
+nothing, while the real run lands.
 
 For a Berry project run by Yarn 4.10 or later, [`sync`]({{< relref "../commands/other.md" >}}#yarn-berry)
 writes the native age gate, `npmMinimalAgeGate` and `npmPreapprovedPackages`, into its

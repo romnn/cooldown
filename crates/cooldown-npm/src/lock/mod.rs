@@ -22,7 +22,9 @@ mod yarn_berry;
 pub use crate::manifest::workspaces::{WorkspaceDialect, WorkspaceManifests};
 pub use yarn::{UnattributedName, Unproven, UnprovenDeclaration, YarnBindings};
 
-pub(crate) use yarn_berry::{BerryLock, YarnBerry, berry_workspace_paths, percent_decode};
+pub(crate) use yarn_berry::{
+    BerryLock, YarnBerry, berry_workspace_paths, percent_decode, seed as berry_seed,
+};
 
 use crate::version::{CeilingHold, RangeMatch, is_exact_npm_specifier, range_match};
 use cooldown_core::{CoreError, Result, ToolId};
@@ -90,6 +92,15 @@ pub trait NodeLock: Send + Sync + 'static {
     /// [`member_attribution_in`](NodeLock::member_attribution_in); the other managers' hooks
     /// ignore them.
     const WORKSPACE_MANIFESTS: Option<WorkspaceDialect> = None;
+
+    /// Whether this manager lands an exact target by binding the declared descriptors to it in the
+    /// lock itself, through a runner of its own, rather than through a command
+    /// ([`preserving_pin`](NodeLock::preserving_pin) or [`relock_args`](NodeLock::relock_args)).
+    ///
+    /// Only Yarn Berry does: it reuses every binding its lock records, so no command lands a
+    /// version below the maximum of a range the lock binds elsewhere.
+    /// The landing keeps every declaration that admits the target as it is.
+    const SEEDS_EXACT_DESCRIPTORS: bool = false;
 
     /// Parses the lockfile body into the flat list of resolved [`NameVersion`] pairs.
     ///

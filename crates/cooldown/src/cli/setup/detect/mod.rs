@@ -51,7 +51,7 @@ pub(super) fn adapter_set(
     rejection_memo_enabled: bool,
     revalidate_npm_listings: bool,
 ) -> Result<(AdapterSet, SharedHttp), CoreError> {
-    let http = SharedHttp::new(discovery::cache_dir().into_std_path_buf(), http_options)?;
+    let http = SharedHttp::new(discovery::cache_dir()?, http_options)?;
 
     let mut adapters = AdapterSet::new();
     adapters.register_target_verified_mutator(Arc::new(GoTool::from_http(http.clone())))?;

@@ -258,11 +258,12 @@ fn an_unredirected_output_folder_outside_the_copy_declines() {
     );
 }
 
-/// An rc file using Yarn's conflict-marker form anywhere declines, since Yarn unwraps it: here
-/// the top-level `onConflict` hides per-host network settings that turn the network on, a nested
-/// one hides an output folder outside the copy, and one inside an array declines too.
+/// An rc file using Yarn's conflict-marker form around what screening reads declines, since Yarn
+/// unwraps it: here the top-level `onConflict` hides per-host network settings that turn the
+/// network on, a nested one hides an output folder outside the copy, and one inside an array
+/// declines too.
 #[test]
-fn a_conflict_marker_anywhere_declines() {
+fn a_conflict_marker_around_a_screened_setting_declines() {
     for settings in [
         indoc! {"
             onConflict: reset
@@ -290,5 +291,30 @@ fn a_conflict_marker_anywhere_declines() {
                 .is_some_and(|reason| reason.contains("uses Yarn's `onConflict` form")),
             "{settings}: {reason:?}"
         );
+    }
+}
+
+/// A conflict marker under a setting screening never reads changes nothing it screens, so the rc
+/// file `sync` writes, with its `npmPreapprovedPackages` in the `onConflict: reset` form, passes,
+/// and so does a marker nested in another unscreened setting.
+#[test]
+fn a_conflict_marker_around_another_setting_passes() {
+    for settings in [
+        indoc! {r#"
+            npmMinimalAgeGate: 10080
+            npmPreapprovedPackages:
+              onConflict: reset
+              value:
+                - "left-pad"
+        "#},
+        indoc! {"
+            npmScopes:
+              corp:
+                onConflict: reset
+                value:
+                  npmAlwaysAuth: true
+        "},
+    ] {
+        assert_eq!(declined_rc(settings), None, "{settings}");
     }
 }

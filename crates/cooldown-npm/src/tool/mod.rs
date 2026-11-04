@@ -7,9 +7,9 @@
 //! differ only in how their lock is parsed and how their CLI re-pins a dependency.
 
 use crate::apply::landing::{
-    CandidateLanding, LandingPlan, OwnedStep, absolute_cutoff_from_project, candidate_landing,
-    holds_exact_pins, restore_after_owned_step, run_candidate_landing_with,
-    target_in_declared_range, window_minutes_from_cutoff,
+    CandidateLanding, CandidateRunner, LandingPlan, OwnedStep, absolute_cutoff_from_project,
+    candidate_landing, holds_exact_pins, restore_after_owned_step, target_in_declared_range,
+    window_minutes_from_cutoff,
 };
 use crate::lock::{
     AliasOnlyVersions, EffectiveRegistryQuery, FixedBinding, FixedOwner, MemberAttribution,
@@ -42,10 +42,10 @@ use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, CoreError, Declaration, DepScope,
     Dependency, Diagnostic, DiagnosticKind, FetchContext, LockStatus, LockVerifyReport, MemberRef,
     MutationBaseline, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
-    Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher,
-    ReleaseOrder, ReleaseQuality, ResolvedPolicy, Result, RewriteMode, SingleCopyPolicy,
-    SkipReason, Skipped, SyncReport, SyncScope, TargetFallback, ToolId, ToolRead, ToolWrite,
-    UpdateKind, VerifyReport, Version,
+    Project, ProjectMarker, ProjectMutationJournal, ProjectMutationState, RawRelease, Release,
+    ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolvedPolicy, Result, RewriteMode,
+    SingleCopyPolicy, SkipReason, Skipped, SyncReport, SyncScope, TargetFallback, ToolId, ToolRead,
+    ToolWrite, UpdateKind, VerifyReport, Version, redact,
 };
 use cooldown_registry::SharedHttp;
 use serde::de::DeserializeOwned;
@@ -1051,6 +1051,88 @@ impl LandingBaseline {
                 .unwrap_or_default(),
         }
     }
+}
+
+/// The newest locked version of each name in the lock the landings of a per-package apply left.
+///
+/// # Errors
+///
+/// Returns a [`CoreError`] when the lock cannot be read or parsed.
+fn settled_versions<L: NodeLock>(project: &Project) -> Result<HashMap<String, String>> {
+    let after_content = match std::fs::read_to_string(project.root.join(L::LOCKFILE)) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    // This is fresh post-install content the driver just wrote, so the earlier strict reads
+    // prove nothing about it: a failed parse must fail the batch rather than diff against an
+    // empty map that hides every collateral move. Only an absent lock diffs as empty.
+    versions_in::<L>(after_content.as_deref())
+}
+
+/// The newest locked version of each name in the lock `content`, or none without a lock.
+///
+/// # Errors
+///
+/// Returns a [`CoreError`] when the lock cannot be parsed.
+fn versions_in<L: NodeLock>(content: Option<&str>) -> Result<HashMap<String, String>> {
+    Ok(content
+        .map(locked_versions::<L>)
+        .transpose()?
+        .unwrap_or_default())
+}
+
+/// The row skipping `change` for `reason`, which names the package itself and needs no detail.
+fn own_row(change: &Change, reason: SkipReason) -> Skipped {
+    Skipped {
+        change: change.clone(),
+        reason,
+        offending: Some(change.package.clone()),
+        detail: None,
+    }
+}
+
+/// The row `runner` holds `change` with before its landing runs, or `None` to land it.
+///
+/// A held candidate is restored from `authorized`, the state cooldown's own edits left before the
+/// hold read anything.
+/// The row's detail is redacted, since a runner quotes declarations and tool output, which may
+/// carry registry credentials.
+fn runner_hold<L: NodeLock>(
+    runner: &dyn CandidateRunner,
+    project: &Project,
+    plan: &Plan,
+    change: &Change,
+    candidate_journal: &ProjectMutationJournal,
+    authorized: &ProjectMutationState,
+) -> Result<Option<Skipped>> {
+    let lock = journaled_lock::<L>(candidate_journal);
+    let Some(mut held) = runner.hold(project, plan, change, lock)? else {
+        return Ok(None);
+    };
+    restore_after_owned_step(candidate_journal, authorized)?;
+    held.detail = held.detail.as_deref().map(redact::url_secrets);
+    Ok(Some(held))
+}
+
+/// The row skipping `change`, whose landing failed with the candidate's own `error`, with the
+/// detail `runner` gives it, redacted as a hold's is ([`runner_hold`]).
+///
+/// # Errors
+///
+/// Returns `error` itself when it is a local environment failure.
+fn failed_landing_row(
+    runner: &dyn CandidateRunner,
+    change: &Change,
+    error: CoreError,
+) -> Result<Skipped> {
+    let detail = runner
+        .skip_detail(&error)
+        .as_deref()
+        .map(redact::url_secrets);
+    let mut skipped = skipped_on_apply_error(change, error)?;
+    skipped.detail = skipped.detail.or(detail);
+    Ok(skipped)
 }
 
 /// Plans one per-package candidate's landing ([`candidate_landing`]), or the row that skips it.
@@ -2179,13 +2261,55 @@ fn excluded_paths(plan: &Plan) -> HashSet<String> {
 }
 
 impl<L: NodeLock> NpmTool<L> {
-    async fn run_candidate_landing(
+    /// Applies `mutation` as [`ToolWrite::apply`] does, with `runner` running each per-package
+    /// landing transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] when the mutation belongs to another tool family, and
+    /// any error the peer gate, a landing, or a guard on the settled lock raises.
+    pub(crate) async fn apply_with_runner(
         &self,
-        project: &Project,
-        candidate_journal: &ProjectMutationJournal,
-        landing: &CandidateLanding,
-    ) -> Result<OwnedStep> {
-        run_candidate_landing_with(&self.cmd, project, candidate_journal, landing).await
+        mutation: &PreparedMutation,
+        runner: &dyn CandidateRunner,
+    ) -> Result<ApplyReport> {
+        let (project, plan, journal) = mutation.parts_for(self)?;
+        // The peer-feasibility gate runs against the journaled pre-apply lock, before any resolver
+        // work: a cross-major target a still-present dependent's peer range excludes is held up
+        // front — pnpm's resolver only *warns* on the mismatch, and npm (which rejects it by
+        // default) commits it under relaxed enforcement.
+        // The gated changes never reach the resolve (no manifest widen, no pin).
+        // Workspace member manifests are read from disk here — still pre-apply state — because the
+        // lock is not authoritative for a local package's peer contracts.
+        let lock = journaled_lock::<L>(journal);
+        let evidence = PeerEvidence::gather::<L>(Some(&project.root), lock, plan);
+        let PeerPartition {
+            retained: plan,
+            skipped: peer_held,
+        } = partition_peer_held::<L>(plan, &evidence);
+        // A manager with a native joint resolve (pnpm) re-resolves the whole importer graph
+        // jointly (peer verification may reject candidates and re-resolve) and reports the full
+        // before/after lock diff, so a candidate can never silently move another package and
+        // mutually-exclusive peers settle at a single fixed point.
+        // The others (npm/yarn/bun) lack a joint pin-set resolve, so they keep the per-package relock
+        // path.
+        // A recovery subset shares its operation's baseline, so every trial judges the same pins.
+        let protected_pins = ProtectedPins::from_baseline::<L>(mutation.baseline())?;
+        let mut report = if L::supports_whole_graph_resolve() {
+            self.apply_whole_graph(project, &plan, journal, &evidence, &protected_pins)
+                .await?
+        } else {
+            self.apply_per_package(
+                project,
+                &plan,
+                journal,
+                (&evidence.workspace, &protected_pins),
+                runner,
+            )
+            .await?
+        };
+        report.skipped.extend(peer_held);
+        Ok(report)
     }
 
     /// For each change, moves the lock with a lock-only update or an exact pin around cooldown's
@@ -2199,20 +2323,20 @@ impl<L: NodeLock> NpmTool<L> {
     /// and reported as a resolver conflict naming the pin.
     /// Each candidate is judged against the state the earlier accepted landings left, so only the
     /// candidate that moved the pin is rolled back.
+    ///
+    /// `runner` runs each landing transaction, and may hold a candidate before its landing runs.
     async fn apply_per_package(
         &self,
         project: &Project,
         plan: &Plan,
         baseline_journal: &ProjectMutationJournal,
-        peer_workspace: &[WorkspacePeer],
-        protected_pins: &ProtectedPins,
+        peers: (&[WorkspacePeer], &ProtectedPins),
+        runner: &dyn CandidateRunner,
     ) -> Result<ApplyReport> {
+        let (peer_workspace, protected_pins) = peers;
         // A project without a journaled lock diffs from an empty baseline; a present but
         // unparsable one is a real error, never an empty graph.
-        let before = journaled_lock::<L>(baseline_journal)
-            .map(locked_versions::<L>)
-            .transpose()?
-            .unwrap_or_default();
+        let before = versions_in::<L>(journaled_lock::<L>(baseline_journal))?;
         let workspace = protected_pins.workspace();
         let landing_baseline =
             LandingBaseline::of::<L>(journaled_lock::<L>(baseline_journal), workspace);
@@ -2246,8 +2370,22 @@ impl<L: NodeLock> NpmTool<L> {
                         continue;
                     }
                 };
-            let attempt = self
-                .run_candidate_landing(project, &candidate_journal, &landing)
+            // The state cooldown's widen left, captured before anything else reads the project, is
+            // what a hold or a landing that writes nothing rolls back from.
+            let authorized = candidate_journal.capture_state()?;
+            if let Some(held) = runner_hold::<L>(
+                runner,
+                project,
+                plan,
+                change,
+                &candidate_journal,
+                &authorized,
+            )? {
+                report.skipped.push(held);
+                continue;
+            }
+            let attempt = runner
+                .land(project, change, &candidate_journal, &landing, &authorized)
                 .await?;
             let settled_edits = accepted_edits.union(&candidate_edits);
             let landed_workspace = workspace.map(|workspace| settled_edits.apply_to(workspace));
@@ -2286,12 +2424,9 @@ impl<L: NodeLock> NpmTool<L> {
                     // the package where it is, a ceiling the resolver imposed rather than a
                     // rejection it raised.
                     restore_after_owned_step(&candidate_journal, &attempt.postimage)?;
-                    report.skipped.push(Skipped {
-                        change: change.clone(),
-                        reason: SkipReason::GraphCeilingHeld,
-                        offending: Some(change.package.clone()),
-                        detail: None,
-                    });
+                    report
+                        .skipped
+                        .push(own_row(change, SkipReason::GraphCeilingHeld));
                 }
                 Err(error) if error.is_local_environment_failure() => {
                     restore_after_owned_step(&candidate_journal, &attempt.postimage)?;
@@ -2299,23 +2434,13 @@ impl<L: NodeLock> NpmTool<L> {
                 }
                 Err(error) => {
                     restore_after_owned_step(&candidate_journal, &attempt.postimage)?;
-                    report.skipped.push(skipped_on_apply_error(change, error)?);
+                    report
+                        .skipped
+                        .push(failed_landing_row(runner, change, error)?);
                 }
             }
         }
-        let after_content = match std::fs::read_to_string(project.root.join(L::LOCKFILE)) {
-            Ok(content) => Some(content),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
-        // This is fresh post-install content the driver just wrote, so the earlier strict reads
-        // prove nothing about it: a failed parse must fail the batch rather than diff against an
-        // empty map that hides every collateral move. Only an absent lock diffs as empty.
-        let after = after_content
-            .as_deref()
-            .map(locked_versions::<L>)
-            .transpose()?
-            .unwrap_or_default();
+        let after = settled_versions::<L>(project)?;
         let collateral = collateral_changes::<L>(&before, &after, &report.applied);
         report.applied.extend(collateral);
         Ok(report)
@@ -3921,43 +4046,7 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
     }
 
     async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
-        let (project, plan, journal) = mutation.parts_for(self)?;
-        // The peer-feasibility gate runs against the journaled pre-apply lock, before any resolver
-        // work: a cross-major target a still-present dependent's peer range excludes is held up
-        // front — pnpm's resolver only *warns* on the mismatch, and npm (which rejects it by
-        // default) commits it under relaxed enforcement.
-        // The gated changes never reach the resolve (no manifest widen, no pin).
-        // Workspace member manifests are read from disk here — still pre-apply state — because the
-        // lock is not authoritative for a local package's peer contracts.
-        let lock = journaled_lock::<L>(journal);
-        let evidence = PeerEvidence::gather::<L>(Some(&project.root), lock, plan);
-        let PeerPartition {
-            retained: plan,
-            skipped: peer_held,
-        } = partition_peer_held::<L>(plan, &evidence);
-        // A manager with a native joint resolve (pnpm) re-resolves the whole importer graph
-        // jointly (peer verification may reject candidates and re-resolve) and reports the full
-        // before/after lock diff, so a candidate can never silently move another package and
-        // mutually-exclusive peers settle at a single fixed point.
-        // The others (npm/yarn/bun) lack a joint pin-set resolve, so they keep the per-package relock
-        // path.
-        // A recovery subset shares its operation's baseline, so every trial judges the same pins.
-        let protected_pins = ProtectedPins::from_baseline::<L>(mutation.baseline())?;
-        let mut report = if L::supports_whole_graph_resolve() {
-            self.apply_whole_graph(project, &plan, journal, &evidence, &protected_pins)
-                .await?
-        } else {
-            self.apply_per_package(
-                project,
-                &plan,
-                journal,
-                &evidence.workspace,
-                &protected_pins,
-            )
-            .await?
-        };
-        report.skipped.extend(peer_held);
-        Ok(report)
+        self.apply_with_runner(mutation, &self.cmd).await
     }
 
     async fn build(&self, project: &Project) -> Result<VerifyReport> {

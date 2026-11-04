@@ -8,7 +8,8 @@ use crate::version;
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{
-    Change, CoreError, Project, ProjectMutationJournal, ProjectMutationState, Result, RewriteMode,
+    Change, CoreError, Plan, Project, ProjectMutationJournal, ProjectMutationState, Result,
+    RewriteMode, Skipped,
 };
 
 /// The result and exact write-set state observed when an adapter-owned command returned.
@@ -38,6 +39,75 @@ impl CandidateCommand for NodeCmd {
     }
 }
 
+/// How the per-package apply runs each candidate's landing transaction.
+///
+/// [`NodeCmd`] runs the transaction [`candidate_landing`] planned with the manager's own commands.
+/// A manager whose exact landing needs more than commands in the project, such as Yarn Berry's
+/// descriptor seeding ([`CandidateLanding::Seeded`]), brings its own runner.
+#[async_trait]
+pub(crate) trait CandidateRunner: Send + Sync {
+    /// The row that skips `change` before its landing runs, or `None` to land it.
+    ///
+    /// It is asked once the change's authorized manifest edits are written, with `lock` the
+    /// candidate's starting lock, and the caller restores those edits when it skips, from the
+    /// state it captured before asking.
+    /// The caller redacts URL credentials from the row's detail.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`] when the manifests or the lock cannot be read.
+    fn hold(
+        &self,
+        _project: &Project,
+        _plan: &Plan,
+        _change: &Change,
+        _lock: Option<&str>,
+    ) -> Result<Option<Skipped>> {
+        Ok(None)
+    }
+
+    /// The detail of the row that skips a candidate whose landing failed with `error`, or `None`
+    /// for the row's own wording.
+    ///
+    /// The caller redacts URL credentials from it, so it may quote the tool's output as it is.
+    fn skip_detail(&self, _error: &CoreError) -> Option<String> {
+        None
+    }
+
+    /// Runs `landing` for `change`, returning its result and the candidate journal's postimage.
+    ///
+    /// `authorized` is the journal's state once cooldown's own edits were written, before the
+    /// hold was asked: a runner whose failed landing writes nothing returns it as the postimage,
+    /// so the rollback never takes a change someone else made meanwhile for its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`] when the journal's postimage cannot be captured; a failed resolver
+    /// is the step's own result.
+    async fn land(
+        &self,
+        project: &Project,
+        change: &Change,
+        candidate_journal: &ProjectMutationJournal,
+        landing: &CandidateLanding,
+        authorized: &ProjectMutationState,
+    ) -> Result<OwnedStep>;
+}
+
+#[async_trait]
+impl CandidateRunner for NodeCmd {
+    async fn land(
+        &self,
+        project: &Project,
+        _change: &Change,
+        candidate_journal: &ProjectMutationJournal,
+        landing: &CandidateLanding,
+        _authorized: &ProjectMutationState,
+    ) -> Result<OwnedStep> {
+        run_candidate_landing_with(self, project, candidate_journal, landing).await
+    }
+}
+
 /// Restores an adapter-owned step only while its exact postimage remains live.
 pub(crate) fn restore_after_owned_step(
     journal: &ProjectMutationJournal,
@@ -64,28 +134,22 @@ pub(crate) enum CandidateLanding {
         authorized_manifests: ProjectMutationJournal,
         resync: Vec<String>,
     },
+    /// The declared descriptors are bound to the exact target in the lock itself
+    /// ([`NodeLock::SEEDS_EXACT_DESCRIPTORS`]), by a runner of the manager's own that leaves the
+    /// authorized manifests as they are.
+    Seeded,
 }
 
-impl CandidateLanding {
-    fn command(&self) -> &[String] {
-        match self {
-            CandidateLanding::Direct { command, .. } => command,
-            CandidateLanding::PinRestoreResync { pin, .. } => pin,
-        }
-    }
-
-    fn authorized_manifests(&self) -> &ProjectMutationJournal {
-        match self {
-            CandidateLanding::Direct {
-                authorized_manifests,
-                ..
-            }
-            | CandidateLanding::PinRestoreResync {
-                authorized_manifests,
-                ..
-            } => authorized_manifests,
-        }
-    }
+/// The exact landing a manager offers ([`candidate_landing`]).
+enum ExactLanding {
+    /// None: a bare relock, steered to the target by shifting the declared ranges.
+    Relock,
+    /// An exact pin bracketed by a restore of the authorized manifests ([`PreservingPin`]).
+    ///
+    /// [`PreservingPin`]: crate::lock::PreservingPin
+    Pin(crate::lock::PreservingPin),
+    /// Descriptor seeding ([`CandidateLanding::Seeded`]).
+    Seeded,
 }
 
 /// What [`candidate_landing`] decided for one candidate.
@@ -151,10 +215,15 @@ pub(crate) fn candidate_landing<L: NodeLock>(
     if declarations.absent() {
         return Ok(LandingPlan::NotEligible);
     }
-    let preserving_pin = preserving_pin::<L>(project, change, declarations.install_workspaces());
-    // Without an exact preserving pin, shifting even an in-range declaration is the only way to
-    // steer a bare relock to the planned target.
-    let manifest_mode = if mode == RewriteMode::Auto && preserving_pin.is_none() {
+    let exact = if L::SEEDS_EXACT_DESCRIPTORS {
+        ExactLanding::Seeded
+    } else {
+        preserving_pin::<L>(project, change, declarations.install_workspaces())
+            .map_or(ExactLanding::Relock, ExactLanding::Pin)
+    };
+    // Without an exact landing, shifting even an in-range declaration is the only way to steer a
+    // bare relock to the planned target.
+    let manifest_mode = if mode == RewriteMode::Auto && matches!(exact, ExactLanding::Relock) {
         RewriteMode::Always
     } else {
         mode
@@ -173,7 +242,7 @@ pub(crate) fn candidate_landing<L: NodeLock>(
     if mode == RewriteMode::Auto
         && rewrite.modified.is_empty()
         && declarations.has_install()
-        && preserving_pin.is_some()
+        && matches!(exact, ExactLanding::Pin(_))
     {
         // npm's resync can select the old lock again when every install range remains compatible.
         // Shift those ranges only when no declaration needed widening.
@@ -188,20 +257,25 @@ pub(crate) fn candidate_landing<L: NodeLock>(
         authorized.record(change, mode, rewrite_pins, &shifted);
         edits.record(&shifted);
     }
-    let authorized_manifests = manifest_snapshot(project, change)?;
-    let landing = if let Some(crate::lock::PreservingPin { pin, resync }) = preserving_pin {
-        CandidateLanding::PinRestoreResync {
-            pin,
-            authorized_manifests,
-            resync,
+    let landing = match exact {
+        ExactLanding::Pin(crate::lock::PreservingPin { pin, resync }) => {
+            CandidateLanding::PinRestoreResync {
+                pin,
+                authorized_manifests: manifest_snapshot(project, change)?,
+                resync,
+            }
         }
-    } else {
-        let before =
-            absolute_cutoff_from_project(project.exclude_newer.as_deref(), jiff::Timestamp::now());
-        CandidateLanding::Direct {
-            command: L::relock_args(before.as_deref()),
-            authorized_manifests,
+        ExactLanding::Relock => {
+            let before = absolute_cutoff_from_project(
+                project.exclude_newer.as_deref(),
+                jiff::Timestamp::now(),
+            );
+            CandidateLanding::Direct {
+                command: L::relock_args(before.as_deref()),
+                authorized_manifests: manifest_snapshot(project, change)?,
+            }
         }
+        ExactLanding::Seeded => CandidateLanding::Seeded,
     };
     Ok(LandingPlan::Land {
         landing,
@@ -348,24 +422,36 @@ pub(crate) async fn run_candidate_landing_with<C: CandidateCommand>(
     candidate_journal: &ProjectMutationJournal,
     landing: &CandidateLanding,
 ) -> Result<OwnedStep> {
-    let authorized_baseline = candidate_journal.state_for(landing.authorized_manifests())?;
-    let first_result = command
-        .run_candidate(&project.root, landing.command())
-        .await;
+    let (first_command, authorized_manifests) = match landing {
+        CandidateLanding::Direct {
+            command,
+            authorized_manifests,
+        } => (command, authorized_manifests),
+        CandidateLanding::PinRestoreResync {
+            pin,
+            authorized_manifests,
+            ..
+        } => (pin, authorized_manifests),
+        CandidateLanding::Seeded => {
+            return Err(CoreError::System(
+                "a seeded landing runs only through its package manager's own runner".into(),
+            ));
+        }
+    };
+    let authorized_baseline = candidate_journal.state_for(authorized_manifests)?;
+    let first_result = command.run_candidate(&project.root, first_command).await;
     let first = OwnedStep::capture(first_result, candidate_journal)?;
     let (attempt, retried_without_cutoff) = match first.result {
         Ok(()) => (first, false),
         Err(error) => {
             let fallback = matches!(&error, CoreError::Tool { .. })
-                .then(|| without_before(landing.command()))
+                .then(|| without_before(first_command))
                 .flatten();
             if let Some(fallback) = fallback {
                 // A baselined post-cutoff package can make npm's historical-tree resolve impossible.
                 // Restore the baseline and reapply authorized manifests before retrying without it.
                 restore_after_owned_step(candidate_journal, &first.postimage)?;
-                landing
-                    .authorized_manifests()
-                    .restore_if_unchanged(&authorized_baseline)?;
+                authorized_manifests.restore_if_unchanged(&authorized_baseline)?;
                 let fallback_result = command.run_candidate(&project.root, &fallback).await;
                 (
                     OwnedStep::capture(fallback_result, candidate_journal)?,

@@ -1,5 +1,6 @@
 //! The `yarn` adapter's routing: each project reaches the backend its own lock's format names, a
-//! Berry project is read but never mutated, and a Classic lock is never handed to a Berry `yarn`.
+//! Berry lock is never handed to a Classic `yarn` nor mutated unverified, and a Classic lock is
+//! never handed to a Berry `yarn`.
 
 use super::YarnTool;
 use crate::lock::yarn_berry_fixtures::{
@@ -305,61 +306,31 @@ mod mutation {
         }
     }
 
-    /// A Berry project is never mutated: `apply` and `--build` refuse it before running Yarn at all,
-    /// so its lock stays byte for byte, and the refusal is an environment failure that candidate
-    /// isolation propagates instead of blaming each candidate.
+    /// A Berry mutation starts only from a lock Yarn proves current, so a project whose lock no
+    /// verification copy can judge, here through an `exec:` package, is refused while the mutation
+    /// is prepared, before any Yarn runs, as an environment failure candidate isolation never
+    /// bisects, and its lock stays byte for byte.
     #[tokio::test]
-    async fn berry_mutation_is_refused_before_any_resolver_runs() -> eyre::Result<()> {
+    async fn a_berry_lock_verification_cannot_judge_is_never_mutated() -> eyre::Result<()> {
         let TempProject { _guard, project } = berry_project(&EVERY_SOURCE)?;
         let script = fake_yarn(&project.root, "4.18.1")?;
         let (_cache, tool) = tool()?;
         let tool = tool.with_driver(script.as_str());
 
-        let mutation = PreparedMutation::prepare(&tool, &project, &chalk_plan()).await?;
-        let applied = system_message(tool.apply(&mutation).await)?;
-        let built = system_message(tool.build(&project).await)?;
+        let prepared = PreparedMutation::prepare(&tool, &project, &chalk_plan()).await;
 
-        for message in [&applied, &built] {
-            assert!(
-                message.contains("Yarn Berry (v2+) lockfile")
-                    && message.contains("cannot change yet"),
-                "{message}"
-            );
-        }
-        assert!(CoreError::System(applied).is_local_environment_failure());
+        let message = system_message(prepared)?;
+        assert!(
+            message.contains("`exec:` package")
+                && message.contains("only once Yarn proves it current"),
+            "{message}"
+        );
+        assert!(CoreError::System(message).is_local_environment_failure());
         assert_eq!(yarn_invocations(&project.root), Vec::<String>::new());
         assert_eq!(
             std::fs::read_to_string(project.root.join("yarn.lock"))?,
             EVERY_SOURCE.lock
         );
-        Ok(())
-    }
-
-    /// The observed apply reports the same refusal as a finished attempt, with the unchanged project
-    /// as its postimage.
-    #[tokio::test]
-    async fn an_observed_berry_apply_finishes_refused() -> eyre::Result<()> {
-        /// An observer that ignores every notification.
-        struct Silent;
-        impl cooldown_core::ApplyObserver for Silent {}
-
-        let TempProject { _guard, project } = berry_project(&EVERY_SOURCE)?;
-        let script = fake_yarn(&project.root, "4.18.1")?;
-        let (_cache, tool) = tool()?;
-        let tool = tool.with_driver(script.as_str());
-
-        let mutation = PreparedMutation::prepare(&tool, &project, &chalk_plan()).await?;
-        let attempt = tool.apply_with_observer(&mutation, &Silent).await?;
-
-        match attempt.into_outcome_for(&mutation)? {
-            cooldown_core::ApplyAttemptOutcome::Finished { report, .. } => {
-                system_message(report)?;
-            }
-            other @ cooldown_core::ApplyAttemptOutcome::PendingRecovery { .. } => {
-                eyre::bail!("expected a finished attempt, got {other:?}");
-            }
-        }
-        assert_eq!(yarn_invocations(&project.root), Vec::<String>::new());
         Ok(())
     }
 
@@ -588,8 +559,8 @@ mod mutation {
     }
 
     /// A lock whose metadata key only the decoded YAML names, whose metadata is null, or whose
-    /// inline metadata precedes malformed YAML is a Berry lock, so `--build` refuses it instead of
-    /// running a Classic install over it.
+    /// inline metadata precedes malformed YAML is a Berry lock, so `--build` asks Yarn only its
+    /// version and refuses the Classic `yarn` instead of running a Classic install over it.
     #[tokio::test]
     async fn an_unusual_metadata_spelling_is_never_built_as_classic() -> eyre::Result<()> {
         for lock in [
@@ -609,14 +580,11 @@ mod mutation {
             let message = system_message(tool.build(&project).await)?;
 
             assert!(
-                message.contains("Yarn Berry (v2+) lockfile"),
+                message.contains("Yarn Berry (v2+) lockfile")
+                    && message.contains("a Yarn Classic (v1) release"),
                 "{lock:?}: {message}"
             );
-            assert_eq!(
-                yarn_invocations(&project.root),
-                Vec::<String>::new(),
-                "{lock:?}"
-            );
+            assert_eq!(yarn_invocations(&project.root), ["--version"], "{lock:?}");
         }
         Ok(())
     }

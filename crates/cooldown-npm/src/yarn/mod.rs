@@ -9,10 +9,14 @@
 //! A lock's format says how to read it, not which Yarn runs it.
 //! Before a resolver runs, the executable the project declares (`packageManager`) and the one
 //! `yarn --version` reaches in the project, through any `yarnPath` or Corepack, must be able to
-//! run the lock without migrating it ([`executable`]), and the live lock must still be of the
-//! format the run was judged on.
-//! Berry projects are read only: their mutation is refused before any resolver could run, and
-//! `sync` writes only their native age gate ([`age_gate`]).
+//! run the lock without migrating or replacing it ([`executable`]), and the live lock must still
+//! be of the format the run was judged on.
+//!
+//! A Berry project's `upgrade` and `fix` land each candidate at its exact target under Yarn 4
+//! ([`mutate`]), in a copy of the project, writing back only the lock.
+//! A mutation starts only from a lock Yarn proves current, so a landing never carries along a
+//! change the manifests made before it, and `sync` writes the project's native age gate
+//! ([`age_gate`]).
 //!
 //! `check` verifies a Berry lock with Yarn itself, in a copy of the project ([`verify`]), and
 //! confirms afterwards that none of the inputs it verified changed while the dependencies were
@@ -22,6 +26,7 @@
 
 mod age_gate;
 mod executable;
+mod mutate;
 mod routing;
 mod verify;
 
@@ -36,7 +41,7 @@ use cooldown_core::fs::{ManifestFamily, ProjectCoordination};
 use cooldown_core::{
     ApplyAttempt, ApplyObserver, ApplyReport, CandidateScope, Capabilities, CoreError, Declaration,
     DepScope, Dependency, Diagnostic, EdgeNormalizationReport, EdgePolicy, EdgeRebind,
-    FetchContext, LockVerifyReport, MemberRef, MutationBaseline, MutationExecution,
+    FetchContext, LockStatus, LockVerifyReport, MemberRef, MutationBaseline, MutationExecution,
     MutationRecovery, NativePolicyLayer, NestedOwnership, Plan, PreparedMutation, Project,
     ProjectMarker, ProjectMutationJournal, Release, ReleaseFetcher, ResolveInputs, ResolvedPolicy,
     Result, SyncReport, SyncScope, TargetFallback, Tool, ToolId, ToolRead, ToolWrite, UpdateKind,
@@ -115,8 +120,9 @@ fn yarn_driver(cmd: NodeCmd) -> NodeCmd {
 /// A Berry lock records its workspaces, so each member's direct dependencies are attributed
 /// through the lock's own record of the member, joined to the member's manifest, and read through
 /// the current manifests and Yarn configuration (see `YarnBerry`).
-/// `upgrade`, `fix`, and `--build` refuse a Berry project before running any resolver, while
-/// `sync` writes its native age gate into the project's `.yarnrc.yml`.
+/// `upgrade` and `fix` land each candidate exactly by seeding its declared descriptors, `--build`
+/// runs Yarn's immutable install, and `sync` writes the native age gate into the project's
+/// `.yarnrc.yml`.
 ///
 /// Either way, a resolver runs only under a Yarn that reads the lock in its own format: a Berry
 /// `yarn` beside a Classic lock would migrate it, so that combination is refused with what to do
@@ -284,25 +290,23 @@ impl YarnTool {
         Ok(self.backend(LockFormat::on_disk(&project.root)?))
     }
 
-    /// The backend for `project` where the call has no error to report: the Classic one when the
-    /// lock cannot be read, since both answer these calls alike.
-    fn backend_or_classic(&self, project: &Project) -> &dyn Tool {
-        LockFormat::on_disk(&project.root).map_or(&self.classic, |format| self.backend(format))
-    }
-
     /// The backend that may run a resolver in `root` for the lock it was judged on, read as
     /// `judged`.
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::System`] for a Berry lock, whose mutation is not supported, and when
-    /// the Yarn that would run in `root` cannot run a Classic lock without migrating it.
+    /// Returns [`CoreError::System`] when the Yarn that would run in `root` cannot run the lock
+    /// without migrating or replacing it.
     /// Returns [`CoreError::LockConflict`] when the live lock is no longer of the judged format,
     /// leaving it as it is, ahead of any refusal of the Yarn executable.
-    async fn admitted_backend(&self, root: &Utf8Path, judged: LockFormat) -> Result<&dyn Tool> {
+    async fn admitted_backend(&self, root: &Utf8Path, judged: LockFormat) -> Result<Admitted> {
         let probed = match judged {
-            LockFormat::Classic => executable::ensure_classic_executable(&self.driver, root).await,
-            LockFormat::Berry => Ok(()),
+            LockFormat::Classic => executable::ensure_classic_executable(&self.driver, root)
+                .await
+                .map(|()| Admitted::Classic),
+            LockFormat::Berry => executable::ensure_berry_executable(&self.driver, root)
+                .await
+                .map(Admitted::Berry),
         };
         // The version probe runs Yarn, and anything else may write the lock meanwhile, so the
         // format the mutation was judged on is confirmed right before a backend writes: the
@@ -319,28 +323,83 @@ impl YarnTool {
                 live = live.describe()
             )));
         }
-        probed?;
-        match judged {
-            LockFormat::Classic => Ok(&self.classic),
-            LockFormat::Berry => Err(berry_mutation_unsupported()),
-        }
+        probed
     }
 
     /// The backend that may apply `mutation`, judged on the lock its journal captured.
-    async fn applying_backend(&self, mutation: &PreparedMutation) -> Result<&dyn Tool> {
+    async fn applying_backend(&self, mutation: &PreparedMutation) -> Result<Admitted> {
         let (project, _, journal) = mutation.parts_for(self)?;
         self.admitted_backend(&project.root, LockFormat::captured(journal))
             .await
     }
+
+    /// Applies `mutation` to a Berry project that Yarn `version` runs, landing each candidate by
+    /// descriptor seeding ([`mutate`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::System`] under any Yarn but Yarn 4, and when Yarn's age gate cannot
+    /// be read; otherwise what the per-package apply returns.
+    async fn apply_berry(
+        &self,
+        mutation: &PreparedMutation,
+        version: &semver::Version,
+    ) -> Result<ApplyReport> {
+        if version.major != BERRY_MUTATION_MAJOR {
+            return Err(CoreError::System(format!(
+                "yarn.lock is a Yarn Berry (v2+) lockfile and `yarn` there runs Yarn {version}, \
+                 but cooldown changes a Yarn Berry lock only under Yarn {BERRY_MUTATION_MAJOR}, \
+                 whose lockfile and install modes it lands targets with"
+            )));
+        }
+        let (project, _, _) = mutation.parts_for(self)?;
+        let settings = mutate::Settings::query(&self.driver, &project.root, version).await?;
+        let landing = mutate::Landing {
+            driver: &self.driver,
+            context: self.verify_context(),
+            settings,
+        };
+        self.berry.apply_with_runner(mutation, &landing).await
+    }
+
+    /// Verifies that `project`'s Berry lock is current, the state a mutation must start from, and
+    /// returns the digest of the inputs verified.
+    ///
+    /// A stale lock would carry the manifests' unrelated changes into the first landing, and a
+    /// lock whose currency is unknown proves nothing a landing could be judged against.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::StaleLock`] for a stale lock and [`CoreError::System`] for one whose
+    /// currency is unknown, each with the verification's detail.
+    async fn verified_start(&self, project: &Project) -> Result<verify::InputDigest> {
+        let verify::Verification { report, digest } =
+            verify::lock_current(&self.driver, project, &self.verify_context()).await?;
+        let remedy = "cooldown changes a Yarn Berry lock only once Yarn proves it current";
+        match (report.status, digest) {
+            (LockStatus::Current, Some(digest)) => Ok(digest),
+            (LockStatus::Stale, _) => Err(CoreError::StaleLock(format!(
+                "{detail}\n{remedy}: run `yarn install` and re-run",
+                detail = report.detail
+            ))),
+            (LockStatus::Current | LockStatus::Unknown, _) => Err(CoreError::System(format!(
+                "{detail}; {remedy}",
+                detail = report.detail
+            ))),
+        }
+    }
 }
 
-/// The refusal of every Berry mutation, which cooldown does not support yet.
-fn berry_mutation_unsupported() -> CoreError {
-    CoreError::System(
-        "yarn.lock is a Yarn Berry (v2+) lockfile, which cooldown reads but cannot change yet: \
-         `upgrade`, `fix`, and `--build` do not run for a Yarn Berry project"
-            .into(),
-    )
+/// The Yarn major release whose lockfile and install modes a Berry landing is built and tested
+/// against.
+const BERRY_MUTATION_MAJOR: u64 = 4;
+
+/// What may run a resolver in a project.
+enum Admitted {
+    /// The Classic backend.
+    Classic,
+    /// The Berry backend, under the Yarn release `yarn --version` reported.
+    Berry(semver::Version),
 }
 
 #[async_trait]
@@ -518,19 +577,38 @@ impl ToolWrite for YarnTool {
         self.classic.target_fallback()
     }
 
+    /// A preview of a Berry mutation runs in a copy that must hold what Yarn reads, so every file a
+    /// verification copies is a root: each `file:` folder's files, which Yarn archives into the
+    /// lock, and the rc files above the project among them.
     fn external_resolve_roots(&self, project: &Project) -> Vec<Utf8PathBuf> {
-        self.backend_or_classic(project)
-            .external_resolve_roots(project)
+        match LockFormat::on_disk(&project.root) {
+            Ok(LockFormat::Berry) => verify::copied_sources(project, &self.verify_context()),
+            _ => self.classic.external_resolve_roots(project),
+        }
     }
 
+    /// A Berry mutation with changes to land starts only from a lock Yarn verifies current
+    /// (`YarnTool::verified_start`), and the journal binds the verified state: inputs that
+    /// changed between the verification and the capture fail it.
     async fn mutation_journal(
         &self,
         project: &Project,
         plan: &Plan,
     ) -> Result<ProjectMutationJournal> {
-        self.backend_for(project)?
-            .mutation_journal(project, plan)
-            .await
+        let format = LockFormat::on_disk(&project.root)?;
+        if format == LockFormat::Classic || plan.changes.is_empty() {
+            return self.backend(format).mutation_journal(project, plan).await;
+        }
+        let verified = self.verified_start(project).await?;
+        let journal = self.berry.mutation_journal(project, plan).await?;
+        if verify::live_digest(project, &self.verify_context())?.as_ref() != Some(&verified) {
+            return Err(CoreError::LockConflict(format!(
+                "the inputs of yarn.lock in {} changed while cooldown verified them; re-run once \
+                 they have settled",
+                project.root
+            )));
+        }
+        Ok(journal)
     }
 
     async fn mutation_baseline(&self, project: &Project, plan: &Plan) -> Result<MutationBaseline> {
@@ -540,7 +618,10 @@ impl ToolWrite for YarnTool {
     }
 
     async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
-        self.applying_backend(mutation).await?.apply(mutation).await
+        match self.applying_backend(mutation).await? {
+            Admitted::Classic => self.classic.apply(mutation).await,
+            Admitted::Berry(version) => self.apply_berry(mutation, &version).await,
+        }
     }
 
     async fn apply_with_observer(
@@ -548,23 +629,25 @@ impl ToolWrite for YarnTool {
         mutation: &PreparedMutation,
         observer: &dyn ApplyObserver,
     ) -> Result<ApplyAttempt> {
-        match self.applying_backend(mutation).await {
-            Ok(backend) => backend.apply_with_observer(mutation, observer).await,
+        let report = match self.applying_backend(mutation).await {
+            Ok(Admitted::Classic) => {
+                return self.classic.apply_with_observer(mutation, observer).await;
+            }
+            Ok(Admitted::Berry(version)) => self.apply_berry(mutation, &version).await,
             // A refused apply wrote nothing, and it reports like any failed apply, with the
             // postimage the caller restores from.
-            Err(err) => {
-                let postimage = mutation.journal().capture_state()?;
-                mutation.finished_attempt(Err(err), &postimage)
-            }
-        }
+            Err(err) => Err(err),
+        };
+        let postimage = mutation.journal().capture_state()?;
+        mutation.finished_attempt(report, &postimage)
     }
 
     async fn build(&self, project: &Project) -> Result<VerifyReport> {
         let format = LockFormat::on_disk(&project.root)?;
-        self.admitted_backend(&project.root, format)
-            .await?
-            .build(project)
-            .await
+        match self.admitted_backend(&project.root, format).await? {
+            Admitted::Classic => self.classic.build(project).await,
+            Admitted::Berry(_) => self.berry.build(project).await,
+        }
     }
 
     async fn refresh_lock(&self, project: &Project) -> Result<Option<LockVerifyReport>> {

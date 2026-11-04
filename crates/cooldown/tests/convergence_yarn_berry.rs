@@ -1,16 +1,20 @@
 //! End-to-end tests that drive the REAL Yarn Berry (the `yarn = "4.18.1"` pin in `mise.toml`)
 //! against fixtures generated on the fly in temp dirs.
 //!
-//! cooldown reads a Berry `yarn.lock` for its registry releases and attributes each to the
-//! workspace members whose own declarations bind it, but does not mutate a Berry project yet, so
-//! these tests check these invariants against Yarn itself:
+//! cooldown reads a Berry `yarn.lock` for its registry releases, attributes each to the workspace
+//! members whose own declarations bind it, and lands exact targets in it, so these tests check
+//! these invariants against Yarn itself:
 //!
 //! - the rows cooldown reads are exactly the npm releases Yarn's own `yarn info` reports;
 //! - each row's members are exactly the workspaces `yarn why` binds it for through a declaration
 //!   of its own name, and a declaration a rewrite or a plugin may have moved leaves its name
 //!   direct but owned by no member;
 //! - excluding a member drops exactly the rows only it owns;
-//! - `upgrade` refuses a Berry project without touching any of its files;
+//! - `upgrade` and `fix` land each target exactly where Yarn's own `yarn why` then binds it, below
+//!   a range's maximum and downward too, moving no other binding, writing nothing but the lock,
+//!   leaving a lock Yarn verifies current, and converging on a second run;
+//! - a candidate Yarn rejects, such as one whose new transitive its age gate quarantines, is
+//!   rolled back alone, while a young target cooldown admits lands through an exact approval;
 //! - a Berry `yarn` never runs on a Classic lock, which it would silently migrate;
 //! - `check` takes Yarn's own verdict on the lock from an offline run in a copy, so a current
 //!   lock is evaluated, a stale one is refused unless waived, one Yarn cannot judge offline is
@@ -38,6 +42,10 @@ use support::Fixture;
 
 /// The Yarn release the fixtures declare and require.
 const YARN: &str = "4.18.1";
+
+/// The environment that keeps Yarn's human output plain, which Yarn colours wherever it detects a
+/// terminal or a CI that shows colours, such as GitHub Actions.
+const PLAIN: [(&str, &str); 1] = [("YARN_ENABLE_COLORS", "0")];
 
 /// Whether the `yarn` that runs in `fixture` is [`YARN`]; anything else skips the test locally and
 /// fails it in CI, where the pin must be provisioned.
@@ -249,47 +257,6 @@ fn berry_inventory_matches_yarns_own_registry_releases() -> eyre::Result<()> {
         lock,
         "reading wrote the lock"
     );
-    Ok(())
-}
-
-/// `upgrade` refuses a Berry project before running Yarn, with an explicit error and no change to
-/// its lock or manifests, in a dry run and a real one alike.
-#[test]
-fn berry_upgrade_is_refused_without_touching_the_project() -> eyre::Result<()> {
-    let fixture = berry_workspace();
-    if !runs_pinned_yarn(&fixture) {
-        return Ok(());
-    }
-    seed_lock(&fixture)?;
-    let lock = fixture.read_bytes("yarn.lock");
-    let manifest = fixture.read_bytes("package.json");
-    let member = fixture.read_bytes("packages/app/package.json");
-
-    // `chalk@^4` has matured majors beyond it, so `--major` plans a change for the apply to refuse.
-    for args in [
-        ["upgrade", "--major", "--dry-run"].as_slice(),
-        ["upgrade", "--major"].as_slice(),
-    ] {
-        let upgrade = cooldown(&fixture, args)?;
-        assert_eq!(upgrade.code, Some(4), "{args:?}: {:#}", upgrade.envelope);
-        let errors = error_messages(&upgrade.envelope);
-        assert!(
-            !errors.is_empty()
-                && errors
-                    .iter()
-                    .all(|message| message.contains("Yarn Berry (v2+) lockfile")
-                        && message.contains("cannot change yet")),
-            "{args:?}: {:#}",
-            upgrade.envelope
-        );
-        assert_eq!(fixture.read_bytes("yarn.lock"), lock, "{args:?}");
-        assert_eq!(fixture.read_bytes("package.json"), manifest, "{args:?}");
-        assert_eq!(
-            fixture.read_bytes("packages/app/package.json"),
-            member,
-            "{args:?}"
-        );
-    }
     Ok(())
 }
 
@@ -1347,7 +1314,7 @@ fn seed_lock_in(fixture: &Fixture, dir: &str) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Runs `yarn args` in the project in `dir`.
+/// Runs `yarn args` in the project in `dir`, its human output plain ([`PLAIN`]).
 fn yarn_in(
     fixture: &Fixture,
     dir: &str,
@@ -1356,7 +1323,7 @@ fn yarn_in(
 ) -> eyre::Result<support::CapturedOutput> {
     let mut full = vec!["--cwd", dir];
     full.extend_from_slice(args);
-    fixture.run_tool_traced(phase, "yarn", &full, &[])
+    fixture.run_tool_traced(phase, "yarn", &full, &PLAIN)
 }
 
 /// Yarn's own reading of its setting `key` in the project in `dir`.
@@ -1642,5 +1609,714 @@ fn berry_sync_leaves_an_empty_scope_entry_masking_its_inherited_one() -> eyre::R
         "{:#}",
         run.envelope
     );
+    Ok(())
+}
+
+/// The fixed date the landing fixtures' locks are seeded at: Yarn resolves every descriptor to
+/// its newest release published before it, so the starting versions never drift.
+const SEEDED_AT: &str = "2020-05-01T00:00:00Z";
+
+/// The freeze the landing tests upgrade and fix under: after `chalk` 4.1.0 (2020-06-09),
+/// `supports-color` 7.2.0 (2020-08-28), and `ansi-styles` 4.3.0 (2020-10-04), before `chalk`
+/// 4.1.1 (2021-04-21) and any of their next majors.
+const FROZEN_AT: &str = "2020-11-01";
+
+/// A Berry project of `manifests` (path and JSON body, the root's `packageManager` and
+/// `private` added) with `rc` as its `.yarnrc.yml`.
+fn landing_fixture(manifests: &[(&str, &str)], rc: &str) -> Fixture {
+    let fixture = Fixture::new().tag_independent();
+    for (path, body) in manifests {
+        let contents = if *path == "package.json" {
+            body.replacen(
+                '{',
+                &format!("{{\n  \"private\": true,\n  \"packageManager\": \"yarn@{YARN}\","),
+                1,
+            )
+        } else {
+            (*body).to_string()
+        };
+        fixture.write(path, &contents);
+    }
+    fixture.write(".yarnrc.yml", rc);
+    fixture
+}
+
+/// Seeds the lock as Yarn resolves it under an age gate reaching back to [`SEEDED_AT`], with
+/// `envs` set too.
+fn seed_lock_at(fixture: &Fixture, envs: &[(&str, &str)]) -> eyre::Result<()> {
+    let seeded_at: jiff::Timestamp = SEEDED_AT.parse()?;
+    let minutes = jiff::Timestamp::now().duration_since(seeded_at).as_secs() / 60;
+    let gate = minutes.to_string();
+    let mut envs = envs.to_vec();
+    envs.push(("YARN_NPM_MINIMAL_AGE_GATE", &gate));
+    fixture.write("yarn.lock", "");
+    fixture
+        .run_tool_traced(
+            "seed the Berry lock in the past",
+            "yarn",
+            &["install", "--mode=update-lockfile"],
+            &envs,
+        )?
+        .require_success()?;
+    Ok(())
+}
+
+/// One landing row of a mutation's envelope: what it planned and what became of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Landed {
+    from: String,
+    to: String,
+    applied: bool,
+    /// The skip reason, when skipped.
+    reason: Option<String>,
+    message: Option<String>,
+}
+
+/// The row of `name` in a mutation's envelope.
+fn landed(envelope: &serde_json::Value, name: &str) -> eyre::Result<Landed> {
+    let item = envelope
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|item| item.get("name").and_then(serde_json::Value::as_str) == Some(name))
+        .ok_or_else(|| eyre::eyre!("no row for {name}: {envelope:#}"))?;
+    let text = |pointer: &str| {
+        item.pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string)
+    };
+    Ok(Landed {
+        from: text("/from").unwrap_or_default(),
+        to: text("/to").unwrap_or_default(),
+        applied: item.get("applied").and_then(serde_json::Value::as_bool) == Some(true),
+        reason: text("/skipped/reason"),
+        message: text("/skipped/message"),
+    })
+}
+
+/// The bindings of `name` Yarn's own `yarn why` reports, as `version → workspaces`.
+fn bindings(fixture: &Fixture, name: &str) -> eyre::Result<Vec<(String, Vec<String>)>> {
+    Ok(yarns_owners(fixture, name)?
+        .into_iter()
+        .map(|(version, owners)| (version, owners.into_iter().collect()))
+        .collect())
+}
+
+/// `owners` as the shape [`bindings`] returns.
+fn bound(owners: &[(&str, &[&str])]) -> Vec<(String, Vec<String>)> {
+    owners
+        .iter()
+        .map(|(version, members)| {
+            (
+                (*version).to_string(),
+                members.iter().map(ToString::to_string).collect(),
+            )
+        })
+        .collect()
+}
+
+/// Requires `check --offline` to find the lock current, with no lock diagnostic at all.
+fn assert_current(fixture: &Fixture) -> eyre::Result<()> {
+    let checked = check(fixture, &[])?;
+    assert!(
+        lock_kinds(&checked.envelope, "errors").is_empty()
+            && lock_kinds(&checked.envelope, "warnings").is_empty(),
+        "{:#}",
+        checked.envelope
+    );
+    Ok(())
+}
+
+/// Every snapshot entry but the lock's.
+fn beside_the_lock(root: &std::path::Path) -> eyre::Result<BTreeMap<String, String>> {
+    let mut entries = snapshot(root)?;
+    entries.remove("yarn.lock");
+    Ok(entries)
+}
+
+/// `upgrade` lands each direct dependency at exactly its target: `chalk` at 4.1.0, the newest
+/// release the freeze admits, below its range's maximum 4.1.2, and the root's `supports-color`
+/// at 7.2.0 although `chalk` declares the very descriptor too, which Yarn would otherwise keep
+/// bound to the old copy for both.
+/// Only the lock changes, not even its modification time elsewhere, Yarn verifies it current,
+/// and a second run applies nothing and leaves it byte for byte.
+#[test]
+fn berry_upgrade_lands_each_exact_target_and_converges() -> eyre::Result<()> {
+    let fixture = landing_fixture(
+        &[(
+            "package.json",
+            r#"{ "name": "berry-land", "dependencies": { "chalk": "^4.0.0", "supports-color": "^7.1.0" } }"#,
+        )],
+        "enableTelemetry: false\n",
+    );
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock_at(&fixture, &[])?;
+    assert_eq!(bindings(&fixture, "chalk")?, bound(&[("4.0.0", &["."])]));
+    assert_eq!(
+        bindings(&fixture, "supports-color")?,
+        bound(&[("7.1.0", &["."])])
+    );
+    let before = beside_the_lock(fixture.root())?;
+
+    let upgrade = cooldown(&fixture, &["upgrade", "--freeze", FROZEN_AT])?;
+
+    assert_eq!(upgrade.code, Some(0), "{:#}", upgrade.envelope);
+    // Checked before Yarn runs again, since Yarn's own queries rewrite its install state.
+    assert_eq!(
+        changed(&before, &beside_the_lock(fixture.root())?),
+        [] as [&str; 0]
+    );
+    for (name, from, to) in [
+        ("chalk", "4.0.0", "4.1.0"),
+        ("supports-color", "7.1.0", "7.2.0"),
+    ] {
+        let row = landed(&upgrade.envelope, name)?;
+        assert!(
+            row.applied && row.from == from && row.to == to,
+            "{name}: {row:?}"
+        );
+    }
+    assert_eq!(bindings(&fixture, "chalk")?, bound(&[("4.1.0", &["."])]));
+    assert_eq!(
+        bindings(&fixture, "supports-color")?,
+        bound(&[("7.2.0", &["."])])
+    );
+    // `chalk`'s own `supports-color@^7.1.0` is the root's descriptor, so it moved with it.
+    let releases = yarns_registry_releases(&fixture)?;
+    assert!(
+        !releases.contains("supports-color@7.1.0") && !releases.contains("chalk@4.0.0"),
+        "{releases:?}"
+    );
+    assert_current(&fixture)?;
+
+    let lock = fixture.read_bytes("yarn.lock");
+    let again = cooldown(&fixture, &["upgrade", "--freeze", FROZEN_AT])?;
+    assert_eq!(again.code, Some(0), "{:#}", again.envelope);
+    assert!(
+        again
+            .envelope
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|items| items
+                .iter()
+                .all(|item| item.get("applied") != Some(&serde_json::Value::Bool(true)))),
+        "{:#}",
+        again.envelope
+    );
+    assert_eq!(fixture.read_bytes("yarn.lock"), lock);
+    Ok(())
+}
+
+/// `fix` lands a target below the locked release the same way: the freeze makes `chalk` 4.1.2
+/// too young, so it moves down to 4.1.0 under the unchanged `^4.0.0`, and Yarn verifies the lock
+/// current.
+#[test]
+fn berry_fix_lands_an_older_target() -> eyre::Result<()> {
+    let fixture = landing_fixture(
+        &[(
+            "package.json",
+            r#"{ "name": "berry-fix", "dependencies": { "chalk": "^4.0.0" } }"#,
+        )],
+        "enableTelemetry: false\n",
+    );
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock(&fixture)?;
+    assert_eq!(bindings(&fixture, "chalk")?, bound(&[("4.1.2", &["."])]));
+    let manifest = fixture.read_bytes("package.json");
+
+    let fix = cooldown(&fixture, &["fix", "--freeze", FROZEN_AT])?;
+
+    assert_eq!(fix.code, Some(0), "{:#}", fix.envelope);
+    let row = landed(&fix.envelope, "chalk")?;
+    assert!(
+        row.applied && row.from == "4.1.2" && row.to == "4.1.0",
+        "{row:?}"
+    );
+    assert_eq!(bindings(&fixture, "chalk")?, bound(&[("4.1.0", &["."])]));
+    assert_eq!(fixture.read_bytes("package.json"), manifest);
+    assert_current(&fixture)?;
+    Ok(())
+}
+
+/// A landing moves only the descriptors its declaring members declare: the root's
+/// `supports-color@^7.0.0` lands at 7.2.0 while `chalk`'s own `^7.1.0`, bound to the same copy
+/// before, keeps 7.1.0, and a member's `chalk@^3.0.0` keeps its 3.0.0 while the other member's
+/// `^4.0.0` lands.
+#[test]
+fn berry_landing_leaves_every_other_binding_alone() -> eyre::Result<()> {
+    let fixture = landing_fixture(
+        &[
+            (
+                "package.json",
+                r#"{ "name": "berry-root", "workspaces": ["packages/*"], "dependencies": { "supports-color": "^7.0.0" } }"#,
+            ),
+            (
+                "packages/a/package.json",
+                r#"{ "name": "a", "version": "1.0.0", "dependencies": { "chalk": "^4.0.0" } }"#,
+            ),
+            (
+                "packages/b/package.json",
+                r#"{ "name": "b", "version": "1.0.0", "dependencies": { "chalk": "^3.0.0" } }"#,
+            ),
+        ],
+        "enableTelemetry: false\n",
+    );
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock_at(&fixture, &[])?;
+    assert_eq!(
+        bindings(&fixture, "chalk")?,
+        bound(&[("3.0.0", &["packages/b"]), ("4.0.0", &["packages/a"])])
+    );
+
+    let upgrade = cooldown(&fixture, &["upgrade", "--freeze", FROZEN_AT])?;
+
+    assert_eq!(upgrade.code, Some(0), "{:#}", upgrade.envelope);
+    assert_eq!(
+        bindings(&fixture, "chalk")?,
+        bound(&[("3.0.0", &["packages/b"]), ("4.1.0", &["packages/a"])])
+    );
+    assert_eq!(
+        bindings(&fixture, "supports-color")?,
+        bound(&[("7.2.0", &["."])])
+    );
+    let releases = yarns_registry_releases(&fixture)?;
+    assert!(releases.contains("supports-color@7.1.0"), "{releases:?}");
+    assert_current(&fixture)?;
+    Ok(())
+}
+
+/// An excluded member's exact pin keeps its own binding while the root's range beside it lands;
+/// an excluded member that declares the very descriptor the root lands would move with it, so
+/// that candidate is held, naming the member, and the lock stays byte for byte.
+#[test]
+fn berry_excluded_members_keep_their_bindings() -> eyre::Result<()> {
+    let fixture = landing_fixture(
+        &[
+            (
+                "package.json",
+                r#"{ "name": "berry-root", "workspaces": ["packages/*"], "dependencies": { "chalk": "^4.0.0" } }"#,
+            ),
+            (
+                "packages/legacy/package.json",
+                r#"{ "name": "legacy", "version": "1.0.0", "dependencies": { "chalk": "4.0.0" } }"#,
+            ),
+        ],
+        "enableTelemetry: false\n",
+    );
+    fixture.write(
+        "cooldown.toml",
+        "[global]\nexclude-folders = [\"packages/legacy\"]\n",
+    );
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock_at(&fixture, &[])?;
+    assert_eq!(
+        bindings(&fixture, "chalk")?,
+        bound(&[("4.0.0", &[".", "packages/legacy"])])
+    );
+
+    let upgrade = cooldown(&fixture, &["upgrade", "--freeze", FROZEN_AT])?;
+
+    assert_eq!(upgrade.code, Some(0), "{:#}", upgrade.envelope);
+    assert!(
+        landed(&upgrade.envelope, "chalk")?.applied,
+        "{:#}",
+        upgrade.envelope
+    );
+    assert_eq!(
+        bindings(&fixture, "chalk")?,
+        bound(&[("4.0.0", &["packages/legacy"]), ("4.1.0", &["."])])
+    );
+    assert_current(&fixture)?;
+
+    // The excluded member now shares the root's range.
+    let fixture = landing_fixture(
+        &[
+            (
+                "package.json",
+                r#"{ "name": "berry-root", "workspaces": ["packages/*"], "dependencies": { "chalk": "^4.0.0" } }"#,
+            ),
+            (
+                "packages/legacy/package.json",
+                r#"{ "name": "legacy", "version": "1.0.0", "dependencies": { "chalk": "^4.0.0" } }"#,
+            ),
+        ],
+        "enableTelemetry: false\n",
+    );
+    fixture.write(
+        "cooldown.toml",
+        "[global]\nexclude-folders = [\"packages/legacy\"]\n",
+    );
+    seed_lock_at(&fixture, &[])?;
+    let lock = fixture.read_bytes("yarn.lock");
+
+    let upgrade = cooldown(&fixture, &["upgrade", "--freeze", FROZEN_AT])?;
+
+    let row = landed(&upgrade.envelope, "chalk")?;
+    assert!(
+        !row.applied
+            && row.reason.as_deref() == Some("not_eligible")
+            && row
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("packages/legacy")),
+        "{row:?}"
+    );
+    assert_eq!(fixture.read_bytes("yarn.lock"), lock);
+    Ok(())
+}
+
+/// The age gate `sync` writes keeps Yarn from resolving young releases afresh while the locked
+/// ones stay: a lock Yarn still verifies current after the sync is landed into, `chalk`'s target
+/// lands through an approval of exactly that release, and `is-odd`'s, which newly needs an
+/// `is-number` the century gate quarantines, is rolled back alone, its manifest range restored
+/// and Yarn's quarantine named.
+#[test]
+fn berry_rejected_candidate_rolls_back_alone() -> eyre::Result<()> {
+    let fixture = landing_fixture(
+        &[(
+            "package.json",
+            r#"{ "name": "berry-gated", "dependencies": { "chalk": "^4.0.0", "is-odd": "^2.0.0" } }"#,
+        )],
+        "enableTelemetry: false\n",
+    );
+    fixture.write(
+        "cooldown.toml",
+        indoc! {r#"
+            min-age = "36500d"
+
+            [package."chalk"]
+            latest = true
+
+            [package."is-odd"]
+            latest = true
+        "#},
+    );
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock_at(&fixture, &[])?;
+    assert_eq!(sync_statuses(&fixture, &[])?, ["written"]);
+    assert_current(&fixture)?;
+
+    let upgrade = cooldown(&fixture, &["upgrade", "--major"])?;
+
+    let chalk = landed(&upgrade.envelope, "chalk")?;
+    assert!(chalk.applied, "{:#}", upgrade.envelope);
+    assert_eq!(
+        bindings(&fixture, "chalk")?,
+        bound(&[(chalk.to.as_str(), &["."])])
+    );
+    let is_odd = landed(&upgrade.envelope, "is-odd")?;
+    assert!(
+        !is_odd.applied
+            && is_odd.reason.as_deref() == Some("resolver_conflict")
+            && is_odd
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("quarantined")),
+        "{is_odd:?}"
+    );
+    assert_eq!(bindings(&fixture, "is-odd")?, bound(&[("2.0.0", &["."])]));
+    let manifest: serde_json::Value = serde_json::from_slice(&fixture.read_bytes("package.json"))?;
+    assert_eq!(
+        manifest.pointer("/dependencies/is-odd"),
+        Some(&serde_json::json!("^2.0.0"))
+    );
+    assert_current(&fixture)?;
+    Ok(())
+}
+
+/// A target cooldown admits but the native gate would quarantine, here `chalk`'s newest major
+/// through `--allow`, which `sync` never wrote, lands through a temporary approval of exactly
+/// that release that the project's rc file never sees.
+#[test]
+fn berry_young_target_lands_through_an_exact_approval() -> eyre::Result<()> {
+    let fixture = landing_fixture(
+        &[(
+            "package.json",
+            r#"{ "name": "berry-young", "dependencies": { "chalk": "^4.0.0" } }"#,
+        )],
+        "enableTelemetry: false\n",
+    );
+    fixture.write("cooldown.toml", "min-age = \"36500d\"\n");
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock_at(&fixture, &[])?;
+    assert_eq!(sync_statuses(&fixture, &[])?, ["written"]);
+    let rc = fixture.read_bytes(".yarnrc.yml");
+    assert!(quarantined(
+        &fixture,
+        ".",
+        &["add", "chalk@4.1.2", "--mode=update-lockfile"]
+    )?);
+
+    let upgrade = cooldown(&fixture, &["upgrade", "--major", "--allow", "chalk"])?;
+
+    let row = landed(&upgrade.envelope, "chalk")?;
+    assert!(row.applied, "{:#}", upgrade.envelope);
+    assert_eq!(
+        bindings(&fixture, "chalk")?,
+        bound(&[(row.to.as_str(), &["."])])
+    );
+    assert_eq!(fixture.read_bytes(".yarnrc.yml"), rc);
+    assert_current(&fixture)?;
+    Ok(())
+}
+
+/// A landing leaves an npm alias of the package, a `file:` package with files of its own, and a
+/// `link:` package bound as they were, and a dry run first reports the same landing and writes
+/// nothing, its copy holding everything Yarn reads.
+#[test]
+fn berry_landing_leaves_aliases_and_local_sources() -> eyre::Result<()> {
+    let fixture = landing_fixture(
+        &[
+            (
+                "package.json",
+                r#"{ "name": "berry-local", "dependencies": { "chalk": "^4.0.0", "chalk4": "npm:chalk@^4.0.0", "local": "file:./local", "linked": "link:./linked" } }"#,
+            ),
+            (
+                "local/package.json",
+                r#"{ "name": "local", "version": "1.0.0" }"#,
+            ),
+            (
+                "linked/package.json",
+                r#"{ "name": "linked", "version": "1.0.0" }"#,
+            ),
+        ],
+        "enableTelemetry: false\n",
+    );
+    fixture.write("local/index.js", "module.exports = 1;\n");
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock_at(&fixture, &[])?;
+    // The entry's lines up to the blank line after it, whatever line ending Yarn wrote.
+    let entry = |lock: &str, key: &str| -> Option<String> {
+        let lines: Vec<&str> = lock
+            .lines()
+            .skip_while(|line| !line.starts_with(key))
+            .take_while(|line| !line.trim().is_empty())
+            .collect();
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    };
+    let lock = String::from_utf8(fixture.read_bytes("yarn.lock"))?;
+    let local = entry(&lock, "\"local@file:");
+    let linked = entry(&lock, "\"linked@link:");
+    assert!(local.is_some() && linked.is_some(), "{lock}");
+    let before = snapshot(fixture.root())?;
+
+    let preview = cooldown(&fixture, &["upgrade", "--dry-run", "--freeze", FROZEN_AT])?;
+
+    assert_eq!(preview.code, Some(0), "{:#}", preview.envelope);
+    let planned = landed(&preview.envelope, "chalk")?;
+    assert!(
+        planned.from == "4.0.0" && planned.to == "4.1.0",
+        "{planned:?}"
+    );
+    assert_eq!(
+        changed(&before, &snapshot(fixture.root())?),
+        [] as [&str; 0]
+    );
+
+    let upgrade = cooldown(&fixture, &["upgrade", "--freeze", FROZEN_AT])?;
+
+    assert!(
+        landed(&upgrade.envelope, "chalk")?.applied,
+        "{:#}",
+        upgrade.envelope
+    );
+    assert_eq!(bindings(&fixture, "chalk")?, bound(&[("4.1.0", &["."])]));
+    let output = fixture
+        .run_tool_traced("ask Yarn why chalk", "yarn", &["why", "chalk"], &PLAIN)?
+        .require_success()?;
+    assert!(
+        output
+            .stdout_str()
+            .contains("chalk@npm:4.0.0 (via npm:chalk@^4.0.0)"),
+        "the alias keeps its copy: {}",
+        output.stdout_str()
+    );
+    let landed_lock = String::from_utf8(fixture.read_bytes("yarn.lock"))?;
+    assert_eq!(entry(&landed_lock, "\"local@file:"), local);
+    assert_eq!(entry(&landed_lock, "\"linked@link:"), linked);
+    assert_current(&fixture)?;
+    Ok(())
+}
+
+/// A landing only rewrites the lock, so a project already linked by Plug'n'Play or into
+/// `node_modules` keeps every artifact of that install as it was, and `--build` links the next
+/// landed release with Yarn's immutable install.
+#[test]
+fn berry_landing_leaves_the_linked_install_until_the_build() -> eyre::Result<()> {
+    for linker in ["pnp", "node-modules"] {
+        let fixture = landing_fixture(
+            &[(
+                "package.json",
+                r#"{ "name": "berry-linked", "dependencies": { "chalk": "^4.0.0" } }"#,
+            )],
+            &format!("enableTelemetry: false\nnodeLinker: {linker}\n"),
+        );
+        if !runs_pinned_yarn(&fixture) {
+            return Ok(());
+        }
+        seed_lock_at(&fixture, &[])?;
+        fixture
+            .run_tool_traced("link the project", "yarn", &["install"], &[])?
+            .require_success()?;
+        let before = beside_the_lock(fixture.root())?;
+
+        let upgrade = cooldown(&fixture, &["upgrade", "--freeze", FROZEN_AT])?;
+
+        assert!(
+            landed(&upgrade.envelope, "chalk")?.applied,
+            "{linker}: {:#}",
+            upgrade.envelope
+        );
+        assert_eq!(
+            changed(&before, &beside_the_lock(fixture.root())?),
+            [] as [&str; 0],
+            "{linker}"
+        );
+
+        let built = cooldown(&fixture, &["upgrade", "--freeze", "2021-06-01", "--build"])?;
+
+        assert_eq!(built.code, Some(0), "{linker}: {:#}", built.envelope);
+        let row = landed(&built.envelope, "chalk")?;
+        assert!(row.applied && row.to == "4.1.1", "{linker}: {row:?}");
+        let installed = fixture
+            .run_tool_traced(
+                "read the linked chalk",
+                "yarn",
+                &["node", "-p", "require('chalk/package.json').version"],
+                &[],
+            )?
+            .require_success()?;
+        assert_eq!(installed.stdout_str().trim(), "4.1.1", "{linker}");
+    }
+    Ok(())
+}
+
+/// Offline, a landing resolves from Yarn's warm metadata cache and mirror: a dry run online
+/// warms them, then the real run lands with Yarn's network off.
+/// With a cold global folder the same offline run cannot resolve the target, which skips the
+/// candidate with Yarn's error and leaves the lock as it was, and no stale lock is reported.
+#[test]
+fn berry_landing_runs_offline_from_warm_caches() -> eyre::Result<()> {
+    let fixture = landing_fixture(
+        &[(
+            "package.json",
+            r#"{ "name": "berry-offline", "dependencies": { "chalk": "^4.0.0" } }"#,
+        )],
+        "enableTelemetry: false\n",
+    );
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    // A home of its own gives the run a default global folder nothing else shares.
+    let home = tempfile::tempdir()?;
+    let home = home.path().to_string_lossy().into_owned();
+    let online = [("HOME", home.as_str())];
+    seed_lock_at(&fixture, &online)?;
+    let run = |args: &[&str], envs: &[(&str, &str)]| -> eyre::Result<serde_json::Value> {
+        let mut full = args.to_vec();
+        full.push("--json");
+        let output = fixture.cooldown_in_env(None, &full, envs);
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+    let warmed = run(&["upgrade", "--dry-run", "--freeze", FROZEN_AT], &online)?;
+    assert_eq!(landed(&warmed, "chalk")?.to, "4.1.0", "{warmed:#}");
+    let lock = fixture.read_bytes("yarn.lock");
+
+    // A cold global folder
+    let cold = tempfile::tempdir()?;
+    let cold = cold.path().to_string_lossy().into_owned();
+    let offline_cold = [
+        ("HOME", home.as_str()),
+        ("YARN_ENABLE_OFFLINE_MODE", "1"),
+        ("YARN_ENABLE_NETWORK", "0"),
+        ("YARN_GLOBAL_FOLDER", cold.as_str()),
+    ];
+    let missed = run(
+        &["upgrade", "--offline", "--freeze", FROZEN_AT],
+        &offline_cold,
+    )?;
+    let row = landed(&missed, "chalk")?;
+    assert!(
+        !row.applied && row.reason.as_deref() == Some("resolver_conflict"),
+        "{missed:#}"
+    );
+    assert!(
+        lock_kinds(&missed, "errors").is_empty() && lock_kinds(&missed, "warnings").is_empty(),
+        "{missed:#}"
+    );
+    assert_eq!(fixture.read_bytes("yarn.lock"), lock);
+
+    // The warm default global folder
+    let offline_warm = [
+        ("HOME", home.as_str()),
+        ("YARN_ENABLE_OFFLINE_MODE", "1"),
+        ("YARN_ENABLE_NETWORK", "0"),
+    ];
+    let landed_offline = run(
+        &["upgrade", "--offline", "--freeze", FROZEN_AT],
+        &offline_warm,
+    )?;
+    assert!(
+        landed(&landed_offline, "chalk")?.applied,
+        "{landed_offline:#}"
+    );
+    assert_eq!(bindings(&fixture, "chalk")?, bound(&[("4.1.0", &["."])]));
+    Ok(())
+}
+
+/// Yarn's default global folder under an `XDG_DATA_HOME` inside the project takes no write from
+/// a landing: neither from a dry run, whose copy cannot see that the folder lies in the project
+/// it copied, nor from the real run, which still lands the target.
+#[test]
+fn berry_landing_writes_no_global_folder_inside_the_project() -> eyre::Result<()> {
+    let fixture = landing_fixture(
+        &[(
+            "package.json",
+            r#"{ "name": "berry-xdg", "dependencies": { "chalk": "^4.0.0" } }"#,
+        )],
+        "enableTelemetry: false\n",
+    );
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock_at(&fixture, &[])?;
+    let data = fixture.root().join(".data");
+    let data = data.to_string_lossy().into_owned();
+    let envs = [("XDG_DATA_HOME", data.as_str())];
+    let run = |args: &[&str]| -> eyre::Result<serde_json::Value> {
+        let mut full = args.to_vec();
+        full.push("--json");
+        let output = fixture.cooldown_in_env(None, &full, &envs);
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+    let before = snapshot(fixture.root())?;
+
+    let previewed = run(&["upgrade", "--dry-run", "--freeze", FROZEN_AT])?;
+    assert_eq!(landed(&previewed, "chalk")?.to, "4.1.0", "{previewed:#}");
+    assert_eq!(snapshot(fixture.root())?, before);
+
+    let upgraded = run(&["upgrade", "--freeze", FROZEN_AT])?;
+    assert!(landed(&upgraded, "chalk")?.applied, "{upgraded:#}");
+    assert_eq!(beside_the_lock(fixture.root())?, {
+        let mut entries = before;
+        entries.remove("yarn.lock");
+        entries
+    });
+    assert_eq!(bindings(&fixture, "chalk")?, bound(&[("4.1.0", &["."])]));
     Ok(())
 }

@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- **The HTTP cache no longer lands in the working directory when `HOME` is unset.** Without
+  `XDG_CACHE_HOME` and `HOME`, as in a Windows PowerShell or cmd session, cooldown fell back to a
+  relative `.cache/cooldown` and wrote its registry responses into the project it ran in. The
+  cache now falls back to the platform's home directory, the user profile on Windows. A relative
+  `XDG_CACHE_HOME` or `HOME` is ignored, and with no absolute home at all cooldown stops with an
+  error naming the variables to set, rather than using a shared temp directory.
+
+- **`upgrade` and `fix` land Yarn Berry targets exactly.** Every mutation of a Berry project was
+  refused before running Yarn. Under Yarn 4, cooldown now has Yarn prove the lock current first,
+  then lands each candidate in a throwaway copy of the project: a lock-only install with every
+  declaration of the package pinned to the target, the declared ranges bound to the target's lock
+  entry, and a second lock-only install, since Yarn otherwise keeps a range bound to its old copy
+  or resolves it afresh to the newest release, and Yarn's offline immutable install proves the
+  result current in the copy. Only `yarn.lock` is written back, once every input of the copy is
+  unchanged in the project, so manifests, install state, and caches stay as they were, and a
+  failed candidate is skipped `resolver_conflict` with Yarn's error and rolled back alone. From
+  Yarn 4.10, each landing runs under an approval of exactly its target and under cooldown's window
+  when that is stricter than Yarn's own age gate, so a new transitive the gate quarantines fails
+  the candidate; from Yarn 4.17, a landing that newly resolves another release in a
+  configured scope gated below the window fails too. Yarn's global folder, whose warm caches serve
+  an `--offline` landing, is replaced by one in the copy when it lies inside any directory holding
+  a `package.json`. A declaration that is no registry range admitting the target (an alias, a
+  `patch:` or local source), a member declaring the package at several ranges, and a range
+  shared with another copy or with a member the run excludes hold the candidate `not_eligible`.
+  `--build` runs `yarn install --immutable`, and `outdated` verifies a Berry project's adoptable
+  rows against the landing as for the other managers. A Berry project run by Yarn 2 or 3 is
+  still refused by `upgrade` and `fix`.
+
 - **The config cascade collects every layer when the root and a project are spelled
   differently.** The walk from a project directory up to the repository root compared raw paths,
   so a root reached through a symlinked checkout, a `$HOME` fallback, or a Windows verbatim or 8.3
@@ -28,9 +56,10 @@
   faithfully (a configured plugin, an `exec:` dependency, a workspace pattern or local package
   that leaves the project, a symbolic link the copy would resolve elsewhere, injected environment
   files other than `.env.yarn`, another lockfile name, per-host network settings, hardened mode,
-  or an rc file using `onConflict`), an input that changes while the copy is written, or an
-  unsupported Yarn. An input that changes after the verdict, before the dependencies are read, is
-  a `lock_conflict`. A Berry row now keeps its advisory identity when every lock entry of the
+  or an rc file using `onConflict` at its top level or for a setting the copy must reproduce, so
+  the `npmPreapprovedPackages` `sync` writes still verifies), an input that changes while the
+  copy is written, or an unsupported Yarn. An input that changes after the verdict, before the
+  dependencies are read, is a `lock_conflict`. A Berry row now keeps its advisory identity when every lock entry of the
   release was fetched from the configured registry by name, or from an archive URL on
   registry.npmjs.org, and `yarn config get` routes the package's scope to the public registry;
   npm's `.npmrc`, which Yarn Berry never reads, no longer vetoes it.
@@ -273,9 +302,7 @@
   left out, whatever version, checksum, or link type they record. A malformed lock, a descriptor
   bound to two different packages, and a lockfile version no released Yarn wrote, such as the 7
   of Yarn 4's release candidates, are reported as `lockfile_unreadable`, never read as a smaller
-  graph. Berry support is read-only for now: `upgrade`, `fix`, and `--build` refuse a Berry
-  project before running Yarn, and `outdated` warns that its adoptable rows were not verified
-  against `upgrade`. cooldown also no longer runs a Yarn Berry executable on a Classic lock, which its first install would migrate to
+  graph. cooldown also no longer runs a Yarn Berry executable on a Classic lock, which its first install would migrate to
   the Berry format: before running Yarn on a Classic lock it checks the root `packageManager` and
   the version `yarn --version` reports in the project, through any `yarnPath` or Corepack, and
   refuses a Berry Yarn with what to do instead. Every Yarn run turns Corepack's auto-pin off, so

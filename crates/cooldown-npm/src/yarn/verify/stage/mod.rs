@@ -75,13 +75,13 @@ pub(in crate::yarn) struct InputDigest([u8; 32]);
 
 /// The folders Yarn writes outside the project, each redirected into the scratch directory.
 #[derive(Debug, Clone)]
-pub(super) struct Outputs {
-    pub(super) cache: Utf8PathBuf,
-    pub(super) global: Utf8PathBuf,
-    pub(super) install_state: Utf8PathBuf,
+pub(in crate::yarn) struct Outputs {
+    pub(in crate::yarn) cache: Utf8PathBuf,
+    pub(in crate::yarn) global: Utf8PathBuf,
+    pub(in crate::yarn) install_state: Utf8PathBuf,
     /// Ends in `__virtual__`, the only name Yarn accepts for it.
-    pub(super) virtual_folder: Utf8PathBuf,
-    pub(super) unplugged: Utf8PathBuf,
+    pub(in crate::yarn) virtual_folder: Utf8PathBuf,
+    pub(in crate::yarn) unplugged: Utf8PathBuf,
 }
 
 impl Outputs {
@@ -247,6 +247,20 @@ pub(super) fn plan(
 }
 
 impl Plan {
+    /// The source of every file and directory the copy holds, in the copy's order, an empty
+    /// directory of a `file:` folder included.
+    pub(super) fn copied_sources(&self) -> Vec<Utf8PathBuf> {
+        self.entries
+            .values()
+            .filter_map(|entry| match entry {
+                Entry::File { source }
+                | Entry::Screened { source, .. }
+                | Entry::Directory { source } => Some(source.clone()),
+                Entry::Link { .. } => None,
+            })
+            .collect()
+    }
+
     /// The digest the copy would have if it were written now, or `None` when a screened input
     /// no longer holds the bytes planning screened.
     ///

@@ -86,6 +86,26 @@ pub(super) fn classify(stdout: &str) -> Verdict {
     }
 }
 
+/// Every error a Yarn report `stdout` holds, each as `YN<code>: <message>`, the way an unknown
+/// verdict quotes them.
+pub(in crate::yarn) fn errors(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|raw| serde_json::from_str::<Line>(raw.trim_end_matches('\r')).ok())
+        .filter(|line| line.kind == "error")
+        .map(|line| {
+            let data = match &line.data {
+                serde_json::Value::String(data) => data.clone(),
+                other => other.to_string(),
+            };
+            match line.name {
+                Some(name) => format!("YN{name:04}: {data}"),
+                None => data,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 pub(in crate::yarn) mod captures;
 #[cfg(test)]
