@@ -3390,7 +3390,17 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 }
             },
             Err(error) => {
-                self.record_lock_status(LockStatus::Stale);
+                // An adapter may report a stale or absent lock as an error (cargo does), but any
+                // other failure leaves the lock's currency unproven rather than known stale.
+                let status = if matches!(
+                    error.diagnostic_kind(),
+                    DiagnosticKind::StaleLock | DiagnosticKind::NotFound
+                ) {
+                    LockStatus::Stale
+                } else {
+                    LockStatus::Unknown
+                };
+                self.record_lock_status(status);
                 self.record_project_error(&error, None);
                 terminal = true;
             }

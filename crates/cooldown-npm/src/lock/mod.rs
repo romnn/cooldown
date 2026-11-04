@@ -14,6 +14,7 @@
 //! each workspace.
 //! Formats without either fall back to the root manifest's declared dependency names.
 
+mod pnpm_frozen;
 mod yaml;
 mod yarn;
 mod yarn_berry;
@@ -271,6 +272,18 @@ pub trait NodeLock: Send + Sync + 'static {
     #[must_use]
     fn verify_current_args() -> Option<Vec<String>> {
         None
+    }
+
+    /// Whether `output`, the failure detail of a [`NodeLock::verify_current_args`] run, is the
+    /// manager's own refusal of a lock that no longer matches its inputs or is absent.
+    ///
+    /// Only that refusal is staleness, which `--allow-stale-lock` may waive.
+    /// Every other failure (a registry, authentication, configuration, CLI, or store error) is a
+    /// tool error that nothing waives.
+    /// The default recognizes no refusal, so a manager wired without a classifier fails closed.
+    #[must_use]
+    fn verify_refusal_is_stale(_output: &str) -> bool {
+        false
     }
 
     /// The mutating driver args that refresh the lock before a read-only command evaluates it.
@@ -2113,11 +2126,22 @@ impl NodeLock for Pnpm {
     }
 
     fn verify_current_args() -> Option<Vec<String>> {
+        // The output settings are pinned so a `reporter`, `loglevel`, `json`, or `parseable`
+        // from the user's configuration cannot hide or reshape the error header
+        // `verify_refusal_is_stale` reads.
         Some(vec![
             "install".into(),
             "--lockfile-only".into(),
             "--frozen-lockfile".into(),
+            "--reporter=append-only".into(),
+            "--loglevel=error".into(),
+            "--config.json=false".into(),
+            "--config.parseable=false".into(),
         ])
+    }
+
+    fn verify_refusal_is_stale(output: &str) -> bool {
+        pnpm_frozen::frozen_refusal_is_stale(output)
     }
 
     fn refresh_lock_args(window_minutes: Option<i64>) -> Option<Vec<String>> {
