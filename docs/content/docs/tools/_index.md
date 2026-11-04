@@ -57,12 +57,35 @@ version 6 or older, which records ranges without their protocol, a bare range wh
 `YARN_PLUGINS`, can rewrite any declaration, so no member is attributed at all and the run warns.
 
 The attribution reads the lock through the manifests and Yarn configuration as they are now, not
-as they were at the last install, so it does not reproduce the bindings Yarn last installed: a
-lock that is stale against its inputs, such as a `.yarnrc.yml` or a `resolutions` entry changed
-since that install, can be misattributed. Not yet supported for Berry:
+as they were at the last install. `check` verifies the lock first and evaluates only a current
+one; `outdated` and `explain` read the lock as written, so a lock that is stale against its
+inputs, such as a `.yarnrc.yml` or a `resolutions` entry changed since the last install, can be
+misattributed there.
 
-- lock-currency verification, so `check` fails closed on a Berry project as it does on a Yarn
-  Classic one, and advisory identity;
+`check` asks Yarn itself whether a Berry lock is current, with Yarn 2.4 through 4 (the `yarn` that
+runs in the project, through `yarnPath` or Corepack). It runs `yarn install --immutable` without
+builds in a throwaway copy of every input Yarn reads (the lock, every `package.json` outside
+`node_modules`, `.git`, and `.yarn`, the `.yarnrc.yml` files from the project up to the home
+directory, `.env.yarn`, `.yarn/releases`, `.yarn/patches`, `file:` folders whole with their
+permissions, and the manifests of `portal:` and `link:` targets) and never in the project, which
+stays byte for byte as it was. The run is offline for Yarn, Corepack, and git, and every folder Yarn writes is redirected
+into the copy. A lock is current only when Yarn reaches its fetch step, and stale only when it
+reports `YN0028` (the lockfile would be modified); a stale lock is an error that
+`--allow-stale-lock` waives. Anything else is `lock_unknown`, an error nothing waives: a lock
+whose change needs registry metadata the offline run cannot fetch, a configuration the copy
+cannot reproduce faithfully (a configured plugin, an `exec:` dependency, a workspace pattern with
+`..` or an absolute path, a local package named by an absolute path, through a symbolic link, or
+outside the home directory, a symbolic link whose copy would resolve outside the copy, injected
+environment files other than `.env.yarn`, a lockfile name other than `yarn.lock`,
+`networkSettings` or an enabled `enableNetwork`, hardened mode set to anything but off, an output
+folder outside the copy, or an rc file using Yarn's `onConflict` form), an input that changes
+while the copy is written, or a Yarn without a supported version.
+Should any input change while `check` reads the dependencies after the verdict, the run reports
+`lock_conflict` instead of evaluating a graph Yarn never verified. A change undone before that
+second read goes unnoticed, the same window pnpm's verify-then-read check leaves.
+
+Not yet supported for Berry:
+
 - `sync` of Yarn's native `npmMinimalAgeGate`;
 - every mutation: `upgrade`, `fix`, and `--build` refuse a Berry project before running Yarn, and
   `outdated` warns that its adoptable rows were not verified against `upgrade`.

@@ -7,6 +7,7 @@ use cooldown_adapter_util::{resolve_program, supervised_output};
 use cooldown_core::{
     CoreError, LockStatus, LockVerifyReport, Result, ToolTermination, VerifyReport, failure_detail,
 };
+use std::ffi::OsString;
 use tokio::process::Command;
 
 /// A handle to one package manager binary. The binary defaults to its canonical name on `PATH`
@@ -24,6 +25,27 @@ pub struct NodeCmd {
 struct EnvVar {
     name: &'static str,
     value: &'static str,
+}
+
+/// One environment variable a single run sets on top of the driver's own
+/// ([`NodeCmd::output_overriding`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EnvOverride {
+    pub(crate) name: &'static str,
+    pub(crate) value: OsString,
+}
+
+/// The names among `inherited` that equal one of `names` without regard to case, the exact
+/// spellings included.
+fn case_variants(inherited: impl IntoIterator<Item = OsString>, names: &[&str]) -> Vec<OsString> {
+    inherited
+        .into_iter()
+        .filter(|variable| {
+            variable.to_str().is_some_and(|variable| {
+                names.iter().any(|name| variable.eq_ignore_ascii_case(name))
+            })
+        })
+        .collect()
 }
 
 impl NodeCmd {
@@ -68,6 +90,48 @@ impl NodeCmd {
             &self.bin,
             || format!("{} {}", self.bin, args.join(" ")),
         )
+        .await
+    }
+
+    /// Runs the driver with `overrides` set on top of the driver's own variables, and returns its
+    /// output whatever its exit status.
+    ///
+    /// Every inherited variable whose name equals one the run sets, compared without case, is
+    /// removed first.
+    /// Yarn reads `YARN_*` settings case-insensitively, so a `yarn_enable_network` the caller's
+    /// shell exports would otherwise compete with the `YARN_ENABLE_NETWORK` set here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ToolSpawn`] if the binary cannot be spawned.
+    pub(crate) async fn output_overriding(
+        &self,
+        dir: &Utf8Path,
+        args: &[String],
+        overrides: &[EnvOverride],
+    ) -> Result<std::process::Output> {
+        let names: Vec<&str> = self
+            .env
+            .iter()
+            .map(|EnvVar { name, .. }| *name)
+            .chain(overrides.iter().map(|EnvOverride { name, .. }| *name))
+            .collect();
+        let mut command = Command::new(resolve_program(&self.bin));
+        for variant in case_variants(std::env::vars_os().map(|(name, _)| name), &names) {
+            command.env_remove(variant);
+        }
+        command
+            .args(args)
+            .envs(self.env.iter().map(|EnvVar { name, value }| (name, value)))
+            .envs(
+                overrides
+                    .iter()
+                    .map(|EnvOverride { name, value }| (name, value)),
+            )
+            .current_dir(dir.as_std_path());
+        supervised_output(&mut command, &self.bin, || {
+            format!("{} {}", self.bin, args.join(" "))
+        })
         .await
     }
 
@@ -161,5 +225,39 @@ impl NodeCmd {
                 format!("{lockfile} is stale in {dir}: {}", failure_detail(&out))
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::case_variants;
+    use std::ffi::OsString;
+
+    /// Every spelling of a set variable is scrubbed, whatever its case, and no other variable
+    /// is.
+    #[test]
+    fn case_variants_match_names_without_case() {
+        let inherited = [
+            "YARN_ENABLE_NETWORK",
+            "yarn_enable_network",
+            "Yarn_Enable_Network",
+            "YARN_ENABLE_NETWORK_X",
+            "git_allow_protocol",
+            "PATH",
+        ]
+        .map(OsString::from);
+
+        let scrubbed = case_variants(inherited, &["YARN_ENABLE_NETWORK", "GIT_ALLOW_PROTOCOL"]);
+
+        assert_eq!(
+            scrubbed,
+            [
+                "YARN_ENABLE_NETWORK",
+                "yarn_enable_network",
+                "Yarn_Enable_Network",
+                "git_allow_protocol"
+            ]
+            .map(OsString::from)
+        );
     }
 }

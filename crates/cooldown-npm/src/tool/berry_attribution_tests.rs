@@ -240,6 +240,74 @@ async fn a_release_its_own_name_binds_under_any_locator_stays_direct() -> eyre::
     Ok(())
 }
 
+/// `ARCHIVE_TWINS` with its two `is-number` locators in the other order, the plain one first.
+fn archive_twins_reversed() -> String {
+    let lock = ARCHIVE_TWINS.lock;
+    let alias = lock.find("\"flag@npm:").expect("the alias entry");
+    let plain = lock
+        .find("\"is-number@npm:7.0.0\":")
+        .expect("the plain entry");
+    let reversed = format!(
+        "{}{}\n{}",
+        &lock[..alias],
+        lock[plain..].trim_end(),
+        lock[alias..plain].trim_end()
+    );
+    assert_ne!(reversed, lock);
+    reversed + "\n"
+}
+
+/// A release with one locator fetched from a private archive URL and another from the
+/// configured registry grants no advisory identity, whichever entry the lock lists first: every
+/// locator of the release must prove public routing.
+#[tokio::test]
+async fn a_release_grants_identity_only_when_every_locator_proves_it() -> eyre::Result<()> {
+    let (_cache, tool) = tool()?;
+    let identity = async |lock: &str| -> eyre::Result<Option<String>> {
+        let fixture = BerryProject {
+            files: ARCHIVE_TWINS.files,
+            lock: "",
+        };
+        let TempProject { _guard, project } = berry_project(&fixture, &[("yarn.lock", lock)])?;
+        let graph = tool.dependencies(&project, DepScope::Graph).await?;
+        let [row] = graph.as_slice() else {
+            eyre::bail!("one is-number row: {graph:?}")
+        };
+        Ok(row.advisory_identity.clone())
+    };
+
+    assert_eq!(identity(ARCHIVE_TWINS.lock).await?, None);
+    assert_eq!(identity(&archive_twins_reversed()).await?, None);
+
+    // The same release whose archive URL is the public registry's keeps its identity.
+    let public = ARCHIVE_TWINS
+        .lock
+        .replace("npm.example.com", "registry.npmjs.org");
+    assert_eq!(identity(&public).await?.as_deref(), Some("is-number"));
+    Ok(())
+}
+
+/// Yarn Berry never reads npm's configuration, so an `.npmrc` routing every package to a
+/// private registry vetoes no Berry identity; Yarn's own routing decides at feed time.
+#[tokio::test]
+async fn an_npmrc_vetoes_no_berry_identity() -> eyre::Result<()> {
+    let (_cache, tool) = tool()?;
+    let TempProject { _guard, project } = berry_project(
+        &EVERY_SOURCE,
+        &[(".npmrc", "registry=https://npm.example.com/\n")],
+    )?;
+
+    let graph = tool.dependencies(&project, DepScope::Graph).await?;
+
+    let chalk: Vec<Option<&str>> = graph
+        .iter()
+        .filter(|dep| dep.package.name == "chalk")
+        .map(|dep| dep.advisory_identity.as_deref())
+        .collect();
+    assert_eq!(chalk, [Some("chalk"), Some("chalk")], "{graph:?}");
+    Ok(())
+}
+
 /// Dropping an excluded member from a shared copy recomputes its pin from the remaining owners:
 /// the root's caret no longer keeps `packages/a`'s exact `chalk` pin from pinning the copy.
 #[tokio::test]

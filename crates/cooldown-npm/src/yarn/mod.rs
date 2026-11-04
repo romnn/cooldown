@@ -12,10 +12,19 @@
 //! run the lock without migrating it ([`executable`]), and the live lock must still be of the
 //! format the run was judged on.
 //! Berry projects are read only: their mutation is refused before any resolver could run.
+//!
+//! `check` verifies a Berry lock with Yarn itself, in a copy of the project ([`verify`]), and
+//! confirms afterwards that none of the inputs it verified changed while the dependencies were
+//! read.
+//! An advisory identity a Berry lock grants survives only where Yarn's effective routing names
+//! the public registry for the package ([`routing`]).
 
 mod executable;
+mod routing;
+mod verify;
 
 use crate::lock::{NodeLock, Yarn, YarnBerry, is_yarn_berry_lock};
+use crate::manifest::workspaces::{YarnConfiguration, YarnEnvironment};
 use crate::nodecmd::NodeCmd;
 use crate::registry::NpmRegistry;
 use crate::tool::NpmTool;
@@ -32,6 +41,7 @@ use cooldown_core::{
     VerifyReport,
 };
 use cooldown_registry::SharedHttp;
+use std::collections::HashMap;
 
 /// The format a `yarn.lock` is written in, which picks the backend that reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,19 +122,43 @@ pub struct YarnTool {
     classic: NpmTool<Yarn>,
     berry: NpmTool<YarnBerry>,
     /// The `yarn` binary whose version the executable check asks for, the same one the backends
-    /// run.
+    /// run, and the one that verifies a Berry lock and reports its routing.
     driver: NodeCmd,
+    /// The directories a Berry verification may create its copy in, in order of preference.
+    verify_bases: Vec<Utf8PathBuf>,
+    /// The Yarn environment a test verifies under, in place of this process's.
+    yarn_environment: Option<YarnEnvironment>,
+    /// The digest of the inputs each project root's Berry lock was verified current against,
+    /// until [`ToolRead::confirm_verified_inputs`] checks it.
+    verified: tokio::sync::Mutex<HashMap<Utf8PathBuf, verify::InputDigest>>,
+    /// Yarn's routing per project root, asked once per run, `None` cached for a project whose
+    /// routing Yarn cannot establish.
+    routing: tokio::sync::Mutex<HashMap<Utf8PathBuf, Option<routing::Routing>>>,
 }
 
 impl YarnTool {
     /// Creates the adapter from a configured [`NpmRegistry`], which both backends share.
     #[must_use]
     pub fn new(registry: NpmRegistry) -> Self {
+        // The system's temporary directory serves a project outside the home directory, and
+        // cooldown's cache directory one inside it, wherever the temporary directory lies.
+        let verify_bases = [
+            Some(std::env::temp_dir()),
+            Some(registry.cache_dir().join("yarn-verify")),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|base| Utf8PathBuf::from_path_buf(base).ok())
+        .collect();
         YarnTool {
             classic: NpmTool::new(registry.clone())
                 .with_driver(yarn_driver(NodeCmd::new(Yarn::BIN))),
             berry: NpmTool::new(registry).with_driver(yarn_driver(NodeCmd::new(YarnBerry::BIN))),
             driver: yarn_driver(NodeCmd::new(Yarn::BIN)),
+            verify_bases,
+            yarn_environment: None,
+            verified: tokio::sync::Mutex::new(HashMap::new()),
+            routing: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -141,7 +175,7 @@ impl YarnTool {
         YarnTool {
             classic: self.classic.with_listing_revalidation(revalidate),
             berry: self.berry.with_listing_revalidation(revalidate),
-            driver: self.driver,
+            ..self
         }
     }
 
@@ -158,7 +192,80 @@ impl YarnTool {
             classic: self.classic.with_driver(fake()),
             berry: self.berry.with_driver(fake()),
             driver: fake(),
+            ..self
         }
+    }
+
+    /// Verifies Berry locks under `environment`, with copies created in `bases`, so a test
+    /// controls the home directory and the scratch location.
+    #[cfg(all(test, unix))]
+    fn with_verification(self, environment: YarnEnvironment, bases: Vec<Utf8PathBuf>) -> Self {
+        YarnTool {
+            yarn_environment: Some(environment),
+            verify_bases: bases,
+            ..self
+        }
+    }
+
+    /// The environment Yarn reads its configuration from.
+    fn yarn_environment(&self) -> YarnEnvironment {
+        self.yarn_environment
+            .clone()
+            .unwrap_or_else(YarnEnvironment::from_process)
+    }
+
+    fn verify_context(&self) -> verify::Context {
+        verify::Context {
+            environment: self.yarn_environment(),
+            bases: self.verify_bases.clone(),
+        }
+    }
+
+    /// Verifies `project`'s Berry lock and records the digest of the inputs a current verdict
+    /// covers.
+    async fn verify_berry_lock(&self, project: &Project) -> Result<LockVerifyReport> {
+        let verification =
+            verify::lock_current(&self.driver, project, &self.verify_context()).await?;
+        let mut verified = self.verified.lock().await;
+        match verification.digest {
+            Some(digest) => verified.insert(project.root.clone(), digest),
+            None => verified.remove(&project.root),
+        };
+        Ok(verification.report)
+    }
+
+    /// Withholds every provisional identity of a Berry project that Yarn's routing does not send
+    /// to the public registry, and all of them when the routing cannot be established.
+    async fn confirm_berry_identities(&self, project: &Project, deps: &mut [Dependency]) {
+        if deps.iter().all(|dep| dep.advisory_identity.is_none()) {
+            return;
+        }
+        let routing = self.berry_routing(&project.root).await;
+        for dep in deps {
+            let public = routing
+                .as_ref()
+                .is_some_and(|routing| !routing.reroutes(&dep.package.name));
+            if !public {
+                dep.advisory_identity = None;
+            }
+        }
+    }
+
+    /// Yarn's routing for the Berry project at `root`, asked once and memoized.
+    ///
+    /// A configured plugin may add resolvers or fetchers of its own, and an rc file Yarn would
+    /// refuse configures nothing provable, so either establishes no routing without asking.
+    async fn berry_routing(&self, root: &Utf8Path) -> Option<routing::Routing> {
+        let mut cache = self.routing.lock().await;
+        if let Some(cached) = cache.get(root) {
+            return cached.clone();
+        }
+        let routing = match YarnConfiguration::read(root, &self.yarn_environment()) {
+            Ok(_) => routing::query(&self.driver, root).await,
+            Err(_) => None,
+        };
+        cache.insert(root.to_owned(), routing.clone());
+        routing
     }
 
     /// The backend that reads locks of `format`.
@@ -268,9 +375,14 @@ impl ToolRead for YarnTool {
     }
 
     async fn confirm_advisory_identities(&self, project: &Project, deps: &mut [Dependency]) {
-        self.backend_or_classic(project)
-            .confirm_advisory_identities(project, deps)
-            .await;
+        match LockFormat::on_disk(&project.root) {
+            Ok(LockFormat::Berry) => self.confirm_berry_identities(project, deps).await,
+            _ => {
+                self.classic
+                    .confirm_advisory_identities(project, deps)
+                    .await;
+            }
+        }
     }
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
@@ -309,9 +421,33 @@ impl ToolRead for YarnTool {
     }
 
     async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport> {
-        self.backend_for(project)?
-            .verify_lock_current(project)
-            .await
+        match LockFormat::on_disk(&project.root)? {
+            LockFormat::Classic => self.classic.verify_lock_current(project).await,
+            LockFormat::Berry => self.verify_berry_lock(project).await,
+        }
+    }
+
+    /// A Berry lock verified current is confirmed against its inputs as they are now: planning
+    /// the copy again must give the digest the verification recorded.
+    /// An input that changed, one that appeared where the copy looks for inputs, or a lock that
+    /// is no longer Berry means the dependencies just read may not be the ones Yarn verified.
+    /// A change undone before this second read goes unnoticed, the same window pnpm's
+    /// verify-then-read check leaves.
+    async fn confirm_verified_inputs(&self, project: &Project) -> Result<()> {
+        let Some(recorded) = self.verified.lock().await.remove(&project.root) else {
+            return Ok(());
+        };
+        let unchanged = LockFormat::on_disk(&project.root)? == LockFormat::Berry
+            && verify::live_digest(project, &self.verify_context())?.as_ref() == Some(&recorded);
+        if unchanged {
+            Ok(())
+        } else {
+            Err(CoreError::LockConflict(format!(
+                "the inputs of yarn.lock in {} changed while cooldown verified them; re-run once \
+                 they have settled",
+                project.root
+            )))
+        }
     }
 
     async fn lock_inputs(&self, project: &Project) -> Result<Vec<Utf8PathBuf>> {

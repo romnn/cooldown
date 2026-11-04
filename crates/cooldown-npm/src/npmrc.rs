@@ -103,6 +103,11 @@ impl RegistryOverrides {
         ])
     }
 
+    /// The overrides of a manager that reads no npm configuration: nothing is rerouted.
+    pub(crate) fn none() -> Self {
+        Self::merge([])
+    }
+
     fn merge(layers: impl IntoIterator<Item = LayerOverrides>) -> Self {
         let mut global = None;
         let mut scopes: HashMap<String, bool> = HashMap::new();
@@ -210,7 +215,7 @@ pub(crate) fn advisory_identity(
 /// Whether a lock entry's `resolved` URL names the public npm registry — the positive origin
 /// evidence advisory identity requires. The integrity hash pins the artifact's content to what
 /// that registry served at lock time, so even a later mirror fetch delivers the same bytes.
-fn resolved_from_npmjs(url: &str) -> bool {
+pub(crate) fn resolved_from_npmjs(url: &str) -> bool {
     let url = url.to_ascii_lowercase();
     [
         "https://registry.npmjs.org/",
@@ -311,7 +316,7 @@ fn in_scope(package: &str, scope: &str) -> bool {
 }
 
 /// The public npm registry; `registry.yarnpkg.com` is its long-standing alias.
-fn is_npmjs_registry(url: &str) -> bool {
+pub(crate) fn is_npmjs_registry(url: &str) -> bool {
     let url = url.trim_end_matches('/');
     url.eq_ignore_ascii_case("https://registry.npmjs.org")
         || url.eq_ignore_ascii_case("https://registry.yarnpkg.com")

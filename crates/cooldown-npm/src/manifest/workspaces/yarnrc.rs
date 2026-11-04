@@ -22,7 +22,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// The rc file name Yarn reads when `YARN_RC_FILENAME` names none.
-const DEFAULT_RC_FILENAME: &str = ".yarnrc.yml";
+pub(crate) const DEFAULT_RC_FILENAME: &str = ".yarnrc.yml";
 
 /// The protocol a Berry lock of a protocol-less schema omits.
 const NPM_PROTOCOL: &str = "npm:";
@@ -40,6 +40,16 @@ pub(crate) struct YarnEnvironment {
     pub(crate) plugins: Vec<String>,
     /// Every `YARN_DEFAULT_PROTOCOL` value.
     pub(crate) default_protocol: Vec<String>,
+    /// Every `YARN_*` variable, whatever its case, as Yarn reads its settings from them.
+    pub(crate) variables: Vec<YarnVariable>,
+}
+
+/// One `YARN_*` environment variable, its name lower-cased the way Yarn compares it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct YarnVariable {
+    /// The lower-cased name, `yarn_` prefix included.
+    pub(crate) name: String,
+    pub(crate) value: String,
 }
 
 impl YarnEnvironment {
@@ -56,16 +66,33 @@ impl YarnEnvironment {
         };
         for (key, value) in std::env::vars_os() {
             let value = value.to_string_lossy().into_owned();
-            match key.to_string_lossy().to_ascii_lowercase().as_str() {
+            let name = key.to_string_lossy().to_ascii_lowercase();
+            match name.as_str() {
                 "yarn_rc_filename" => {
-                    environment.rc_filename.get_or_insert(value);
+                    environment.rc_filename.get_or_insert(value.clone());
                 }
-                "yarn_plugins" => environment.plugins.push(value),
-                "yarn_default_protocol" => environment.default_protocol.push(value),
+                "yarn_plugins" => environment.plugins.push(value.clone()),
+                "yarn_default_protocol" => environment.default_protocol.push(value.clone()),
                 _ => {}
+            }
+            if name.starts_with("yarn_") {
+                environment.variables.push(YarnVariable { name, value });
             }
         }
         environment
+    }
+
+    /// The value of every `YARN_*` variable `name` (lower-cased, `yarn_` included) spells.
+    pub(crate) fn variable(&self, name: &str) -> impl Iterator<Item = &str> {
+        self.variables
+            .iter()
+            .filter(move |variable| variable.name == name)
+            .map(|variable| variable.value.as_str())
+    }
+
+    /// The rc file name Yarn reads in the project and every directory above it.
+    pub(crate) fn rc_filename(&self) -> &str {
+        self.rc_filename.as_deref().unwrap_or(DEFAULT_RC_FILENAME)
     }
 
     /// An environment that sets nothing, whose home directory is the absent `root/.home`.
@@ -102,9 +129,9 @@ fn home_directory(
 
 /// What Yarn's configuration around a project establishes about its member bindings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct YarnConfiguration {
+pub(crate) struct YarnConfiguration {
     /// Whether every source of `defaultProtocol` Yarn reads leaves it at, or sets it to, `npm:`.
-    pub(super) npm_default_protocol: bool,
+    pub(crate) npm_default_protocol: bool,
 }
 
 impl YarnConfiguration {
@@ -114,7 +141,7 @@ impl YarnConfiguration {
     ///
     /// Returns why the bindings cannot be read: a configured plugin, no home directory, or an rc
     /// file Yarn itself would refuse to read.
-    pub(super) fn read(root: &Utf8Path, environment: &YarnEnvironment) -> Result<Self, String> {
+    pub(crate) fn read(root: &Utf8Path, environment: &YarnEnvironment) -> Result<Self, String> {
         if let Some(plugins) = environment
             .plugins
             .iter()
@@ -187,25 +214,42 @@ fn rc_files(root: &Utf8Path, home: &Utf8Path, environment: &YarnEnvironment) -> 
 ///
 /// An empty file sets nothing.
 /// A file that cannot be read, or holds no YAML mapping, is refused, since Yarn refuses it too.
-fn read_settings(root: &Utf8Path, path: &Utf8Path) -> Result<Option<Map<String, Value>>, String> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(format!("{}: {err}", shown(root, path))),
+pub(crate) fn read_settings(
+    root: &Utf8Path,
+    path: &Utf8Path,
+) -> Result<Option<Map<String, Value>>, String> {
+    match std::fs::read(path) {
+        Ok(content) => parse_settings(root, path, &content).map(Some),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!("{}: {err}", shown(root, path))),
+    }
+}
+
+/// The top-level settings of the rc file at `path`, whose bytes are `content`.
+///
+/// An empty file sets nothing.
+/// A file that is not UTF-8, or holds no YAML mapping, is refused, since Yarn refuses it too.
+pub(crate) fn parse_settings(
+    root: &Utf8Path,
+    path: &Utf8Path,
+    content: &[u8],
+) -> Result<Map<String, Value>, String> {
+    let Ok(content) = std::str::from_utf8(content) else {
+        return Err(format!("{} is not UTF-8", shown(root, path)));
     };
     if content.trim().is_empty() {
-        return Ok(Some(Map::new()));
+        return Ok(Map::new());
     }
-    match serde_saphyr::from_str::<Value>(&content) {
-        Ok(Value::Object(settings)) => Ok(Some(settings)),
-        Ok(Value::Null) => Ok(Some(Map::new())),
+    match serde_saphyr::from_str::<Value>(content) {
+        Ok(Value::Object(settings)) => Ok(settings),
+        Ok(Value::Null) => Ok(Map::new()),
         Ok(_) => Err(format!("{} is no YAML mapping", shown(root, path))),
         Err(err) => Err(format!("{}: {err}", shown(root, path))),
     }
 }
 
 /// Whether a `plugins` setting names any plugin: every value but an empty list or none does.
-fn configures_plugins(plugins: &Value) -> bool {
+pub(crate) fn configures_plugins(plugins: &Value) -> bool {
     match plugins {
         Value::Null => false,
         Value::Array(entries) => !entries.is_empty(),
