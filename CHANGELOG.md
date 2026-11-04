@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **The config cascade collects every layer when the root and a project are spelled
+  differently.** The walk from a project directory up to the repository root compared raw paths,
+  so a root reached through a symlinked checkout, a `$HOME` fallback, or a Windows verbatim or 8.3
+  spelling was not recognized as the project's ancestor. The walk then skipped every intermediate
+  `cooldown.toml`, read the root file a second time as a nested layer, which a root file with
+  `exclude-folders` turned into an error, or, for a root spelled through `..`, climbed past the root
+  and applied config files above it. The walk now compares canonical paths, so each layer between
+  the root and the project applies exactly once and nothing above the root is read. A project
+  directory that does not resolve gets the root layer alone. The `$HOME` fallback root is itself
+  canonical, so the Cargo recovery probe under `--dir` also stops at the same root whichever way
+  `HOME` is spelled.
+
 - **`check` verifies a Yarn Berry lock with Yarn itself instead of failing closed.** `check`
   reported every Berry lock's currency as unknown, so no Berry project was ever evaluated. It now
   runs `yarn install --immutable` without builds, with Yarn 2.4 through 4, in a throwaway copy of
