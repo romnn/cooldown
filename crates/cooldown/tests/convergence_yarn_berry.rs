@@ -43,6 +43,10 @@ use support::Fixture;
 /// The Yarn release the fixtures declare and require.
 const YARN: &str = "4.18.1";
 
+/// The environment that keeps Yarn's human output plain, which Yarn colours wherever it detects a
+/// terminal or a CI that shows colours, such as GitHub Actions.
+const PLAIN: [(&str, &str); 1] = [("YARN_ENABLE_COLORS", "0")];
+
 /// Whether the `yarn` that runs in `fixture` is [`YARN`]; anything else skips the test locally and
 /// fails it in CI, where the pin must be provisioned.
 fn runs_pinned_yarn(fixture: &Fixture) -> bool {
@@ -1310,7 +1314,7 @@ fn seed_lock_in(fixture: &Fixture, dir: &str) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Runs `yarn args` in the project in `dir`.
+/// Runs `yarn args` in the project in `dir`, its human output plain ([`PLAIN`]).
 fn yarn_in(
     fixture: &Fixture,
     dir: &str,
@@ -1319,7 +1323,7 @@ fn yarn_in(
 ) -> eyre::Result<support::CapturedOutput> {
     let mut full = vec!["--cwd", dir];
     full.extend_from_slice(args);
-    fixture.run_tool_traced(phase, "yarn", &full, &[])
+    fixture.run_tool_traced(phase, "yarn", &full, &PLAIN)
 }
 
 /// Yarn's own reading of its setting `key` in the project in `dir`.
@@ -2133,7 +2137,7 @@ fn berry_landing_leaves_aliases_and_local_sources() -> eyre::Result<()> {
     );
     assert_eq!(bindings(&fixture, "chalk")?, bound(&[("4.1.0", &["."])]));
     let output = fixture
-        .run_tool_traced("ask Yarn why chalk", "yarn", &["why", "chalk"], &[])?
+        .run_tool_traced("ask Yarn why chalk", "yarn", &["why", "chalk"], &PLAIN)?
         .require_success()?;
     assert!(
         output

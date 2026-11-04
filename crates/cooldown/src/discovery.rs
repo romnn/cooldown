@@ -9,6 +9,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::config::{ConfigDocument, ScanConfig};
 use cooldown_core::{CoreError, EdgePolicy, Origin, PolicyLayer};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// The repo-level config file name (`cooldown.toml`), used for both the repo cascade and repo-root
@@ -432,15 +433,44 @@ fn home_dir() -> Option<Utf8PathBuf> {
 
 /// The XDG cache dir for cooldown: `${XDG_CACHE_HOME:-~/.cache}/cooldown`.
 ///
-/// Falls back to a relative `.cache/cooldown` when neither `XDG_CACHE_HOME` nor `HOME` is set.
+/// Without `HOME`, as in a Windows shell, `~` is the platform's home directory, the user profile
+/// on Windows, and without any home the cache lives in the system temp directory.
+/// A relative `XDG_CACHE_HOME` or home is ignored, as the XDG spec has it, so the cache never
+/// resolves against the working directory, which is usually the project the run reads.
 #[must_use]
-pub fn cache_dir() -> Utf8PathBuf {
-    std::env::var("XDG_CACHE_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(Utf8PathBuf::from)
-        .or_else(|| home_dir().map(|h| h.join(".cache")))
-        .unwrap_or_else(|| Utf8PathBuf::from(".cache"))
+pub fn cache_dir() -> PathBuf {
+    cache_dir_from(CacheBases {
+        xdg_cache_home: std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
+        home: std::env::var_os("HOME").map(PathBuf::from),
+        platform_home: std::env::home_dir(),
+        temp: std::env::temp_dir(),
+    })
+}
+
+/// Where the cache directory may live, in order of preference.
+struct CacheBases {
+    xdg_cache_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    platform_home: Option<PathBuf>,
+    temp: PathBuf,
+}
+
+/// The cache directory [`cache_dir`] picks among `bases`.
+fn cache_dir_from(bases: CacheBases) -> PathBuf {
+    let absolute = |path: Option<PathBuf>| path.filter(|path| path.is_absolute());
+    let CacheBases {
+        xdg_cache_home,
+        home,
+        platform_home,
+        temp,
+    } = bases;
+    absolute(xdg_cache_home)
+        .or_else(|| {
+            absolute(home)
+                .or_else(|| absolute(platform_home))
+                .map(|home| home.join(".cache"))
+        })
+        .unwrap_or(temp)
         .join("cooldown")
 }
 
@@ -448,6 +478,45 @@ pub fn cache_dir() -> Utf8PathBuf {
 mod tests {
     use super::*;
     use indoc::indoc;
+
+    /// The cache follows `XDG_CACHE_HOME`, then `HOME`, then the platform's home, then the temp
+    /// directory, and never a relative path, which would resolve inside the project being run on.
+    #[test]
+    fn the_cache_dir_is_never_relative() {
+        let temp = std::env::temp_dir();
+        let home = temp.join("home");
+        let profile = temp.join("profile");
+        let bases = |xdg: Option<&str>,
+                     home: Option<&std::path::Path>,
+                     profile: Option<&std::path::Path>| CacheBases {
+            xdg_cache_home: xdg.map(PathBuf::from),
+            home: home.map(std::path::Path::to_path_buf),
+            platform_home: profile.map(std::path::Path::to_path_buf),
+            temp: temp.clone(),
+        };
+        let xdg = temp.join("xdg");
+
+        assert_eq!(
+            cache_dir_from(bases(xdg.to_str(), Some(&home), Some(&profile))),
+            xdg.join("cooldown")
+        );
+        assert_eq!(
+            cache_dir_from(bases(Some(".cache"), Some(&home), Some(&profile))),
+            home.join(".cache").join("cooldown")
+        );
+        assert_eq!(
+            cache_dir_from(bases(None, None, Some(&profile))),
+            profile.join(".cache").join("cooldown")
+        );
+        assert_eq!(
+            cache_dir_from(bases(
+                Some(""),
+                Some(std::path::Path::new("")),
+                Some(std::path::Path::new("home"))
+            )),
+            temp.join("cooldown")
+        );
+    }
 
     #[test]
     fn repo_root_stops_at_git() {
