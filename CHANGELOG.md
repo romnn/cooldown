@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **`check` verifies a Yarn Berry lock with Yarn itself instead of failing closed.** `check`
+  reported every Berry lock's currency as unknown, so no Berry project was ever evaluated. It now
+  runs `yarn install --immutable` without builds, with Yarn 2.4 through 4, in a throwaway copy of
+  every input Yarn reads: the lock, every `package.json` outside `node_modules`, `.git`, and
+  `.yarn`, the `.yarnrc.yml` files from the project up to the home directory, `file:` folders
+  whole with their permissions, and the manifests of `portal:` and `link:` targets. The run is
+  offline for Yarn, Corepack, and git, and every folder Yarn writes goes into the copy, so the
+  project stays byte for byte as it was. Only `YN0028`, the lockfile Yarn would modify, makes a
+  lock stale, which `--allow-stale-lock` waives, and only reaching the fetch step makes it
+  current. Anything else is `lock_unknown`, which nothing waives: a lock whose change needs
+  registry metadata the offline run cannot fetch, a configuration the copy cannot reproduce
+  faithfully (a configured plugin, an `exec:` dependency, a workspace pattern or local package
+  that leaves the project, a symbolic link the copy would resolve elsewhere, injected environment
+  files other than `.env.yarn`, another lockfile name, per-host network settings, hardened mode,
+  or an rc file using `onConflict`), an input that changes while the copy is written, or an
+  unsupported Yarn. An input that changes after the verdict, before the dependencies are read, is
+  a `lock_conflict`. A Berry row now keeps its advisory identity when every lock entry of the
+  release was fetched from the configured registry by name, or from an archive URL on
+  registry.npmjs.org, and `yarn config get` routes the package's scope to the public registry;
+  npm's `.npmrc`, which Yarn Berry never reads, no longer vetoes it.
+
 - **A Yarn Classic member owns the release a same-name alias declares.** Member attribution read
   every `npm:` selector as an alias of another package, so a declaration such as
   `"has-flag": "npm:has-flag@^4.0.0"` owned no copy, and the release read as transitive though the
@@ -233,18 +254,16 @@
   `__metadata:` entry, matched none of the Classic grammar, so `outdated` reported nothing and
   `upgrade` found nothing to do on a project it never read. cooldown now reads the lock Yarn 2
   through 4.18 writes, lockfile versions 4 to 6 and 8 to 10, and evaluates every npm release it
-  resolves, so `outdated` and `explain` cover a Berry project, while `check` fails closed on it,
-  as on a Yarn Classic one, until the lock's currency can be verified. An npm alias is read as
+  resolves, so `outdated` and `explain` cover a Berry project. An npm alias is read as
   its target's release, which no declaration of the target's name claims unless a descriptor of
   that name resolves to it too, a patched package's own npm release is read like any other, and
   workspaces and `link:`, `portal:`, `file:`, `patch:`, `exec:`, git, and tarball URL entries are
   left out, whatever version, checksum, or link type they record. A malformed lock, a descriptor
   bound to two different packages, and a lockfile version no released Yarn wrote, such as the 7
   of Yarn 4's release candidates, are reported as `lockfile_unreadable`, never read as a smaller
-  graph. Berry support is read-only for now: advisory identity is not established, and `sync`
-  writes nothing. `upgrade`, `fix`, and `--build` refuse a Berry project before running Yarn, and
-  `outdated` warns that its adoptable rows were not verified against `upgrade`. cooldown also no
-  longer runs a Yarn Berry executable on a Classic lock, which its first install would migrate to
+  graph. Berry support is read-only for now: `upgrade`, `fix`, and `--build` refuse a Berry
+  project before running Yarn, and `outdated` warns that its adoptable rows were not verified
+  against `upgrade`. cooldown also no longer runs a Yarn Berry executable on a Classic lock, which its first install would migrate to
   the Berry format: before running Yarn on a Classic lock it checks the root `packageManager` and
   the version `yarn --version` reports in the project, through any `yarnPath` or Corepack, and
   refuses a Berry Yarn with what to do instead. Every Yarn run turns Corepack's auto-pin off, so

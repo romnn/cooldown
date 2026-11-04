@@ -3,10 +3,10 @@ use super::{
     BerryLock, Descriptor, Ident, Locator, ReferenceParts, YarnBerry, combined_key_descriptors,
     is_semver_range, is_tag, is_workspace_path, legacy_patch_inner, percent_decode,
 };
-use crate::lock::{NameVersion, NodeLock, Yarn, is_yarn_berry_lock};
+use crate::lock::{LockOrigin, NameVersion, NodeLock, Yarn, is_yarn_berry_lock};
 use color_eyre::eyre;
 use cooldown_core::CoreError;
-use indoc::indoc;
+use indoc::{formatdoc, indoc};
 use std::collections::BTreeSet;
 
 /// The `(name, version)` of every row, sorted.
@@ -87,12 +87,13 @@ fn every_source_inventories_only_its_npm_releases() -> eyre::Result<()> {
             ("supports-preserve-symlinks-flag", "1.0.0"),
         ])
     );
-    // One row per locator, so no release appears twice.
+    // One row per release, so no release appears twice.
     assert_eq!(rows.len(), 19);
-    // A checksum and a hard link prove no registry, so no row carries origin evidence.
+    // A checksum and a hard link prove no registry, so every row's archive comes only from the
+    // registry Yarn's configuration routes it to.
     assert!(
         rows.iter()
-            .all(|row| row.origin == crate::lock::LockOrigin::Unrecorded),
+            .all(|row| row.origin == crate::lock::LockOrigin::ConfiguredRegistry),
         "{rows:?}"
     );
     Ok(())
@@ -279,7 +280,7 @@ fn a_resolution_rewritten_dependency_reads() -> eyre::Result<()> {
 }
 
 /// An npm locator whose archive comes from another URL is still the registry release it names,
-/// read without origin evidence.
+/// its origin that URL.
 ///
 /// Synthetic: Yarn binds `__archiveUrl` only for a registry whose tarball URL breaks npm's
 /// convention, which the public registry never does; the spelling follows `bindLocator` in Yarn
@@ -297,10 +298,63 @@ fn an_archive_url_parameter_keeps_the_release() -> eyre::Result<()> {
           languageName: node
           linkType: hard
     "#};
+    let rows = YarnBerry::parse(lock)?;
+    assert_eq!(releases(&rows), expected(&[("private-pkg", "1.0.0")]));
     assert_eq!(
-        releases(&YarnBerry::parse(lock)?),
-        expected(&[("private-pkg", "1.0.0")])
+        rows.iter().map(|row| &row.origin).collect::<Vec<_>>(),
+        [&LockOrigin::Url(
+            "https://npm.example.com/private-pkg/1.0.0.tgz".to_string()
+        )]
     );
+    Ok(())
+}
+
+/// Bindings other than one decodable `__archiveUrl` leave a registry locator without origin
+/// evidence, since Yarn's fetchers may then fetch it from anywhere.
+///
+/// Synthetic: the bindings are spelled as Yarn's `bindLocator` writes them.
+#[test]
+fn only_a_lone_archive_url_binding_is_origin_evidence() -> eyre::Result<()> {
+    let origin = |resolution: &str| -> eyre::Result<LockOrigin> {
+        let lock = formatdoc! {r#"
+            __metadata:
+              version: 10
+              cacheKey: 10c0
+
+            "pkg@npm:^1.0.0":
+              version: 1.0.0
+              resolution: "{resolution}"
+              languageName: node
+              linkType: hard
+        "#};
+        let rows = YarnBerry::parse(&lock)?;
+        let [row] = rows.as_slice() else {
+            eyre::bail!("one row for {resolution}: {rows:?}")
+        };
+        Ok(row.origin.clone())
+    };
+
+    // No binding, a lone archive URL, and a `+` the query string reads as a space
+    assert_eq!(origin("pkg@npm:1.0.0")?, LockOrigin::ConfiguredRegistry);
+    assert_eq!(
+        origin(
+            "pkg@npm:1.0.0::__archiveUrl=https%3A%2F%2Fregistry.npmjs.org%2Fpkg%2F-%2Fpkg-1.0.0.tgz"
+        )?,
+        LockOrigin::Url("https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz".to_string())
+    );
+    assert_eq!(
+        origin("pkg@npm:1.0.0::__archiveUrl=https%3A%2F%2Fx.example%2Fa+b.tgz")?,
+        LockOrigin::Url("https://x.example/a b.tgz".to_string())
+    );
+
+    // A second binding, another binding, and a malformed escape
+    for resolution in [
+        "pkg@npm:1.0.0::__archiveUrl=https%3A%2F%2Fregistry.npmjs.org%2Fp.tgz&other=1",
+        "pkg@npm:1.0.0::locator=root%40workspace%3A.",
+        "pkg@npm:1.0.0::__archiveUrl=https%3A%2F%2Fregistry.npmjs.org%2F%zz",
+    ] {
+        assert_eq!(origin(resolution)?, LockOrigin::Unrecorded, "{resolution}");
+    }
     Ok(())
 }
 

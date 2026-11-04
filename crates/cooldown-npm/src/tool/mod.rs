@@ -652,12 +652,16 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
 
         // Advisory identity needs positive origin evidence: the lock entry's own record — npm's and
         // yarn's `resolved` URL naming the public npm registry, or pnpm's registry-only resolution
-        // shape, whose registry the feed-time query then has to name (see
-        // `confirm_advisory_identities`).
+        // shape and Yarn Berry's binding-free npm locator, whose registry the feed-time query then
+        // has to name (see `confirm_advisory_identities`).
         // A format without a per-entry record (bun) grants nothing; the config layers can only veto
         // a granted identity, never substitute for the record.
-        let registry_overrides =
-            crate::npmrc::RegistryOverrides::read(&project.root, L::NATIVE_MIN_AGE_FILE);
+        // A manager that never reads npm's configuration (Yarn Berry) gets no veto from it.
+        let registry_overrides = if L::NPMRC_ROUTING {
+            crate::npmrc::RegistryOverrides::read(&project.root, L::NATIVE_MIN_AGE_FILE)
+        } else {
+            crate::npmrc::RegistryOverrides::none()
+        };
         let mut seen: HashMap<(String, String), usize> = HashMap::new();
         let mut deps: Vec<Dependency> = Vec::new();
         for NameVersion {

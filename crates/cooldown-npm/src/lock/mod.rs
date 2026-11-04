@@ -22,7 +22,7 @@ mod yarn_berry;
 pub use crate::manifest::workspaces::{WorkspaceDialect, WorkspaceManifests};
 pub use yarn::{UnattributedName, Unproven, UnprovenDeclaration, YarnBindings};
 
-pub(crate) use yarn_berry::{YarnBerry, berry_workspace_paths};
+pub(crate) use yarn_berry::{BerryLock, YarnBerry, berry_workspace_paths, percent_decode};
 
 use crate::version::{CeilingHold, RangeMatch, is_exact_npm_specifier, range_match};
 use cooldown_core::{CoreError, Result, ToolId};
@@ -57,6 +57,13 @@ pub trait NodeLock: Send + Sync + 'static {
     /// See [`EffectiveRegistryQuery`]; the default is the manager with no reliably parseable query
     /// (yarn classic, bun) or none wired yet (yarn Berry), whose identities never survive the feed.
     const EFFECTIVE_REGISTRY: EffectiveRegistryQuery = EffectiveRegistryQuery::Unavailable;
+
+    /// Whether the manager routes registry requests by npm's configuration (`.npmrc` and
+    /// `npm_config_*`), whose overrides then veto an advisory identity at read time.
+    ///
+    /// Yarn Berry reads none of it: its routing lives in its own configuration, which the `yarn`
+    /// adapter confirms when the advisory feed runs.
+    const NPMRC_ROUTING: bool = true;
 
     /// Whether the peer gate can tell which copy a member's peer contract binds to.
     ///

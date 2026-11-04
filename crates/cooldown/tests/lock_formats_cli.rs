@@ -316,3 +316,166 @@ fn unreadable_yarn_berry_locks_are_reported() -> eyre::Result<()> {
     }
     Ok(())
 }
+
+/// `check` against a Berry project, driven by a scripted fake `yarn` (`COOLDOWN_YARN`), which
+/// prints a report Yarn 4.18.1 printed and runs `install_hook` first.
+#[cfg(unix)]
+mod check {
+    use super::{BERRY_LOCK, berry_project, fields};
+    use color_eyre::eyre;
+    use indoc::indoc;
+    use std::process::Command;
+
+    /// Yarn 4.18.1's report verifying this workspace's current lock.
+    const CURRENT_REPORT: &str = indoc! {r#"
+        {"type":"info","name":0,"displayName":"YN0000","indent":"· ","data":"Yarn 4.18.1"}
+        {"type":"info","name":null,"displayName":"YN0000","indent":"","data":"┌ Resolution step"}
+        {"type":"info","name":null,"displayName":"YN0000","indent":"","data":"└ Completed"}
+        {"type":"info","name":null,"displayName":"YN0000","indent":"","data":"┌ Fetch step"}
+        {"type":"info","name":null,"displayName":"YN0000","indent":"","data":"└ Completed"}
+        {"type":"info","name":null,"displayName":"YN0000","indent":"","data":"┌ Link step"}
+        {"type":"info","name":null,"displayName":"YN0000","indent":"","data":"└ Completed"}
+        {"type":"info","name":0,"displayName":"YN0000","indent":"· ","data":"Done in 0s 35ms"}
+    "#};
+
+    /// Yarn 4.18.1's report after the member's `has-flag` range moved to `^5.0.0`.
+    ///
+    /// An excerpt: the diff's context lines and its second hunk are cut.
+    const STALE_REPORT: &str = indoc! {r#"
+        {"type":"info","name":0,"displayName":"YN0000","indent":"· ","data":"Yarn 4.18.1"}
+        {"type":"info","name":null,"displayName":"YN0000","indent":"","data":"┌ Resolution step"}
+        {"type":"info","name":85,"displayName":"YN0085","indent":"│ ","data":"+ has-flag@npm:5.0.1"}
+        {"type":"info","name":null,"displayName":"YN0000","indent":"","data":"└ Completed in 0s 273ms"}
+        {"type":"info","name":null,"displayName":"YN0000","indent":"","data":"┌ Post-resolution validation"}
+        {"type":"error","name":28,"displayName":"YN0028","indent":"│ ","data":"-    has-flag: \"npm:^4.0.0\""}
+        {"type":"error","name":28,"displayName":"YN0028","indent":"│ ","data":"+    has-flag: \"npm:^5.0.0\""}
+        {"type":"error","name":28,"displayName":"YN0028","indent":"│ ","data":"The lockfile would have been modified by this install, which is explicitly forbidden."}
+        {"type":"info","name":null,"displayName":"YN0000","indent":"","data":"└ Completed"}
+        {"type":"error","name":0,"displayName":"YN0000","indent":"· ","data":"Failed with errors in 0s 280ms"}
+    "#};
+
+    /// Runs `cooldown check --offline` in `project` with a fake `yarn` printing `report` after
+    /// running `install_hook`, under a home and cache of their own.
+    fn check(
+        project: &tempfile::TempDir,
+        report: &str,
+        install_hook: &str,
+        extra: &[&str],
+    ) -> eyre::Result<(Option<i32>, serde_json::Value)> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = tempfile::tempdir()?;
+        let report_path = scratch.path().join("report.ndjson");
+        std::fs::write(&report_path, report)?;
+        let script = scratch.path().join("fake-yarn.sh");
+        std::fs::write(
+            &script,
+            indoc::formatdoc! {r#"
+                #!/bin/sh
+                case "$1" in
+                  --version) echo 4.18.1 ;;
+                  install) {install_hook}; cat "{report}"; exit 1 ;;
+                  *) exit 1 ;;
+                esac
+            "#, report = report_path.display()},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let home = scratch.path().join("home");
+        std::fs::create_dir_all(&home)?;
+        let output = Command::new(env!("CARGO_BIN_EXE_cooldown"))
+            .current_dir(project.path())
+            .env("COOLDOWN_YARN", &script)
+            .env("HOME", &home)
+            .env("XDG_CACHE_HOME", scratch.path().join("cache"))
+            .args(["check", "--offline", "--json", "--no-progress"])
+            .args(extra)
+            .output()?;
+        let document = serde_json::from_slice(&output.stdout).map_err(|err| {
+            eyre::eyre!(
+                "cooldown check printed no JSON envelope ({err}); stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })?;
+        Ok((output.status.code(), document))
+    }
+
+    /// The kinds of the envelope's lock diagnostics in `section`.
+    fn lock_kinds(document: &serde_json::Value, section: &str) -> Vec<String> {
+        fields(document, section, "kind")
+            .into_iter()
+            .filter(|kind| kind.contains("lock"))
+            .collect()
+    }
+
+    /// A current Berry lock is evaluated, a stale one is an error `--allow-stale-lock` waives,
+    /// and a lock whose currency verification cannot establish is an error nothing waives.
+    #[test]
+    fn check_evaluates_only_a_berry_lock_yarn_proves_current() -> eyre::Result<()> {
+        let project = berry_project(BERRY_LOCK)?;
+
+        // Current: evaluated, with no lock diagnostic.
+        let (_, current) = check(&project, CURRENT_REPORT, ":", &[])?;
+        assert!(lock_kinds(&current, "errors").is_empty(), "{current:#}");
+        assert!(lock_kinds(&current, "warnings").is_empty(), "{current:#}");
+        assert!(
+            current
+                .pointer("/summary/checked")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|checked| checked > 0),
+            "{current:#}"
+        );
+
+        // Stale: an error, waived to a warning with the evaluation skipped.
+        let (code, stale) = check(&project, STALE_REPORT, ":", &[])?;
+        assert_eq!(lock_kinds(&stale, "errors"), ["stale_lock"], "{stale:#}");
+        assert_eq!(code, Some(4), "{stale:#}");
+        let (_, waived) = check(&project, STALE_REPORT, ":", &["--allow-stale-lock"])?;
+        assert!(lock_kinds(&waived, "errors").is_empty(), "{waived:#}");
+        assert_eq!(
+            lock_kinds(&waived, "warnings"),
+            ["stale_lock"],
+            "{waived:#}"
+        );
+
+        // Unknown: a configured plugin declines the copy, and the waiver does not apply.
+        std::fs::write(
+            project.path().join(".yarnrc.yml"),
+            "plugins:\n  - .yarn/plugins/x.cjs\n",
+        )?;
+        let (code, unknown) = check(&project, CURRENT_REPORT, ":", &["--allow-stale-lock"])?;
+        assert_eq!(
+            lock_kinds(&unknown, "errors"),
+            ["lock_unknown"],
+            "{unknown:#}"
+        );
+        assert_eq!(code, Some(4), "{unknown:#}");
+        Ok(())
+    }
+
+    /// An input that changes while Yarn verifies the copy is a conflict: the graph read
+    /// afterwards is not the one Yarn proved current.
+    #[test]
+    fn an_input_changed_during_verification_is_a_conflict() -> eyre::Result<()> {
+        let project = berry_project(BERRY_LOCK)?;
+        let member = project.path().join("packages/app/package.json");
+        let hook = format!(
+            r#"printf '{{"name":"app","version":"1.0.1"}}' > "{}""#,
+            member.display()
+        );
+
+        let (code, conflicted) = check(&project, CURRENT_REPORT, &hook, &[])?;
+
+        assert_eq!(
+            lock_kinds(&conflicted, "errors"),
+            ["lock_conflict"],
+            "{conflicted:#}"
+        );
+        // The diagnostic names the manifest relative to its project, as every other one does.
+        assert_eq!(
+            fields(&conflicted, "errors", "path"),
+            ["package.json"],
+            "{conflicted:#}"
+        );
+        assert_eq!(code, Some(4), "{conflicted:#}");
+        Ok(())
+    }
+}

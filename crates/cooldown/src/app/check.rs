@@ -281,10 +281,37 @@ impl<'a> CheckRunner<'a> {
         }
 
         let deps = self.read_dependencies(pctx, &read).await;
+        let deps = match deps {
+            Some(deps) => self.confirm_verified_inputs(pctx, &read, deps).await,
+            None => None,
+        };
         drop(read_guard);
         drop(refresh_guard);
         if let Some(deps) = deps {
             self.evaluate_dependencies(pctx, &read, deps).await;
+        }
+    }
+
+    /// Hands back `deps` once the adapter confirms that the inputs its lock verification proved
+    /// current are the ones the graph was just read from, or `None` after recording why not.
+    ///
+    /// The graph is read after the verdict, so an input that changed in between would otherwise
+    /// be evaluated under a verdict it never earned.
+    async fn confirm_verified_inputs(
+        &mut self,
+        pctx: &super::ProjectCtx,
+        read: &ReadProjectCtx<'_>,
+        deps: Vec<Dependency>,
+    ) -> Option<Vec<Dependency>> {
+        match read.adapter.confirm_verified_inputs(&pctx.project).await {
+            Ok(()) => Some(deps),
+            Err(err) => {
+                self.acc.errors.push(
+                    diag_from_error(&err, pctx.tool, &read.project_label, None)
+                        .with_path(pctx.manifest_report_path()),
+                );
+                None
+            }
         }
     }
 

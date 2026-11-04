@@ -120,6 +120,11 @@ impl NpmRegistry {
         self
     }
 
+    /// The directory the shared HTTP client caches responses in.
+    pub(crate) fn cache_dir(&self) -> &std::path::Path {
+        self.http.cache_dir()
+    }
+
     /// The cache TTL for package-document fetches: zero (always revalidate) when
     /// [`Self::with_listing_revalidation`] enabled it, the shared listing TTL otherwise.
     fn listing_ttl(&self) -> std::time::Duration {
