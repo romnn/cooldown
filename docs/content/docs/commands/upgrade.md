@@ -61,8 +61,10 @@ lock is one Yarn's own reader refuses, `check`, `outdated`, and `upgrade` warn t
 the root `package.json` alone: no member owns a copy, a landing is judged by the name's newest
 locked copy, and no member's exact pin is protected from another candidate's resolve.
 
-A Yarn Berry (v2+) project is read but not yet upgraded: `upgrade` and `fix` refuse it, and so
-does `--build`, before running Yarn, leaving its files as they were. A Classic lock is never handed
+On Yarn Berry (v2+), `upgrade` and `fix` land each target exactly under Yarn 4: every candidate
+resolves in a throwaway copy of the project, and only `yarn.lock` is written back, once Yarn proves
+it current there. See [Yarn Berry]({{< relref "../tools/_index.md" >}}) for the age gate a landing
+runs under and the declarations it holds. A Classic lock is never handed
 to a Berry Yarn either, since that Yarn's first install would migrate the lock: when the root
 `packageManager` declares Yarn 2 or later, or `yarn --version` in the project reports it, through
 a `yarnPath` or Corepack, the run refuses the project and says what to do instead.

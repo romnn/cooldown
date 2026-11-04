@@ -19,6 +19,7 @@
 //! [project]: https://github.com/yarnpkg/berry/blob/%40yarnpkg/cli/4.18.1/packages/yarnpkg-core/sources/Project.ts
 
 mod attribution;
+pub(crate) mod seed;
 
 use super::yaml::{YamlEntries, parse_lock_yaml};
 use super::{
@@ -50,9 +51,9 @@ const LAST_PROTOCOL_LESS_SCHEMA: u64 = 6;
 ///
 /// It reads the registry releases the lock resolves, and attributes each to the workspace members
 /// whose own manifest declarations the lock binds to it ([`attribution`]).
-/// Native `sync` and mutation are not supported yet, so the `yarn` adapter
-/// ([`YarnTool`](crate::YarnTool)) runs no resolver for a Berry project; it verifies the lock
-/// itself, in a copy of the project, since this backend has no in-place check to run.
+/// The `yarn` adapter ([`YarnTool`](crate::YarnTool)) verifies the lock itself, in a copy of the
+/// project, since this backend has no in-place check to run, and lands each exact target through
+/// a runner of its own that seeds the declared descriptors ([`seed`]).
 /// Berry binds peers through virtual packages its lock does not record, so the peer gate stays out
 /// of its locks ([`NodeLock::PEER_CONTEXTS_MODELED`]).
 pub(crate) struct YarnBerry;
@@ -64,6 +65,7 @@ impl NodeLock for YarnBerry {
     const PEER_CONTEXTS_MODELED: bool = false;
     const WORKSPACE_MANIFESTS: Option<WorkspaceDialect> = Some(WorkspaceDialect::Berry);
     const NPMRC_ROUTING: bool = false;
+    const SEEDS_EXACT_DESCRIPTORS: bool = true;
 
     fn parse(content: &str) -> Result<Vec<NameVersion>> {
         Ok(BerryLock::read(content)?.registry_releases())
@@ -111,14 +113,17 @@ impl NodeLock for YarnBerry {
             .unwrap_or_default()
     }
 
-    // The `yarn` adapter refuses every Berry mutation before a resolver could run, so neither
-    // command is ever spawned; they name the plain install only because the trait requires one.
+    // A Berry landing seeds its descriptors ([`seed`]) through the `yarn` adapter's own runner,
+    // so no relock command ever runs; it names the lock-only install the runner runs only
+    // because the trait requires one.
     fn relock_args(_before: Option<&str>) -> Vec<String> {
-        vec!["install".into()]
+        vec!["install".into(), "--mode=update-lockfile".into()]
     }
 
+    // The build links the lock the run settled, which Yarn's immutable install refuses to
+    // change.
     fn build_args(_before: Option<&str>) -> Vec<String> {
-        vec!["install".into()]
+        vec!["install".into(), "--immutable".into()]
     }
 }
 

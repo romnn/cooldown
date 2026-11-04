@@ -29,7 +29,8 @@ mod tests;
 
 #[cfg(all(test, unix))]
 pub(super) use report::captures;
-pub(super) use stage::InputDigest;
+pub(super) use report::errors as report_errors;
+pub(super) use stage::{InputDigest, Outputs};
 
 use crate::manifest::workspaces::YarnEnvironment;
 use crate::nodecmd::{EnvOverride, NodeCmd};
@@ -169,6 +170,118 @@ pub(super) async fn lock_current(
     })
 }
 
+/// A copy of a project, made as a verification makes one ([`stage`]), for Yarn's resolver to
+/// change in place of the project.
+#[derive(Debug)]
+pub(super) struct ResolveCopy {
+    #[expect(
+        dead_code,
+        reason = "the scratch directory lives as long as the copy, which dropping it deletes"
+    )]
+    scratch: stage::Scratch,
+    /// The project's position in the copy, where Yarn runs.
+    pub(super) copy_root: Utf8PathBuf,
+    /// The folders Yarn writes outside the project, redirected into the scratch directory.
+    pub(super) outputs: Outputs,
+    /// The digest of the project's inputs the copy holds, which [`live_digest`] gives again only
+    /// while none of them changed.
+    pub(super) digest: InputDigest,
+}
+
+/// Whether a project could be copied for Yarn's resolver, and the copy if it could.
+pub(super) enum Copied {
+    Ready(Box<ResolveCopy>),
+    /// Why the copy could not reproduce what Yarn reads for the project.
+    Declined(String),
+}
+
+/// Copies `project`, whose `yarn.lock` holds `lock`, for Yarn's resolver.
+///
+/// The copy holds every input a verification copies, its rc files mirrored where Yarn looks for
+/// them, so Yarn resolves in it what it would resolve in the project.
+///
+/// # Errors
+///
+/// Returns [`CoreError::LockUnreadable`] for a lock the Berry reader refuses, and
+/// [`CoreError::Filesystem`] when an input cannot be read or the copy cannot be written.
+pub(super) fn resolve_copy(project: &Project, lock: &str, context: &Context) -> Result<Copied> {
+    let plan = match stage::plan(&project.root, lock, &context.environment, &context.bases)? {
+        Planned::Ready(plan) => plan,
+        Planned::Declined(reason) => return Ok(Copied::Declined(reason)),
+    };
+    Ok(match plan.materialize()? {
+        Materialized::Ready(staged) => {
+            let Staged {
+                scratch,
+                copy_root,
+                outputs,
+                digest,
+            } = *staged;
+            Copied::Ready(Box::new(ResolveCopy {
+                scratch,
+                copy_root,
+                outputs,
+                digest,
+            }))
+        }
+        Materialized::Declined(reason) => Copied::Declined(reason),
+    })
+}
+
+/// Yarn 4's verdict on the lock `copy` holds, from the same offline immutable install a
+/// verification runs: `Ok` when the lock is current for the copy's inputs, or the verdict's
+/// detail when it is stale or undecided.
+///
+/// # Errors
+///
+/// Returns [`CoreError::ToolSpawn`] when `yarn` cannot be spawned.
+pub(super) async fn copy_current(
+    driver: &NodeCmd,
+    copy: &ResolveCopy,
+    root: &Utf8Path,
+) -> Result<std::result::Result<(), String>> {
+    let mut overrides = profile::base_overrides(&copy.outputs);
+    overrides.extend(Profile::Yarn4.overrides());
+    let output = driver
+        .output_overriding(&copy.copy_root, &Profile::Yarn4.args(), &overrides)
+        .await?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = match report::classify(&stdout) {
+        Verdict::Current => return Ok(Ok(())),
+        Verdict::Stale { diff } => format!(
+            "Yarn would still rewrite it:\n{}",
+            quoted(&diff, QUOTED_DIFF)
+        ),
+        Verdict::Undecided { errors } => format!(
+            "Yarn reached no verdict on it: {}",
+            quoted(&errors, QUOTED_ERRORS)
+        ),
+        Verdict::NoReport => format!(
+            "Yarn printed no install report: {}",
+            first_lines(
+                &format!("{stdout}\n{}", String::from_utf8_lossy(&output.stderr)),
+                QUOTED_ERRORS
+            )
+        ),
+    };
+    Ok(Err(relabel(&detail, &copy.copy_root, root)))
+}
+
+/// Every file and directory a verification of `project` copies from the source, so a copy that
+/// holds them has what Yarn reads for the project: its manifests, each `file:` folder whole, each
+/// rc file between the project and the copy's boundary, and the rest [`stage`] names.
+///
+/// A project the copy cannot reproduce, or whose lock cannot be read, has none to name.
+pub(super) fn copied_sources(project: &Project, context: &Context) -> Vec<Utf8PathBuf> {
+    let Ok(lock) = std::fs::read_to_string(project.root.join(LOCKFILE)) else {
+        return Vec::new();
+    };
+    match stage::plan(&project.root, &lock, &context.environment, &context.bases) {
+        Ok(Planned::Ready(plan)) => plan.copied_sources(),
+        Ok(Planned::Declined(_)) | Err(_) => Vec::new(),
+    }
+}
+
 /// The digest of the inputs a verification of `project` would copy now, or `None` when the
 /// project would no longer be verified at all or a screened input changed while it was read.
 ///
@@ -228,7 +341,7 @@ fn unknown(root: &Utf8Path, reason: &str) -> Verification {
 
 /// `text` with the copy's paths spelled as the project's, so a diagnostic never names the
 /// throwaway copy.
-fn relabel(text: &str, copy_root: &Utf8Path, root: &Utf8Path) -> String {
+pub(super) fn relabel(text: &str, copy_root: &Utf8Path, root: &Utf8Path) -> String {
     text.replace(copy_root.as_str(), root.as_str())
 }
 

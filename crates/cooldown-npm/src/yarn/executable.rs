@@ -2,8 +2,9 @@
 //!
 //! The lock's format and the executable are separate evidence.
 //! A Classic lock run by a Berry `yarn` is migrated to the Berry format on the first install, an
-//! unfinished migration cooldown must not complete on the user's behalf, so before a resolver runs
-//! the adapter checks:
+//! unfinished migration cooldown must not complete on the user's behalf, and a Berry lock run by
+//! a Classic `yarn` is replaced by a lock of its own, so before a resolver runs the adapter
+//! checks:
 //!
 //! - the `packageManager` field of the root `package.json`, which Corepack and Yarn 1.22 enforce;
 //! - the version `yarn --version` reports in the project, which is the executable actually
@@ -57,6 +58,52 @@ pub(super) async fn ensure_classic_executable(driver: &NodeCmd, root: &Utf8Path)
 
 /// The first major version of Yarn Berry; every earlier one is Yarn Classic.
 const FIRST_BERRY_MAJOR: u64 = 2;
+
+/// Refuses to let Yarn run a Berry lock in `root` unless both the declared package manager and
+/// the executable `driver` reaches there are Yarn Berry, and returns the executable's version.
+///
+/// Yarn Classic would read the Berry lock as no lock at all and replace it with a lock of its
+/// own.
+///
+/// # Errors
+///
+/// Returns [`CoreError::System`] when `packageManager` names another package manager or a Yarn
+/// Classic release, when `yarn --version` fails or names no version, or when it names a Yarn
+/// Classic release; returns [`CoreError::ToolSpawn`] when `yarn` cannot be spawned.
+pub(super) async fn ensure_berry_executable(
+    driver: &NodeCmd,
+    root: &Utf8Path,
+) -> Result<semver::Version> {
+    match declared_manager(root)? {
+        Some(DeclaredManager::Yarn { spelled, major }) if major < FIRST_BERRY_MAJOR => {
+            return Err(berry_lock_refused(&format!(
+                "package.json declares \"packageManager\": \"{spelled}\", a Yarn Classic (v1) release"
+            )));
+        }
+        Some(DeclaredManager::Other { spelled }) => {
+            return Err(CoreError::System(format!(
+                "package.json declares \"packageManager\": \"{spelled}\", so this project is not \
+                 run by Yarn, and cooldown does not run Yarn on its yarn.lock"
+            )));
+        }
+        Some(DeclaredManager::Yarn { .. }) | None => {}
+    }
+    let version = executable_version(driver, root).await?;
+    if version.major < FIRST_BERRY_MAJOR {
+        return Err(berry_lock_refused(&format!(
+            "`yarn` there runs Yarn {version}, a Yarn Classic (v1) release"
+        )));
+    }
+    Ok(version)
+}
+
+/// The refusal to run a Classic executable on a Berry lock, `executable` saying which one.
+fn berry_lock_refused(executable: &str) -> CoreError {
+    CoreError::System(format!(
+        "yarn.lock is a Yarn Berry (v2+) lockfile, but {executable}, which cannot read it and would \
+         replace it; run the project's Yarn Berry release here, for example through Corepack"
+    ))
+}
 
 /// The refusal to run a Berry executable on a Classic lock, `executable` saying which one.
 fn classic_lock_refused(executable: &str) -> CoreError {

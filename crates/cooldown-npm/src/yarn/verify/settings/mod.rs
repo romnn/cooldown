@@ -22,10 +22,12 @@
 //! is a conflict marker: an object with an `onConflict` key, which Yarn unwraps to its `value`
 //! (or to the rest of the object) at any depth before it merges the files
 //! ([configUtils.ts][config]).
-//! An rc file using that form anywhere therefore declines, so every file screening admits is
-//! the document Yarn merges.
 //! Screening each file on its own is conservative across the merge, since Yarn's merged value at
 //! any path is built only from the files' values at that path.
+//! An rc file therefore declines when that form wraps the whole file or a setting screening or
+//! staging reads ([`READ_KEYS`]), so every value screening admits is the one Yarn merges.
+//! A marker under any other setting changes only that setting, the same way in the copy and in
+//! the project, such as the `npmPreapprovedPackages` list `sync` writes in that form.
 //!
 //! [config]: https://github.com/yarnpkg/berry/blob/%40yarnpkg/cli/4.18.1/packages/yarnpkg-core/sources/configUtils.ts
 
@@ -60,6 +62,22 @@ const UNREDIRECTED_OUTPUTS: [Setting; 3] = [
         key: "bstatePath",
         variable: "yarn_bstate_path",
     },
+];
+
+/// Every top-level setting screening or staging reads from an rc file, so a conflict marker
+/// under one of them could hide a value Yarn merges from the one screened.
+const READ_KEYS: [&str; 11] = [
+    "plugins",
+    "injectEnvironmentFiles",
+    "lockfileFilename",
+    "networkSettings",
+    "enableNetwork",
+    "enableHardenedMode",
+    "packageExtensions",
+    "pnpmStoreFolder",
+    "pnpDataPath",
+    "bstatePath",
+    "yarnPath",
 ];
 
 /// A setting's rc key and the lower-cased `YARN_*` variable that sets it.
@@ -162,7 +180,10 @@ fn screen_environment(environment: &YarnEnvironment) -> Result<(), String> {
 
 fn screen_rc_file(rc_file: &RcFile, shown: &str) -> Result<(), String> {
     let settings = &rc_file.settings;
-    if settings.contains_key(CONFLICT_KEY) || settings.values().any(holds_conflict_marker) {
+    let wraps_a_read_setting = READ_KEYS
+        .iter()
+        .any(|key| settings.get(*key).is_some_and(holds_conflict_marker));
+    if settings.contains_key(CONFLICT_KEY) || wraps_a_read_setting {
         return Err(format!(
             "{shown} uses Yarn's `{CONFLICT_KEY}` form, whose unwrapped settings cooldown does \
              not screen"
