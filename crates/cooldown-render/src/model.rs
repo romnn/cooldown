@@ -835,7 +835,7 @@ pub struct BaselineSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BaselineMeta {
-    /// The path of the baseline file to write.
+    /// The path of the baseline file to write, relative to the repository root.
     pub path: String,
     /// Whether the command computed the would-be baseline without writing it.
     pub dry_run: bool,

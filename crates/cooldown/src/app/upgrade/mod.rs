@@ -869,7 +869,7 @@ fn read_only_mutator_diag(pctx: &super::ProjectCtx) -> Diagnostic {
     )
     .with_tool(pctx.tool.as_str())
     .with_project(pctx.rel_path.as_str())
-    .with_path(pctx.project.manifest.as_str())
+    .with_path(pctx.manifest_report_path())
 }
 
 /// Records a failure raised for one project before anything about it was staged or written.

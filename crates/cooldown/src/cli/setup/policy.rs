@@ -211,19 +211,7 @@ async fn assemble_ctx(
 /// leaves the process as data — the `project` field of every diagnostic and JSON report row — and
 /// is matched against `/`-separated folder globs. A Windows run must spell it the same way.
 fn scan_relative_project(root: &Utf8Path, scan_root: &Utf8Path) -> Utf8PathBuf {
-    let Ok(relative) = root.strip_prefix(scan_root) else {
-        return root.to_owned();
-    };
-    if relative.as_str().is_empty() {
-        return Utf8PathBuf::from(".");
-    }
-    Utf8PathBuf::from(
-        relative
-            .components()
-            .map(|component| component.as_str())
-            .collect::<Vec<_>>()
-            .join("/"),
-    )
+    crate::report_path::relative_report_path(root, scan_root).unwrap_or_else(|| root.to_owned())
 }
 
 fn compute_strict_native(layers: &[PolicyLayer], invocation: &ResolvedInvocation) -> bool {

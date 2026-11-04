@@ -45,6 +45,22 @@ impl ToolTermination {
         }
         ToolTermination::Unknown
     }
+
+    /// Whether the process was stopped rather than exiting on its own: a signal, an exit status
+    /// that reports an interruption or kill (`130`, `137`, `143`, Windows Ctrl-C), or a
+    /// termination with no detail at all.
+    ///
+    /// Whatever such a process printed may be cut short, so it proves nothing about the outcome
+    /// it describes.
+    #[must_use]
+    pub fn is_abnormal(self) -> bool {
+        matches!(
+            self,
+            ToolTermination::Signal(_)
+                | ToolTermination::Unknown
+                | ToolTermination::ExitCode(130 | 137 | 143 | WINDOWS_CONTROL_C_EXIT)
+        )
+    }
 }
 
 impl fmt::Display for ToolTermination {
@@ -224,14 +240,7 @@ impl CoreError {
                 termination,
                 stderr,
                 ..
-            } => {
-                matches!(
-                    termination,
-                    ToolTermination::Signal(_)
-                        | ToolTermination::Unknown
-                        | ToolTermination::ExitCode(130 | 137 | 143 | WINDOWS_CONTROL_C_EXIT)
-                ) || detail_indicates_broken_environment(stderr)
-            }
+            } => termination.is_abnormal() || detail_indicates_broken_environment(stderr),
             _ => false,
         }
     }
@@ -331,6 +340,10 @@ pub struct Diagnostic {
     pub registry: Option<String>,
     /// The filesystem path involved (for example a lockfile or manifest), when
     /// relevant.
+    ///
+    /// It is `/`-separated and relative to the root of the [`project`](Diagnostic::project) the
+    /// diagnostic names, or to the repository root when it names none, so it reads the same on
+    /// every machine and platform.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 }

@@ -1,6 +1,7 @@
 use super::{detect, scan_root_for};
 use crate::app::{Progress, RecoveryTarget};
 use crate::cli::GlobalArgs;
+use crate::report_path::relative_report_path;
 use crate::{discovery, scan};
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_cargo::{
@@ -150,7 +151,7 @@ pub(in crate::cli) fn prepare_recovery(global: &GlobalArgs) -> Result<PreparedRe
     let mut warnings = Vec::new();
     if tools.is_empty() || tools.contains(&CARGO_ID) {
         let mut roots = direct_cargo_recovery_roots(&workdir, &repo_root, &scope, &mut warnings)?;
-        let discovery = cargo_recovery_discovery(&scope, !global.no_gitignore)?;
+        let discovery = cargo_recovery_discovery(&scope, &repo_root, !global.no_gitignore)?;
         roots.extend(discovery.roots);
         warnings.extend(discovery.warnings);
         roots.sort();
@@ -222,16 +223,14 @@ fn direct_cargo_recovery_roots(
                     if ancestor != workdir
                         && error.kind() == std::io::ErrorKind::PermissionDenied =>
                 {
-                    warnings.push(
-                        Diagnostic::new(
-                            DiagnosticKind::Filesystem,
-                            format!(
-                                "skipped unreadable ancestor {ancestor} while probing for Cargo recovery artifacts: {error}"
-                            ),
-                        )
-                        .with_tool(CARGO_ID.as_str())
-                        .with_path(ancestor.as_str()),
-                    );
+                    let warning = Diagnostic::new(
+                        DiagnosticKind::Filesystem,
+                        format!(
+                            "skipped unreadable ancestor {ancestor} while probing for Cargo recovery artifacts: {error}"
+                        ),
+                    )
+                    .with_tool(CARGO_ID.as_str());
+                    warnings.push(with_repo_relative_path(warning, ancestor, repo_root));
                 }
                 // The io error alone does not say which directory failed; name the probed path so
                 // the loud failure is actionable.
@@ -294,7 +293,7 @@ fn cargo_recovery_roots(
     scope: &RecoveryScope,
     respect_gitignore: bool,
 ) -> Result<Vec<Utf8PathBuf>, CoreError> {
-    Ok(cargo_recovery_discovery(scope, respect_gitignore)?.roots)
+    Ok(cargo_recovery_discovery(scope, scope.root(), respect_gitignore)?.roots)
 }
 
 struct CargoRecoveryDiscovery {
@@ -304,6 +303,7 @@ struct CargoRecoveryDiscovery {
 
 fn cargo_recovery_discovery(
     scope: &RecoveryScope,
+    repo_root: &Utf8Path,
     respect_gitignore: bool,
 ) -> Result<CargoRecoveryDiscovery, CoreError> {
     let root = scope.root();
@@ -322,15 +322,15 @@ fn cargo_recovery_discovery(
         })
         .collect();
     warnings.extend(authority.warnings.into_iter().map(|warning| {
-        Diagnostic::new(
+        let diagnostic = Diagnostic::new(
             warning.error.diagnostic_kind(),
             format!(
                 "could not validate Cargo recovery authority at {}: {}",
                 warning.path, warning.error
             ),
         )
-        .with_tool(CARGO_ID.as_str())
-        .with_path(warning.path.as_str())
+        .with_tool(CARGO_ID.as_str());
+        with_repo_relative_path(diagnostic, &warning.path, repo_root)
     }));
     let detected = scan::find_project_marker_dirs_batch(
         root,
@@ -360,17 +360,27 @@ fn cargo_recovery_discovery(
     })
 }
 
+/// A recovery target's `project` label: its root relative to the repository root, or the
+/// absolute root when it lies outside, like a run's project identity.
 fn relative_project(repo_root: &Utf8Path, root: &Utf8Path) -> String {
-    root.strip_prefix(repo_root).ok().map_or_else(
-        || root.to_string(),
-        |relative| {
-            if relative.as_str().is_empty() {
-                ".".to_string()
-            } else {
-                relative.to_string()
-            }
-        },
-    )
+    relative_report_path(root, repo_root).map_or_else(|| root.to_string(), Utf8PathBuf::into_string)
+}
+
+/// Sets a recovery warning's `path` to `path` relative to the repository root, the base of the
+/// recovery rows' `project` labels.
+///
+/// A path outside the repository, such as an artifact in a linked worktree's shared Git
+/// directory, has no relative spelling, so the warning carries none and its message alone names
+/// the location.
+fn with_repo_relative_path(
+    warning: Diagnostic,
+    path: &Utf8Path,
+    repo_root: &Utf8Path,
+) -> Diagnostic {
+    match relative_report_path(path, repo_root) {
+        Some(relative) => warning.with_path(relative.into_string()),
+        None => warning,
+    }
 }
 
 #[cfg(test)]
@@ -571,6 +581,8 @@ mod tests {
                 "the warning names the skipped ancestor, got: {}",
                 warning.message
             );
+            // As data, the ancestor is spelled relative to the repository root.
+            assert_eq!(warning.path.as_deref(), Some("deploy"));
         }
         Ok(())
     }
@@ -758,6 +770,68 @@ mod tests {
                 .message
                 .contains(anchor.to_string_lossy().as_ref())
         );
+        // The anchor sits in the repository's own Git directory, so its `path` is relative to the
+        // repository root, the base of the recovery rows' `project` labels.
+        let path = prepared.warnings[0]
+            .path
+            .as_deref()
+            .ok_or_else(|| eyre::eyre!("an in-repository anchor must carry a path"))?;
+        assert!(path.starts_with(".git/"), "{path}");
+        assert_eq!(root.join(path).as_std_path(), anchor.as_path());
+        Ok(())
+    }
+
+    /// An authority artifact outside the repository has no repo-relative spelling, so its warning
+    /// carries no `path` rather than the absolute location.
+    #[cfg(unix)]
+    #[test]
+    fn a_warning_about_an_authority_outside_the_repository_carries_no_path() -> eyre::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Two linked worktrees share one common Git directory beside them, so the recovery
+        // authority both use lies outside either worktree's root.
+        let directory = tempfile::tempdir()?;
+        let base = canonical_root(&directory)?;
+        let common = base.join("common.git");
+        std::fs::create_dir_all(&common)?;
+        std::fs::write(common.join("HEAD"), "ref: refs/heads/main\n")?;
+        for name in ["first", "second"] {
+            let git_dir = common.join("worktrees").join(name);
+            std::fs::create_dir_all(&git_dir)?;
+            std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n")?;
+            std::fs::write(git_dir.join("commondir"), "../..\n")?;
+            let root = base.join(name);
+            std::fs::create_dir_all(&root)?;
+            std::fs::write(
+                root.join(".git"),
+                format!("gitdir: ../common.git/worktrees/{name}\n"),
+            )?;
+        }
+        let first = base.join("first");
+        let second = base.join("second");
+        // A malformed anchor of the sibling worktree is unattributable from `first`.
+        let coordination = cooldown_core::fs::ProjectCoordination::resolve(&second)?;
+        let authority = coordination
+            .recovery_authority()
+            .ok_or_else(|| eyre::eyre!("test project has no recovery authority"))?;
+        let anchor = authority.directory().join(format!(
+            "{:016x}.cargo-recovery.anchor",
+            cooldown_core::fs::fnv1a_64(second.as_str())
+        ));
+        std::fs::write(&anchor, "not valid recovery authority")?;
+        std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o600))?;
+        let cli = Cli::parse_from(["cooldown", "recover", "-C", first.as_str(), "--cargo"]);
+
+        let prepared = prepare_recovery(&cli.global)?;
+
+        // The warning still names the anchor for the human, but reports no absolute path as data.
+        assert_eq!(prepared.warnings.len(), 1, "{:?}", prepared.warnings);
+        assert!(
+            prepared.warnings[0]
+                .message
+                .contains(anchor.to_string_lossy().as_ref())
+        );
+        assert_eq!(prepared.warnings[0].path, None);
         Ok(())
     }
 

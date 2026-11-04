@@ -5,6 +5,7 @@
 pub mod app;
 pub mod cli;
 pub mod discovery;
+mod report_path;
 mod scan;
 #[cfg(test)]
 mod test_support;
