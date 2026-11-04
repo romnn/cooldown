@@ -1177,11 +1177,13 @@ pub trait ToolWrite: Send + Sync {
         Ok(crate::EdgeNormalizationReport::default())
     }
 
-    /// Whether native sync needs evaluated exact locked-version admissions.
+    /// Whether native sync of `project` needs evaluated exact locked-version admissions.
     ///
     /// Opting in requests read-side evaluation under the sync lease before writing.
     /// Evaluation failures preserve existing exact admissions while syncing the remaining policy.
-    fn requires_sync_admission_evaluation(&self) -> bool {
+    /// An adapter serving several native formats under one tool answers per project, so a
+    /// project whose format has no native exemption list never pays for the evaluation.
+    fn requires_sync_admission_evaluation(&self, _project: &Project) -> bool {
         false
     }
 

@@ -11,7 +11,8 @@
 //! `yarn --version` reaches in the project, through any `yarnPath` or Corepack, must be able to
 //! run the lock without migrating it ([`executable`]), and the live lock must still be of the
 //! format the run was judged on.
-//! Berry projects are read only: their mutation is refused before any resolver could run.
+//! Berry projects are read only: their mutation is refused before any resolver could run, and
+//! `sync` writes only their native age gate ([`age_gate`]).
 //!
 //! `check` verifies a Berry lock with Yarn itself, in a copy of the project ([`verify`]), and
 //! confirms afterwards that none of the inputs it verified changed while the dependencies were
@@ -19,6 +20,7 @@
 //! An advisory identity a Berry lock grants survives only where Yarn's effective routing names
 //! the public registry for the package ([`routing`]).
 
+mod age_gate;
 mod executable;
 mod routing;
 mod verify;
@@ -113,7 +115,8 @@ fn yarn_driver(cmd: NodeCmd) -> NodeCmd {
 /// A Berry lock records its workspaces, so each member's direct dependencies are attributed
 /// through the lock's own record of the member, joined to the member's manifest, and read through
 /// the current manifests and Yarn configuration (see `YarnBerry`).
-/// `upgrade`, `fix`, and `--build` refuse a Berry project before running any resolver.
+/// `upgrade`, `fix`, and `--build` refuse a Berry project before running any resolver, while
+/// `sync` writes its native age gate into the project's `.yarnrc.yml`.
 ///
 /// Either way, a resolver runs only under a Yarn that reads the lock in its own format: a Berry
 /// `yarn` beside a Classic lock would migrate it, so that combination is refused with what to do
@@ -614,8 +617,11 @@ impl ToolWrite for YarnTool {
             .await
     }
 
-    fn requires_sync_admission_evaluation(&self) -> bool {
-        self.classic.requires_sync_admission_evaluation()
+    /// Only a Berry project has a native exemption list to admit young locked versions into, and
+    /// only when its declared Yarn has the age gate at all.
+    fn requires_sync_admission_evaluation(&self, project: &Project) -> bool {
+        LockFormat::on_disk(&project.root).is_ok_and(|format| format == LockFormat::Berry)
+            && !age_gate::declares_ungated_yarn(&project.root)
     }
 
     async fn write_native(
@@ -624,13 +630,19 @@ impl ToolWrite for YarnTool {
         policy: &ResolvedPolicy,
         dry_run: bool,
     ) -> Result<SyncReport> {
-        self.backend_for(project)?
-            .write_native(project, policy, dry_run)
-            .await
+        match LockFormat::on_disk(&project.root)? {
+            LockFormat::Classic => self.classic.write_native(project, policy, dry_run).await,
+            LockFormat::Berry => {
+                let environment = age_gate::SyncEnvironment::from_process();
+                age_gate::write(&self.driver, project, policy, &environment, dry_run).await
+            }
+        }
     }
 
+    /// Yarn Berry's age gate lives in each project's own rc file, while a Classic project reports
+    /// that it has none.
     fn sync_scope(&self) -> SyncScope {
-        self.classic.sync_scope()
+        SyncScope::Project
     }
 
     async fn write_repo_native(

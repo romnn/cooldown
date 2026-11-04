@@ -14,6 +14,7 @@
 //! each workspace.
 //! Formats without either fall back to the root manifest's declared dependency names.
 
+mod pnpm_frozen;
 mod yaml;
 mod yarn;
 mod yarn_berry;
@@ -278,6 +279,18 @@ pub trait NodeLock: Send + Sync + 'static {
     #[must_use]
     fn verify_current_args() -> Option<Vec<String>> {
         None
+    }
+
+    /// Whether `output`, the failure detail of a [`NodeLock::verify_current_args`] run, is the
+    /// manager's own refusal of a lock that no longer matches its inputs or is absent.
+    ///
+    /// Only that refusal is staleness, which `--allow-stale-lock` may waive.
+    /// Every other failure (a registry, authentication, configuration, CLI, or store error) is a
+    /// tool error that nothing waives.
+    /// The default recognizes no refusal, so a manager wired without a classifier fails closed.
+    #[must_use]
+    fn verify_refusal_is_stale(_output: &str) -> bool {
+        false
     }
 
     /// The mutating driver args that refresh the lock before a read-only command evaluates it.
@@ -2120,11 +2133,22 @@ impl NodeLock for Pnpm {
     }
 
     fn verify_current_args() -> Option<Vec<String>> {
+        // The output settings are pinned so a `reporter`, `loglevel`, `json`, or `parseable`
+        // from the user's configuration cannot hide or reshape the error header
+        // `verify_refusal_is_stale` reads.
         Some(vec![
             "install".into(),
             "--lockfile-only".into(),
             "--frozen-lockfile".into(),
+            "--reporter=append-only".into(),
+            "--loglevel=error".into(),
+            "--config.json=false".into(),
+            "--config.parseable=false".into(),
         ])
+    }
+
+    fn verify_refusal_is_stale(output: &str) -> bool {
+        pnpm_frozen::frozen_refusal_is_stale(output)
     }
 
     fn refresh_lock_args(window_minutes: Option<i64>) -> Option<Vec<String>> {
@@ -2249,7 +2273,17 @@ impl NodeLock for Yarn {
                     .into(),
             ));
         }
-        Ok(parse_yarn(content))
+        yarn::graph::packages(content).ok_or_else(|| {
+            CoreError::LockUnreadable(
+                "yarn.lock is no lockfile Yarn Classic (v1) reads: it holds merge conflicts, a \
+                 newer lockfile version, or a malformed entry"
+                    .into(),
+            )
+        })
+    }
+
+    fn alias_only_versions(content: &str) -> AliasOnlyVersions {
+        yarn::graph::alias_only_versions(content)
     }
 
     fn member_paths_in(_content: &str, workspace: Option<&WorkspaceManifests>) -> HashSet<String> {
@@ -3390,57 +3424,6 @@ fn parse_pnpm_exact_pins(content: &str, excluded: &HashSet<String>) -> HashSet<(
         .collect()
 }
 
-/// Parses a classic (v1) `yarn.lock`: each entry is one or more comma-separated `name@range`
-/// specifiers ending in `:`, followed by an indented `version "x.y.z"` line that resolves them.
-///
-/// This lenient line reading is the flat graph's projection only.
-/// Member attribution reads the lock through Yarn's own grammar instead ([`YarnBindings`]), so a
-/// descriptor this reading would misspell never names a member's copy.
-fn parse_yarn(content: &str) -> Vec<NameVersion> {
-    let mut out = Vec::new();
-    let mut pending: Vec<String> = Vec::new();
-    // The entry's fields arrive line by line (`version` before `resolved` in yarn's own output,
-    // but the order is not load-bearing here): the names flush on `version`, and a later
-    // `resolved` back-fills the rows just flushed — they are the tail of `out`.
-    let mut flushed_at = 0;
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("  version ") {
-            let version = rest.trim().trim_matches('"');
-            flushed_at = out.len();
-            for name in pending.drain(..) {
-                out.push(NameVersion::new(name, version));
-            }
-        } else if let Some(rest) = line.strip_prefix("  resolved ") {
-            // `resolved "https://registry.yarnpkg.com/…/lodash-4.17.21.tgz#<hash>"` — the
-            // fragment is yarn's checksum, not part of the origin URL.
-            let url = rest.trim().trim_matches('"');
-            let url = url.split('#').next().unwrap_or(url);
-            for entry in out.get_mut(flushed_at..).unwrap_or_default() {
-                entry.origin = LockOrigin::Url(url.to_string());
-            }
-        } else if !line.starts_with([' ', '#']) && line.trim_end().ends_with(':') {
-            flushed_at = out.len();
-            let key = line.trim_end().trim_end_matches(':');
-            // One entry can list several ranges for the same name (`foo@^1, foo@~1.2`); they all
-            // resolve to one version, so collapse them to a single name.
-            pending = key
-                .split(',')
-                .filter_map(|spec| {
-                    let spec = spec.trim().trim_matches('"');
-                    let at = spec.rfind('@').filter(|&i| i > 0)?;
-                    Some(spec[..at].to_string())
-                })
-                .fold(Vec::new(), |mut acc, name| {
-                    if !acc.contains(&name) {
-                        acc.push(name);
-                    }
-                    acc
-                });
-        }
-    }
-    out
-}
-
 /// Parses `bun.lock`: a JSONC document whose `packages` map values are arrays of the form
 /// `["name@version", registry, {...}, integrity]`.
 ///
@@ -4441,7 +4424,7 @@ mod tests {
             unrecorded@^2.0.0:
               version "2.0.0"
         "#};
-        let entries = parse_yarn(lock);
+        let entries = <Yarn as NodeLock>::parse(lock).expect("a Classic lock is read");
         let origin_of = |name: &str| {
             entries
                 .iter()
@@ -4928,25 +4911,35 @@ mod tests {
             );
         }
 
-        // A Classic entry for a package named `__metadata` is keyed by its selector.
+        // A Classic entry for a package named `__metadata` is keyed by its selector, which Yarn
+        // quotes since an unquoted key must start with a letter.
         let classic_metadata_package = indoc! {r#"
             # yarn lockfile v1
 
 
-            __metadata@^1.0.0:
+            "__metadata@^1.0.0":
               version "1.0.0"
               resolved "https://registry.yarnpkg.com/__metadata/-/__metadata-1.0.0.tgz#abc"
         "#};
         let entries = <Yarn as NodeLock>::parse(classic_metadata_package)
             .expect("a Classic package named __metadata is read");
         assert_eq!(entries.len(), 1, "{entries:?}");
+
+        // Unquoted, the selector is no lock Yarn Classic reads, but still no Berry one.
+        let unquoted =
+            classic_metadata_package.replace("\"__metadata@^1.0.0\":", "__metadata@^1.0.0:");
+        let error = <Yarn as NodeLock>::parse(&unquoted).expect_err("Yarn's grammar refuses it");
+        assert!(
+            matches!(&error, CoreError::LockUnreadable(message) if message.contains("Yarn Classic")),
+            "{error:?}"
+        );
     }
 
     #[test]
     fn yarn_classic_entries() {
         let lock = "# THIS IS AN AUTOGENERATED FILE.\n\n\nlodash@^4.17.0, lodash@~4.17.15:\n  version \"4.17.15\"\n  resolved \"https://x\"\n\n\"@babel/core@^7.0.0\":\n  version \"7.1.0\"\n  resolved \"https://y\"\n";
         assert_eq!(
-            sorted(parse_yarn(lock)),
+            sorted(<Yarn as NodeLock>::parse(lock).expect("a Classic lock is read")),
             sorted(vec![
                 NameVersion {
                     name: "lodash".into(),

@@ -196,34 +196,49 @@ impl NodeCmd {
         })
     }
 
-    /// Runs the driver as a lock-currency proof/refresh, folding resolver failure into a
-    /// [`LockVerifyReport`] so callers can report a stale lock without treating it as a subprocess
-    /// infrastructure error.
+    /// Runs the driver as a lock-currency proof, telling the manager's refusal of a stale lock
+    /// apart from every other failure.
+    ///
+    /// A failed run is [`LockStatus::Stale`] only when `is_stale` recognizes its failure detail
+    /// as the manager's own stale-lock refusal, and the run exited on its own rather than through
+    /// a signal or an interruption ([`ToolTermination::is_abnormal`]).
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::ToolSpawn`] only if the binary cannot be spawned at all.
+    /// Returns [`CoreError::ToolSpawn`] if the binary cannot be spawned, or [`CoreError::Tool`]
+    /// for any other failure, such as a registry, authentication, or configuration error, which
+    /// `--allow-stale-lock` never waives.
     pub async fn lock_report(
         &self,
         dir: &Utf8Path,
         args: &[String],
         lockfile: &str,
+        is_stale: fn(&str) -> bool,
     ) -> Result<LockVerifyReport> {
         let out = self.output(dir, args).await?;
+        if out.status.success() {
+            return Ok(LockVerifyReport {
+                status: LockStatus::Current,
+                detail: format!("{lockfile} is current"),
+            });
+        }
+        let termination = ToolTermination::from_exit_status(out.status);
+        let detail = failure_detail(&out);
+        // Only the termination is checked, not the detail's broken-environment phrases: a stale
+        // refusal quotes the manifest's dependency names, which can spell one of them.
+        if termination.is_abnormal() || !is_stale(&detail) {
+            return Err(CoreError::Tool {
+                tool: self.bin.clone(),
+                termination,
+                stderr: detail,
+            });
+        }
         // The stale detail leads with the lockfile and its project, ahead of the manager's own
         // failure text: the diagnostic's path field is not printed on the TTY, and a repository
         // with several locks needs to know which one the manager rejected.
         Ok(LockVerifyReport {
-            status: if out.status.success() {
-                LockStatus::Current
-            } else {
-                LockStatus::Stale
-            },
-            detail: if out.status.success() {
-                format!("{lockfile} is current")
-            } else {
-                format!("{lockfile} is stale in {dir}: {}", failure_detail(&out))
-            },
+            status: LockStatus::Stale,
+            detail: format!("{lockfile} is stale in {dir}: {detail}"),
         })
     }
 }

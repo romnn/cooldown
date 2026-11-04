@@ -44,6 +44,24 @@ pub struct ProjectCtx {
     pub generated_members: Option<crate::discovery::DeclaredGeneratedMembers>,
 }
 
+impl ProjectCtx {
+    /// The project's manifest as a diagnostic reports it in `path`: relative to the project root
+    /// and `/`-separated, so it reads `package.json` or `Cargo.toml` while `project` says where
+    /// the project sits.
+    ///
+    /// A staged copy keeps the manifest at the same position under its own root, so a copy run
+    /// reports the same path as the source.
+    /// Every adapter builds the manifest under the root, and staging refuses one outside it; were
+    /// one outside anyway, its file name is reported rather than the absolute path.
+    pub(crate) fn manifest_report_path(&self) -> String {
+        let manifest = &self.project.manifest;
+        crate::report_path::relative_report_path(manifest, &self.project.root)
+            .map(Utf8PathBuf::into_string)
+            .or_else(|| manifest.file_name().map(str::to_string))
+            .unwrap_or_default()
+    }
+}
+
 /// Which refresh a lock needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LockRefreshKind {
@@ -1041,7 +1059,7 @@ impl Workspace {
             )
             .with_tool(pctx.tool.as_str())
             .with_project(pctx.rel_path.as_str())
-            .with_path(pctx.project.manifest.as_str());
+            .with_path(pctx.manifest_report_path());
             return Ok(LockRefresh {
                 report: Ok(None),
                 warnings: vec![note],
@@ -1587,7 +1605,7 @@ pub(crate) fn lock_report_outcome(
     report: LockVerifyReport,
     tool: ToolId,
     project_label: &str,
-    manifest: &camino::Utf8Path,
+    manifest_path: &str,
     allow_stale_lock: bool,
 ) -> LockReportOutcome {
     let kind = match report.status {
@@ -1607,7 +1625,7 @@ pub(crate) fn lock_report_outcome(
     let diagnostic = Diagnostic::new(kind, cooldown_core::redact::url_secrets(&detail))
         .with_tool(tool.as_str())
         .with_project(project_label)
-        .with_path(manifest.as_str());
+        .with_path(manifest_path);
     let action = if allow_stale_lock && report.status == LockStatus::Stale {
         LockReportAction::Continue
     } else {
@@ -2918,6 +2936,23 @@ pub(crate) mod tests {
             .expect("dependencies")
             .deps;
         assert!(deps.is_empty());
+    }
+
+    /// A diagnostic names the manifest relative to the project root and `/`-separated, and never
+    /// falls back to the absolute path.
+    #[test]
+    fn manifest_report_path_is_project_relative() {
+        let mut pctx = project_ctx(CARGO, "/repo/svc");
+        pctx.project.manifest = pctx.project.root.join("Cargo.toml");
+        assert_eq!(pctx.manifest_report_path(), "Cargo.toml");
+
+        // A nested manifest spells `/` even where `join` spells the native separator.
+        pctx.project.manifest = pctx.project.root.join("sub").join("Cargo.toml");
+        assert_eq!(pctx.manifest_report_path(), "sub/Cargo.toml");
+
+        // A manifest outside the root keeps only its name rather than leaking the absolute path.
+        pctx.project.manifest = Utf8PathBuf::from("/elsewhere/Cargo.toml");
+        assert_eq!(pctx.manifest_report_path(), "Cargo.toml");
     }
 
     #[test]

@@ -192,7 +192,11 @@ impl YarnConfiguration {
 /// runs ([Configuration.ts][configuration]).
 ///
 /// [configuration]: https://github.com/yarnpkg/berry/blob/%40yarnpkg/cli/4.18.1/packages/yarnpkg-core/sources/Configuration.ts
-fn rc_files(root: &Utf8Path, home: &Utf8Path, environment: &YarnEnvironment) -> Vec<Utf8PathBuf> {
+pub(crate) fn rc_files(
+    root: &Utf8Path,
+    home: &Utf8Path,
+    environment: &YarnEnvironment,
+) -> Vec<Utf8PathBuf> {
     let filename = environment
         .rc_filename
         .as_deref()

@@ -26,6 +26,7 @@ mod yarnrc;
 pub(crate) use yarnrc::YarnVariable;
 pub(crate) use yarnrc::{
     DEFAULT_RC_FILENAME, YarnConfiguration, YarnEnvironment, configures_plugins, parse_settings,
+    rc_files, read_settings,
 };
 
 use super::{DeclarationKey, display_rel};

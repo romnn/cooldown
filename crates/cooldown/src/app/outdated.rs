@@ -290,7 +290,7 @@ impl<'a> OutdatedRunner<'a> {
                     "could not enumerate dependencies"
                 );
                 let diagnostic = diag_from_error(&error, pctx.tool, &read.project_label, None)
-                    .with_path(pctx.project.manifest.as_str());
+                    .with_path(pctx.manifest_report_path());
                 if self.opts.allow_stale_lock
                     && matches!(error, cooldown_core::CoreError::StaleLock(_))
                 {
@@ -484,7 +484,7 @@ impl<'a> OutdatedRunner<'a> {
                     Err(error) => {
                         self.acc.errors.push(
                             diag_from_error(&error, pctx.tool, project_label, None)
-                                .with_path(pctx.project.manifest.as_str()),
+                                .with_path(pctx.manifest_report_path()),
                         );
                         false
                     }
@@ -494,7 +494,7 @@ impl<'a> OutdatedRunner<'a> {
             Err(error) => {
                 self.acc.errors.push(
                     diag_from_error(&error, pctx.tool, project_label, None)
-                        .with_path(pctx.project.manifest.as_str()),
+                        .with_path(pctx.manifest_report_path()),
                 );
                 (false, None)
             }
@@ -512,7 +512,7 @@ impl<'a> OutdatedRunner<'a> {
             report,
             pctx.tool,
             project_label,
-            &pctx.project.manifest,
+            &pctx.manifest_report_path(),
             self.opts.allow_stale_lock,
         );
         match outcome.action {

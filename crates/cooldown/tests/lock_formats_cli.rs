@@ -469,6 +469,12 @@ mod check {
             ["lock_conflict"],
             "{conflicted:#}"
         );
+        // The diagnostic names the manifest relative to its project, as every other one does.
+        assert_eq!(
+            fields(&conflicted, "errors", "path"),
+            ["package.json"],
+            "{conflicted:#}"
+        );
         assert_eq!(code, Some(4), "{conflicted:#}");
         Ok(())
     }

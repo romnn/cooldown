@@ -2,6 +2,91 @@
 
 ## Unreleased
 
+- **`check` verifies a Yarn Berry lock with Yarn itself instead of failing closed.** `check`
+  reported every Berry lock's currency as unknown, so no Berry project was ever evaluated. It now
+  runs `yarn install --immutable` without builds, with Yarn 2.4 through 4, in a throwaway copy of
+  every input Yarn reads: the lock, every `package.json` outside `node_modules`, `.git`, and
+  `.yarn`, the `.yarnrc.yml` files from the project up to the home directory, `file:` folders
+  whole with their permissions, and the manifests of `portal:` and `link:` targets. The run is
+  offline for Yarn, Corepack, and git, and every folder Yarn writes goes into the copy, so the
+  project stays byte for byte as it was. Only `YN0028`, the lockfile Yarn would modify, makes a
+  lock stale, which `--allow-stale-lock` waives, and only reaching the fetch step makes it
+  current. Anything else is `lock_unknown`, which nothing waives: a lock whose change needs
+  registry metadata the offline run cannot fetch, a configuration the copy cannot reproduce
+  faithfully (a configured plugin, an `exec:` dependency, a workspace pattern or local package
+  that leaves the project, a symbolic link the copy would resolve elsewhere, injected environment
+  files other than `.env.yarn`, another lockfile name, per-host network settings, hardened mode,
+  or an rc file using `onConflict`), an input that changes while the copy is written, or an
+  unsupported Yarn. An input that changes after the verdict, before the dependencies are read, is
+  a `lock_conflict`. A Berry row now keeps its advisory identity when every lock entry of the
+  release was fetched from the configured registry by name, or from an archive URL on
+  registry.npmjs.org, and `yarn config get` routes the package's scope to the public registry;
+  npm's `.npmrc`, which Yarn Berry never reads, no longer vetoes it.
+
+- **`sync` writes Yarn Berry's native age gate.** A Berry project reported `unsupported`, so a bare
+  `yarn add` or `yarn up` ignored the cooldown window. `sync` now writes the default window into
+  the project's `.yarnrc.yml` as `npmMinimalAgeGate`, in whole minutes rounded up, and the
+  selectors and young locked versions cooldown exempts as `npmPreapprovedPackages`, written with
+  `onConflict: reset` because Yarn adds up the lists of every rc file it reads. Only selectors
+  Yarn matches no more widely than cooldown are written, and a leading `*`, which Yarn stops at a
+  scope's `/`, is reported as narrower. From Yarn 4.17, where every configured scope has a gate of
+  its own that defaults to one day, `sync` sets the gate of each scope entry in the project's file
+  and warns about a scope configured elsewhere whose gate differs, without ever adding a scope
+  entry, which would reroute it. A project whose Yarn predates 4.10.0, which would refuse the
+  settings, is left `unsupported`, and one that declares Yarn 4.10.0 or later while an older Yarn
+  runs there is refused. The rc file keeps its other lines and comments and is replaced atomically, and an
+  rc file sync cannot edit without changing another setting is refused untouched. Atomic
+  replacements now start owner-only on Unix when the file they replace has permissions of its
+  own, so a private file's contents, such as a registry token in `.yarnrc.yml`, are never readable
+  through the temporary file.
+
+- **The pnpm integration tests no longer share pnpm's metadata cache.** Up to four of them run
+  at once, and concurrent pnpm processes writing one per-user cache entry could leave it
+  unreadable, so every later test resolving that package failed with
+  `ERR_PNPM_CACHE_MISSING_AFTER_304` through all of its retries. Each test fixture now gives the
+  pnpm it runs, and the pnpm cooldown starts for it, a private cache and store through
+  `pnpm_config_cache_dir` and `pnpm_config_store_dir`. So that a fixture need not fetch every
+  package's metadata again, a pnpm fixture's cache starts as hard links into a pool of the
+  entries earlier fixtures finished; pnpm replaces an entry by renaming a new file over it, so no
+  fixture writes another's copy, and the pool takes only entries that parse, so a damaged entry
+  stays with the fixture that wrote it.
+
+- **`--allow-stale-lock` waives only pnpm's own stale-lock refusal.** Every nonzero exit of
+  pnpm's frozen lock verification counted as a stale lock, so `--allow-stale-lock` also waived a
+  registry or network failure, an authentication error, an invalid `.npmrc` or
+  `pnpm-workspace.yaml`, an unsupported flag, or a corrupted store, and `check` then evaluated a
+  lock pnpm never confirmed and passed with a stale-lock warning. cooldown now reads the error
+  code pnpm 9, 10, and 11 print: only `ERR_PNPM_OUTDATED_LOCKFILE`,
+  `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`, `ERR_PNPM_NO_LOCKFILE`, and
+  `ERR_PNPM_FROZEN_LOCKFILE_WITH_OUTDATED_LOCKFILE`, alone and from a run that was not
+  interrupted, are a stale lock. Any other failure is a `tool_failed` error that no flag waives,
+  and a mutating command that hits one after its apply reports the lock's status as unknown rather
+  than stale. The verification pins pnpm's reporter, log level, and JSON output, so a `reporter`,
+  `loglevel`, `json`, or `parseable` setting cannot hide the code.
+
+- **Reported paths are relative and `/`-separated instead of absolute.** A diagnostic about a
+  project's lock or manifest from `check`, `outdated`, `upgrade`, or `fix`, such as `lock_unknown`,
+  `stale_lock`, or `lockfile_unreadable`, named the manifest by its absolute path, so a JSON
+  report leaked the checkout's location and differed between machines and between Windows and
+  Unix. Its `path` is now relative to the project root (`package.json`, `Cargo.toml`), as the
+  adapters' own diagnostics already were, beside the scan-relative `project`. A `sync` row's
+  `path` is relative to the directory its `project` names, `baseline` reports its file as
+  `.cooldown-baseline.toml`, and a `recover` warning's `path` is relative to the repository root,
+  or left out for an artifact outside it, such as one in a linked worktree's shared Git directory.
+  A `recover` row's `project` is `/`-separated on Windows as well.
+
+- **Yarn Classic aliases report the package they install.** The Classic lock's rows split each
+  entry key at commas and took the package name up to the last `@`, so an `npm:` alias such as
+  `isnum@npm:is-number@^6.0.0` became a phantom registry package `isnum@npm:is-number` that was
+  evaluated and reported while its real target never was, and a quoted key holding a comma, such
+  as a `file:` directory named `dir,other@1.0.0`, gave a phantom `other`. The rows are now read
+  through the same port of Yarn's lockfile grammar as member attribution, so an `npm:` or `yarn:`
+  alias is the target's release under the target's own name, with its `resolved` origin, its
+  advisory identity, and no member's ownership. A release only aliases install is no longer a
+  declaration's copy or a landing's evidence, unless a registry selector of its own name resolves
+  it from a registry tarball. A `yarn.lock` Yarn's own reader refuses, such as one holding merge
+  conflicts or a newer lockfile version, is now an unreadable lock instead of being listed line by
+  line.
 - **Yarn Berry workspace members are attributed through the lock's own workspace entries.** A
   Berry run credited nothing per member: the rows followed the root `package.json`, so a
   dependency only a member declares read as transitive, and the run warned about it. A Berry lock
@@ -145,18 +230,16 @@
   `__metadata:` entry, matched none of the Classic grammar, so `outdated` reported nothing and
   `upgrade` found nothing to do on a project it never read. cooldown now reads the lock Yarn 2
   through 4.18 writes, lockfile versions 4 to 6 and 8 to 10, and evaluates every npm release it
-  resolves, so `outdated` and `explain` cover a Berry project, while `check` fails closed on it,
-  as on a Yarn Classic one, until the lock's currency can be verified. An npm alias is read as
+  resolves, so `outdated` and `explain` cover a Berry project. An npm alias is read as
   its target's release, which no declaration of the target's name claims unless a descriptor of
   that name resolves to it too, a patched package's own npm release is read like any other, and
   workspaces and `link:`, `portal:`, `file:`, `patch:`, `exec:`, git, and tarball URL entries are
   left out, whatever version, checksum, or link type they record. A malformed lock, a descriptor
   bound to two different packages, and a lockfile version no released Yarn wrote, such as the 7
   of Yarn 4's release candidates, are reported as `lockfile_unreadable`, never read as a smaller
-  graph. Berry support is read-only for now: advisory identity is not established, and `sync`
-  writes nothing. `upgrade`, `fix`, and `--build` refuse a Berry project before running Yarn, and
-  `outdated` warns that its adoptable rows were not verified against `upgrade`. cooldown also no
-  longer runs a Yarn Berry executable on a Classic lock, which its first install would migrate to
+  graph. Berry support is read-only for now: `upgrade`, `fix`, and `--build` refuse a Berry
+  project before running Yarn, and `outdated` warns that its adoptable rows were not verified
+  against `upgrade`. cooldown also no longer runs a Yarn Berry executable on a Classic lock, which its first install would migrate to
   the Berry format: before running Yarn on a Classic lock it checks the root `packageManager` and
   the version `yarn --version` reports in the project, through any `yarnPath` or Corepack, and
   refuses a Berry Yarn with what to do instead. Every Yarn run turns Corepack's auto-pin off, so

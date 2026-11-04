@@ -127,8 +127,8 @@ fn newest_versions(entries: impl IntoIterator<Item = NameVersion>) -> HashMap<St
 }
 
 /// The root manifest's declared names, the direct set of a lock without per-member attribution
-/// (npm v1, an unsupported `bun.lock`, or a yarn classic lock that Yarn's own reader refuses or
-/// whose workspace members cannot all be discovered).
+/// (npm v1, an unsupported `bun.lock`, or a yarn classic lock whose workspace members cannot all
+/// be discovered).
 struct ManifestDirect<'a> {
     /// Every name the root manifest declares.
     names: HashSet<String>,
@@ -623,7 +623,7 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
         let entries = L::parse(&content)?;
         // Which workspace member(s) own each resolved copy, for source attribution; empty for lock
         // formats without per-member data (npm v1, an unsupported bun.lock, a yarn classic lock
-        // Yarn refuses or whose workspace members cannot all be discovered).
+        // whose workspace members cannot all be discovered).
         // npm's index attributes a copy only to the members whose own install-tree lookup binds
         // it, so a nested duplicate of a declared name stays transitive, and yarn's only to the
         // members whose own declaration identifies it, a copy no edit may move included.
@@ -662,8 +662,8 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
         } else {
             crate::npmrc::RegistryOverrides::none()
         };
-        let mut seen = HashSet::new();
-        let mut deps = Vec::new();
+        let mut seen: HashMap<(String, String), usize> = HashMap::new();
+        let mut deps: Vec<Dependency> = Vec::new();
         for NameVersion {
             name,
             version,
@@ -692,9 +692,21 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
             if scope == DepScope::Direct && !is_direct {
                 continue;
             }
-            if !seen.insert((name.clone(), version.clone())) {
-                continue; // a name can resolve to the same version via several paths
+            let advisory_identity =
+                crate::npmrc::advisory_identity(&name, &origin, &registry_overrides);
+            // A name can resolve to the same version via several paths, which share one row.
+            // Any of them proving the release came from the public registry grants its identity,
+            // whichever the lock lists first.
+            let release = (name.clone(), version.clone());
+            if let Some(&row) = seen.get(&release) {
+                if let Some(dep) = deps.get_mut(row)
+                    && dep.advisory_identity.is_none()
+                {
+                    dep.advisory_identity = advisory_identity;
+                }
+                continue;
             }
+            seen.insert(release, deps.len());
             let members: Vec<MemberRef> = member_paths
                 .into_iter()
                 .map(|path| MemberRef {
@@ -711,8 +723,6 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
             } else {
                 None
             };
-            let advisory_identity =
-                crate::npmrc::advisory_identity(&name, &origin, &registry_overrides);
             deps.push(Dependency {
                 package: PackageId::new(L::ID, name, Some(NPM.to_string())),
                 advisory_identity,
@@ -740,6 +750,9 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
     /// from another candidate's resolve.
     /// Yarn Berry's rows count every copy of a name a workspace declares as direct, owned by no
     /// member, so no landing is proven and no exact pin is protected.
+    /// A refused lock whose rows cannot be read either has nothing to fall back to, so it is the
+    /// error [`NodeLock::parse`] returns instead, as a Yarn classic lock always is, since both its
+    /// reads share Yarn's grammar.
     ///
     /// A Yarn Berry lock whose workspaces are known can still leave single declarations unproven
     /// ([`YarnBindings::unattributed`](crate::lock::YarnBindings::unattributed)), which one
@@ -763,10 +776,14 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
         } else {
             let content = read_lock::<L>(project)?;
             match L::member_attribution_in(&content, Some(&workspace)) {
-                MemberAttribution::Unknown => (
-                    DiagnosticKind::LockfileUnreadable,
-                    format!("{} is no lock {} itself would read", L::LOCKFILE, L::BIN),
-                ),
+                MemberAttribution::Unknown => {
+                    // A lock whose rows cannot be read either has no rows to fall back to.
+                    L::parse(&content)?;
+                    (
+                        DiagnosticKind::LockfileUnreadable,
+                        format!("{} is no lock {} itself would read", L::LOCKFILE, L::BIN),
+                    )
+                }
                 MemberAttribution::Selectors(bindings) => {
                     return Ok(unattributed_notice(&bindings).into_iter().collect());
                 }
@@ -804,7 +821,12 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
             return Ok(verify_current_unknown(L::LOCKFILE));
         };
         self.cmd
-            .lock_report(&project.root, &args, L::LOCKFILE)
+            .lock_report(
+                &project.root,
+                &args,
+                L::LOCKFILE,
+                L::verify_refusal_is_stale,
+            )
             .await
     }
 }
@@ -3978,7 +4000,7 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         }
     }
 
-    fn requires_sync_admission_evaluation(&self) -> bool {
+    fn requires_sync_admission_evaluation(&self, _project: &Project) -> bool {
         L::NATIVE_MIN_AGE_FILE.is_some()
     }
 
@@ -4106,6 +4128,9 @@ mod berry_attribution_tests;
 
 #[cfg(test)]
 mod npm_attribution_tests;
+
+#[cfg(all(test, unix))]
+mod pnpm_verify_tests;
 
 #[cfg(test)]
 mod yarn_attribution_tests;

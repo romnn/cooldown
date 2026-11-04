@@ -6,7 +6,7 @@
 
 use super::lock::{ProjectReadGuard, ProjectWriteGuard, RepoToolReadGuard, RepoToolWriteGuard};
 use super::{Exit, RunOpts, Workspace, diag_from_error, recovery_diagnostics};
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::fs::ManifestFamily;
 use cooldown_core::{
     Diagnostic, NativeExemptions, PolicyContext, ResolveKind, ResolveQuery, ResolvedPolicy,
@@ -88,7 +88,8 @@ pub struct SyncItem {
     pub project: String,
     /// The outcome for this project.
     pub status: SyncStatus,
-    /// The native config file written or checked, when applicable.
+    /// The native config file written or checked, when applicable, relative to the directory
+    /// `project` names and `/`-separated.
     pub path: Option<String>,
     /// The policy window synced (e.g. `14d`), for display.
     pub window: Option<String>,
@@ -319,7 +320,7 @@ impl Workspace {
                 .await
                 .map_err(|err| diag_from_error(&err, tool, &project, None))?;
             warnings.extend(access.recovery);
-            if writer.requires_sync_admission_evaluation() {
+            if writer.requires_sync_admission_evaluation(&pctx.project) {
                 policy.admitted_versions = match self
                     .sync_admitted_versions(pctx, opts, &window, warnings)
                     .await
@@ -343,7 +344,7 @@ impl Workspace {
         .await;
         match result {
             Ok(report) => {
-                let SyncClassification { status, path } = classify(&report);
+                let SyncClassification { status, path } = classify(&report, &pctx.project.root);
                 summary.record(status);
                 warnings.extend(report_warnings(report, tool, &project));
                 SyncItem {
@@ -414,7 +415,7 @@ impl Workspace {
             };
         match result {
             Ok(report) => {
-                let SyncClassification { status, path } = classify(&report);
+                let SyncClassification { status, path } = classify(&report, self.repo_root());
                 summary.record(status);
                 warnings.extend(report_warnings(report, tool, &project));
                 SyncItem {
@@ -543,17 +544,24 @@ fn repo_relative_root() -> String {
 /// A [`SyncReport`] mapped to its report row parts.
 struct SyncClassification {
     status: SyncStatus,
-    /// The native config path the sync touched, when one exists.
+    /// The native config path the sync touched, relative to the row's base, when one exists.
     path: Option<String>,
 }
 
-fn classify(report: &SyncReport) -> SyncClassification {
+/// Maps `report` to its row parts, spelling the touched path relative to `base`, the directory
+/// the row's `project` names.
+///
+/// A path outside `base` has no relative spelling, so the row then reports none.
+fn classify(report: &SyncReport, base: &Utf8Path) -> SyncClassification {
     let (status, path) = match report {
-        SyncReport::Written { path, .. } => (SyncStatus::Written, Some(path.to_string())),
-        SyncReport::Unchanged { path, .. } => (SyncStatus::Unchanged, Some(path.to_string())),
+        SyncReport::Written { path, .. } => (SyncStatus::Written, Some(path)),
+        SyncReport::Unchanged { path, .. } => (SyncStatus::Unchanged, Some(path)),
         SyncReport::Deferred { .. } => (SyncStatus::Written, None),
         SyncReport::Unsupported => (SyncStatus::Unsupported, None),
     };
+    let path = path
+        .and_then(|path| crate::report_path::relative_report_path(path, base))
+        .map(Utf8PathBuf::into_string);
     SyncClassification { status, path }
 }
 
@@ -771,7 +779,7 @@ mod tests {
             cooldown_core::SyncScope::Project
         }
 
-        fn requires_sync_admission_evaluation(&self) -> bool {
+        fn requires_sync_admission_evaluation(&self, _project: &cooldown_core::Project) -> bool {
             true
         }
 

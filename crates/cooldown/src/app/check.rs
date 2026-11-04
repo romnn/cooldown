@@ -308,7 +308,7 @@ impl<'a> CheckRunner<'a> {
             Err(err) => {
                 self.acc.errors.push(
                     diag_from_error(&err, pctx.tool, &read.project_label, None)
-                        .with_path(pctx.project.manifest.as_str()),
+                        .with_path(pctx.manifest_report_path()),
                 );
                 None
             }
@@ -440,7 +440,7 @@ impl<'a> CheckRunner<'a> {
             report,
             pctx.tool,
             project_label,
-            &pctx.project.manifest,
+            &pctx.manifest_report_path(),
             self.opts.allow_stale_lock,
         );
         match outcome.action {
@@ -474,7 +474,7 @@ impl<'a> CheckRunner<'a> {
         project_label: &str,
     ) -> LockProbe {
         let diag = diag_from_error(err, pctx.tool, project_label, None)
-            .with_path(pctx.project.manifest.as_str());
+            .with_path(pctx.manifest_report_path());
         let downgradable = matches!(
             diag.kind,
             DiagnosticKind::StaleLock | DiagnosticKind::NotFound

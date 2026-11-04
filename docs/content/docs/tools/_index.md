@@ -68,10 +68,10 @@ builds in a throwaway copy of every input Yarn reads (the lock, every `package.j
 `node_modules`, `.git`, and `.yarn`, the `.yarnrc.yml` files from the project up to the home
 directory, `.env.yarn`, `.yarn/releases`, `.yarn/patches`, `file:` folders whole with their
 permissions, and the manifests of `portal:` and `link:` targets) and never in the project, which
-stays byte for byte as it was. The run is offline for Yarn, Corepack, and git, and every folder Yarn writes is redirected
-into the copy. A lock is current only when Yarn reaches its fetch step, and stale only when it
-reports `YN0028` (the lockfile would be modified); a stale lock is an error that
-`--allow-stale-lock` waives. Anything else is `lock_unknown`, an error nothing waives: a lock
+stays byte for byte as it was. The run is offline for Yarn, Corepack, and git, and every folder
+Yarn writes is redirected into the copy. A lock is current only when Yarn reaches its fetch step,
+and stale only when it reports `YN0028` (the lockfile would be modified); a stale lock is an error
+that `--allow-stale-lock` waives. Anything else is `lock_unknown`, an error nothing waives: a lock
 whose change needs registry metadata the offline run cannot fetch, a configuration the copy
 cannot reproduce faithfully (a configured plugin, an `exec:` dependency, a workspace pattern with
 `..` or an absolute path, a local package named by an absolute path, through a symbolic link, or
@@ -86,9 +86,12 @@ second read goes unnoticed, the same window pnpm's verify-then-read check leaves
 
 Not yet supported for Berry:
 
-- `sync` of Yarn's native `npmMinimalAgeGate`;
 - every mutation: `upgrade`, `fix`, and `--build` refuse a Berry project before running Yarn, and
   `outdated` warns that its adoptable rows were not verified against `upgrade`.
+
+For a Berry project run by Yarn 4.10 or later, [`sync`]({{< relref "../commands/other.md" >}}#yarn-berry)
+writes the native age gate, `npmMinimalAgeGate` and `npmPreapprovedPackages`, into its
+`.yarnrc.yml`; a Yarn Classic project has no native age gate.
 
 Before running Yarn on a Classic lock, cooldown checks that the Yarn the project declares
 (`packageManager`) and the one `yarn --version` reports there, through `yarnPath` or Corepack, are
