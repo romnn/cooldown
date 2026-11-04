@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **The pnpm integration tests no longer share pnpm's metadata cache.** Up to four of them run
+  at once, and concurrent pnpm processes writing one per-user cache entry could leave it
+  unreadable, so every later test resolving that package failed with
+  `ERR_PNPM_CACHE_MISSING_AFTER_304` through all of its retries. Each test fixture now gives the
+  pnpm it runs, and the pnpm cooldown starts for it, a private cache and store through
+  `pnpm_config_cache_dir` and `pnpm_config_store_dir`. So that a fixture need not fetch every
+  package's metadata again, a pnpm fixture's cache starts as hard links into a pool of the
+  entries earlier fixtures finished; pnpm replaces an entry by renaming a new file over it, so no
+  fixture writes another's copy, and the pool takes only entries that parse, so a damaged entry
+  stays with the fixture that wrote it.
+
 - **`--allow-stale-lock` waives only pnpm's own stale-lock refusal.** Every nonzero exit of
   pnpm's frozen lock verification counted as a stale lock, so `--allow-stale-lock` also waived a
   registry or network failure, an authentication error, an invalid `.npmrc` or

@@ -111,7 +111,7 @@ fn assert_pnpm_lock_current(report: &support::Envelope) {
 }
 
 fn multiline_fixture() -> Fixture {
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
     fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
     fixture.write("pkgs/v6/package.json", MEMBER_V6_PACKAGE_JSON);
@@ -264,7 +264,7 @@ const MEMBER_CARET7_PACKAGE_JSON: &str = r#"{
 const TILDE_MAX: &str = "7.3.8";
 
 fn tilde_fixture() -> Fixture {
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
     fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
     fixture.write("pkgs/tilde/package.json", MEMBER_TILDE_PACKAGE_JSON);

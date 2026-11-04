@@ -134,7 +134,7 @@ fn upgrade_sync_persists_a_shorter_package_windows_exact_native_exclusion_withou
 fn assert_shorter_package_window_persists_exact_native_exclusion(
     native_config: &str,
 ) -> eyre::Result<()> {
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write(
         "package.json",
         indoc::indoc! {r#"
@@ -218,7 +218,7 @@ fn assert_shorter_package_window_persists_exact_native_exclusion(
 #[test]
 fn upgrade_persists_an_admission_into_the_packages_first_native_rule() -> eyre::Result<()> {
     skip_if_missing!("pnpm", Ok(()));
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write(
         "package.json",
         indoc::indoc! {r#"
@@ -292,7 +292,7 @@ fn assert_pnpm_lock_current(report: &support::Envelope) {
 }
 
 fn conflict_fixture(seed_cutoff: &str) -> Fixture {
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write("package.json", PACKAGE_JSON);
     fixture.write(".npmrc", NPMRC);
     seed_lock(&fixture, seed_cutoff);
@@ -516,7 +516,7 @@ fn upgrade_advances_a_matured_transitive_no_importer_declares() {
     // `pnpm update debug@…` cannot reach an undeclared package (named selectors match direct
     // dependencies only, `--depth` notwithstanding), so only the temporary qualified-override leg
     // can advance it.
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write(
         "package.json",
         r#"{ "name": "transitive-advance", "private": true, "dependencies": { "agent-base": "7.1.1" } }"#,
@@ -566,7 +566,7 @@ fn upgrade_reverts_a_transitive_advance_a_dependents_exact_pin_excludes() {
     // monaco-editor/dompurify shape: no importer declares debug, so the advance rides the
     // qualified-override leg; 4.3.7 matures under FREEZE_LATER, the override forces it, and the
     // settlement must take it back — 4.3.6 is the only version the pinner admits.
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write(
         "package.json",
         r#"{ "name": "settlement-revert", "private": true, "dependencies": { "pinner": "file:./pinner" } }"#,
@@ -722,7 +722,7 @@ fn native_minimum_age_migration_fixture() -> eyre::Result<(Fixture, Vec<u8>)> {
     // exemption while adding exact allowances for the versions it is repairing. TypeScript is
     // pinned to an older, still-in-range version so `outdated` has one independently adoptable
     // candidate to verify against the rejected starting lock.
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write("package.json", PACKAGE_JSON);
     fixture.write(".npmrc", NPMRC);
     add_root_dependency(&fixture, "nanoid", "^3.3.0");
@@ -912,7 +912,7 @@ const PERPKG_PROJECT_NEWEST: &str = "9.5.0";
 /// not a CLI `--freeze`: a CLI flag is the highest-authority layer and would override the per-package
 /// rule, which is exactly the overshoot this test guards against.)
 fn perpkg_fixture() -> Fixture {
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write("package.json", PERPKG_PACKAGE_JSON);
     fixture.write(".npmrc", NPMRC);
     let config = indoc::formatdoc! {r#"
@@ -1037,7 +1037,7 @@ const WORKSPACE_UNRELATED_MEMBER_PACKAGE_JSON: &str = r#"{
 "#;
 
 fn workspace_member_fixture() -> Fixture {
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
     fixture.write("pnpm-workspace.yaml", COMPLEX_MEMBER_WORKSPACE_YAML);
     fixture.write("'app [literal]/package.json", WORKSPACE_MEMBER_PACKAGE_JSON);
@@ -1049,7 +1049,7 @@ fn workspace_member_fixture() -> Fixture {
 }
 
 fn workspace_root_dependency_fixture() -> Fixture {
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write("package.json", WORKSPACE_ROOT_DEP_PACKAGE_JSON);
     fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
     fixture.write(
@@ -1213,7 +1213,7 @@ const PEER_ONLY_LIB_PACKAGE_JSON: &str = r#"{
 const PEER_ONLY_SEED: &str = "2021-01-01T00:00:00Z";
 
 fn peer_only_fixture() -> Fixture {
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
     fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
     fixture.write("pkgs/app/package.json", PEER_ONLY_APP_PACKAGE_JSON);
@@ -1290,7 +1290,7 @@ const SINGLE_COPY_PACKAGE_JSON: &str = r#"{
 const SINGLE_COPY_CONFIG: &str = "[tool.pnpm]\nsingle-copy = [\"chalk\"]\n";
 
 fn single_copy_fixture(config: Option<&str>) -> Fixture {
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write("package.json", SINGLE_COPY_PACKAGE_JSON);
     fixture.write(".npmrc", NPMRC);
     if let Some(config) = config {
@@ -1476,7 +1476,7 @@ const MULTI_VERSION_B_PACKAGE_JSON: &str = r#"{
 const MULTI_VERSION_SEED: &str = "2022-06-01T00:00:00Z";
 
 fn multi_version_fixture() -> Fixture {
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
     fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
     fixture.write("pkgs/a/package.json", MULTI_VERSION_A_PACKAGE_JSON);
@@ -1540,7 +1540,7 @@ const CARET_SPELLING_SEED: &str = "2021-10-01T00:00:00Z";
 /// Three members declare `chalk` on one resolved line under different spellings: two carets
 /// whose implicit ceilings exclude chalk 5, and an open range that admits it.
 fn caret_spelling_fixture() -> Fixture {
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
     fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
     fixture.write(
@@ -1700,7 +1700,7 @@ fn upgrade_major_respects_an_explicit_bound_beside_a_caret() {
 /// pnpm resolves and records only the `dependencies` declaration, so the lock alone shows a plain
 /// caret.
 fn two_field_fixture(second: &str, seed: &str) -> Fixture {
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
     fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
     fixture.write(
@@ -2004,7 +2004,7 @@ const EXCLUDED_RANGE_PACKAGE_JSON: &str = indoc::indoc! {r#"
 /// Both members start on `chalk@4.1.0`, and every locked version predates [`FREEZE`], so pnpm's
 /// native age gate admits the starting lock.
 fn excluded_member_fixture(excluded_manifest: &str) -> Fixture {
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write("package.json", WORKSPACE_ROOT_PACKAGE_JSON);
     fixture.write("pnpm-workspace.yaml", WORKSPACE_YAML);
     fixture.write(".npmrc", NPMRC);
@@ -2446,7 +2446,7 @@ fn the_override_repair_moves_an_excluded_members_range_only_copy_with_a_warning(
 #[test]
 fn sync_writes_minimum_release_age_exclude_for_latest_packages() {
     skip_if_missing!("pnpm");
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write(
         "package.json",
         "{\n  \"name\": \"cooldown-sync-fixture\",\n  \"version\": \"0.1.0\",\n  \"private\": true\n}\n",
@@ -2484,7 +2484,7 @@ fn sync_writes_minimum_release_age_exclude_for_latest_packages() {
 #[test]
 fn sync_reports_selectors_pnpm_would_match_differently() {
     skip_if_missing!("pnpm");
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write(
         "package.json",
         "{\n  \"name\": \"cooldown-sync-fixture\",\n  \"version\": \"0.1.0\",\n  \"private\": true\n}\n",
@@ -2547,7 +2547,7 @@ fn sync_reports_selectors_pnpm_would_match_differently() {
 /// The minimal pnpm project `sync` discovers, with `workspace` as its `pnpm-workspace.yaml` and
 /// `config` as its `cooldown.toml`; `sync` writes the native YAML without running the resolver.
 fn sync_fixture(workspace: &str, config: &str) -> Fixture {
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write(
         "package.json",
         indoc::indoc! {r#"
@@ -2703,7 +2703,7 @@ const PEER_HELD_PACKAGE_JSON: &str = indoc::indoc! {r#"
 "#};
 
 fn peer_held_fixture(seed_cutoff: &str) -> Fixture {
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write("package.json", PEER_HELD_PACKAGE_JSON);
     fixture.write(".npmrc", NPMRC);
     seed_lock(&fixture, seed_cutoff);
@@ -2805,7 +2805,7 @@ fn outdated_reports_the_peer_held_target_as_blocked_by_the_dependent() {
 #[test]
 fn upgrade_holds_a_cross_major_move_a_workspace_dependents_peer_excludes() {
     skip_if_missing!("pnpm");
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     // `autoInstallPeers: false` (a pnpm-workspace.yaml setting on pnpm ≥ 10; the `.npmrc` key is
     // ignored there) is the regime that needs the manifest source: the shim's peer is NOT
     // materialized as an importer dependency, so the lock carries no trace of the contract — the
@@ -2881,7 +2881,7 @@ fn upgrade_holds_a_cross_major_move_a_workspace_dependents_peer_excludes() {
 #[test]
 fn upgrade_holds_a_cross_major_move_an_injected_workspace_dependents_peer_excludes() {
     skip_if_missing!("pnpm");
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write(
         "pnpm-workspace.yaml",
         indoc::indoc! {"
@@ -3081,7 +3081,7 @@ const LOCKSTEP_FREEZE: &str = "2026-06-30T00:00:00Z";
 #[test]
 fn upgrade_rejects_a_joint_move_that_breaks_a_ceiling_held_targets_peer_contract() {
     skip_if_missing!("pnpm");
-    let fixture = Fixture::new().tag_independent();
+    let fixture = Fixture::pnpm().tag_independent();
     fixture.write(
         "package.json",
         indoc::indoc! {r#"
@@ -3163,4 +3163,159 @@ fn upgrade_rejects_a_joint_move_that_breaks_a_ceiling_held_targets_peer_contract
             .contains("peer_held")
     );
     assert_eq!(lock_before, fixture.read_bytes("pnpm-lock.yaml"));
+}
+
+/// Seed cutoff for the cache-isolation probes: `semver@^7` resolves to `7.3.8`.
+const ISOLATION_SEED: &str = "2023-01-01T00:00:00Z";
+
+/// Freeze for the cache-isolation probes: `semver@^7` matures up to `7.5.4`.
+const ISOLATION_FREEZE: &str = "2023-12-01T00:00:00Z";
+
+/// The one-dependency manifest of the cache-isolation probes, small enough to resolve cold.
+const ISOLATION_PACKAGE_JSON: &str = indoc::indoc! {r#"
+    {
+      "name": "cooldown-pnpm-cache-isolation-fixture",
+      "version": "0.1.0",
+      "private": true,
+      "dependencies": {
+        "semver": "^7.0.0"
+      }
+    }
+"#};
+
+/// Every fixture resolves through its own pnpm cache and store, both in the pnpm the harness runs
+/// and in the pnpm cooldown starts.
+///
+/// Concurrent tests sharing pnpm's per-user metadata cache corrupted its entries, failing every
+/// later test that resolved the same package with `ERR_PNPM_CACHE_MISSING_AFTER_304` (#53).
+#[test]
+fn every_fixture_resolves_through_its_own_pnpm_cache_and_store() -> eyre::Result<()> {
+    skip_if_missing!("pnpm", Ok(()));
+
+    // The harness's own pnpm sees each fixture's private directories, and no two fixtures share
+    // them.
+    let first = Fixture::new();
+    let second = Fixture::new();
+    for fixture in [&first, &second] {
+        let effective = |key: &str| {
+            let output = fixture
+                .run_tool("pnpm", &["config", "get", key], &[])
+                .require_success()?;
+            Ok::<_, eyre::Report>(std::path::PathBuf::from(output.stdout_str().trim()))
+        };
+        assert_eq!(effective("cache-dir")?, fixture.pnpm_cache_dir());
+        assert_eq!(effective("store-dir")?, fixture.pnpm_store_dir());
+    }
+    assert_ne!(first.pnpm_cache_dir(), second.pnpm_cache_dir());
+    assert_ne!(first.pnpm_store_dir(), second.pnpm_store_dir());
+
+    // Emptying the seeded cache leaves only the pnpm cooldown starts to fill it again, so a
+    // `semver` entry afterwards proves cooldown's pnpm resolved through the fixture's cache too.
+    let fixture = Fixture::new().tag_independent();
+    fixture.write("package.json", ISOLATION_PACKAGE_JSON);
+    seed_lock(&fixture, ISOLATION_SEED);
+    let cache_dir = fixture.pnpm_cache_dir();
+    assert!(
+        find_metadata_entry(&cache_dir, "semver.jsonl")?.is_some(),
+        "the seed must resolve through the fixture's own cache"
+    );
+    std::fs::remove_dir_all(&cache_dir)?;
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", ISOLATION_FREEZE]);
+    assert!(upgrade.ok(), "upgrade should succeed: {upgrade:?}");
+    assert!(
+        upgrade.applied_names().contains("semver"),
+        "the upgrade must re-resolve `semver` through pnpm: {upgrade:?}"
+    );
+    assert!(
+        find_metadata_entry(&cache_dir, "semver.jsonl")?.is_some(),
+        "the pnpm cooldown starts must resolve through the fixture's own cache"
+    );
+    Ok(())
+}
+
+/// Pooled pnpm fixtures share metadata only as finished entries: a fixture starts with what an
+/// earlier one fetched, but replacing, deleting, or damaging its own copy reaches no other fixture
+/// and no later one.
+#[test]
+fn pooled_pnpm_fixtures_share_only_finished_metadata_entries() -> eyre::Result<()> {
+    skip_if_missing!("pnpm", Ok(()));
+    // A test-owned pool starts empty, so whatever it holds came from these fixtures.
+    let pool = tempfile::tempdir()?;
+
+    // The first fixture's seed publishes the metadata its pnpm fetched once the command exits.
+    let first = Fixture::pnpm_with_pool(pool.path()).tag_independent();
+    first.write("package.json", ISOLATION_PACKAGE_JSON);
+    seed_lock(&first, ISOLATION_SEED);
+    let pooled = find_metadata_entry(pool.path(), "semver.jsonl")?
+        .ok_or_else(|| eyre::eyre!("the seed's `semver` metadata must reach the pool"))?;
+    let pooled_bytes = std::fs::read(&pooled)?;
+    let relative = pooled.strip_prefix(pool.path())?;
+    let first_entry = first.pnpm_cache_dir().join(relative);
+
+    // A later fixture starts with that entry in its own cache.
+    let second = Fixture::pnpm_with_pool(pool.path());
+    let seeded = second.pnpm_cache_dir().join(relative);
+    assert_eq!(std::fs::read(&seeded)?, pooled_bytes);
+
+    // pnpm replaces an entry by renaming a fresh file over it, and can delete one; neither touches
+    // the pooled entry or the first fixture's copy.
+    let replacement = seeded.with_extension("jsonl_tmp_probe");
+    std::fs::write(&replacement, "{}\n{}")?;
+    std::fs::rename(&replacement, &seeded)?;
+    std::fs::remove_file(&seeded)?;
+    assert_eq!(std::fs::read(&pooled)?, pooled_bytes);
+    assert_eq!(std::fs::read(&first_entry)?, pooled_bytes);
+
+    // After the next command, the pool takes a new entry that parses and leaves a damaged one in
+    // the fixture that wrote it.
+    let valid = seeded.with_file_name("cooldown-valid-probe.jsonl");
+    std::fs::write(
+        &valid,
+        "{\"etag\":\"probe\"}\n{\"name\":\"cooldown-valid-probe\"}",
+    )?;
+    let damaged = seeded.with_file_name("cooldown-damaged-probe.jsonl");
+    std::fs::write(&damaged, "{\"etag\":\"probe\"}\n{\"name\":")?;
+    // A body that parses as JSON but is no object is just as unreadable to pnpm.
+    let unloadable = seeded.with_file_name("cooldown-unloadable-probe.jsonl");
+    std::fs::write(&unloadable, "{\"etag\":\"probe\"}\nnull")?;
+    second
+        .run_tool("pnpm", &["--version"], &[])
+        .require_success()?;
+    assert!(
+        find_metadata_entry(pool.path(), "cooldown-valid-probe.jsonl")?.is_some(),
+        "a finished entry must be pooled"
+    );
+    assert!(
+        find_metadata_entry(pool.path(), "cooldown-damaged-probe.jsonl")?.is_none(),
+        "a damaged entry must stay in the fixture that wrote it"
+    );
+    assert!(
+        find_metadata_entry(pool.path(), "cooldown-unloadable-probe.jsonl")?.is_none(),
+        "an entry pnpm cannot load must stay in the fixture that wrote it"
+    );
+    Ok(())
+}
+
+/// The path of the first file named `file_name` below a pnpm cache or pool directory, at whatever
+/// depth the pnpm version lays its metadata out.
+fn find_metadata_entry(
+    dir: &std::path::Path,
+    file_name: &str,
+) -> eyre::Result<Option<std::path::PathBuf>> {
+    if !dir.exists() {
+        return Ok(None);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            if let Some(found) = find_metadata_entry(&path, file_name)? {
+                return Ok(Some(found));
+            }
+        } else if entry.file_name() == file_name {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
 }
