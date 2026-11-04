@@ -2468,14 +2468,12 @@ async fn a_dry_run_stale_lock_names_the_source_project_not_the_copy() {
         format!("fake.lock is stale in {root}"),
         "the detail names the source root, not the copy the dry run resolved in"
     );
-    // The structured path is relabeled like the message: `--json` readers follow it.
-    assert!(
-        stale
-            .path
-            .as_deref()
-            .is_some_and(|path| path.starts_with(root.as_str())),
-        "the path names the source project, not the copy: {:?}",
-        stale.path
+    // The structured path is project-relative, so neither the copy's nor the source's location
+    // reaches `--json` readers, and it names the same manifest the source project has.
+    assert_eq!(
+        stale.path.as_deref(),
+        Some("go.mod"),
+        "the path names the project's manifest relative to its root"
     );
 }
 
