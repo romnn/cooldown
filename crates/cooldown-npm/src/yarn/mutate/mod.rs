@@ -418,7 +418,7 @@ impl Landing<'_> {
         )?;
         let floor = floor_minutes(project.exclude_newer.as_deref(), jiff::Timestamp::now());
         let overrides = self.overrides(&copy, floor, name, to);
-        self.install(project, &copy, &overrides).await?;
+        self.install(&copy, &overrides).await?;
         manifests.restore()?;
         let seeding = Seeding {
             name,
@@ -427,9 +427,9 @@ impl Landing<'_> {
         };
         let seeded = berry_seed::seed(&read(&copy_lock)?, &seeding)?;
         write(&copy_lock, seeded.as_bytes())?;
-        self.install(project, &copy, &overrides).await?;
+        self.install(&copy, &overrides).await?;
         manifests.restore()?;
-        if let Err(detail) = verify::copy_current(self.driver, &copy, &project.root).await? {
+        if let Err(detail) = verify::copy_current(self.driver, &copy).await? {
             return Err(CoreError::UnacceptableResolve(format!(
                 "Yarn does not prove the lock that lands {name}@{to} current: {detail}"
             )));
@@ -451,7 +451,7 @@ impl Landing<'_> {
         // then is someone else's change, which the landing must neither overwrite nor ignore.
         if verify::live_digest(project, &self.context)?.as_ref() != Some(&copy.digest) {
             return Err(CoreError::LockConflict(format!(
-                "the inputs of {lock_path} changed while cooldown resolved {name}@{to} in a copy, \
+                "the inputs of {LOCKFILE} changed while cooldown resolved {name}@{to} in a copy, \
                  so the lock was left as it is; re-run once they have settled"
             )));
         }
@@ -462,14 +462,9 @@ impl Landing<'_> {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::Tool`] with Yarn's errors, spelled against the project, when the
-    /// install fails, and [`CoreError::ToolSpawn`] when `yarn` cannot be spawned.
-    async fn install(
-        &self,
-        project: &Project,
-        copy: &ResolveCopy,
-        overrides: &[EnvOverride],
-    ) -> Result<()> {
+    /// Returns [`CoreError::Tool`] with Yarn's errors, their paths relative to the project, when
+    /// the install fails, and [`CoreError::ToolSpawn`] when `yarn` cannot be spawned.
+    async fn install(&self, copy: &ResolveCopy, overrides: &[EnvOverride]) -> Result<()> {
         let args = ["install", "--mode=update-lockfile", "--json"].map(ToString::to_string);
         let output = self
             .driver
@@ -492,7 +487,7 @@ impl Landing<'_> {
         Err(CoreError::Tool {
             tool: "yarn".to_string(),
             termination: ToolTermination::from_exit_status(output.status),
-            stderr: verify::relabel(&detail, &copy.copy_root, &project.root),
+            stderr: verify::relabel(&detail, &copy.copy_root),
         })
     }
 

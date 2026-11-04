@@ -142,7 +142,7 @@ impl<'a> Planner<'a> {
     /// Stages every manifest below `directory` outside the directories Yarn's glob ignores, and
     /// every symbolic link that glob would follow.
     fn walk(&mut self, directory: &Utf8Path) -> std::result::Result<(), Refusal> {
-        for Child { name, file_type } in children(directory)? {
+        for Child { name, file_type } in children(&self.root, directory)? {
             let path = directory.join(&name);
             if file_type.is_dir() {
                 if !IGNORED.contains(&name.as_str()) {
@@ -416,7 +416,7 @@ impl<'a> Planner<'a> {
                 source: folder.to_owned(),
             },
         )?;
-        for Child { name, file_type } in children(folder)? {
+        for Child { name, file_type } in children(&self.root, folder)? {
             let path = folder.join(&name);
             if file_type.is_dir() {
                 self.stage_folder(&path)?;
@@ -747,7 +747,8 @@ impl<'a> Planner<'a> {
         match path.strip_prefix(&self.boundary) {
             Ok(relative) => Ok(relative.to_owned()),
             Err(_) => decline(format!(
-                "{path} lies outside {}, below which the verification copy mirrors the project",
+                "{} lies outside {}, below which the verification copy mirrors the project",
+                shown(&self.root, path),
                 self.boundary
             )),
         }
@@ -879,8 +880,9 @@ fn parent(path: &Utf8Path) -> &Utf8Path {
     path.parent().unwrap_or(path)
 }
 
-/// `path` as a reason names it: relative and `/`-separated inside the project, as it is outside.
-fn shown(root: &Utf8Path, path: &Utf8Path) -> String {
+/// `path` as a reason names it: relative to the project and `/`-separated inside it, and
+/// absolute outside it, such as an rc file in the home directory.
+pub(super) fn shown(root: &Utf8Path, path: &Utf8Path) -> String {
     match path.strip_prefix(root) {
         Ok(relative) if relative.as_str().is_empty() => ".".to_string(),
         Ok(relative) => display_rel(relative),
@@ -894,15 +896,16 @@ struct Child {
     file_type: std::fs::FileType,
 }
 
-/// The entries of `directory`, sorted by name.
-fn children(directory: &Utf8Path) -> std::result::Result<Vec<Child>, Refusal> {
+/// The entries of `directory`, sorted by name, a reason naming it as [`shown`] from `root`.
+fn children(root: &Utf8Path, directory: &Utf8Path) -> std::result::Result<Vec<Child>, Refusal> {
     let entries = std::fs::read_dir(directory).map_err(|err| filesystem(directory, &err))?;
     let mut children = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|err| filesystem(directory, &err))?;
         let name = entry.file_name().into_string().map_err(|name| {
             Refusal::Decline(format!(
-                "{directory} holds an entry whose name is not UTF-8: {}",
+                "{} holds an entry whose name is not UTF-8: {}",
+                shown(root, directory),
                 name.to_string_lossy()
             ))
         })?;

@@ -38,12 +38,36 @@
   that leaves the project, a symbolic link the copy would resolve elsewhere, injected environment
   files other than `.env.yarn`, another lockfile name, per-host network settings, hardened mode,
   or an rc file using `onConflict` at its top level or for a setting the copy must reproduce, so
-  the `npmPreapprovedPackages` `sync` writes still verifies), an input that changes while the copy is written, or an
-  unsupported Yarn. An input that changes after the verdict, before the dependencies are read, is
-  a `lock_conflict`. A Berry row now keeps its advisory identity when every lock entry of the
+  the `npmPreapprovedPackages` `sync` writes still verifies), an input that changes while the
+  copy is written, or an unsupported Yarn. An input that changes after the verdict, before the
+  dependencies are read, is a `lock_conflict`. A Berry row now keeps its advisory identity when every lock entry of the
   release was fetched from the configured registry by name, or from an archive URL on
   registry.npmjs.org, and `yarn config get` routes the package's scope to the public registry;
   npm's `.npmrc`, which Yarn Berry never reads, no longer vetoes it.
+
+- **A Yarn Classic member owns the release a same-name alias declares.** Member attribution read
+  every `npm:` selector as an alias of another package, so a declaration such as
+  `"has-flag": "npm:has-flag@^4.0.0"` owned no copy, and the release read as transitive though the
+  root-manifest reading counted it direct. A registry reference to the dependency's own name,
+  `npm:` or `yarn:`, scoped or bare, now binds that registry release for its member like a plain
+  range, even where a workspace package carries the name, which Yarn never links for such a
+  reference. Its copy is direct for the member but not eligible for an edit, with a reason naming
+  the reference, since cooldown never rewrites one, and an exact reference such as
+  `npm:has-flag@4.0.0` pins and holds the copy and is protected by the exact-pin guard, as in Yarn
+  Berry. A `yarn:` alias of another package is now read as an alias too, rather than as a source of
+  its own under the declared name.
+
+- **Config layer tokens name repository files relative to the repository root.** A layer's
+  origin token, as in `config`'s `layers`, `source`, and `generatedMembers.origin`, `explain`'s
+  step `layer` and `decidedBy`, and every row's window `source` and `clampedBy`, spelled a
+  `cooldown.toml` or `--config` file as `repo:<absolute path>` or `config:<absolute path>`, so the
+  output differed between machines and between Windows and Unix. A file inside the repository is
+  now `repo:cooldown.toml`, `repo:apps/web/cooldown.toml`, or `config:ci/cooldown.toml`,
+  `/`-separated on every platform; a symlinked config file is named where the link sits. A file
+  outside the repository, such as a `--config` file elsewhere, keeps its absolute path, and the
+  global config stays `global`. The tokens were documented as stable, so this is a format change:
+  a consumer that matched the absolute spelling must match the relative one. The JSON schema and
+  `schemaVersion` are unchanged, since every field remains a string.
 
 - **`sync` writes Yarn Berry's native age gate.** A Berry project reported `unsupported`, so a bare
   `yarn add` or `yarn up` ignored the cooldown window. `sync` now writes the default window into

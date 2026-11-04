@@ -106,7 +106,7 @@ pub(super) async fn lock_current(
     let probe = probe(driver, &copy_root, &overrides).await?;
     let probed = match probe.and_then(|version| Profile::of(&version)) {
         Ok(probed) => probed,
-        Err(reason) => return Ok(unknown(root, &relabel(&reason, &copy_root, root))),
+        Err(reason) => return Ok(unknown(root, &relabel(&reason, &copy_root))),
     };
     overrides.extend(probed.profile.overrides());
     let output = driver
@@ -138,7 +138,6 @@ pub(super) async fn lock_current(
                         quoted(&diff, QUOTED_DIFF)
                     ),
                     &copy_root,
-                    root,
                 ),
             },
             digest: None,
@@ -153,7 +152,6 @@ pub(super) async fn lock_current(
                     quoted(&errors, QUOTED_ERRORS)
                 ),
                 &copy_root,
-                root,
             ),
         ),
         Verdict::NoReport => unknown(
@@ -164,7 +162,6 @@ pub(super) async fn lock_current(
                     first_lines(&format!("{stdout}\n{stderr}"), QUOTED_ERRORS)
                 ),
                 &copy_root,
-                root,
             ),
         ),
     })
@@ -238,7 +235,6 @@ pub(super) fn resolve_copy(project: &Project, lock: &str, context: &Context) -> 
 pub(super) async fn copy_current(
     driver: &NodeCmd,
     copy: &ResolveCopy,
-    root: &Utf8Path,
 ) -> Result<std::result::Result<(), String>> {
     let mut overrides = profile::base_overrides(&copy.outputs);
     overrides.extend(Profile::Yarn4.overrides());
@@ -264,7 +260,7 @@ pub(super) async fn copy_current(
             )
         ),
     };
-    Ok(Err(relabel(&detail, &copy.copy_root, root)))
+    Ok(Err(relabel(&detail, &copy.copy_root)))
 }
 
 /// Every file and directory a verification of `project` copies from the source, so a copy that
@@ -339,10 +335,16 @@ fn unknown(root: &Utf8Path, reason: &str) -> Verification {
     }
 }
 
-/// `text` with the copy's paths spelled as the project's, so a diagnostic never names the
-/// throwaway copy.
-pub(super) fn relabel(text: &str, copy_root: &Utf8Path, root: &Utf8Path) -> String {
-    text.replace(copy_root.as_str(), root.as_str())
+/// `text` with each path inside the copy spelled relative to the project, as every reason names
+/// a project file, so a diagnostic never names the throwaway copy.
+///
+/// Yarn may print a path with either separator on Windows, so both are stripped after the copy's
+/// root, and the root itself reads `.`.
+pub(super) fn relabel(text: &str, copy_root: &Utf8Path) -> String {
+    let root = copy_root.as_str();
+    text.replace(&format!("{root}/"), "")
+        .replace(&format!("{root}\\"), "")
+        .replace(root, ".")
 }
 
 /// The first `limit` of `lines`, one per line, with a count of the rest.

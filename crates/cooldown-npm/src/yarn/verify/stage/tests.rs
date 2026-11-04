@@ -976,8 +976,22 @@ fn a_screened_input_changed_after_planning_declines_the_copy() -> eyre::Result<(
         let Materialized::Declined(reason) = plan.materialize()? else {
             eyre::bail!("{changed}: a copy of changed input was written");
         };
-        assert_mentions(&reason, "changed while cooldown copied the project");
-        assert_mentions(&reason, changed);
+        // A project file is named from the project, `/`-separated, and one outside it as it is.
+        let named = changed.strip_prefix("project/").map_or_else(
+            || {
+                changed
+                    .split('/')
+                    .fold(world.top.clone(), |path, part| path.join(part))
+                    .to_string()
+            },
+            str::to_string,
+        );
+        assert!(
+            reason.starts_with(&format!(
+                "{named} changed while cooldown copied the project"
+            )),
+            "{changed}: {reason}"
+        );
     }
     Ok(())
 }

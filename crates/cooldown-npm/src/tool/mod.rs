@@ -1153,8 +1153,9 @@ fn failed_landing_row(
 /// A direct candidate is not eligible either when a member binds its copy in a way no edit of its
 /// declaration is proven to move ([`MemberIndex::fixed_owners`]): a source of its own, a git
 /// dependency or a local or remote tarball, and for yarn classic a local path, a selector the root
-/// `resolutions` can rewrite, a name a workspace package carries, or an origin that is no registry
-/// tarball.
+/// `resolutions` can rewrite, a name a workspace package carries, an origin that is no registry
+/// tarball, or a registry reference to the name itself (`"chalk": "npm:chalk@^4.1.0"`), which no
+/// widen rewrites.
 /// The member declares it directly, but npm's exact pin would replace that source with a registry
 /// release, and no range the widen writes is proven to land one either.
 /// The row names each such member with its reason.
@@ -1288,6 +1289,9 @@ fn fixed_binding_detail(
         ),
         FixedBinding::UnrecognizedOrigin => format!(
             "{copy} is locked for {members} from a URL that is no registry tarball of it, so no manifest edit is proven to land a registry release in its place"
+        ),
+        FixedBinding::SelfAlias => format!(
+            "{copy} is declared for {members} through an `npm:` or `yarn:` reference to {name} itself, which cooldown never rewrites, so no manifest edit may move it"
         ),
     }
 }

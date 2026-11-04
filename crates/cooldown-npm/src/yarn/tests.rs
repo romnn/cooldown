@@ -641,7 +641,7 @@ mod verification {
             &script,
             indoc::formatdoc! {r#"
                 #!/bin/sh
-                echo "$*" >> "{top}/yarn.log"
+                echo "$* auto-pin=${{COREPACK_ENABLE_AUTO_PIN-}} network=${{YARN_ENABLE_NETWORK-}}" >> "{top}/yarn.log"
                 case "$1 $3" in
                   "--version ") echo 4.18.1 ;;
                   "install --mode=skip-build") cat "{top}/report.ndjson"; exit 1 ;;
@@ -677,11 +677,17 @@ mod verification {
         }
 
         fn runs(&self, prefix: &str) -> usize {
+            self.logged(prefix).len()
+        }
+
+        /// Every logged run whose arguments start with `prefix`, with the settings it ran under.
+        fn logged(&self, prefix: &str) -> Vec<String> {
             std::fs::read_to_string(self.top.join("yarn.log"))
                 .unwrap_or_default()
                 .lines()
                 .filter(|line| line.starts_with(prefix))
-                .count()
+                .map(str::to_string)
+                .collect()
         }
 
         fn write(&self, relative: &str, contents: &str) -> eyre::Result<()> {
@@ -778,6 +784,14 @@ mod verification {
         );
         assert_eq!(world.runs("config get npmRegistryServer"), 1);
         assert_eq!(world.runs("config get npmScopes"), 1);
+        // The queries run under the adapter's own driver settings, offline.
+        let queries = world.logged("config get");
+        assert!(
+            queries
+                .iter()
+                .all(|run| run.ends_with("auto-pin=0 network=0")),
+            "{queries:?}"
+        );
 
         // A mirror withholds every identity that falls back to it.
         let world = new_world()?;

@@ -904,6 +904,28 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> eyre::Result<()> {
     Ok(())
 }
 
+/// `lock` with its `__metadata` schema changed from `from` to `to`, whatever line ending Yarn
+/// wrote, which is CRLF on Windows.
+fn with_schema(lock: &str, from: &str, to: &str) -> String {
+    let mut in_metadata = false;
+    let mut changed = false;
+    lock.split_inclusive('\n')
+        .map(|line| {
+            let content = line.trim_end_matches(['\r', '\n']);
+            let ending = &line[content.len()..];
+            if content == "__metadata:" {
+                in_metadata = true;
+            } else if in_metadata && !changed && content == format!("  version: {from}") {
+                changed = true;
+                return format!("  version: {to}{ending}");
+            } else if !content.starts_with(' ') {
+                in_metadata = false;
+            }
+            line.to_string()
+        })
+        .collect()
+}
+
 /// Runs `cooldown check --offline` with `extra`.
 fn check(fixture: &Fixture, extra: &[&str]) -> eyre::Result<Run> {
     let mut args = vec!["check", "--offline"];
@@ -951,7 +973,7 @@ fn check_proves_a_seeded_lock_current_without_touching_the_project() -> eyre::Re
 
     // The schema Yarn 4.0 through 4.13 wrote, which Yarn 4.18.1 migrates the rc file for.
     let lock = String::from_utf8(fixture.read_bytes("yarn.lock"))?;
-    let older = lock.replacen("  version: 10\n", "  version: 8\n", 1);
+    let older = with_schema(&lock, "10", "8");
     assert_ne!(older, lock);
     fixture.write("yarn.lock", &older);
     let before = snapshot(fixture.root())?;
@@ -972,7 +994,8 @@ fn check_proves_a_seeded_lock_current_without_touching_the_project() -> eyre::Re
     let control = tempfile::tempdir()?;
     copy_tree(fixture.root(), control.path())?;
     let copied = snapshot(control.path())?;
-    let output = std::process::Command::new("yarn")
+    // Resolve `yarn` as the harness does, since Windows installs it as `yarn.cmd`.
+    let output = std::process::Command::new(cooldown_adapter_util::resolve_program("yarn"))
         .args(["install", "--immutable", "--mode=skip-build"])
         .current_dir(control.path())
         .output()?;
@@ -1170,7 +1193,8 @@ fn an_ancestor_rc_file_decides_the_verdict() -> eyre::Result<()> {
     if !runs_pinned_yarn(&fixture) {
         return Ok(());
     }
-    let seeded = std::process::Command::new("yarn")
+    // Resolve `yarn` as the harness does, since Windows installs it as `yarn.cmd`.
+    let seeded = std::process::Command::new(cooldown_adapter_util::resolve_program("yarn"))
         .args(["install", "--mode=update-lockfile"])
         .current_dir(fixture.root().join("nested/project"))
         .output()?;
@@ -2072,13 +2096,14 @@ fn berry_landing_leaves_aliases_and_local_sources() -> eyre::Result<()> {
         return Ok(());
     }
     seed_lock_at(&fixture, &[])?;
+    // The entry's lines up to the blank line after it, whatever line ending Yarn wrote.
     let entry = |lock: &str, key: &str| -> Option<String> {
-        let start = lock.find(key)?;
-        let end = lock
-            .get(start..)?
-            .find("\n\n")
-            .map_or(lock.len(), |end| start + end);
-        lock.get(start..end).map(ToString::to_string)
+        let lines: Vec<&str> = lock
+            .lines()
+            .skip_while(|line| !line.starts_with(key))
+            .take_while(|line| !line.trim().is_empty())
+            .collect();
+        (!lines.is_empty()).then(|| lines.join("\n"))
     };
     let lock = String::from_utf8(fixture.read_bytes("yarn.lock"))?;
     let local = entry(&lock, "\"local@file:");

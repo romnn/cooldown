@@ -349,3 +349,36 @@ fn local_checksums_are_dropped_and_nothing_else() -> eyre::Result<()> {
     BerryLock::read(&edited)?;
     Ok(())
 }
+
+/// Yarn keeps the line endings of the lock it rewrites, CRLF in a Windows checkout, so both edits
+/// keep them too and read the CRLF lock as they read the LF one.
+#[test]
+fn crlf_line_endings_survive_both_edits() -> eyre::Result<()> {
+    let crlf = |text: &str| text.replace('\n', "\r\n");
+    let seeds = ranges(&["npm:^4.0.0", "npm:~4.1.0"]);
+    let seeding = Seeding {
+        name: "chalk",
+        version: "4.1.1",
+        ranges: &seeds,
+    };
+
+    let seeded = seed(&crlf(PINNED), &seeding)?;
+
+    assert_eq!(seeded, crlf(&seed(PINNED, &seeding)?));
+
+    let local = indoc! {r#"
+
+        "local@file:./local::locator=e7%40workspace%3A.":
+          version: 1.0.0
+          resolution: "local@file:./local#./local::hash=7f2c1d&locator=e7%40workspace%3A."
+          checksum: 10c0/a5b94c3623
+          languageName: node
+          linkType: hard
+    "#};
+    let lock = crlf(&format!("{PINNED}{local}"));
+
+    let edited = without_local_checksums(&lock)?;
+
+    assert_eq!(edited, lock.replace("  checksum: 10c0/a5b94c3623\r\n", ""));
+    Ok(())
+}

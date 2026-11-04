@@ -122,10 +122,12 @@ async fn yarn_members_pinning_different_versions_each_own_their_copy() -> eyre::
     Ok(())
 }
 
-/// Every alias reports its target's release under the target's own name, owned by no member and
-/// with the target's advisory identity, so no row is named after an alias's whole selector.
-/// The root's genuine copy of the alias target's name and its local directory, whose quoted key
-/// holds a comma, keep their owner.
+/// Every alias of another package reports its target's release under the target's own name, owned
+/// by no member and with the target's advisory identity, so no row is named after an alias's whole
+/// selector.
+/// The root's genuine copy of the alias target's name, its local directory, whose quoted key holds
+/// a comma, and the copy its same-name alias of `has-flag` shares with a transitive range keep
+/// their owner.
 #[tokio::test]
 async fn yarn_aliases_report_their_targets_release() -> eyre::Result<()> {
     let TempProject { _guard, project } = fixture_project(&yarn_fixtures::ALIASES)?;
@@ -135,7 +137,12 @@ async fn yarn_aliases_report_their_targets_release() -> eyre::Result<()> {
 
     assert_eq!(
         direct_rows(&graph),
-        ["chalk@4.1.2 [.]", "is-number@7.0.0 [.]", "pkg@0.3.0 [.]"]
+        [
+            "chalk@4.1.2 [.]",
+            "has-flag@4.0.0 [.]",
+            "is-number@7.0.0 [.]",
+            "pkg@0.3.0 [.]"
+        ]
     );
     let mut transitive: Vec<(String, Option<&str>)> = graph
         .iter()
@@ -158,11 +165,40 @@ async fn yarn_aliases_report_their_targets_release() -> eyre::Result<()> {
             ("ansi-styles@4.3.0".to_string(), Some("ansi-styles")),
             ("color-convert@2.0.1".to_string(), Some("color-convert")),
             ("color-name@1.1.4".to_string(), Some("color-name")),
-            ("has-flag@4.0.0".to_string(), Some("has-flag")),
             ("is-number@6.0.0".to_string(), Some("is-number")),
             ("ms@2.1.3".to_string(), Some("ms")),
             ("supports-color@7.2.0".to_string(), Some("supports-color")),
         ]
+    );
+    Ok(())
+}
+
+/// A registry reference to the dependency's own name makes the release its member's direct copy,
+/// pinned where the reference spells an exact version, and shared with a plain range of the same
+/// copy, while an alias of another package stays transitive.
+#[tokio::test]
+async fn yarn_self_aliases_are_their_members_direct_copies() -> eyre::Result<()> {
+    let TempProject { _guard, project } = fixture_project(&yarn_fixtures::SELF_ALIASES)?;
+    let (_cache, tool) = tool()?;
+
+    let graph = tool.dependencies(&project, DepScope::Graph).await?;
+
+    assert_eq!(
+        direct_rows(&graph),
+        [
+            "@sindresorhus/is@4.6.0 [packages/b]",
+            "color-name@1.1.4 [packages/a] pinned",
+            "has-flag@5.0.1 [packages/a]",
+            "is-number@7.0.0 [packages/a,packages/b]",
+            "ms@2.1.2 [.] pinned",
+        ]
+    );
+    assert!(
+        graph.iter().any(|dep| !dep.direct
+            && dep.package.name == "is-number"
+            && dep.current.as_str() == "6.0.0"
+            && dep.members.is_empty()),
+        "{graph:?}"
     );
     Ok(())
 }
@@ -362,42 +398,88 @@ async fn yarn_unproven_bindings_are_not_eligible() -> eyre::Result<()> {
             ],
         ),
     ] {
-        let TempProject { _guard, project } = fixture_project(fixture)?;
-        let (_cache, tool) = scripted_yarn(&project.root, "")?;
-        let plan = Plan {
-            changes,
-            rewrite: RewriteMode::Auto,
-            ..Plan::default()
-        };
+        assert_not_eligible(fixture, changes, &expected).await?;
+    }
+    Ok(())
+}
 
-        let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
-        let report = tool.apply(&mutation).await?;
+/// `upgrade` holds a copy a self-alias binds `not_eligible`, naming the reference, even where
+/// another member's plain caret shares the copy and could be edited.
+#[cfg(unix)]
+#[tokio::test]
+async fn yarn_self_aliases_are_not_eligible() -> eyre::Result<()> {
+    assert_not_eligible(
+        &yarn_fixtures::SELF_ALIASES,
+        vec![
+            yarn_change(
+                "is-number",
+                "7.0.0",
+                "7.0.1",
+                &[("pkg-a", "packages/a"), ("pkg-b", "packages/b")],
+            ),
+            yarn_change("has-flag", "5.0.1", "5.0.2", &[("pkg-a", "packages/a")]),
+        ],
+        &[
+            (
+                "is-number",
+                "is-number@7.0.0 is declared for pkg-a through an `npm:` or `yarn:` reference \
+                 to is-number itself, which cooldown never rewrites, so no manifest edit may \
+                 move it",
+            ),
+            (
+                "has-flag",
+                "has-flag@5.0.1 is declared for pkg-a through an `npm:` or `yarn:` reference \
+                 to has-flag itself, which cooldown never rewrites, so no manifest edit may \
+                 move it",
+            ),
+        ],
+    )
+    .await
+}
 
-        assert!(report.applied.is_empty(), "{report:?}");
-        let skips: Vec<(&str, SkipReason, Option<&str>)> = report
-            .skipped
-            .iter()
-            .map(|skip| {
-                (
-                    skip.change.package.name.as_str(),
-                    skip.reason,
-                    skip.detail.as_deref(),
-                )
-            })
-            .collect();
-        let expected: Vec<(&str, SkipReason, Option<&str>)> = expected
-            .into_iter()
-            .map(|(name, detail)| (name, SkipReason::NotEligible, Some(detail)))
-            .collect();
-        assert_eq!(skips, expected);
-        assert!(!project.root.join("legs.log").exists(), "Yarn never ran");
-        for (rel, contents) in fixture.manifests {
-            assert_eq!(
-                std::fs::read_to_string(project.root.join(rel))?,
-                *contents,
-                "{rel}"
-            );
-        }
+/// Applies `changes` to `fixture` under a Yarn that must never run, asserting each is skipped
+/// `not_eligible` with its `(name, detail)` from `expected`, in order, and no manifest is touched.
+#[cfg(unix)]
+async fn assert_not_eligible(
+    fixture: &YarnWorkspace,
+    changes: Vec<Change>,
+    expected: &[(&str, &str)],
+) -> eyre::Result<()> {
+    let TempProject { _guard, project } = fixture_project(fixture)?;
+    let (_cache, tool) = scripted_yarn(&project.root, "")?;
+    let plan = Plan {
+        changes,
+        rewrite: RewriteMode::Auto,
+        ..Plan::default()
+    };
+
+    let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
+    let report = tool.apply(&mutation).await?;
+
+    assert!(report.applied.is_empty(), "{report:?}");
+    let skips: Vec<(&str, SkipReason, Option<&str>)> = report
+        .skipped
+        .iter()
+        .map(|skip| {
+            (
+                skip.change.package.name.as_str(),
+                skip.reason,
+                skip.detail.as_deref(),
+            )
+        })
+        .collect();
+    let expected: Vec<(&str, SkipReason, Option<&str>)> = expected
+        .iter()
+        .map(|&(name, detail)| (name, SkipReason::NotEligible, Some(detail)))
+        .collect();
+    assert_eq!(skips, expected);
+    assert!(!project.root.join("legs.log").exists(), "Yarn never ran");
+    for (rel, contents) in fixture.manifests {
+        assert_eq!(
+            std::fs::read_to_string(project.root.join(rel))?,
+            *contents,
+            "{rel}"
+        );
     }
     Ok(())
 }
@@ -690,6 +772,95 @@ async fn yarn_rolls_back_only_the_candidate_that_moves_an_excluded_members_pin()
     let declared = std::fs::read_to_string(project.root.join("package.json"))?;
     assert!(declared.contains(r#""first": "^1.1.0""#), "{declared}");
     assert!(declared.contains(r#""second": "^1.0.0""#), "{declared}");
+    Ok(())
+}
+
+/// An exact self-alias (`"pinned": "npm:pinned@1.0.0"`) is a pin the resolve must leave in place,
+/// judged against the registry copy it binds: the candidate whose install moves that copy is
+/// rolled back.
+#[cfg(unix)]
+#[tokio::test]
+async fn yarn_protects_an_exact_self_alias_pin() -> eyre::Result<()> {
+    // Synthetic, in the shape Yarn 1.22.22 writes: `pkg-a` pins `pinned` through a self-alias, and
+    // landing `second` stands in for a resolve that moves the alias's entry.
+    let TempProject { _guard, project } = yarn_project(&[
+        (
+            "package.json",
+            r#"{ "name": "app", "version": "1.0.0", "private": true, "workspaces": ["packages/*"], "dependencies": { "first": "^1.0.0", "second": "^1.0.0" } }"#,
+        ),
+        (
+            "packages/a/package.json",
+            r#"{ "name": "pkg-a", "version": "1.0.0", "dependencies": { "pinned": "npm:pinned@1.0.0" } }"#,
+        ),
+        (
+            "yarn.lock",
+            indoc! {r#"
+                # THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.
+                # yarn lockfile v1
+
+
+                first@^1.0.0:
+                  version "1.0.0"
+                  resolved "https://registry.yarnpkg.com/first/-/first-1.0.0.tgz"
+
+                "pinned@npm:pinned@1.0.0":
+                  version "1.0.0"
+                  resolved "https://registry.yarnpkg.com/pinned/-/pinned-1.0.0.tgz"
+
+                second@^1.0.0:
+                  version "1.0.0"
+                  resolved "https://registry.yarnpkg.com/second/-/second-1.0.0.tgz"
+            "#},
+        ),
+    ])?;
+    let (_cache, tool) = scripted_yarn(
+        &project.root,
+        indoc! {r#"
+            if grep -q '"first": "^1.1.0"' package.json; then land first 1.0.0 1.1.0; fi
+            if grep -q '"second": "^1.1.0"' package.json; then
+              land second 1.0.0 1.1.0
+              sed -e '/^"pinned@/,/^$/s|version "1.0.0"|version "1.1.0"|' \
+                  -e 's|/pinned-1.0.0.tgz|/pinned-1.1.0.tgz|' \
+                yarn.lock > yarn.next && mv yarn.next yarn.lock
+            fi
+        "#},
+    )?;
+    let plan = Plan {
+        changes: vec![
+            yarn_change("first", "1.0.0", "1.1.0", &[("app", ".")]),
+            yarn_change("second", "1.0.0", "1.1.0", &[("app", ".")]),
+        ],
+        ..Plan::default()
+    };
+
+    let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
+    let report = tool.apply(&mutation).await?;
+
+    // The first candidate leaves the self-alias's copy alone and stays applied.
+    assert_eq!(
+        report
+            .applied
+            .iter()
+            .map(|change| format!("{}@{}", change.package.name, change.to))
+            .collect::<Vec<_>>(),
+        ["first@1.1.0"]
+    );
+
+    // The second is refused on the self-alias's inner pin, which its resolve moved.
+    let [skip] = report.skipped.as_slice() else {
+        eyre::bail!("one rolled-back candidate: {:?}", report.skipped)
+    };
+    assert_eq!(skip.change.package.name, "second");
+    assert_eq!(skip.reason, SkipReason::ResolverConflict);
+    assert_eq!(
+        skip.detail.as_deref(),
+        Some(
+            "the resolve moved an exact pin it was not asked to rewrite: pinned resolves to \
+             1.1.0 for packages/a/package.json, whose dependencies pins 1.0.0"
+        )
+    );
+    let lock = std::fs::read_to_string(project.root.join("yarn.lock"))?;
+    assert!(lock.contains("/pinned-1.0.0.tgz"), "{lock}");
     Ok(())
 }
 

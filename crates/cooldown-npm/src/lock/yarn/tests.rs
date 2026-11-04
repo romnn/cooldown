@@ -778,6 +778,220 @@ fn the_member_index_holds_unproven_bindings_as_fixed_owners() -> eyre::Result<()
     Ok(())
 }
 
+/// A registry reference to the dependency's own name binds that registry release for its member,
+/// `npm:` and `yarn:` alike, scoped or bare, even where a workspace package carries the name.
+/// The member owns the copy but may not edit it, while its exact reference still pins the copy;
+/// a reference to another package binds nothing.
+#[test]
+fn self_aliases_bind_their_own_names_registry_copy() -> eyre::Result<()> {
+    let bindings = fixture_bindings(&yarn_fixtures::SELF_ALIASES)?;
+    let resolution = |member: &str, name: &str| Resolution::of(bindings.resolution(member, name));
+
+    // Each self-alias resolves its own name's registry copy, the root's beside a sibling `ms`.
+    assert_eq!(resolution(".", "ms"), resolved("2.1.2"));
+    assert_eq!(resolution("packages/a", "is-number"), resolved("7.0.0"));
+    assert_eq!(resolution("packages/a", "has-flag"), resolved("5.0.1"));
+    assert_eq!(resolution("packages/a", "color-name"), resolved("1.1.4"));
+    assert_eq!(
+        resolution("packages/b", "@sindresorhus/is"),
+        resolved("4.6.0")
+    );
+    assert_eq!(resolution("packages/b", "is-number"), resolved("7.0.0"));
+    assert_eq!(resolution("packages/a", "isnum"), Resolution::Unknown);
+
+    let owner = |member: &str| FixedOwner {
+        member: member.to_string(),
+        reason: FixedBinding::SelfAlias,
+    };
+    let index = bindings.member_index(&HashSet::new());
+
+    // The copy a self-alias shares with a plain caret has both owners, only the caret's editable.
+    assert_eq!(
+        index.members_for("is-number", "7.0.0"),
+        ["packages/a", "packages/b"]
+    );
+    assert_eq!(
+        index.fixed_owners("is-number", "7.0.0"),
+        [owner("packages/a")]
+    );
+    assert_eq!(
+        index.editable_members_for("is-number", "7.0.0"),
+        ["packages/b"]
+    );
+
+    // A self-alias alone owns its copy fixed in place, and pins it when it spells an exact version.
+    for (name, version, member, pinned) in [
+        ("ms", "2.1.2", ".", true),
+        ("color-name", "1.1.4", "packages/a", true),
+        ("has-flag", "5.0.1", "packages/a", false),
+        ("@sindresorhus/is", "4.6.0", "packages/b", false),
+    ] {
+        assert_eq!(index.members_for(name, version), [member], "{name}");
+        assert_eq!(index.fixed_owners(name, version), [owner(member)], "{name}");
+        assert!(
+            index.editable_members_for(name, version).is_empty(),
+            "{name}"
+        );
+        assert_eq!(index.is_exact_pinned(name, version), pinned, "{name}");
+    }
+
+    // The alias of another package owns nothing.
+    assert_eq!(
+        index.members_for("is-number", "6.0.0"),
+        Vec::<String>::new()
+    );
+    assert!(index.declares("isnum"));
+    Ok(())
+}
+
+/// A self-alias is held by the same reasons as a plain range, other than a sibling's name: a
+/// selector the root `resolutions` can rewrite and an origin that is no registry tarball leave its
+/// copy unknown.
+/// A `yarn:` reference to another package is an alias like an `npm:` one, so it fixes no copy
+/// under the declared name.
+#[test]
+fn self_aliases_keep_the_reasons_that_fix_a_copy_in_place() -> eyre::Result<()> {
+    // Synthetic: `ms` is pinned through a self-alias and `isnum` aliases another package.
+    let lock = indoc! {r#"
+        # yarn lockfile v1
+
+
+        "isnum@yarn:is-number@^6.0.0":
+          version "6.0.0"
+          resolved "https://registry.yarnpkg.com/is-number/-/is-number-6.0.0.tgz"
+
+        "ms@npm:ms@2.1.2":
+          version "2.1.2"
+          resolved "https://registry.yarnpkg.com/ms/-/ms-2.1.2.tgz"
+    "#};
+    let plain = r#"{ "dependencies": { "ms": "npm:ms@2.1.2", "isnum": "yarn:is-number@^6.0.0" } }"#;
+    assert_eq!(
+        root_binding(plain, lock, "ms")?,
+        (resolved("2.1.2"), Some("2.1.2".to_string()))
+    );
+
+    // Resolutions
+    let rewritten =
+        r#"{ "dependencies": { "ms": "npm:ms@2.1.2" }, "resolutions": { "ms": "2.1.2" } }"#;
+    assert_eq!(
+        root_binding(rewritten, lock, "ms")?,
+        (Resolution::Unknown, Some("2.1.2".to_string()))
+    );
+    let index = root_bindings(rewritten, lock)?
+        .ok_or_else(|| eyre::eyre!("the lock is unreadable"))?
+        .member_index(&HashSet::new());
+    assert_eq!(
+        index.fixed_owners("ms", "2.1.2"),
+        [FixedOwner {
+            member: ".".to_string(),
+            reason: FixedBinding::Resolutions,
+        }]
+    );
+    assert!(!index.is_exact_pinned("ms", "2.1.2"));
+
+    // An origin that is no registry tarball
+    let forked = lock.replace(
+        "https://registry.yarnpkg.com/ms/-/ms-2.1.2.tgz",
+        "https://example.com/ms-fork.tgz",
+    );
+    assert_eq!(
+        root_binding(plain, &forked, "ms")?,
+        (Resolution::Unknown, Some("2.1.2".to_string()))
+    );
+
+    // A `yarn:` alias of another package
+    assert_eq!(
+        root_binding(plain, lock, "isnum")?,
+        (Resolution::Unknown, None)
+    );
+    let index = root_bindings(plain, lock)?
+        .ok_or_else(|| eyre::eyre!("the lock is unreadable"))?
+        .member_index(&HashSet::new());
+    assert_eq!(
+        index.fixed_owners("isnum", "6.0.0"),
+        Vec::<FixedOwner>::new()
+    );
+    assert_eq!(index.members_for("isnum", "6.0.0"), Vec::<String>::new());
+    Ok(())
+}
+
+/// An install field's self-alias constrains the copy by the range inside it, so the copy is
+/// pinned exactly when every field pins it, whichever field's selector Yarn keeps.
+#[test]
+fn a_self_alias_beside_a_plain_range_pins_by_its_inner_range() -> eyre::Result<()> {
+    // Synthetic: the root declares `ms` in two install fields, each binding the same entry.
+    let lock = indoc! {r#"
+        # yarn lockfile v1
+
+
+        ms@2.1.2, "ms@npm:ms@2.1.2":
+          version "2.1.2"
+          resolved "https://registry.yarnpkg.com/ms/-/ms-2.1.2.tgz"
+    "#};
+    for (manifest, pinned) in [
+        (
+            r#"{ "dependencies": { "ms": "npm:ms@2.1.2" }, "devDependencies": { "ms": "2.1.2" } }"#,
+            true,
+        ),
+        (
+            r#"{ "dependencies": { "ms": "2.1.2" }, "devDependencies": { "ms": "npm:ms@2.1.2" } }"#,
+            true,
+        ),
+        (
+            r#"{ "dependencies": { "ms": "npm:ms@2.1.2" }, "devDependencies": { "ms": "^2.1.0" } }"#,
+            false,
+        ),
+        (
+            r#"{ "dependencies": { "ms": "2.1.2" }, "devDependencies": { "ms": "npm:ms@^2.1.0" } }"#,
+            false,
+        ),
+    ] {
+        let index = root_bindings(manifest, lock)?
+            .ok_or_else(|| eyre::eyre!("the lock is unreadable"))?
+            .member_index(&HashSet::new());
+        assert_eq!(index.members_for("ms", "2.1.2"), ["."], "{manifest}");
+        assert_eq!(index.is_exact_pinned("ms", "2.1.2"), pinned, "{manifest}");
+    }
+    Ok(())
+}
+
+/// A declaration's constraint on the dependency itself unwraps a same-name registry reference as
+/// Yarn Classic's registry resolver splits it, so a bare version after the protocol names another
+/// package, and the exact-pin guard captures only a constraint that spells an exact version.
+#[test]
+fn same_name_constraints_split_as_yarn_classic_reads_them() {
+    for (dependency, specifier, constraint, pin) in [
+        ("ms", "^2.1.0", Some("^2.1.0"), None),
+        ("ms", "2.1.2", Some("2.1.2"), Some("2.1.2")),
+        ("ms", "npm:ms@2.1.2", Some("2.1.2"), Some("2.1.2")),
+        ("ms", "npm:ms@=2.1.2", Some("=2.1.2"), Some("=2.1.2")),
+        ("ms", "npm:ms@^2.1.0", Some("^2.1.0"), None),
+        ("ms", "yarn:ms@2.1.2", Some("2.1.2"), Some("2.1.2")),
+        ("ms", "npm:ms", Some("latest"), None),
+        ("ms", "npm:ms@", Some("latest"), None),
+        (
+            "@scope/x",
+            "npm:@scope/x@1.0.0",
+            Some("1.0.0"),
+            Some("1.0.0"),
+        ),
+        ("ms", "npm:other@2.1.2", None, None),
+        ("ms", "npm:2.1.2", None, None),
+        ("@scope/x", "npm:@scope/y@1.0.0", None, None),
+    ] {
+        assert_eq!(
+            same_name_constraint(dependency, specifier),
+            constraint,
+            "{dependency}: {specifier}"
+        );
+        assert_eq!(
+            <crate::lock::Yarn as crate::lock::NodeLock>::install_pin(dependency, specifier),
+            pin,
+            "{dependency}: {specifier}"
+        );
+    }
+}
+
 /// The tokenizer swallows a blank line after a newline as Yarn's does, and reads `true`, `false`,
 /// and digits as plain values.
 #[test]
