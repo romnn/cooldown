@@ -36,10 +36,31 @@ for every npm release it resolves, so `outdated` and `explain` cover it. An npm 
 its target's release, a patched package's own npm release as usual, and workspaces and `link:`,
 `portal:`, `file:`, `patch:`, `exec:`, git, and tarball URL entries are no registry releases and
 are left out. A lock that is malformed or of another lockfile version is reported
-`lockfile_unreadable`. Not yet supported for Berry:
+`lockfile_unreadable`.
 
-- workspace member attribution: the rows follow the root `package.json`, so a dependency only a
-  member declares reads as transitive, which the run warns about;
+A Berry lock records every workspace Yarn installed, each with the dependencies its manifest
+declared, so cooldown takes the members from the lock and credits each one the registry releases
+its own declarations bind: the lock entry a member's current declaration of a name resolves to,
+through an `npm:` range, a same-name `npm:` alias, or Yarn's builtin `typescript`, `fsevents`, and
+`resolve` patches. A row is direct exactly when some member owns it, and `exclude-folders` drops
+the rows only an excluded member owns. An alias of another package, a `workspace:` range, and a
+`file:`, `link:`, `portal:`, `exec:`, git, or tarball source bind no registry release of the name
+they are declared under. A declaration whose binding cooldown cannot prove leaves its name
+unattributed: every locked copy of that name is reported as a direct dependency of no member, none
+is landed, an exact pin of it holds no copy, and the run warns naming each such declaration and
+why. That covers a name the root `resolutions` can rewrite, a `catalog:` or `patch:` reference, a
+name declared at different ranges across one manifest's install fields, a declaration the lock
+records under another range or not at all, a member the lock does not list, and, in a lock of
+version 6 or older, which records ranges without their protocol, a bare range when the project's
+`defaultProtocol` is set to anything but `npm:` in a `.yarnrc.yml` Yarn reads or in
+`YARN_DEFAULT_PROTOCOL`. A Yarn plugin, configured in any `.yarnrc.yml` Yarn reads or through
+`YARN_PLUGINS`, can rewrite any declaration, so no member is attributed at all and the run warns.
+
+The attribution reads the lock through the manifests and Yarn configuration as they are now, not
+as they were at the last install, so it does not reproduce the bindings Yarn last installed: a
+lock that is stale against its inputs, such as a `.yarnrc.yml` or a `resolutions` entry changed
+since that install, can be misattributed. Not yet supported for Berry:
+
 - lock-currency verification, so `check` fails closed on a Berry project as it does on a Yarn
   Classic one, and advisory identity;
 - `sync` of Yarn's native `npmMinimalAgeGate`;

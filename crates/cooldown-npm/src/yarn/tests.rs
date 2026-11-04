@@ -3,7 +3,7 @@
 
 use super::YarnTool;
 use crate::lock::yarn_berry_fixtures::{
-    BerryProject, EVERY_SOURCE, ProjectFile, RESOLUTIONS, SCHEMA_FILES, SCHEMAS,
+    BerryProject, EVERY_SOURCE, ProjectFile, RESOLUTIONS, REWRITES, SCHEMA_FILES, SCHEMAS,
 };
 use crate::lock::yarn_fixtures::{self, YarnWorkspace};
 use crate::lock::{NodeLock, Yarn};
@@ -73,8 +73,8 @@ fn rows(deps: &[Dependency]) -> BTreeSet<String> {
         .collect()
 }
 
-/// A Berry project reaches the Berry reader: its rows are the lock's npm releases, without any
-/// member, since Berry attribution is not supported yet.
+/// A Berry project reaches the Berry reader: its rows are the lock's npm releases, each credited
+/// to the members whose own declarations bind it, and none carrying advisory identity.
 #[tokio::test]
 async fn a_berry_project_reads_its_registry_releases() -> eyre::Result<()> {
     let TempProject { _guard, project } = berry_project(&EVERY_SOURCE)?;
@@ -109,11 +109,19 @@ async fn a_berry_project_reads_its_registry_releases() -> eyre::Result<()> {
             .map(str::to_string)
         )
     );
-    // No row names a member or carries advisory identity.
-    assert!(
+    // Each member owns its own `chalk` copy, and the transitive `is-number@6.0.0` none.
+    let members = |name: &str, version: &str| -> Vec<String> {
         graph
             .iter()
-            .all(|dep| dep.members.is_empty() && dep.advisory_identity.is_none()),
+            .filter(|dep| dep.package.name == name && dep.current.as_str() == version)
+            .flat_map(|dep| dep.members.iter().map(|member| member.path.clone()))
+            .collect()
+    };
+    assert_eq!(members("chalk", "4.1.2"), [".", "packages/a"]);
+    assert_eq!(members("chalk", "4.1.0"), ["packages/b"]);
+    assert_eq!(members("is-number", "6.0.0"), [] as [String; 0]);
+    assert!(
+        graph.iter().all(|dep| dep.advisory_identity.is_none()),
         "{graph:?}"
     );
     Ok(())
@@ -138,25 +146,29 @@ async fn an_alias_only_release_is_no_direct_dependency() -> eyre::Result<()> {
     Ok(())
 }
 
-/// A Berry workspace warns that its members are not attributed, while a single-package Berry
-/// project, whose only workspace is the root, does not.
+/// A Berry workspace whose every declaration the lock proves warns of nothing, while one with
+/// declarations a rewrite may have moved warns once, through the Berry backend.
 #[tokio::test]
-async fn a_berry_workspace_warns_that_its_members_are_unattributed() -> eyre::Result<()> {
+async fn a_berry_workspace_warns_only_of_unproven_declarations() -> eyre::Result<()> {
     let (_cache, tool) = tool()?;
 
-    let TempProject { _guard, project } = berry_project(&EVERY_SOURCE)?;
+    for fixture in [&EVERY_SOURCE, &RESOLUTIONS] {
+        let TempProject { _guard, project } = berry_project(fixture)?;
+        assert_eq!(tool.manifest_notices(&project).await?, []);
+    }
+
+    let TempProject { _guard, project } = berry_project(&REWRITES)?;
     let notices = tool.manifest_notices(&project).await?;
     let [notice] = notices.as_slice() else {
         eyre::bail!("one notice: {notices:?}");
     };
     assert_eq!(notice.kind, DiagnosticKind::Config);
     assert!(
-        notice.message.contains("does not attribute yet"),
+        notice.message.starts_with(
+            "cooldown cannot prove which locked copy these workspace declarations bind: chalk"
+        ),
         "{notice:?}"
     );
-
-    let TempProject { _guard, project } = berry_project(&RESOLUTIONS)?;
-    assert_eq!(tool.manifest_notices(&project).await?, []);
     Ok(())
 }
 

@@ -189,7 +189,8 @@ fn fields(document: &serde_json::Value, section: &str, field: &str) -> Vec<Strin
         .collect()
 }
 
-/// One inventoried row: `name@current`, with ` direct` for a direct dependency.
+/// One inventoried row: `name@current`, with ` direct` for a direct dependency and the path of
+/// each member it is credited to in brackets.
 fn inventory(document: &serde_json::Value) -> BTreeSet<String> {
     document
         .pointer("/items")
@@ -207,15 +208,28 @@ fn inventory(document: &serde_json::Value) -> BTreeSet<String> {
             } else {
                 ""
             };
-            format!("{}@{}{direct}", field("name"), field("current"))
+            let members: Vec<&str> = item
+                .get("members")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|member| member.get("path").and_then(serde_json::Value::as_str))
+                .collect();
+            let members = if members.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", members.join(","))
+            };
+            format!("{}@{}{direct}{members}", field("name"), field("current"))
         })
         .collect()
 }
 
 /// A Berry lock is read for its registry releases: every npm locator is a row, under the alias
-/// target's own name, while the workspaces and the `link:` package are none, and the root's own
-/// declarations are its direct rows.
-/// The member's dependency reads as transitive, which the run warns about.
+/// target's own name, while the workspaces and the `link:` package are none.
+/// Each workspace's own declarations are its direct rows, credited to it, the member's included,
+/// and a release only the alias installs is transitive; with every binding proven, the run warns
+/// of nothing.
 #[test]
 fn a_yarn_berry_lock_is_inventoried() -> eyre::Result<()> {
     let project = berry_project(BERRY_LOCK)?;
@@ -230,12 +244,12 @@ fn a_yarn_berry_lock_is_inventoried() -> eyre::Result<()> {
         inventory(&outdated),
         BTreeSet::from(
             [
-                "@sindresorhus/is@4.6.0 direct",
+                "@sindresorhus/is@4.6.0 direct [.]",
                 "ansi-styles@4.3.0",
-                "chalk@4.1.2 direct",
+                "chalk@4.1.2 direct [.]",
                 "color-convert@2.0.1",
                 "color-name@1.1.4",
-                "has-flag@4.0.0",
+                "has-flag@4.0.0 direct [packages/app]",
                 "is-number@6.0.0",
                 "supports-color@7.2.0",
             ]
@@ -248,13 +262,9 @@ fn a_yarn_berry_lock_is_inventoried() -> eyre::Result<()> {
         fields(&outdated, "errors", "kind").is_empty(),
         "{outdated:#}"
     );
-    assert_eq!(fields(&outdated, "warnings", "kind"), ["config"]);
-    let warnings = fields(&outdated, "warnings", "message");
     assert!(
-        warnings
-            .iter()
-            .all(|message| message.contains("workspace members cooldown does not attribute yet")),
-        "{warnings:?}"
+        fields(&outdated, "warnings", "message").is_empty(),
+        "{outdated:#}"
     );
     Ok(())
 }

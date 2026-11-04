@@ -1,4 +1,5 @@
 use super::*;
+use crate::lock::WorkspaceDialect;
 use crate::lock::yarn_fixtures::{self, YarnWorkspace};
 use camino::{Utf8Path, Utf8PathBuf};
 use color_eyre::eyre;
@@ -17,7 +18,7 @@ fn workspace_of(manifests: &[(&str, &str)]) -> eyre::Result<WorkspaceManifests> 
         }
         std::fs::write(path, contents)?;
     }
-    let workspace = WorkspaceManifests::read(&root);
+    let workspace = WorkspaceManifests::read(&root, WorkspaceDialect::Classic);
     if let Some(reason) = workspace.unavailable_reason() {
         eyre::bail!("the fixture workspace is unavailable: {reason}");
     }
@@ -50,6 +51,7 @@ enum Resolution {
     Resolved(String),
     Missing,
     Unknown,
+    Unproven,
 }
 
 impl Resolution {
@@ -58,6 +60,7 @@ impl Resolution {
             MemberResolution::Resolved(version) => Resolution::Resolved(version.to_string()),
             MemberResolution::Missing => Resolution::Missing,
             MemberResolution::Unknown => Resolution::Unknown,
+            MemberResolution::Unproven => Resolution::Unproven,
         }
     }
 }
@@ -645,7 +648,7 @@ fn an_incomplete_workspace_attributes_nothing() -> eyre::Result<()> {
         root.join("package.json"),
         r#"{ "private": true, "workspaces": ["packages/{a,b}"] }"#,
     )?;
-    let workspace = WorkspaceManifests::read(root);
+    let workspace = WorkspaceManifests::read(root, WorkspaceDialect::Classic);
     assert!(!workspace.is_complete());
     assert!(YarnBindings::read(&chalk_lock("chalk@^4.1.0", "4.1.2"), &workspace).is_none());
     Ok(())

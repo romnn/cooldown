@@ -1,5 +1,8 @@
 use super::*;
-use crate::lock::{Bun, Npm, Pnpm, Yarn};
+use crate::lock::yarn_berry_fixtures::{
+    BerryProject, EVERY_SOURCE, MEMBERS, NPM_PINS, ProjectFile,
+};
+use crate::lock::{Bun, Npm, Pnpm, WorkspaceDialect, Yarn, YarnBerry};
 use crate::manifest::RewrittenDeclaration;
 use crate::registry::NPM;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -14,7 +17,11 @@ const NO_VIOLATIONS: [&str; 0] = [];
 fn protected(manifests: &[(&str, &str)]) -> eyre::Result<ProtectedPins> {
     let mut declarations = Vec::new();
     for (member, content) in manifests {
-        declarations.extend(manifest::exact_install_declarations(member, content)?);
+        declarations.extend(manifest::exact_install_declarations(
+            member,
+            content,
+            Pnpm::install_pin,
+        )?);
     }
     declarations.sort_by(|left, right| left.key.cmp(&right.key));
     Ok(ProtectedPins {
@@ -47,7 +54,8 @@ fn protected_yarn(manifests: &[(&str, &str)]) -> eyre::Result<ProtectedPins> {
         std::fs::write(path, contents)?;
         rels.push(Utf8PathBuf::from(rel));
     }
-    let discovery = crate::manifest::workspaces::BaselineDiscovery::run(root);
+    let discovery =
+        crate::manifest::workspaces::BaselineDiscovery::run(root, WorkspaceDialect::Classic);
     rels.extend(discovery.manifests.iter().cloned());
     let mut baseline = MutationBaseline::read(root, rels)?;
     discovery.record(&mut baseline);
@@ -153,7 +161,7 @@ fn exact_pins_are_read_from_every_install_field() -> eyre::Result<()> {
         }
     "#};
 
-    let declarations = manifest::exact_install_declarations("apps/a", content)?;
+    let declarations = manifest::exact_install_declarations("apps/a", content, Pnpm::install_pin)?;
 
     let read: Vec<String> = declarations
         .iter()
@@ -1308,6 +1316,178 @@ fn yarn_selectors_follow_cooldowns_recorded_edits() -> eyre::Result<()> {
     assert_eq!(
         violated_under(&landed, &overshot, later),
         ["devDependencies"]
+    );
+    Ok(())
+}
+
+/// The protected pins of a Berry `fixture` with the workspace snapshot its attribution reads, as
+/// [`ProtectedPins::from_baseline`] yields them from a baseline captured before any mutation.
+///
+/// The snapshot reads Yarn's configuration from the project alone, no home directory or `YARN_*`
+/// variable taking part.
+fn protected_berry(fixture: &BerryProject) -> eyre::Result<ProtectedPins> {
+    let guard = tempfile::tempdir()?;
+    let root = Utf8Path::from_path(guard.path())
+        .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+    for ProjectFile { path, contents } in fixture.files.iter().chain([&ProjectFile {
+        path: "yarn.lock",
+        contents: fixture.lock,
+    }]) {
+        let path = root.join(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, contents)?;
+    }
+    let discovery = crate::manifest::workspaces::BaselineDiscovery::run_in(
+        root,
+        WorkspaceDialect::Berry,
+        &crate::manifest::workspaces::YarnEnvironment::isolated(root),
+    );
+    let mut rels = vec![Utf8PathBuf::from("package.json")];
+    rels.extend(discovery.manifests.iter().cloned());
+    let mut baseline = MutationBaseline::read(root, rels)?;
+    discovery.record(&mut baseline);
+    let pins = ProtectedPins::from_baseline::<YarnBerry>(&baseline)?;
+    if let Some(reason) = pins
+        .workspace()
+        .and_then(WorkspaceManifests::unavailable_reason)
+    {
+        eyre::bail!("the fixture workspace is unavailable: {reason}");
+    }
+    Ok(pins)
+}
+
+/// `lock` with `from` replaced by `to` once, failing when `lock` holds no `from`.
+fn relocked(lock: &str, from: &str, to: &str) -> eyre::Result<String> {
+    eyre::ensure!(lock.contains(from), "the lock holds no {from:?}");
+    Ok(lock.replacen(from, to, 1))
+}
+
+/// A required Berry pin the baseline lock proves bound but the settled lock no longer proves has
+/// lost its evidence, which violates the pin rather than passing it: the settled lock records
+/// another descriptor for the declaration, keys no entry by it, or records no workspace for its
+/// member.
+/// An optional pin may lose its evidence, as it may lose its binding, and a pin the baseline
+/// already left unproven protects nothing.
+#[test]
+fn berry_pins_whose_evidence_is_lost_are_violated() -> eyre::Result<()> {
+    let members = protected_berry(&MEMBERS)?;
+    let unauthorized = AuthorizedPins::default();
+    let baseline = MEMBERS.lock;
+
+    // The settled lock is unchanged.
+    assert_eq!(
+        violated::<YarnBerry>(&members, Some(baseline), baseline, &unauthorized),
+        NO_VIOLATIONS
+    );
+
+    // `packages/b`'s entry records another `ms` descriptor than its manifest's pin.
+    let stale = relocked(baseline, "    ms: \"npm:2.0.0\"", "    ms: \"npm:2.1.3\"")?;
+    assert_eq!(
+        violated::<YarnBerry>(&members, Some(baseline), &stale, &unauthorized),
+        ["packages/b dependencies ms"]
+    );
+
+    // No entry is keyed by `packages/b`'s `ms@npm:2.0.0` any longer.
+    let unjoined = relocked(baseline, "\"ms@npm:2.0.0\":", "\"ms@npm:2.0.1\":")?;
+    assert_eq!(
+        violated::<YarnBerry>(&members, Some(baseline), &unjoined, &unauthorized),
+        ["packages/b dependencies ms"]
+    );
+
+    // The settled lock records no workspace for `packages/b`, whose dev pin is required too.
+    let entry = indoc! {r#"
+        "b@workspace:packages/b":
+          version: 0.0.0-use.local
+          resolution: "b@workspace:packages/b"
+          dependencies:
+            a: "workspace:^"
+            chalk: "npm:^5.3.0"
+            debug: "npm:4.3.4"
+            is-odd: "npm:^3.0.1"
+            ms: "npm:2.0.0"
+          languageName: unknown
+          linkType: soft
+
+    "#};
+    let unlocked = relocked(baseline, entry, "")?;
+    assert_eq!(
+        violated::<YarnBerry>(&members, Some(baseline), &unlocked, &unauthorized),
+        [
+            "packages/b dependencies ms",
+            "packages/b devDependencies debug"
+        ]
+    );
+
+    // The root's `semver` dev pin conflicts with its caret, so no lock proves it, and whatever the
+    // settled lock binds violates nothing.
+    let moved = relocked(
+        baseline,
+        "    semver: \"npm:7.5.4\"",
+        "    semver: \"npm:7.6.0\"",
+    )?;
+    assert_eq!(
+        violated::<YarnBerry>(&members, Some(baseline), &moved, &unauthorized),
+        NO_VIOLATIONS
+    );
+
+    // The root's optional platform pin loses its evidence without a violation, while
+    // `packages/b`'s required `chalk` pin, which loses it the same way, is violated.
+    let sources = protected_berry(&EVERY_SOURCE)?;
+    let optional = relocked(
+        EVERY_SOURCE.lock,
+        "    \"@esbuild/darwin-arm64\": \"npm:0.25.0\"",
+        "    \"@esbuild/darwin-arm64\": \"npm:0.25.1\"",
+    )?;
+    assert_eq!(
+        violated::<YarnBerry>(&sources, Some(EVERY_SOURCE.lock), &optional, &unauthorized),
+        NO_VIOLATIONS
+    );
+    let required = relocked(
+        EVERY_SOURCE.lock,
+        "    chalk: \"npm:4.1.0\"",
+        "    chalk: \"npm:4.1.1\"",
+    )?;
+    assert_eq!(
+        violated::<YarnBerry>(&sources, Some(EVERY_SOURCE.lock), &required, &unauthorized),
+        ["packages/b dependencies chalk"]
+    );
+    Ok(())
+}
+
+/// A same-name `npm:` reference pins the version inside it, in both spellings, so a settled lock
+/// moving either copy off its pin violates it; an alias of another package pins nothing.
+#[test]
+fn berry_npm_protocol_pins_are_protected() -> eyre::Result<()> {
+    let pins = protected_berry(&NPM_PINS)?;
+    let unauthorized = AuthorizedPins::default();
+    let baseline = NPM_PINS.lock;
+    let moved = [
+        (
+            "resolution: \"ms@npm:2.1.3\"",
+            "resolution: \"ms@npm:2.1.2\"",
+        ),
+        ("version: 2.1.3", "version: 2.1.2"),
+        (
+            "resolution: \"is-number@npm:7.0.0\"",
+            "resolution: \"is-number@npm:7.0.1\"",
+        ),
+        ("version: 7.0.0", "version: 7.0.1"),
+        (
+            "resolution: \"has-flag@npm:4.0.0\"",
+            "resolution: \"has-flag@npm:4.0.1\"",
+        ),
+        ("version: 4.0.0", "version: 4.0.1"),
+    ]
+    .into_iter()
+    .try_fold(baseline.to_string(), |lock, (from, to)| {
+        relocked(&lock, from, to)
+    })?;
+
+    assert_eq!(
+        violated::<YarnBerry>(&pins, Some(baseline), &moved, &unauthorized),
+        [". dependencies is-number", ". dependencies ms"]
     );
     Ok(())
 }

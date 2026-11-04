@@ -14,7 +14,8 @@ use crate::apply::landing::{
 use crate::lock::{
     AliasOnlyVersions, EffectiveRegistryQuery, FixedBinding, FixedOwner, MemberAttribution,
     MemberIndex, MemberResolution, NameVersion, NodeLock, SplitHold, SplitVerdict,
-    WorkspaceManifests,
+    UnattributedName, Unproven, UnprovenDeclaration, WorkspaceDialect, WorkspaceManifests,
+    YarnBindings,
 };
 use crate::manifest;
 use crate::native::{
@@ -128,14 +129,14 @@ fn newest_versions(entries: impl IntoIterator<Item = NameVersion>) -> HashMap<St
 /// The root manifest's declared names, the direct set of a lock without per-member attribution
 /// (npm v1, an unsupported `bun.lock`, or a yarn classic lock that Yarn's own reader refuses or
 /// whose workspace members cannot all be discovered).
-struct ManifestDirect {
+struct ManifestDirect<'a> {
     /// Every name the root manifest declares.
     names: HashSet<String>,
     /// The releases only npm aliases install ([`NodeLock::alias_only_versions`]).
-    alias_only: AliasOnlyVersions,
+    alias_only: &'a AliasOnlyVersions,
 }
 
-impl ManifestDirect {
+impl ManifestDirect<'_> {
     /// Whether the root's declaration of `name` claims the copy at `version`.
     ///
     /// The names are read without versions, so a version only an npm alias installs
@@ -388,9 +389,11 @@ fn journal<L: NodeLock>(project: &Project, plan: &Plan) -> Result<ProjectMutatio
 /// Reads the root manifest, every manifest this plan could rewrite, and every other manifest the
 /// lock names, the baseline exact pins the settled resolve must leave in place
 /// ([`ProtectedPins`]) whatever the plan names.
-/// A manager whose lock records no member ([`NodeLock::READS_WORKSPACE_MANIFESTS`]) adds every
-/// manifest its root `workspaces` field names, whether or not a lock exists yet, and records which
-/// members discovery found, so no trial re-derives them from a project it may have changed.
+/// A manager whose member evidence reads the workspace manifests
+/// ([`NodeLock::WORKSPACE_MANIFESTS`]) adds every member manifest its discovery names, whether or
+/// not a lock exists yet, and records which members discovery found, and for Yarn Berry the
+/// configuration their bindings depend on, so no trial re-derives them from a project it may have
+/// changed.
 ///
 /// The manifests are read, not journaled: cooldown writes none of the extra ones, so a member
 /// manifest that is a symbolic or hard link must not block the mutation the way it blocks a
@@ -408,8 +411,8 @@ fn baseline<L: NodeLock>(project: &Project, plan: &Plan) -> Result<MutationBasel
         })
         .collect();
     rels.extend(manifest::manifest_rels(&members));
-    let discovery = L::READS_WORKSPACE_MANIFESTS
-        .then(|| manifest::workspaces::BaselineDiscovery::run(&project.root));
+    let discovery = L::WORKSPACE_MANIFESTS
+        .map(|dialect| manifest::workspaces::BaselineDiscovery::run(&project.root, dialect));
     if let Some(discovery) = &discovery {
         rels.extend(discovery.manifests.iter().cloned());
     }
@@ -421,9 +424,9 @@ fn baseline<L: NodeLock>(project: &Project, plan: &Plan) -> Result<MutationBasel
 }
 
 /// The workspace manifests `L`'s member evidence reads, from disk, or `None` for a manager whose
-/// lock records its members itself ([`NodeLock::READS_WORKSPACE_MANIFESTS`]).
+/// lock records its members' declarations itself ([`NodeLock::WORKSPACE_MANIFESTS`]).
 fn workspace_manifests<L: NodeLock>(project: &Project) -> Option<WorkspaceManifests> {
-    L::READS_WORKSPACE_MANIFESTS.then(|| WorkspaceManifests::read(&project.root))
+    L::WORKSPACE_MANIFESTS.map(|dialect| WorkspaceManifests::read(&project.root, dialect))
 }
 
 /// Every workspace member path the on-disk lock names, sorted; empty without a lock.
@@ -622,8 +625,8 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
         // formats without per-member data (npm v1, an unsupported bun.lock, a yarn classic lock
         // Yarn refuses or whose workspace members cannot all be discovered).
         // npm's index attributes a copy only to the members whose own install-tree lookup binds
-        // it, so a nested duplicate of a declared name stays transitive, and yarn classic's only
-        // to the members whose selector identifies it, a copy no edit may move included.
+        // it, so a nested duplicate of a declared name stays transitive, and yarn's only to the
+        // members whose own declaration identifies it, a copy no edit may move included.
         // Member paths are resolved to package names once, by reading each member's
         // `package.json`.
         let workspace = workspace_manifests::<L>(project);
@@ -637,12 +640,13 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
         // npm's v2/v3 index already gives an alias's release no owner, since a lookup stopping at
         // an alias slot binds no copy of either name, while a member's own copy from any source
         // keeps its owner even when an alias installs a registry release of the same version.
+        let alias_only = L::alias_only_versions(&content);
         let manifest_direct = if member_index.is_authoritative() {
             None
         } else {
             Some(ManifestDirect {
                 names: manifest::direct_names(&project.manifest)?,
-                alias_only: L::alias_only_versions(&content),
+                alias_only: &alias_only,
             })
         };
 
@@ -672,9 +676,14 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
             // On a v2/v3 lock a copy is owned only by the members whose own lookup binds it, so one
             // nested under an unrelated dependency gives a declaration of its name no claim.
             let member_paths = member_index.members_for(&name, &version);
+            // A name some member declares through a binding the lock does not prove has no owner,
+            // and every copy of it is direct, so the unproven declaration never reads as a
+            // transitive one; a release only aliases install is no copy of it.
+            let unattributed =
+                member_index.is_unattributed(&name) && !alias_only.contains(&name, &version);
             let is_direct = match &manifest_direct {
                 Some(fallback) => fallback.claims(&name, &version),
-                None => !member_paths.is_empty(),
+                None => unattributed || !member_paths.is_empty(),
             };
             if scope == DepScope::Direct && !is_direct {
                 continue;
@@ -718,21 +727,35 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
         Ok(deps)
     }
 
-    /// A manager whose members are attributed only through the workspace manifests
-    /// ([`NodeLock::READS_WORKSPACE_MANIFESTS`]) warns when that evidence is lost: when discovery
+    /// A manager whose members are attributed through the workspace manifests
+    /// ([`NodeLock::WORKSPACE_MANIFESTS`]) warns when that evidence is lost: when discovery
     /// cannot establish every member, or the lock is one the manager's own reader would refuse.
-    /// Its rows then fall back to the root manifest's names, so the warning names what is lost:
-    /// no member owns a copy, a landing is judged by the name's newest locked copy, and no exact
-    /// manifest pin is protected from another candidate's resolve.
+    /// The warning names what is lost.
+    /// Yarn classic's rows then fall back to the root manifest's names, so no member owns a copy, a
+    /// landing is judged by the name's newest locked copy, and no exact manifest pin is protected
+    /// from another candidate's resolve.
+    /// Yarn Berry's rows count every copy of a name a workspace declares as direct, owned by no
+    /// member, so no landing is proven and no exact pin is protected.
+    ///
+    /// A Yarn Berry lock whose workspaces are known can still leave single declarations unproven
+    /// ([`YarnBindings::unattributed`](crate::lock::YarnBindings::unattributed)), which one
+    /// warning lists with why.
     async fn manifest_notices(&self, project: &Project) -> Result<Vec<Diagnostic>> {
-        let Some(workspace) = workspace_manifests::<L>(project) else {
+        let (Some(dialect), Some(workspace)) =
+            (L::WORKSPACE_MANIFESTS, workspace_manifests::<L>(project))
+        else {
             return Ok(Vec::new());
         };
         let (kind, cause) = if let Some(reason) = workspace.unavailable_reason() {
-            (
-                DiagnosticKind::Config,
-                format!("its workspace members could not all be discovered ({reason})"),
-            )
+            let cause = match dialect {
+                WorkspaceDialect::Classic => {
+                    format!("its workspace members could not all be discovered ({reason})")
+                }
+                WorkspaceDialect::Berry => format!(
+                    "how Yarn binds its workspace members' declarations could not be established ({reason})"
+                ),
+            };
+            (DiagnosticKind::Config, cause)
         } else {
             let content = read_lock::<L>(project)?;
             match L::member_attribution_in(&content, Some(&workspace)) {
@@ -740,14 +763,27 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
                     DiagnosticKind::LockfileUnreadable,
                     format!("{} is no lock {} itself would read", L::LOCKFILE, L::BIN),
                 ),
-                _ => return Ok(Vec::new()),
+                MemberAttribution::Selectors(bindings) => {
+                    return Ok(unattributed_notice(&bindings).into_iter().collect());
+                }
+                MemberAttribution::Importers(_)
+                | MemberAttribution::InstallTree(_)
+                | MemberAttribution::PackageKeys(_) => return Ok(Vec::new()),
+            }
+        };
+        let lost = match dialect {
+            WorkspaceDialect::Classic => {
+                "the rows follow the root package.json alone, a landing is judged by the name's newest locked copy, and no member's exact manifest pin is protected from another candidate's resolve"
+            }
+            WorkspaceDialect::Berry => {
+                "every locked copy of a name a workspace declares is reported as a direct dependency of no member, no landing is proven, and no member's exact manifest pin is protected from another candidate's resolve"
             }
         };
         Ok(vec![
             Diagnostic::new(
                 kind,
                 format!(
-                    "{cause}, so cooldown attributes no dependency to a workspace member: the rows follow the root package.json alone, a landing is judged by the name's newest locked copy, and no member's exact manifest pin is protected from another candidate's resolve"
+                    "{cause}, so cooldown attributes no dependency to a workspace member: {lost}"
                 ),
             )
             .with_path("package.json"),
@@ -916,16 +952,16 @@ fn exact_target_reached<L: NodeLock>(
             return Ok(change.members.iter().all(|member| {
                 match bindings.resolution(&member.path, name) {
                     MemberResolution::Resolved(version) => version == target,
-                    MemberResolution::Missing => false,
+                    MemberResolution::Missing | MemberResolution::Unproven => false,
                     MemberResolution::Unknown => {
                         newest_reached && bindings.is_uncertain(&member.path, name)
                     }
                 }
             }));
         }
-        // A manager whose members are attributed only through their manifests' selectors has no
-        // other evidence for a named member, so without it no landing is proven.
-        MemberAttribution::Unknown if L::READS_WORKSPACE_MANIFESTS => return Ok(false),
+        // A manager whose members are attributed only through their manifests' declarations has
+        // no other evidence for a named member, so without it no landing is proven.
+        MemberAttribution::Unknown if L::WORKSPACE_MANIFESTS.is_some() => return Ok(false),
         MemberAttribution::Importers(_)
         | MemberAttribution::InstallTree(_)
         | MemberAttribution::Unknown => {}
@@ -1017,6 +1053,10 @@ impl LandingBaseline {
 /// That check runs first: an alias can install a registry release of the same version beside
 /// such a copy, and the copy still has its owner, so the row names the source rather than the
 /// alias.
+///
+/// A candidate whose name some member declares through a binding the lock does not prove
+/// ([`MemberIndex::is_unattributed`]) is held before all of these: its row is direct but owned by
+/// no member, so neither a declaration to edit nor a member to judge the landing at is known.
 fn decide_candidate<L: NodeLock>(
     project: &Project,
     plan: &Plan,
@@ -1032,6 +1072,13 @@ fn decide_candidate<L: NodeLock>(
         })
     };
     let name = &change.package.name;
+    if baseline.members.is_unattributed(name) {
+        let detail = format!(
+            "cooldown cannot prove which copy of {name} its declaring workspace members bind, so no declaration is known to move {name}@{}",
+            change.from
+        );
+        return Ok(skip(SkipReason::NotEligible, Some(detail)));
+    }
     let fixed = baseline.members.fixed_owners(name, change.from.as_str());
     let mut held: BTreeMap<FixedBinding, Vec<String>> = BTreeMap::new();
     for member in &change.members {
@@ -1076,6 +1123,37 @@ fn decide_candidate<L: NodeLock>(
             LandingPlan::NotEligible => skip(SkipReason::NotEligible, None),
             LandingPlan::PinHeld { detail } => skip(SkipReason::PinHeld, Some(detail)),
         },
+    )
+}
+
+/// The warning listing every name a workspace member declares through a binding the lock does not
+/// prove, each with those members and why, or `None` when every binding is proven.
+fn unattributed_notice(bindings: &YarnBindings) -> Option<Diagnostic> {
+    let names = bindings.unattributed();
+    if names.is_empty() {
+        return None;
+    }
+    let listed = names
+        .iter()
+        .flat_map(|UnattributedName { name, declarations }| {
+            let mut by_reason: BTreeMap<Unproven, Vec<&str>> = BTreeMap::new();
+            for UnprovenDeclaration { member, reason } in declarations {
+                by_reason.entry(*reason).or_default().push(member);
+            }
+            by_reason.into_iter().map(move |(reason, members)| {
+                format!("{name} in {} ({})", members.join(", "), reason.describe())
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(
+        Diagnostic::new(
+            DiagnosticKind::Config,
+            format!(
+                "cooldown cannot prove which locked copy these workspace declarations bind: {listed}; every locked copy of these names is reported as a direct dependency of no member, none is landed, and their exact manifest pins are not protected"
+            ),
+        )
+        .with_path("package.json"),
     )
 }
 
@@ -4018,6 +4096,9 @@ fn omitted_selector_warnings(omitted: &[String]) -> Vec<Diagnostic> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod berry_attribution_tests;
 
 #[cfg(test)]
 mod npm_attribution_tests;

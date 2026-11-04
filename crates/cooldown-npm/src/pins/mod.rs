@@ -12,8 +12,9 @@
 //! candidate whose resolve did it.
 //!
 //! Only locks that attribute a resolution to each member can be judged: pnpm's importers, npm's
-//! v2/v3 install tree, the package keys of a `bun.lock` its reader supports, and a Yarn classic
-//! lock's selector keys read through the workspace manifests.
+//! v2/v3 install tree, the package keys of a `bun.lock` its reader supports, a Yarn classic
+//! lock's selector keys read through the workspace manifests, and a Yarn Berry lock's record of
+//! each workspace joined to the member manifests.
 //! npm v1 locks attribute nothing per member, so their pins are reported [`Observed::Unknown`]
 //! and protected by nothing here; the name's newest copy is never a stand-in, since a transitive
 //! duplicate beside an unchanged member copy would read as a moved pin.
@@ -32,6 +33,13 @@
 //! the root `resolutions` can rewrite, a workspace sibling's name, or a descriptor that vanished,
 //! is unknown and protects nothing, and so is every Yarn pin when the captured workspace or the
 //! lock cannot be read.
+//!
+//! Yarn Berry tells an unknown binding from an unproven one: a declaration whose binding the lock
+//! no longer proves, because it records another descriptor, no entry, or no workspace for it.
+//! A required pin the baseline lock proved bound but the settled lock leaves unproven has lost
+//! its evidence, which is a violation rather than a pass ([`Observed::Unproven`]).
+//! A Berry pin is the version it constrains the dependency itself to, a same-name `npm:`
+//! reference unwrapped ([`NodeLock::install_pin`]).
 
 use crate::lock::{MemberResolution, NodeLock, WorkspaceManifests};
 use crate::manifest::{self, DeclarationKey, ExactDeclaration, ManifestRewrite};
@@ -47,8 +55,8 @@ const REQUIRED_FIELDS: [&str; 2] = ["dependencies", "devDependencies"];
 pub(crate) struct ProtectedPins {
     /// Sorted by key, so a refusal names its violations in a stable order.
     declarations: Vec<ExactDeclaration>,
-    /// The baseline workspace manifests the lock's member attribution reads selectors from, for a
-    /// manager that needs them ([`NodeLock::READS_WORKSPACE_MANIFESTS`]).
+    /// The baseline workspace manifests the lock's member attribution reads declarations from, for
+    /// a manager that needs them ([`NodeLock::WORKSPACE_MANIFESTS`]).
     workspace: Option<WorkspaceManifests>,
 }
 
@@ -62,6 +70,9 @@ pub(crate) enum Observed {
     /// The pin cannot be judged: the lock attributes nothing per member, or the owner's binding is
     /// no registry version of the pinned name, such as an npm alias to another package.
     Unknown,
+    /// The owner still declares the dependency, but the lock no longer proves which copy it binds
+    /// (Yarn Berry).
+    Unproven,
 }
 
 impl From<MemberResolution<'_>> for Observed {
@@ -70,6 +81,7 @@ impl From<MemberResolution<'_>> for Observed {
             MemberResolution::Resolved(version) => Observed::Resolved(version.to_string()),
             MemberResolution::Missing => Observed::Missing,
             MemberResolution::Unknown => Observed::Unknown,
+            MemberResolution::Unproven => Observed::Unproven,
         }
     }
 }
@@ -228,14 +240,18 @@ impl PinViolation {
             Observed::Missing | Observed::Unknown => {
                 format!("{dependency} no longer resolves for {manifest}, whose {field} pins {pin}")
             }
+            Observed::Unproven => format!(
+                "yarn.lock no longer proves which copy of {dependency} {manifest} binds, whose {field} pins {pin}"
+            ),
         }
     }
 }
 
 impl ProtectedPins {
     /// Reads the exact install pins of every `package.json` in `baseline`, from the bytes read
-    /// before any mutation, and for a manager whose attribution reads the workspace manifests
-    /// ([`NodeLock::READS_WORKSPACE_MANIFESTS`]), their snapshot, rebuilt from the capture alone.
+    /// before any mutation, each as the manager reads it ([`NodeLock::install_pin`]), and for a
+    /// manager whose attribution reads the workspace manifests
+    /// ([`NodeLock::WORKSPACE_MANIFESTS`]), their snapshot, rebuilt from the capture alone.
     ///
     /// A recovery subset shares its operation's baseline, so every trial judges the same pins.
     ///
@@ -256,11 +272,15 @@ impl ProtectedPins {
             let content = std::str::from_utf8(bytes).map_err(|err| {
                 CoreError::Parse(format!("{}: {err}", manifest::manifest_of_member(&member)))
             })?;
-            declarations.extend(manifest::exact_install_declarations(&member, content)?);
+            declarations.extend(manifest::exact_install_declarations(
+                &member,
+                content,
+                L::install_pin,
+            )?);
         }
         declarations.sort_by(|left, right| left.key.cmp(&right.key));
-        let workspace =
-            L::READS_WORKSPACE_MANIFESTS.then(|| WorkspaceManifests::from_baseline(baseline));
+        let workspace = L::WORKSPACE_MANIFESTS
+            .map(|dialect| WorkspaceManifests::from_baseline(baseline, dialect));
         Ok(ProtectedPins {
             declarations,
             workspace,
@@ -315,6 +335,9 @@ impl ProtectedPins {
     /// beside an old one, is new.
     /// A missing binding violates a required field only where the baseline bound one, and never an
     /// optional one; an unknown attribution violates nothing.
+    /// An unproven binding is lost evidence, judged like a missing one: a violation of a required
+    /// field the baseline proved bound, and never of an optional field or of a pin the baseline
+    /// already left unproven.
     pub(crate) fn new_violations(
         &self,
         baseline: &PinObservations,
@@ -409,7 +432,9 @@ fn violates(pin: &str, field: &str, observed: &Observed, baseline_bound: bool) -
             // guard and the planner judge one pin alike.
             !crate::version::version_in_range(pin, version)
         }
-        Observed::Missing => baseline_bound && REQUIRED_FIELDS.contains(&field),
+        Observed::Missing | Observed::Unproven => {
+            baseline_bound && REQUIRED_FIELDS.contains(&field)
+        }
         Observed::Unknown => false,
     }
 }

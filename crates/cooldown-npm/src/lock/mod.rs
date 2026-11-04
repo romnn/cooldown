@@ -9,16 +9,19 @@
 //! A Yarn Classic lock records none, so its members' declarations come from the workspace
 //! manifests ([`WorkspaceManifests`]) and are looked up through the lock's selector keys
 //! ([`YarnBindings`]).
+//! A Yarn Berry lock records its workspaces but not which manifest field declares what, so its
+//! members' declarations come from their manifests too and are joined to the lock's own record of
+//! each workspace.
 //! Formats without either fall back to the root manifest's declared dependency names.
 
 mod yaml;
 mod yarn;
 mod yarn_berry;
 
-pub use crate::manifest::workspaces::WorkspaceManifests;
-pub use yarn::YarnBindings;
+pub use crate::manifest::workspaces::{WorkspaceDialect, WorkspaceManifests};
+pub use yarn::{UnattributedName, Unproven, UnprovenDeclaration, YarnBindings};
 
-pub(crate) use yarn_berry::YarnBerry;
+pub(crate) use yarn_berry::{YarnBerry, berry_workspace_paths};
 
 use crate::version::{CeilingHold, RangeMatch, is_exact_npm_specifier, range_match};
 use cooldown_core::{CoreError, Result, ToolId};
@@ -64,16 +67,21 @@ pub trait NodeLock: Send + Sync + 'static {
     /// rather than borrowing pnpm's rule: yarn classic and Berry, and bun.
     const PEER_CONTEXTS_MODELED: bool = true;
 
-    /// Whether the lock records no workspace member, so this manager's member evidence comes from
-    /// the workspace manifests the root `package.json` names ([`WorkspaceManifests`]): yarn
-    /// classic.
+    /// How this manager's member evidence reads the workspace manifests ([`WorkspaceManifests`]),
+    /// or `None` for a manager whose lock records every member's declarations itself.
+    ///
+    /// Yarn Classic's lock records no workspace member, so its members are discovered from the
+    /// root `package.json`'s `workspaces` patterns.
+    /// Yarn Berry's lock records its workspaces but not which manifest field declares what, so its
+    /// members are the workspaces the lock lists, read beside the Yarn configuration that decides
+    /// how their declarations resolve.
     ///
     /// The adapter then reads those manifests, captures every member's in the mutation baseline,
     /// and hands them to [`member_paths_in`](NodeLock::member_paths_in),
     /// [`member_sources_in`](NodeLock::member_sources_in), and
     /// [`member_attribution_in`](NodeLock::member_attribution_in); the other managers' hooks
     /// ignore them.
-    const READS_WORKSPACE_MANIFESTS: bool = false;
+    const WORKSPACE_MANIFESTS: Option<WorkspaceDialect> = None;
 
     /// Parses the lockfile body into the flat list of resolved [`NameVersion`] pairs.
     ///
@@ -164,7 +172,7 @@ pub trait NodeLock: Send + Sync + 'static {
     }
 
     /// [`member_paths`](NodeLock::member_paths) given the workspace manifests the adapter read
-    /// when [`READS_WORKSPACE_MANIFESTS`](NodeLock::READS_WORKSPACE_MANIFESTS) asks for them.
+    /// when [`WORKSPACE_MANIFESTS`](NodeLock::WORKSPACE_MANIFESTS) asks for them.
     ///
     /// `None` is a context without them, which attributes no member for yarn classic.
     /// Default: the lock-only [`member_paths`](NodeLock::member_paths).
@@ -221,6 +229,17 @@ pub trait NodeLock: Send + Sync + 'static {
         _workspace: Option<&WorkspaceManifests>,
     ) -> MemberAttribution {
         Self::member_attribution(content)
+    }
+
+    /// The exact version an install declaration of `dependency` as `specifier` pins, or `None` for
+    /// one that pins no exact version of the dependency itself.
+    ///
+    /// The exact-pin guard (`ProtectedPins`) captures and judges this version.
+    /// Default: the specifier itself when it spells an exact version (`1.2.3`, `=1.2.3`).
+    /// Yarn Berry also unwraps a same-name `npm:` reference (`npm:1.2.3`, `npm:chalk@1.2.3`).
+    #[must_use]
+    fn install_pin<'a>(_dependency: &str, specifier: &'a str) -> Option<&'a str> {
+        crate::version::exact_pin_version(specifier).map(|_| specifier)
     }
 
     /// The registry releases the lock installs only through npm aliases.
@@ -522,8 +541,12 @@ pub struct MemberIndex {
     /// release in its place, so they neither pin nor bound it.
     fixed_copies: HashMap<(String, String), Vec<FixedOwner>>,
     /// `(name, version)` pairs every registry declaration binding them pins exactly (pnpm, npm,
-    /// Bun, and yarn classic).
+    /// Bun, and yarn).
     exact_version: HashSet<(String, String)>,
+    /// The names some member declares with a binding no lock evidence proves (Yarn Berry), each
+    /// with those members.
+    /// No copy of such a name is credited to any member, and every copy of it counts as direct.
+    unattributed: HashMap<String, Vec<String>>,
     /// The distinct declared *range specifiers* per name across importers (pnpm records a
     /// `specifier:` per importer).
     /// Whether disagreeing ranges (`~7.3.0` vs `^7.0.0`, `<4` vs `^4`) split a name depends on the
@@ -556,7 +579,7 @@ pub enum FixedBinding {
     /// The root `resolutions` field can rewrite the member's selector (yarn classic).
     Resolutions,
     /// A workspace package carries the dependency's name, which Yarn links in place of a registry
-    /// release whenever its version satisfies a range (yarn classic).
+    /// release whenever its version satisfies a range.
     WorkspaceName,
     /// The lock records the copy from a `resolved` URL that is no registry tarball of it (yarn
     /// classic).
@@ -598,6 +621,25 @@ impl MemberIndex {
     ) -> Self {
         self.importer_entries = entries;
         self
+    }
+
+    /// An authoritative index in which every name of `declarations` (name → declaring members) is
+    /// declared but unattributed, and no copy has an owner: the members are known, but none of
+    /// their bindings is proven.
+    fn unattributed_only(declarations: HashMap<String, Vec<String>>) -> Self {
+        Self {
+            by_name: declarations.clone(),
+            unattributed: declarations,
+            authoritative: true,
+            ..Default::default()
+        }
+    }
+
+    /// Whether some member declares `name` with a binding the lock does not prove, so no copy of
+    /// it has an owner and every copy of it counts as direct.
+    #[must_use]
+    pub fn is_unattributed(&self, name: &str) -> bool {
+        self.unattributed.contains_key(name)
     }
 
     /// Whether `name`@`version` is exact-pinned by every member that declares it, so it is held: it
@@ -1298,8 +1340,9 @@ pub enum MemberAttribution {
     /// The lock records each member's declarations and the package keys Bun binds them through
     /// (`bun.lock`).
     PackageKeys(BunBindings),
-    /// The lock keys each entry by the selectors resolving to it, and the workspace manifests
-    /// name each member's selector (yarn classic).
+    /// The workspace manifests name each member's declarations, and the lock binds each one:
+    /// through the selector keys of yarn classic, or through Yarn Berry's own record of the
+    /// workspace and its descriptor keys.
     Selectors(YarnBindings),
     /// The lock records no per-member resolution (npm v1, an unsupported `bun.lock`, or a yarn
     /// classic lock read without complete workspace manifests).
@@ -1317,6 +1360,10 @@ pub enum MemberResolution<'a> {
     /// registry version of the name (a local reference, or an alias to another package), or the
     /// lock does not establish which copy the member binds.
     Unknown,
+    /// The member declares the name, but the lock no longer proves which copy the declaration
+    /// binds (Yarn Berry): the lock records another descriptor for it, no entry for it, or no
+    /// workspace for the member, or its configuration may rewrite it.
+    Unproven,
 }
 
 impl MemberAttribution {
@@ -2180,7 +2227,7 @@ impl NodeLock for Yarn {
     const LOCKFILE: &'static str = "yarn.lock";
     const BIN: &'static str = "yarn";
     const PEER_CONTEXTS_MODELED: bool = false;
-    const READS_WORKSPACE_MANIFESTS: bool = true;
+    const WORKSPACE_MANIFESTS: Option<WorkspaceDialect> = Some(WorkspaceDialect::Classic);
 
     fn parse(content: &str) -> Result<Vec<NameVersion>> {
         // A Berry lock shares the file name but none of the Classic grammar, so the Classic
