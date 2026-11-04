@@ -80,6 +80,8 @@ Each project also reports its resolved [`[advisories]`]({{< relref "../configura
 
 A cargo project also reports its [`generated-members`]({{< relref "../configuration/selectors.md" >}}#toolcargo-generated-members) declaration — the workspace-hack members whose declarations follow the lock rather than drive candidates — and the config file that declared it (`--json`: `generatedMembers`), or that nothing declares the key, so an audit can see whether the run's scope was narrowed and by which file.
 
+Each layer is named by an origin token: `default`, `global`, `native`, `env`, `cli`, `repo:<path>` for a `cooldown.toml` in the cascade, or `config:<path>` for the `--config` file. The same tokens appear in `explain`'s trace and in every report's window `clampedBy` and `source`; a `source` or `decidedBy` appends `:<selector>` when a rule decided the window, as in `repo:cooldown.toml:package=left-pad`. A file inside the repository is named by its `/`-separated path relative to the repository root, such as `repo:apps/web/cooldown.toml`, so the output reads the same on every machine and platform. A file outside the repository, such as a `--config` file elsewhere, has no such path and keeps its absolute one, which is specific to the machine; the global config is always `global`.
+
 ## `init`
 
 Scaffold a documented starter `cooldown.toml`:

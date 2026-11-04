@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Config layer tokens name repository files relative to the repository root.** A layer's
+  origin token, as in `config`'s `layers`, `source`, and `generatedMembers.origin`, `explain`'s
+  step `layer` and `decidedBy`, and every row's window `source` and `clampedBy`, spelled a
+  `cooldown.toml` or `--config` file as `repo:<absolute path>` or `config:<absolute path>`, so the
+  output differed between machines and between Windows and Unix. A file inside the repository is
+  now `repo:cooldown.toml`, `repo:apps/web/cooldown.toml`, or `config:ci/cooldown.toml`,
+  `/`-separated on every platform; a symlinked config file is named where the link sits. A file
+  outside the repository, such as a `--config` file elsewhere, keeps its absolute path, and the
+  global config stays `global`. The tokens were documented as stable, so this is a format change:
+  a consumer that matched the absolute spelling must match the relative one. The JSON schema and
+  `schemaVersion` are unchanged, since every field remains a string.
+
 - **`sync` writes Yarn Berry's native age gate.** A Berry project reported `unsupported`, so a bare
   `yarn add` or `yarn up` ignored the cooldown window. `sync` now writes the default window into
   the project's `.yarnrc.yml` as `npmMinimalAgeGate`, in whole minutes rounded up, and the

@@ -42,6 +42,7 @@ clap.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 color-eyre.workspace = true
 camino.workspace = true
+dunce.workspace = true
 jiff.workspace = true
 serde.workspace = true
 serde_json.workspace = true
