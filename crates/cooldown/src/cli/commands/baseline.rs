@@ -84,7 +84,9 @@ pub(super) async fn run_baseline(ctx: &CommandContext<'_>, prune: bool) -> Resul
             true,
             ctx.generated_at.to_owned(),
             render::BaselineMeta {
-                path: path.to_string(),
+                // The file sits at the repository root by construction, so its repo-relative
+                // spelling is its name.
+                path: crate::app::baseline::BASELINE_FILE.to_string(),
                 dry_run: ctx.opts.dry_run,
             },
             summary.clone(),

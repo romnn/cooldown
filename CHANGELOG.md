@@ -13,6 +13,18 @@
   `npm:has-flag@4.0.0` pins and holds the copy and is protected by the exact-pin guard, as in Yarn
   Berry. A `yarn:` alias of another package is now read as an alias too, rather than as a source of
   its own under the declared name.
+
+- **Reported paths are relative and `/`-separated instead of absolute.** A diagnostic about a
+  project's lock or manifest from `check`, `outdated`, `upgrade`, or `fix`, such as `lock_unknown`,
+  `stale_lock`, or `lockfile_unreadable`, named the manifest by its absolute path, so a JSON
+  report leaked the checkout's location and differed between machines and between Windows and
+  Unix. Its `path` is now relative to the project root (`package.json`, `Cargo.toml`), as the
+  adapters' own diagnostics already were, beside the scan-relative `project`. A `sync` row's
+  `path` is relative to the directory its `project` names, `baseline` reports its file as
+  `.cooldown-baseline.toml`, and a `recover` warning's `path` is relative to the repository root,
+  or left out for an artifact outside it, such as one in a linked worktree's shared Git directory.
+  A `recover` row's `project` is `/`-separated on Windows as well.
+
 - **Yarn Classic aliases report the package they install.** The Classic lock's rows split each
   entry key at commas and took the package name up to the last `@`, so an `npm:` alias such as
   `isnum@npm:is-number@^6.0.0` became a phantom registry package `isnum@npm:is-number` that was
