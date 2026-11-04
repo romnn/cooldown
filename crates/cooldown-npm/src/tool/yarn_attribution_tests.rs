@@ -122,6 +122,89 @@ async fn yarn_members_pinning_different_versions_each_own_their_copy() -> eyre::
     Ok(())
 }
 
+/// Every alias reports its target's release under the target's own name, owned by no member and
+/// with the target's advisory identity, so no row is named after an alias's whole selector.
+/// The root's genuine copy of the alias target's name and its local directory, whose quoted key
+/// holds a comma, keep their owner.
+#[tokio::test]
+async fn yarn_aliases_report_their_targets_release() -> eyre::Result<()> {
+    let TempProject { _guard, project } = fixture_project(&yarn_fixtures::ALIASES)?;
+    let (_cache, tool) = tool()?;
+
+    let graph = tool.dependencies(&project, DepScope::Graph).await?;
+
+    assert_eq!(
+        direct_rows(&graph),
+        ["chalk@4.1.2 [.]", "is-number@7.0.0 [.]", "pkg@0.3.0 [.]"]
+    );
+    let mut transitive: Vec<(String, Option<&str>)> = graph
+        .iter()
+        .filter(|dep| !dep.direct)
+        .map(|dep| {
+            (
+                format!("{}@{}", dep.package.name, dep.current),
+                dep.advisory_identity.as_deref(),
+            )
+        })
+        .collect();
+    transitive.sort();
+    assert_eq!(
+        transitive,
+        [
+            (
+                "@sindresorhus/is@4.6.0".to_string(),
+                Some("@sindresorhus/is")
+            ),
+            ("ansi-styles@4.3.0".to_string(), Some("ansi-styles")),
+            ("color-convert@2.0.1".to_string(), Some("color-convert")),
+            ("color-name@1.1.4".to_string(), Some("color-name")),
+            ("has-flag@4.0.0".to_string(), Some("has-flag")),
+            ("is-number@6.0.0".to_string(), Some("is-number")),
+            ("ms@2.1.3".to_string(), Some("ms")),
+            ("supports-color@7.2.0".to_string(), Some("supports-color")),
+        ]
+    );
+    Ok(())
+}
+
+/// A release both a rerouted own-name range and an alias resolve is one row, which the alias's
+/// registry tarball grants its advisory identity in either entry order.
+#[tokio::test]
+async fn yarn_a_shared_release_takes_the_identity_any_entry_proves() -> eyre::Result<()> {
+    let (_cache, tool) = tool()?;
+    let fixture = &yarn_fixtures::RESOLVED_TO_GIT;
+    let (git, alias) = fixture
+        .lock
+        .split_once("\n\"isnum@")
+        .ok_or_else(|| eyre::eyre!("the fixture lists the git entry before the alias"))?;
+    let reordered = format!("\"isnum@{alias}\n{git}");
+
+    for lock in [fixture.lock.to_string(), reordered] {
+        let mut files: Vec<(&str, &str)> = fixture.manifests.to_vec();
+        files.push(("yarn.lock", &lock));
+        let TempProject { _guard, project } = yarn_project(&files)?;
+
+        let graph = tool.dependencies(&project, DepScope::Graph).await?;
+
+        let rows: Vec<(String, bool, Option<&str>)> = graph
+            .iter()
+            .map(|dep| {
+                (
+                    format!("{}@{}", dep.package.name, dep.current),
+                    dep.direct,
+                    dep.advisory_identity.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [("is-number@7.0.0".to_string(), true, Some("is-number"))],
+            "{lock}"
+        );
+    }
+    Ok(())
+}
+
 /// A copy a member's selector identifies but whose binding no edit is proven to move stays that
 /// member's direct dependency: a selector the root `resolutions` can rewrite, a local directory,
 /// a name a workspace package carries, and git, URL, and `link:` sources.
@@ -366,8 +449,8 @@ fn yarn_lock_of(descriptors: &str, name: &str, version: &str) -> String {
     "#}
 }
 
-/// Losing the selector evidence warns, naming why and what it costs: a workspace whose members
-/// cannot all be discovered, and a lock Yarn's own reader refuses.
+/// Losing the selector evidence warns, naming why and what it costs, for a workspace whose members
+/// cannot all be discovered, while a lock Yarn's own reader refuses has no rows to warn about.
 /// A complete workspace beside a readable lock warns of nothing, and neither does npm, whose
 /// attribution reads no workspace manifest.
 #[tokio::test]
@@ -389,17 +472,10 @@ async fn yarn_warns_when_the_selector_evidence_is_lost() -> eyre::Result<()> {
             >>>>>>> other"},
     );
     std::fs::write(project.root.join("yarn.lock"), &conflicted)?;
-    let [notice] = tool
-        .manifest_notices(&project)
-        .await?
-        .try_into()
-        .map_err(|notices: Vec<Diagnostic>| eyre::eyre!("one notice: {notices:?}"))?;
-    assert_eq!(notice.kind, DiagnosticKind::LockfileUnreadable);
-    assert_eq!(
-        notice.message,
-        format!("yarn.lock is no lock yarn itself would read, {lost}")
-    );
-    assert_eq!(notice.path.as_deref(), Some("package.json"));
+    assert!(matches!(
+        tool.manifest_notices(&project).await,
+        Err(CoreError::LockUnreadable(_))
+    ));
 
     // Members discovery cannot establish
     std::fs::write(
@@ -812,9 +888,9 @@ fn yarn_landing_is_verified_at_each_members_selector() -> eyre::Result<()> {
     Ok(())
 }
 
-/// A member's landing needs its selector read through the lock: without the workspace snapshot,
-/// with its members undiscovered, or with a lock Yarn's own reader refuses, no change lands, even
-/// where the newest copy is the target.
+/// A member's landing needs its selector read through the lock: without the workspace snapshot or
+/// with its members undiscovered, no change lands, even where the newest copy is the target, and a
+/// lock Yarn's own reader refuses is unreadable.
 #[test]
 fn yarn_landing_without_selector_evidence_is_never_proven() -> eyre::Result<()> {
     let TempProject { _guard, project } = yarn_project(&[
@@ -868,7 +944,7 @@ fn yarn_landing_without_selector_evidence_is_never_proven() -> eyre::Result<()> 
         Some(&undiscovered)
     )?);
 
-    // Locks Yarn's own reader refuses, though cooldown's lenient listing still finds the target
+    // Locks Yarn's own reader refuses, though a line-by-line listing would still find the target
     for refused in [
         lock.replace("yarn lockfile v1", "yarn lockfile v2"),
         indoc::formatdoc! {r#"
@@ -881,15 +957,18 @@ fn yarn_landing_without_selector_evidence_is_never_proven() -> eyre::Result<()> 
         "#},
     ] {
         write_lock(&refused)?;
-        assert_eq!(
-            landing_versions::<Yarn>(&refused)?
-                .get("chalk")
-                .map(String::as_str),
-            Some("4.1.2"),
+        assert!(
+            matches!(
+                landing_versions::<Yarn>(&refused),
+                Err(CoreError::LockUnreadable(_))
+            ),
             "{refused}"
         );
         assert!(
-            !exact_target_reached::<Yarn>(&project, &change, Some(&complete))?,
+            matches!(
+                exact_target_reached::<Yarn>(&project, &change, Some(&complete)),
+                Err(CoreError::LockUnreadable(_))
+            ),
             "{refused}"
         );
     }
