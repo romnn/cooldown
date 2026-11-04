@@ -13,6 +13,18 @@
   or left out for an artifact outside it, such as one in a linked worktree's shared Git directory.
   A `recover` row's `project` is `/`-separated on Windows as well.
 
+- **Yarn Classic aliases report the package they install.** The Classic lock's rows split each
+  entry key at commas and took the package name up to the last `@`, so an `npm:` alias such as
+  `isnum@npm:is-number@^6.0.0` became a phantom registry package `isnum@npm:is-number` that was
+  evaluated and reported while its real target never was, and a quoted key holding a comma, such
+  as a `file:` directory named `dir,other@1.0.0`, gave a phantom `other`. The rows are now read
+  through the same port of Yarn's lockfile grammar as member attribution, so an `npm:` or `yarn:`
+  alias is the target's release under the target's own name, with its `resolved` origin, its
+  advisory identity, and no member's ownership. A release only aliases install is no longer a
+  declaration's copy or a landing's evidence, unless a registry selector of its own name resolves
+  it from a registry tarball. A `yarn.lock` Yarn's own reader refuses, such as one holding merge
+  conflicts or a newer lockfile version, is now an unreadable lock instead of being listed line by
+  line.
 - **Yarn Berry workspace members are attributed through the lock's own workspace entries.** A
   Berry run credited nothing per member: the rows followed the root `package.json`, so a
   dependency only a member declares read as transitive, and the run warned about it. A Berry lock
