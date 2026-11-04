@@ -428,6 +428,7 @@ dependencies = [
  "cooldown-swift",
  "cooldown-toml-util",
  "cooldown-uv",
+ "dunce",
  "futures",
  "globset",
  "ignore",

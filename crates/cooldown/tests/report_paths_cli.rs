@@ -182,3 +182,123 @@ fn sync_and_baseline_report_relative_file_paths() -> eyre::Result<()> {
     );
     Ok(())
 }
+
+/// The string array at `pointer` in `document`.
+fn strings(document: &serde_json::Value, pointer: &str) -> Vec<String> {
+    document
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+/// A repository whose Hex project under `apps/web` sits beneath a root and a nested
+/// `cooldown.toml`, with a further config file under `ci` for `--config`.
+fn layered_repository() -> eyre::Result<tempfile::TempDir> {
+    let repository = repository(&[
+        ("mix.exs", MIX_EXS),
+        ("mix.lock", MIX_LOCK),
+        ("cooldown.toml", "min-age = \"21d\"\n"),
+    ])?;
+    let root = repository.path();
+    std::fs::write(root.join("cooldown.toml"), "min-age = \"14d\"\n")?;
+    std::fs::create_dir_all(root.join("ci"))?;
+    std::fs::write(root.join("ci").join("cooldown.toml"), "min-age = \"30d\"\n")?;
+    Ok(repository)
+}
+
+/// `config` and `explain` name every config file inside the repository by its `/`-separated
+/// path relative to the repository root, never by the checkout's absolute location.
+#[test]
+fn config_and_explain_name_repository_files_relative_to_the_root() -> eyre::Result<()> {
+    let repository = layered_repository()?;
+    // The `--config` path is relative to the working directory, the repository root, and not to
+    // `-C`, so the token must be derived from where the file is rather than from the argument.
+    let args = ["-C", "apps/web", "--config", "ci/cooldown.toml"];
+    let expected_layers = [
+        "default",
+        "repo:cooldown.toml",
+        "repo:apps/web/cooldown.toml",
+        "config:ci/cooldown.toml",
+    ];
+
+    let config = cooldown_json(&repository, &[&["config"], &args[..]].concat())?;
+    assert_eq!(
+        strings(&config, "/items/0/layers"),
+        expected_layers,
+        "config envelope: {config:#}"
+    );
+    assert_eq!(
+        config
+            .pointer("/items/0/source")
+            .and_then(serde_json::Value::as_str),
+        Some("config:ci/cooldown.toml"),
+        "config envelope: {config:#}"
+    );
+
+    // An empty cache leaves the verdict unanswered offline, but the policy trace and its decision
+    // are resolved from the config alone.
+    let explain = cooldown_json(
+        &repository,
+        &[&["explain", "jason", "--offline"], &args[..]].concat(),
+    )?;
+    let steps: Vec<_> = explain
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|step| step.get("layer").and_then(serde_json::Value::as_str))
+        .collect();
+    assert_eq!(steps, expected_layers, "explain envelope: {explain:#}");
+    assert_eq!(
+        explain
+            .pointer("/effective/decidedBy")
+            .and_then(serde_json::Value::as_str),
+        Some("config:ci/cooldown.toml"),
+        "explain envelope: {explain:#}"
+    );
+    Ok(())
+}
+
+/// A `--config` file outside the repository has no repository-relative spelling, so its token
+/// keeps the file's absolute location for the user to find it.
+#[test]
+fn an_explicit_config_outside_the_repository_keeps_its_absolute_path() -> eyre::Result<()> {
+    let repository = layered_repository()?;
+    let elsewhere = tempfile::tempdir()?;
+    let shared = elsewhere.path().join("shared.toml");
+    std::fs::write(&shared, "min-age = \"40d\"\n")?;
+    let shared_arg = shared
+        .to_str()
+        .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+
+    let config = cooldown_json(&repository, &["config", "--config", shared_arg])?;
+    let layers = strings(&config, "/items/0/layers");
+    let external = layers
+        .last()
+        .and_then(|token| token.strip_prefix("config:"))
+        .ok_or_else(|| eyre::eyre!("no config layer in {layers:?}"))?;
+
+    // The token's path is absolute and names the very file passed, whatever spelling the
+    // platform's canonical form takes.
+    assert!(
+        std::path::Path::new(external).is_absolute(),
+        "{external} is not absolute"
+    );
+    assert_eq!(
+        std::fs::canonicalize(external)?,
+        std::fs::canonicalize(&shared)?
+    );
+    assert_eq!(
+        layers[..layers.len() - 1],
+        [
+            "default",
+            "repo:cooldown.toml",
+            "repo:apps/web/cooldown.toml"
+        ]
+    );
+    Ok(())
+}
