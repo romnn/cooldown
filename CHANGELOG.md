@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **A Yarn Classic member owns the release a same-name alias declares.** Member attribution read
+  every `npm:` selector as an alias of another package, so a declaration such as
+  `"has-flag": "npm:has-flag@^4.0.0"` owned no copy, and the release read as transitive though the
+  root-manifest reading counted it direct. A registry reference to the dependency's own name,
+  `npm:` or `yarn:`, scoped or bare, now binds that registry release for its member like a plain
+  range, even where a workspace package carries the name, which Yarn never links for such a
+  reference. Its copy is direct for the member but not eligible for an edit, with a reason naming
+  the reference, since cooldown never rewrites one, and an exact reference such as
+  `npm:has-flag@4.0.0` pins and holds the copy and is protected by the exact-pin guard, as in Yarn
+  Berry. A `yarn:` alias of another package is now read as an alias too, rather than as a source of
+  its own under the declared name.
 - **Yarn Classic aliases report the package they install.** The Classic lock's rows split each
   entry key at commas and took the package name up to the last `@`, so an `npm:` alias such as
   `isnum@npm:is-number@^6.0.0` became a phantom registry package `isnum@npm:is-number` that was
