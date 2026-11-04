@@ -5,8 +5,9 @@
 - **The HTTP cache no longer lands in the working directory when `HOME` is unset.** Without
   `XDG_CACHE_HOME` and `HOME`, as in a Windows PowerShell or cmd session, cooldown fell back to a
   relative `.cache/cooldown` and wrote its registry responses into the project it ran in. The
-  cache now falls back to the platform's home directory, the user profile on Windows, and to the
-  system temp directory without any home; a relative `XDG_CACHE_HOME` or `HOME` is ignored.
+  cache now falls back to the platform's home directory, the user profile on Windows. A relative
+  `XDG_CACHE_HOME` or `HOME` is ignored, and with no absolute home at all cooldown stops with an
+  error naming the variables to set, rather than using a shared temp directory.
 
 - **`upgrade` and `fix` land Yarn Berry targets exactly.** Every mutation of a Berry project was
   refused before running Yarn. Under Yarn 4, cooldown now has Yarn prove the lock current first,
