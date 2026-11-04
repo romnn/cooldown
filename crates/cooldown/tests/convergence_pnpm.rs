@@ -361,6 +361,58 @@ fn check_reports_a_stale_pnpm_lock_from_frozen_verification() {
     );
 }
 
+/// `--allow-stale-lock` still recognizes the real pnpm's stale-lock refusal: the stale lock is a
+/// warning, not a tool error, so cooldown reads pnpm's error code from its actual output.
+#[test]
+fn check_allow_stale_lock_waives_pnpms_stale_lock_refusal() {
+    skip_if_missing!("pnpm");
+    let fixture = conflict_fixture(FREEZE);
+    add_root_dependency(&fixture, "is-number", "^7.0.0");
+
+    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE, "--allow-stale-lock"]);
+    assert!(
+        check.ok(),
+        "--allow-stale-lock should waive the stale lock: {:?}",
+        check.error_kinds()
+    );
+    assert!(
+        check.warning_kinds().contains("stale_lock"),
+        "the waived stale lock must stay visible as a warning, got {:?}",
+        check.warning_kinds()
+    );
+    assert!(
+        !check.error_kinds().contains("tool_failed"),
+        "pnpm's stale-lock refusal is not a tool failure"
+    );
+}
+
+/// A lock whose recorded settings no longer match the configuration is stale too: pnpm refuses it
+/// with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`, and cooldown reports a stale lock, not a tool error.
+#[test]
+fn check_reports_a_pnpm_config_mismatch_as_a_stale_lock() {
+    skip_if_missing!("pnpm");
+    let fixture = conflict_fixture(FREEZE);
+    fixture.write(
+        "pnpm-workspace.yaml",
+        indoc::indoc! {r#"
+            packages: []
+            overrides:
+              is-number: "7.0.0"
+        "#},
+    );
+
+    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE]);
+    assert!(
+        !check.ok(),
+        "a config-mismatched lock should fail the check gate"
+    );
+    assert!(
+        check.error_kinds().contains("stale_lock") && !check.error_kinds().contains("tool_failed"),
+        "an overrides mismatch must be a stale_lock error, got {:?}",
+        check.error_kinds()
+    );
+}
+
 #[test]
 fn check_lock_refreshes_a_stale_pnpm_lock_before_evaluation() {
     skip_if_missing!("pnpm");

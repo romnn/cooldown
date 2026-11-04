@@ -13,6 +13,30 @@
   fixture writes another's copy, and the pool takes only entries that parse, so a damaged entry
   stays with the fixture that wrote it.
 
+- **`--allow-stale-lock` waives only pnpm's own stale-lock refusal.** Every nonzero exit of
+  pnpm's frozen lock verification counted as a stale lock, so `--allow-stale-lock` also waived a
+  registry or network failure, an authentication error, an invalid `.npmrc` or
+  `pnpm-workspace.yaml`, an unsupported flag, or a corrupted store, and `check` then evaluated a
+  lock pnpm never confirmed and passed with a stale-lock warning. cooldown now reads the error
+  code pnpm 9, 10, and 11 print: only `ERR_PNPM_OUTDATED_LOCKFILE`,
+  `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`, `ERR_PNPM_NO_LOCKFILE`, and
+  `ERR_PNPM_FROZEN_LOCKFILE_WITH_OUTDATED_LOCKFILE`, alone and from a run that was not
+  interrupted, are a stale lock. Any other failure is a `tool_failed` error that no flag waives,
+  and a mutating command that hits one after its apply reports the lock's status as unknown rather
+  than stale. The verification pins pnpm's reporter, log level, and JSON output, so a `reporter`,
+  `loglevel`, `json`, or `parseable` setting cannot hide the code.
+
+- **Reported paths are relative and `/`-separated instead of absolute.** A diagnostic about a
+  project's lock or manifest from `check`, `outdated`, `upgrade`, or `fix`, such as `lock_unknown`,
+  `stale_lock`, or `lockfile_unreadable`, named the manifest by its absolute path, so a JSON
+  report leaked the checkout's location and differed between machines and between Windows and
+  Unix. Its `path` is now relative to the project root (`package.json`, `Cargo.toml`), as the
+  adapters' own diagnostics already were, beside the scan-relative `project`. A `sync` row's
+  `path` is relative to the directory its `project` names, `baseline` reports its file as
+  `.cooldown-baseline.toml`, and a `recover` warning's `path` is relative to the repository root,
+  or left out for an artifact outside it, such as one in a linked worktree's shared Git directory.
+  A `recover` row's `project` is `/`-separated on Windows as well.
+
 - **Yarn Classic aliases report the package they install.** The Classic lock's rows split each
   entry key at commas and took the package name up to the last `@`, so an `npm:` alias such as
   `isnum@npm:is-number@^6.0.0` became a phantom registry package `isnum@npm:is-number` that was
