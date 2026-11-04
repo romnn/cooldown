@@ -286,7 +286,7 @@ impl Workspace {
             diagnostic
                 .with_tool(pctx.tool.as_str())
                 .with_project(pctx.rel_path.as_str())
-                .with_path(pctx.project.manifest.as_str())
+                .with_path(pctx.manifest_report_path())
         };
         let refresh = match self
             .refresh_lock_under_lease(pctx, writer, progress, kind)
@@ -296,7 +296,7 @@ impl Workspace {
             Err(err) => {
                 acc.errors.push(
                     diag_from_error(&err, pctx.tool, pctx.rel_path.as_str(), None)
-                        .with_path(pctx.project.manifest.as_str()),
+                        .with_path(pctx.manifest_report_path()),
                 );
                 return TurnLock::Failed;
             }
@@ -337,7 +337,7 @@ impl Workspace {
             Err(err) => {
                 acc.errors.push(
                     diag_from_error(&err, pctx.tool, pctx.rel_path.as_str(), None)
-                        .with_path(pctx.project.manifest.as_str()),
+                        .with_path(pctx.manifest_report_path()),
                 );
                 TurnLock::Failed
             }
@@ -378,7 +378,7 @@ impl Workspace {
                     )
                     .with_tool(pctx.tool.as_str())
                     .with_project(pctx.rel_path.as_str())
-                    .with_path(pctx.project.manifest.as_str());
+                    .with_path(pctx.manifest_report_path());
                     if opts.allow_stale_lock {
                         acc.warnings.push(diagnostic);
                     } else {

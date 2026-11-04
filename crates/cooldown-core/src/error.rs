@@ -340,6 +340,10 @@ pub struct Diagnostic {
     pub registry: Option<String>,
     /// The filesystem path involved (for example a lockfile or manifest), when
     /// relevant.
+    ///
+    /// It is `/`-separated and relative to the root of the [`project`](Diagnostic::project) the
+    /// diagnostic names, or to the repository root when it names none, so it reads the same on
+    /// every machine and platform.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 }

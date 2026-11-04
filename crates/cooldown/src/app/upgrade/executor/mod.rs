@@ -3364,7 +3364,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     )
                     .with_tool(self.ctx.tool_name())
                     .with_project(self.project_label())
-                    .with_path(self.ctx.pctx.project.manifest.as_str());
+                    .with_path(self.ctx.pctx.manifest_report_path());
                     if self.ctx.opts.allow_stale_lock {
                         self.acc.warnings.push(diag);
                     } else {
@@ -3384,7 +3384,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                             )
                             .with_tool(self.ctx.tool_name())
                             .with_project(self.project_label())
-                            .with_path(self.ctx.pctx.project.manifest.as_str()),
+                            .with_path(self.ctx.pctx.manifest_report_path()),
                         );
                     }
                 }
