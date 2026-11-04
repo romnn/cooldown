@@ -15,6 +15,8 @@
 //! escaped keys, grouped selectors, comments, and line endings read exactly as Yarn reads them,
 //! and anything that parser rejects attributes nothing.
 //!
+//! The lock's flat package graph is read through the same grammar ([`graph`]).
+//!
 //! [parse]: https://github.com/yarnpkg/yarn/blob/v1.22.22/src/lockfile/parse.js
 
 use super::{
@@ -24,6 +26,8 @@ use super::{
 use crate::manifest::workspaces::{FieldSpecifier, WorkspaceManifests};
 use crate::version::is_exact_npm_specifier;
 use std::collections::{BTreeMap, HashMap, HashSet};
+
+pub(super) mod graph;
 
 /// The deepest indentation level the lock reader descends to.
 ///
@@ -592,26 +596,9 @@ enum Field {
 
 impl ClassicLock {
     /// Reads the descriptors of a Classic lock body, or `None` where Yarn's own reader would not
-    /// read it as one: a Berry lock, a merge conflict, a newer lockfile version, or any grammar
-    /// error.
-    ///
-    /// Like Yarn, a leading byte-order mark is dropped and `\r\n` line endings read as `\n`.
+    /// read it as one ([`read_items`]).
     fn read(content: &str) -> Option<Self> {
-        if is_yarn_berry_lock(content) {
-            return None;
-        }
-        let content = content.strip_prefix('\u{feff}').unwrap_or(content);
-        let content = content.replace("\r\n", "\n");
-        if content.contains("<<<<<<<") && content.contains("=======") && content.contains(">>>>>>>")
-        {
-            return None;
-        }
-        let tokens = tokenize(&content)?;
-        let items = Parser {
-            tokens,
-            position: 0,
-        }
-        .parse_object(0)?;
+        let items = read_items(content)?;
         let mut descriptors: HashMap<String, Option<LockedEntry>> = HashMap::new();
         for Item { keys, value } in items {
             let entry = match value {
@@ -631,6 +618,27 @@ impl ClassicLock {
         }
         Some(ClassicLock { descriptors })
     }
+}
+
+/// The top-level items of a Classic lock body, or `None` where Yarn's own reader would not read it
+/// as one: a Berry lock, a merge conflict, a newer lockfile version, or any grammar error.
+///
+/// Like Yarn, a leading byte-order mark is dropped and `\r\n` line endings read as `\n`.
+fn read_items(content: &str) -> Option<Vec<Item>> {
+    if is_yarn_berry_lock(content) {
+        return None;
+    }
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let content = content.replace("\r\n", "\n");
+    if content.contains("<<<<<<<") && content.contains("=======") && content.contains(">>>>>>>") {
+        return None;
+    }
+    let tokens = tokenize(&content)?;
+    Parser {
+        tokens,
+        position: 0,
+    }
+    .parse_object(0)
 }
 
 /// The attribution fields of one entry's object, a repeated field's last value winning as in
