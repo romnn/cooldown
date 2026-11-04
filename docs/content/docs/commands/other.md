@@ -166,6 +166,64 @@ without versions that it would not write, keeping every version-qualified entry 
 package gains an exemption. A list it empties stays as `[]`, and when a selector was withheld or
 left out it writes `minimumReleaseAgeExclude: []` even where the key or the file was absent.
 
+### Yarn Berry
+
+For a Yarn Berry project, `sync` writes the project's `.yarnrc.yml` (or the file
+`YARN_RC_FILENAME` names): the default window as `npmMinimalAgeGate`, in whole minutes rounded up,
+and the `npmPreapprovedPackages` Yarn's gate approves:
+
+```yaml
+# .yarnrc.yml, as written by `cooldown sync` for `min-age = "7d"`
+npmPreapprovedPackages:
+  onConflict: reset
+  value:
+    - "@corp/*"
+    - "is-number@7.0.0"
+npmMinimalAgeGate: 10080
+```
+
+Every other line of the file, comments included, stays as it is, and the file is replaced
+atomically. `sync` runs no Yarn command except `yarn --version`.
+
+Yarn introduced both settings in 4.10.0 and refuses an rc file that sets a setting it does not
+know, so `sync` first checks the Yarn the root `package.json` declares as its `packageManager`
+and the one `yarn --version` reports in the project. A project whose Yarn predates 4.10.0 is
+reported `unsupported` and left alone, like a Yarn Classic project; a project that declares 4.10.0
+or later while an older Yarn runs there is an error, and nothing is written.
+
+The list holds the `latest` and `allow` selectors cooldown proves exempt, as for pnpm, followed by
+the exact versions of young locked packages cooldown admits. Yarn approves a release when any
+entry matches it, and its wildcard `*` does not cross a scope's `/`, so `sync` writes a selector
+only when Yarn matches no name cooldown does not: letters, digits, `.`, `_`, `~`, `-`, single `*`
+wildcards, and a leading `@scope/`, as in `@corp/*` or `eslint-*`. A selector that opens with `*`
+and has no scope, such as `*-plugin`, is written but matches only unscoped packages in Yarn, and
+is reported as a `stricter_native` warning; any other selector, such as `@types/{node,react}`, is
+left out and reported the same way.
+
+Yarn adds up the lists of every `.yarnrc.yml` it reads, the ones above the project and in the home
+directory included, and an empty list there removes nothing. `sync` therefore writes the list with
+`onConflict: reset`, so the project's list is the whole list Yarn applies.
+
+When the default window is a `freeze` or `latest`, `sync` leaves `npmMinimalAgeGate` as it is, and
+reports a freeze as a warning, since a rolling minute count cannot express it. It still removes
+from an existing list every entry without a version range that it would not write, keeps every
+ranged entry, and writes the list in reset form; where no list existed, it writes an empty one only
+when a selector was withheld or left out.
+
+From Yarn 4.17.0, every scope configured under `npmScopes` has an age gate of its own, one day
+unless the entry sets one, instead of the global `npmMinimalAgeGate`. `sync` sets
+`npmMinimalAgeGate` in each scope entry of the project's own `.yarnrc.yml`, written as a plain
+block mapping, and leaves the entry's registry and authentication settings alone. It never adds a
+scope entry, since a new entry would route the scope's packages to Yarn's default registry, so a
+scope configured elsewhere, such as in the home directory's `.yarnrc.yml`, is reported when its
+gate differs: a `config` warning when it is shorter, a `stricter_native` one when it is longer.
+A `YARN_NPM_MINIMAL_AGE_GATE` or `YARN_NPM_PREAPPROVED_PACKAGES` variable overrides the file for
+every Yarn run in its environment, so `sync` warns when the environment it runs in sets one.
+
+Yarn applies the gate only when it picks a version afresh: a version the lock already resolves is
+reused, however young. The exact entries let the locked versions cooldown admits resolve again
+when the lock is regenerated.
+
 ### uv
 
 For uv, `sync` writes the repository-root `uv.toml`: the default window as `exclude-newer`, and

@@ -14,6 +14,47 @@
   a consumer that matched the absolute spelling must match the relative one. The JSON schema and
   `schemaVersion` are unchanged, since every field remains a string.
 
+- **`sync` writes Yarn Berry's native age gate.** A Berry project reported `unsupported`, so a bare
+  `yarn add` or `yarn up` ignored the cooldown window. `sync` now writes the default window into
+  the project's `.yarnrc.yml` as `npmMinimalAgeGate`, in whole minutes rounded up, and the
+  selectors and young locked versions cooldown exempts as `npmPreapprovedPackages`, written with
+  `onConflict: reset` because Yarn adds up the lists of every rc file it reads. Only selectors
+  Yarn matches no more widely than cooldown are written, and a leading `*`, which Yarn stops at a
+  scope's `/`, is reported as narrower. From Yarn 4.17, where every configured scope has a gate of
+  its own that defaults to one day, `sync` sets the gate of each scope entry in the project's file
+  and warns about a scope configured elsewhere whose gate differs, without ever adding a scope
+  entry, which would reroute it. A project whose Yarn predates 4.10.0, which would refuse the
+  settings, is left `unsupported`, and one that declares Yarn 4.10.0 or later while an older Yarn
+  runs there is refused. The rc file keeps its other lines and comments and is replaced atomically, and an
+  rc file sync cannot edit without changing another setting is refused untouched. Atomic
+  replacements now start owner-only on Unix when the file they replace has permissions of its
+  own, so a private file's contents, such as a registry token in `.yarnrc.yml`, are never readable
+  through the temporary file.
+
+- **The pnpm integration tests no longer share pnpm's metadata cache.** Up to four of them run
+  at once, and concurrent pnpm processes writing one per-user cache entry could leave it
+  unreadable, so every later test resolving that package failed with
+  `ERR_PNPM_CACHE_MISSING_AFTER_304` through all of its retries. Each test fixture now gives the
+  pnpm it runs, and the pnpm cooldown starts for it, a private cache and store through
+  `pnpm_config_cache_dir` and `pnpm_config_store_dir`. So that a fixture need not fetch every
+  package's metadata again, a pnpm fixture's cache starts as hard links into a pool of the
+  entries earlier fixtures finished; pnpm replaces an entry by renaming a new file over it, so no
+  fixture writes another's copy, and the pool takes only entries that parse, so a damaged entry
+  stays with the fixture that wrote it.
+
+- **`--allow-stale-lock` waives only pnpm's own stale-lock refusal.** Every nonzero exit of
+  pnpm's frozen lock verification counted as a stale lock, so `--allow-stale-lock` also waived a
+  registry or network failure, an authentication error, an invalid `.npmrc` or
+  `pnpm-workspace.yaml`, an unsupported flag, or a corrupted store, and `check` then evaluated a
+  lock pnpm never confirmed and passed with a stale-lock warning. cooldown now reads the error
+  code pnpm 9, 10, and 11 print: only `ERR_PNPM_OUTDATED_LOCKFILE`,
+  `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`, `ERR_PNPM_NO_LOCKFILE`, and
+  `ERR_PNPM_FROZEN_LOCKFILE_WITH_OUTDATED_LOCKFILE`, alone and from a run that was not
+  interrupted, are a stale lock. Any other failure is a `tool_failed` error that no flag waives,
+  and a mutating command that hits one after its apply reports the lock's status as unknown rather
+  than stale. The verification pins pnpm's reporter, log level, and JSON output, so a `reporter`,
+  `loglevel`, `json`, or `parseable` setting cannot hide the code.
+
 - **Reported paths are relative and `/`-separated instead of absolute.** A diagnostic about a
   project's lock or manifest from `check`, `outdated`, `upgrade`, or `fix`, such as `lock_unknown`,
   `stale_lock`, or `lockfile_unreadable`, named the manifest by its absolute path, so a JSON
