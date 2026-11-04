@@ -23,6 +23,18 @@
   registry.npmjs.org, and `yarn config get` routes the package's scope to the public registry;
   npm's `.npmrc`, which Yarn Berry never reads, no longer vetoes it.
 
+- **A Yarn Classic member owns the release a same-name alias declares.** Member attribution read
+  every `npm:` selector as an alias of another package, so a declaration such as
+  `"has-flag": "npm:has-flag@^4.0.0"` owned no copy, and the release read as transitive though the
+  root-manifest reading counted it direct. A registry reference to the dependency's own name,
+  `npm:` or `yarn:`, scoped or bare, now binds that registry release for its member like a plain
+  range, even where a workspace package carries the name, which Yarn never links for such a
+  reference. Its copy is direct for the member but not eligible for an edit, with a reason naming
+  the reference, since cooldown never rewrites one, and an exact reference such as
+  `npm:has-flag@4.0.0` pins and holds the copy and is protected by the exact-pin guard, as in Yarn
+  Berry. A `yarn:` alias of another package is now read as an alias too, rather than as a source of
+  its own under the declared name.
+
 - **Config layer tokens name repository files relative to the repository root.** A layer's
   origin token, as in `config`'s `layers`, `source`, and `generatedMembers.origin`, `explain`'s
   step `layer` and `decidedBy`, and every row's window `source` and `clampedBy`, spelled a

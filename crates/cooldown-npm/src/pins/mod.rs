@@ -33,13 +33,15 @@
 //! the root `resolutions` can rewrite, a workspace sibling's name, or a descriptor that vanished,
 //! is unknown and protects nothing, and so is every Yarn pin when the captured workspace or the
 //! lock cannot be read.
+//! A same-name registry reference (`"chalk": "npm:chalk@4.1.2"`) binds a registry copy, so its
+//! pin is judged like a plain one.
 //!
 //! Yarn Berry tells an unknown binding from an unproven one: a declaration whose binding the lock
 //! no longer proves, because it records another descriptor, no entry, or no workspace for it.
 //! A required pin the baseline lock proved bound but the settled lock leaves unproven has lost
 //! its evidence, which is a violation rather than a pass ([`Observed::Unproven`]).
-//! A Berry pin is the version it constrains the dependency itself to, a same-name `npm:`
-//! reference unwrapped ([`NodeLock::install_pin`]).
+//! A Yarn pin is the version it constrains the dependency itself to, a same-name registry
+//! reference unwrapped as each generation splits it ([`NodeLock::install_pin`]).
 
 use crate::lock::{MemberResolution, NodeLock, WorkspaceManifests};
 use crate::manifest::{self, DeclarationKey, ExactDeclaration, ManifestRewrite};
