@@ -15,9 +15,14 @@ pub enum Origin {
     Global,
     /// A native manifest config, normalised into the unified model.
     Native,
-    /// A repo/project `cooldown.toml` at the given path (nearer wins within the cascade).
+    /// A repo/project `cooldown.toml` (nearer wins within the cascade).
+    ///
+    /// The path is the file's report spelling: `/`-separated and relative to the repository
+    /// root, or absolute for a file outside it (see [`Origin::token`]).
     Repo(camino::Utf8PathBuf),
     /// An explicit `--config` / `COOLDOWN_CONFIG` file (one shared top file layer).
+    ///
+    /// The path is spelled like [`Origin::Repo`]'s.
     Config(camino::Utf8PathBuf),
     /// `COOLDOWN_*` environment variables.
     Env,
@@ -26,7 +31,21 @@ pub enum Origin {
 }
 
 impl Origin {
-    /// The stable token used in the JSON `minAgeSource` (`default|global|native|repo:<path>|…`).
+    /// The stable token that names this layer in reports and messages.
+    ///
+    /// It is one of `default`, `global`, `native`, `env`, `cli`, `repo:<path>` or
+    /// `config:<path>`.
+    /// The `<path>` of a file inside the repository is `/`-separated and relative to the
+    /// repository root, such as `repo:cooldown.toml` or `config:ci/cooldown.toml`, so it reads the
+    /// same on every machine and platform.
+    /// A file outside the repository has no such spelling and keeps its absolute, native path,
+    /// which is machine-specific by nature: a `--config` file elsewhere, or a cascade
+    /// `cooldown.toml` outside the root, which only a run that no `.git` anchors can reach.
+    /// The global config is always `global`, wherever it lives.
+    ///
+    /// The JSON fields built from it are a window's `source` and `clampedBy`, `config`'s `source`,
+    /// `layers` and `generatedMembers.origin`, and `explain`'s `decidedBy` and step `layer`; a
+    /// `source` appends `:<selector>` when a rule decided it.
     #[must_use]
     pub fn token(&self) -> String {
         match self {
