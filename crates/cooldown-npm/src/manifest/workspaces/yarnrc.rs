@@ -165,7 +165,11 @@ impl YarnConfiguration {
 /// runs ([Configuration.ts][configuration]).
 ///
 /// [configuration]: https://github.com/yarnpkg/berry/blob/%40yarnpkg/cli/4.18.1/packages/yarnpkg-core/sources/Configuration.ts
-fn rc_files(root: &Utf8Path, home: &Utf8Path, environment: &YarnEnvironment) -> Vec<Utf8PathBuf> {
+pub(crate) fn rc_files(
+    root: &Utf8Path,
+    home: &Utf8Path,
+    environment: &YarnEnvironment,
+) -> Vec<Utf8PathBuf> {
     let filename = environment
         .rc_filename
         .as_deref()
@@ -187,7 +191,10 @@ fn rc_files(root: &Utf8Path, home: &Utf8Path, environment: &YarnEnvironment) -> 
 ///
 /// An empty file sets nothing.
 /// A file that cannot be read, or holds no YAML mapping, is refused, since Yarn refuses it too.
-fn read_settings(root: &Utf8Path, path: &Utf8Path) -> Result<Option<Map<String, Value>>, String> {
+pub(crate) fn read_settings(
+    root: &Utf8Path,
+    path: &Utf8Path,
+) -> Result<Option<Map<String, Value>>, String> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),

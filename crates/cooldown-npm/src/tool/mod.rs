@@ -3996,7 +3996,7 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         }
     }
 
-    fn requires_sync_admission_evaluation(&self) -> bool {
+    fn requires_sync_admission_evaluation(&self, _project: &Project) -> bool {
         L::NATIVE_MIN_AGE_FILE.is_some()
     }
 

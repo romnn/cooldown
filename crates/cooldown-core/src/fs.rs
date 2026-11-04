@@ -1462,6 +1462,31 @@ fn write_replacement(
     write_replacement_checked(path, bytes, permissions, || Ok(()))
 }
 
+/// The options a replacement's temporary file is created with, `owner_only` when the
+/// replacement's final permissions are known and applied once its bytes are written.
+///
+/// The bytes may be as secret as the file they replace, such as a config file holding a registry
+/// token, so on Unix the temporary file starts readable by its owner alone instead of by the
+/// umask's default until those permissions arrive.
+/// A replacement without known permissions keeps the default mode, which is also its final one.
+#[cfg_attr(
+    not(unix),
+    allow(
+        unused_variables,
+        reason = "only Unix creates a file with an explicit mode"
+    )
+)]
+fn replacement_options(owner_only: bool) -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if owner_only {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options
+}
+
 fn write_replacement_checked<F>(
     path: &Path,
     bytes: &[u8],
@@ -1484,11 +1509,7 @@ where
             std::process::id(),
             attempt
         ));
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
+        let mut file = match replacement_options(permissions.is_some()).open(&tmp) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
@@ -1567,6 +1588,32 @@ mod tests {
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
         );
+        Ok(())
+    }
+
+    /// A replacement whose final permissions are known is created owner-only, so the bytes of a
+    /// private file are never readable through its temporary file before those permissions are
+    /// applied, while the final file still gets the permissions of the one it replaces.
+    #[cfg(unix)]
+    #[test]
+    fn a_replacement_of_a_private_file_is_never_readable_by_others() -> eyre::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir()?;
+        let mode = |path: &std::path::Path| -> eyre::Result<u32> {
+            Ok(std::fs::metadata(path)?.permissions().mode() & 0o777)
+        };
+
+        // The temporary file starts owner-only whatever the umask allows.
+        let temporary = dir.path().join("owner-only.tmp");
+        super::replacement_options(true).open(&temporary)?;
+        assert_eq!(mode(&temporary)?, 0o600);
+
+        // The replacement still ends with the replaced file's own permissions.
+        let path = dir.path().join(".yarnrc.yml");
+        std::fs::write(&path, "npmAuthToken: secret\n")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
+        atomic_write(&path, b"npmAuthToken: secret\nnpmMinimalAgeGate: 10080\n")?;
+        assert_eq!(mode(&path)?, 0o640);
         Ok(())
     }
 

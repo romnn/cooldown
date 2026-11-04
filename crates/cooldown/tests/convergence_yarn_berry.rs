@@ -11,7 +11,9 @@
 //!   direct but owned by no member;
 //! - excluding a member drops exactly the rows only it owns;
 //! - `upgrade` refuses a Berry project without touching any of its files;
-//! - a Berry `yarn` never runs on a Classic lock, which it would silently migrate.
+//! - a Berry `yarn` never runs on a Classic lock, which it would silently migrate;
+//! - the age gate `sync` writes into `.yarnrc.yml` is the one Yarn applies: a release younger
+//!   than it is quarantined when resolved afresh, and a release cooldown exempts or admits is not.
 //!
 //! Each fixture declares `packageManager: "yarn@4.18.1"` and checks the version `yarn` reports
 //! in it, so a Yarn Classic or another Berry release on `PATH` skips the tests locally and fails
@@ -861,6 +863,356 @@ fn a_berry_plugin_makes_every_binding_unproven() -> eyre::Result<()> {
                 && message.contains("so cooldown attributes no dependency to a workspace member")
         ),
         "{warnings:?}"
+    );
+    Ok(())
+}
+
+/// A Berry project in `dir` (`.` for the fixture root) declaring `dependencies`, with a comment and
+/// a setting in its `.yarnrc.yml` and `config` as the repository's `cooldown.toml`.
+///
+/// No dependency here is a release the tests later resolve afresh, so a resolve that succeeds
+/// does so through the age gate, never by reusing a locked copy.
+fn age_gate_fixture(dir: &str, dependencies: &str, config: &str) -> Fixture {
+    let fixture = Fixture::new().tag_independent();
+    let file = |name: &str| {
+        if dir == "." {
+            name.to_string()
+        } else {
+            format!("{dir}/{name}")
+        }
+    };
+    fixture
+        .write(
+            &file("package.json"),
+            &indoc::formatdoc! {r#"
+                {{
+                  "name": "berry-age-gate",
+                  "private": true,
+                  "packageManager": "yarn@{YARN}",
+                  "dependencies": {dependencies}
+                }}
+            "#},
+        )
+        .write(
+            &file(".yarnrc.yml"),
+            "# Kept by every sync\nenableTelemetry: false\n",
+        )
+        .write("cooldown.toml", config);
+    fixture
+}
+
+/// Seeds the lock of the project in `dir` with Yarn's own resolution, before any gate applies.
+fn seed_lock_in(fixture: &Fixture, dir: &str) -> eyre::Result<()> {
+    let lock = if dir == "." {
+        "yarn.lock".to_string()
+    } else {
+        format!("{dir}/yarn.lock")
+    };
+    fixture.write(&lock, "");
+    yarn_in(
+        fixture,
+        dir,
+        "seed the Berry lock",
+        &["install", "--mode=update-lockfile"],
+    )?
+    .require_success()?;
+    Ok(())
+}
+
+/// Runs `yarn args` in the project in `dir`.
+fn yarn_in(
+    fixture: &Fixture,
+    dir: &str,
+    phase: &str,
+    args: &[&str],
+) -> eyre::Result<support::CapturedOutput> {
+    let mut full = vec!["--cwd", dir];
+    full.extend_from_slice(args);
+    fixture.run_tool_traced(phase, "yarn", &full, &[])
+}
+
+/// Yarn's own reading of its setting `key` in the project in `dir`.
+fn yarns_setting(fixture: &Fixture, dir: &str, key: &str) -> eyre::Result<serde_json::Value> {
+    let output = yarn_in(
+        fixture,
+        dir,
+        "read a Yarn setting",
+        &["config", "get", key, "--json"],
+    )?
+    .require_success()?;
+    Ok(serde_json::from_str(output.stdout_str().trim())?)
+}
+
+/// Whether Yarn refuses `args` in the project in `dir` because its age gate quarantines every
+/// release they ask for; any other failure fails the test.
+fn quarantined(fixture: &Fixture, dir: &str, args: &[&str]) -> eyre::Result<bool> {
+    let output = yarn_in(fixture, dir, "resolve under the age gate", args)?;
+    if output.status.success() {
+        return Ok(false);
+    }
+    let text = format!("{}{}", output.stdout_str(), output.stderr_str());
+    eyre::ensure!(
+        text.contains("quarantined"),
+        "yarn {args:?} failed for another reason than the age gate: {text}"
+    );
+    Ok(true)
+}
+
+/// Runs `cooldown sync --tool yarn` with `extra` and returns each item's status, requiring the
+/// sync to succeed.
+fn sync_statuses(fixture: &Fixture, extra: &[&str]) -> eyre::Result<Vec<String>> {
+    let mut args = vec!["sync", "--tool", "yarn"];
+    args.extend_from_slice(extra);
+    let run = cooldown(fixture, &args)?;
+    eyre::ensure!(run.code == Some(0), "sync failed: {:#}", run.envelope);
+    Ok(run
+        .envelope
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| Some(item.get("status")?.as_str()?.to_string()))
+        .collect())
+}
+
+/// One hundred years in Yarn's minutes: older than every release, so the gate quarantines each
+/// one nothing approves.
+const CENTURY_MINUTES: u64 = 36_500 * 24 * 60;
+
+/// The gate `sync` writes is the one Yarn applies, and a `latest` package is approved by it:
+/// with the gate alone Yarn quarantines `has-flag@4.0.0` and changes nothing, and once cooldown
+/// exempts `has-flag` the same resolve succeeds while every other package stays gated.
+/// A dry run reports the write without making it, the rc file keeps its comment and setting, and
+/// a second sync is unchanged.
+#[test]
+fn berry_sync_writes_the_age_gate_yarn_enforces() -> eyre::Result<()> {
+    let fixture = age_gate_fixture(".", r#"{ "is-odd": "3.0.1" }"#, "min-age = \"36500d\"\n");
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock_in(&fixture, ".")?;
+    let rc_before = fixture.read_bytes(".yarnrc.yml");
+
+    // A dry run reports the write and leaves the rc file alone.
+    assert_eq!(sync_statuses(&fixture, &["--dry-run"])?, ["written"]);
+    assert_eq!(fixture.read_bytes(".yarnrc.yml"), rc_before);
+
+    assert_eq!(sync_statuses(&fixture, &[])?, ["written"]);
+    let rc = String::from_utf8(fixture.read_bytes(".yarnrc.yml"))?;
+    assert!(
+        rc.starts_with("# Kept by every sync\nenableTelemetry: false\n"),
+        "{rc}"
+    );
+    assert_eq!(
+        yarns_setting(&fixture, ".", "npmMinimalAgeGate")?,
+        serde_json::json!(CENTURY_MINUTES)
+    );
+
+    // The gate alone quarantines the release, and the failed resolve changes nothing.
+    let manifest = fixture.read_bytes("package.json");
+    let lock = fixture.read_bytes("yarn.lock");
+    let add_has_flag = ["add", "has-flag@4.0.0", "--mode=update-lockfile"];
+    assert!(quarantined(&fixture, ".", &add_has_flag)?);
+    assert_eq!(fixture.read_bytes("package.json"), manifest);
+    assert_eq!(fixture.read_bytes("yarn.lock"), lock);
+
+    // Exempting `has-flag` approves it natively, and only it.
+    fixture.write(
+        "cooldown.toml",
+        indoc! {r#"
+            min-age = "36500d"
+
+            [package."has-flag"]
+            latest = true
+        "#},
+    );
+    assert_eq!(sync_statuses(&fixture, &[])?, ["written"]);
+    assert_eq!(
+        yarns_setting(&fixture, ".", "npmPreapprovedPackages")?,
+        serde_json::json!(["has-flag"])
+    );
+    assert!(!quarantined(&fixture, ".", &add_has_flag)?);
+    assert!(quarantined(
+        &fixture,
+        ".",
+        &["add", "is-number@7.0.0", "--mode=update-lockfile"]
+    )?);
+
+    assert_eq!(sync_statuses(&fixture, &[])?, ["unchanged"]);
+    Ok(())
+}
+
+/// A young locked version cooldown admits is approved by its exact version, so the lock still
+/// resolves afresh: without the admission Yarn quarantines the pinned `is-number@7.0.0` once the
+/// lock is gone, and with it the same fresh resolve succeeds.
+#[test]
+fn berry_sync_approves_the_young_locked_versions_cooldown_admits() -> eyre::Result<()> {
+    let fixture = age_gate_fixture(".", r#"{ "is-number": "7.0.0" }"#, "min-age = \"36500d\"\n");
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock_in(&fixture, ".")?;
+    let seeded = String::from_utf8(fixture.read_bytes("yarn.lock"))?;
+    let resolve_afresh = |fixture: &Fixture| -> eyre::Result<bool> {
+        fixture.write("yarn.lock", "");
+        quarantined(fixture, ".", &["install", "--mode=update-lockfile"])
+    };
+
+    // The gate alone approves nothing, so a fresh resolve of the pin is quarantined.
+    assert_eq!(sync_statuses(&fixture, &[])?, ["written"]);
+    assert_eq!(
+        yarns_setting(&fixture, ".", "npmPreapprovedPackages")?,
+        serde_json::json!([])
+    );
+    assert!(resolve_afresh(&fixture)?);
+
+    // A shorter window for `is-number` admits its locked version, which the admission sync reads
+    // from the restored lock.
+    fixture.write("yarn.lock", &seeded);
+    fixture.write(
+        "cooldown.toml",
+        indoc! {r#"
+            min-age = "36500d"
+
+            [package."is-number"]
+            min-age = "1d"
+        "#},
+    );
+    assert_eq!(sync_statuses(&fixture, &[])?, ["written"]);
+    assert_eq!(
+        yarns_setting(&fixture, ".", "npmPreapprovedPackages")?,
+        serde_json::json!(["is-number@7.0.0"])
+    );
+    assert!(!resolve_afresh(&fixture)?);
+    Ok(())
+}
+
+/// Yarn adds the entries of every rc file above the project to its list, so the list `sync`
+/// writes resets them: the `has-flag` an ancestor approves is approved before the sync and
+/// quarantined after it.
+#[test]
+fn berry_sync_masks_inherited_approvals() -> eyre::Result<()> {
+    let fixture = age_gate_fixture("app", r#"{ "is-odd": "3.0.1" }"#, "min-age = \"36500d\"\n");
+    fixture.write(".yarnrc.yml", "npmPreapprovedPackages:\n  - \"has-flag\"\n");
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock_in(&fixture, "app")?;
+    assert_eq!(
+        yarns_setting(&fixture, "app", "npmPreapprovedPackages")?,
+        serde_json::json!(["has-flag"])
+    );
+
+    assert_eq!(sync_statuses(&fixture, &[])?, ["written"]);
+    assert_eq!(
+        yarns_setting(&fixture, "app", "npmPreapprovedPackages")?,
+        serde_json::json!([])
+    );
+    assert!(quarantined(
+        &fixture,
+        "app",
+        &["add", "has-flag@4.0.0", "--mode=update-lockfile"]
+    )?);
+    Ok(())
+}
+
+/// Yarn gates a configured scope by the scope's own gate, a one-day default unless set, so
+/// `sync` sets the gate of the scope entry the project's rc file holds: before the sync Yarn
+/// reads 1440 minutes for `@sindresorhus`, after it the written gate, with the scope's registry
+/// untouched, and `@sindresorhus/is@4.6.0` is quarantined.
+#[test]
+fn berry_sync_gates_the_scopes_the_project_configures() -> eyre::Result<()> {
+    let fixture = age_gate_fixture(".", r#"{ "is-odd": "3.0.1" }"#, "min-age = \"36500d\"\n");
+    fixture.write(
+        ".yarnrc.yml",
+        indoc! {r#"
+            enableTelemetry: false
+            npmScopes:
+              sindresorhus:
+                npmRegistryServer: "https://registry.yarnpkg.com"
+        "#},
+    );
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock_in(&fixture, ".")?;
+    let scope = |fixture: &Fixture| -> eyre::Result<serde_json::Value> {
+        let scopes = yarns_setting(fixture, ".", "npmScopes")?;
+        scopes
+            .get("sindresorhus")
+            .cloned()
+            .ok_or_else(|| eyre::eyre!("Yarn reads no `sindresorhus` scope: {scopes}"))
+    };
+    assert_eq!(
+        scope(&fixture)?.get("npmMinimalAgeGate"),
+        Some(&serde_json::json!(1440))
+    );
+
+    assert_eq!(sync_statuses(&fixture, &[])?, ["written"]);
+    let gated = scope(&fixture)?;
+    assert_eq!(
+        gated.get("npmMinimalAgeGate"),
+        Some(&serde_json::json!(CENTURY_MINUTES))
+    );
+    assert_eq!(
+        gated.get("npmRegistryServer"),
+        Some(&serde_json::json!("https://registry.yarnpkg.com"))
+    );
+    assert!(quarantined(
+        &fixture,
+        ".",
+        &["add", "@sindresorhus/is@4.6.0", "--mode=update-lockfile"]
+    )?);
+    Ok(())
+}
+
+/// An empty scope entry makes Yarn read the scope's defaults and ignore its entries in the rc
+/// files above, so `sync` never fills it with a gate, which would restore the inherited registry:
+/// Yarn routes `@sindresorhus` to its default registry before and after the sync, its gate stays
+/// the one-day default, and the sync warns about it.
+#[test]
+fn berry_sync_leaves_an_empty_scope_entry_masking_its_inherited_one() -> eyre::Result<()> {
+    let fixture = age_gate_fixture("app", r#"{ "is-odd": "3.0.1" }"#, "min-age = \"36500d\"\n");
+    fixture
+        .write(
+            ".yarnrc.yml",
+            indoc! {r#"
+                npmScopes:
+                  sindresorhus:
+                    npmRegistryServer: "https://npm.corp.invalid"
+            "#},
+        )
+        .write(
+            "app/.yarnrc.yml",
+            "enableTelemetry: false\nnpmScopes:\n  sindresorhus:\n",
+        );
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock_in(&fixture, "app")?;
+    let scope = |fixture: &Fixture| -> eyre::Result<serde_json::Value> {
+        let scopes = yarns_setting(fixture, "app", "npmScopes")?;
+        scopes
+            .get("sindresorhus")
+            .cloned()
+            .ok_or_else(|| eyre::eyre!("Yarn reads no `sindresorhus` scope: {scopes}"))
+    };
+    let masked = scope(&fixture)?;
+    assert_eq!(
+        masked.get("npmRegistryServer"),
+        Some(&serde_json::json!("https://registry.yarnpkg.com"))
+    );
+
+    let run = cooldown(&fixture, &["sync", "--tool", "yarn"])?;
+    assert_eq!(run.code, Some(0), "{:#}", run.envelope);
+    assert_eq!(scope(&fixture)?, masked);
+    assert!(
+        messages(&run.envelope, "warnings")
+            .iter()
+            .any(|message| message.contains("`npmScopes.sindresorhus`")
+                && message.contains("one-day default")),
+        "{:#}",
+        run.envelope
     );
     Ok(())
 }

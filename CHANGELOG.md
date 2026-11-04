@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **`sync` writes Yarn Berry's native age gate.** A Berry project reported `unsupported`, so a bare
+  `yarn add` or `yarn up` ignored the cooldown window. `sync` now writes the default window into
+  the project's `.yarnrc.yml` as `npmMinimalAgeGate`, in whole minutes rounded up, and the
+  selectors and young locked versions cooldown exempts as `npmPreapprovedPackages`, written with
+  `onConflict: reset` because Yarn adds up the lists of every rc file it reads. Only selectors
+  Yarn matches no more widely than cooldown are written, and a leading `*`, which Yarn stops at a
+  scope's `/`, is reported as narrower. From Yarn 4.17, where every configured scope has a gate of
+  its own that defaults to one day, `sync` sets the gate of each scope entry in the project's file
+  and warns about a scope configured elsewhere whose gate differs, without ever adding a scope
+  entry, which would reroute it. A project whose Yarn predates 4.10.0, which would refuse the
+  settings, is left `unsupported`, and one that declares Yarn 4.10.0 or later while an older Yarn
+  runs there is refused. The rc file keeps its other lines and comments and is replaced atomically, and an
+  rc file sync cannot edit without changing another setting is refused untouched. Atomic
+  replacements now start owner-only on Unix when the file they replace has permissions of its
+  own, so a private file's contents, such as a registry token in `.yarnrc.yml`, are never readable
+  through the temporary file.
+
 - **The pnpm integration tests no longer share pnpm's metadata cache.** Up to four of them run
   at once, and concurrent pnpm processes writing one per-user cache entry could leave it
   unreadable, so every later test resolving that package failed with

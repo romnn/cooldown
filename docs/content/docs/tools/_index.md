@@ -63,9 +63,12 @@ since that install, can be misattributed. Not yet supported for Berry:
 
 - lock-currency verification, so `check` fails closed on a Berry project as it does on a Yarn
   Classic one, and advisory identity;
-- `sync` of Yarn's native `npmMinimalAgeGate`;
 - every mutation: `upgrade`, `fix`, and `--build` refuse a Berry project before running Yarn, and
   `outdated` warns that its adoptable rows were not verified against `upgrade`.
+
+For a Berry project run by Yarn 4.10 or later, [`sync`]({{< relref "../commands/other.md" >}}#yarn-berry)
+writes the native age gate, `npmMinimalAgeGate` and `npmPreapprovedPackages`, into its
+`.yarnrc.yml`; a Yarn Classic project has no native age gate.
 
 Before running Yarn on a Classic lock, cooldown checks that the Yarn the project declares
 (`packageManager`) and the one `yarn --version` reports there, through `yarnPath` or Corepack, are
