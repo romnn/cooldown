@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Reported paths are relative and `/`-separated instead of absolute.** A diagnostic about a
+  project's lock or manifest from `check`, `outdated`, `upgrade`, or `fix`, such as `lock_unknown`,
+  `stale_lock`, or `lockfile_unreadable`, named the manifest by its absolute path, so a JSON
+  report leaked the checkout's location and differed between machines and between Windows and
+  Unix. Its `path` is now relative to the project root (`package.json`, `Cargo.toml`), as the
+  adapters' own diagnostics already were, beside the scan-relative `project`. A `sync` row's
+  `path` is relative to the directory its `project` names, `baseline` reports its file as
+  `.cooldown-baseline.toml`, and a `recover` warning's `path` is relative to the repository root,
+  or left out for an artifact outside it, such as one in a linked worktree's shared Git directory.
+  A `recover` row's `project` is `/`-separated on Windows as well.
+
 - **Yarn Berry workspace members are attributed through the lock's own workspace entries.** A
   Berry run credited nothing per member: the rows followed the root `package.json`, so a
   dependency only a member declares read as transitive, and the run warned about it. A Berry lock
