@@ -96,7 +96,7 @@ fn live_latest_tag(fixture: &Fixture) -> Option<String> {
 #[test]
 fn outdated_caps_the_adoptable_target_at_the_live_latest_dist_tag() {
     skip_if_missing!("pnpm");
-    let fixture = Fixture::new();
+    let fixture = Fixture::pnpm();
     fixture.write("package.json", PACKAGE_JSON);
     fixture
         .run_unbounded(
