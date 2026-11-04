@@ -22,7 +22,12 @@
 mod berry;
 mod yarnrc;
 
-pub(crate) use yarnrc::{YarnEnvironment, rc_files, read_settings};
+#[cfg(test)]
+pub(crate) use yarnrc::YarnVariable;
+pub(crate) use yarnrc::{
+    DEFAULT_RC_FILENAME, YarnConfiguration, YarnEnvironment, configures_plugins, parse_settings,
+    rc_files, read_settings,
+};
 
 use super::{DeclarationKey, display_rel};
 use camino::{Utf8Path, Utf8PathBuf};

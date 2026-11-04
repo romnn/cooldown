@@ -50,8 +50,9 @@ const LAST_PROTOCOL_LESS_SCHEMA: u64 = 6;
 ///
 /// It reads the registry releases the lock resolves, and attributes each to the workspace members
 /// whose own manifest declarations the lock binds to it ([`attribution`]).
-/// Lock verification, native `sync`, and mutation are not supported yet, so the `yarn` adapter
-/// ([`YarnTool`](crate::YarnTool)) runs no resolver for a Berry project.
+/// Native `sync` and mutation are not supported yet, so the `yarn` adapter
+/// ([`YarnTool`](crate::YarnTool)) runs no resolver for a Berry project; it verifies the lock
+/// itself, in a copy of the project, since this backend has no in-place check to run.
 /// Berry binds peers through virtual packages its lock does not record, so the peer gate stays out
 /// of its locks ([`NodeLock::PEER_CONTEXTS_MODELED`]).
 pub(crate) struct YarnBerry;
@@ -62,6 +63,7 @@ impl NodeLock for YarnBerry {
     const BIN: &'static str = "yarn";
     const PEER_CONTEXTS_MODELED: bool = false;
     const WORKSPACE_MANIFESTS: Option<WorkspaceDialect> = Some(WorkspaceDialect::Berry);
+    const NPMRC_ROUTING: bool = false;
 
     fn parse(content: &str) -> Result<Vec<NameVersion>> {
         Ok(BerryLock::read(content)?.registry_releases())
@@ -156,8 +158,8 @@ enum BerrySource {
     /// A release of the locator's own package from the npm registry, at this version.
     ///
     /// The archive may still come from another URL (an `__archiveUrl` parameter), and a checksum
-    /// or a hard link proves nothing about which registry served it, so the release carries no
-    /// origin evidence.
+    /// or a hard link proves nothing about which registry served it, so the release's origin
+    /// evidence is only what its reference binds ([`Locator::registry_origin`]).
     Registry { version: String },
     /// A workspace of the project, at this project-relative, `/`-separated path (`.` for the root).
     Workspace { path: String },
@@ -245,22 +247,53 @@ impl BerryLock {
         })
     }
 
-    /// Every registry release the lock resolves, named by the package the locator resolved, an
-    /// npm alias's target included.
+    /// Every registry release the lock resolves, once each, named by the package the locator
+    /// resolved, an npm alias's target included.
     ///
-    /// No entry records origin evidence ([`LockOrigin::Unrecorded`]).
+    /// A release's origin is what all of its locators prove together ([`combined_origin`]): one
+    /// release can have several locators, told apart by an `__archiveUrl` binding, and an
+    /// identity granted on one locator's evidence would also cover the copy another locator
+    /// fetches from elsewhere.
     pub(crate) fn registry_releases(&self) -> Vec<NameVersion> {
-        self.packages
-            .iter()
-            .filter_map(|package| match &package.source {
-                BerrySource::Registry { version } => Some(NameVersion {
-                    name: package.locator.ident.full_name(),
+        let mut releases: Vec<NameVersion> = Vec::new();
+        let mut positions: HashMap<RegistryRelease, usize> = HashMap::new();
+        for package in &self.packages {
+            let BerrySource::Registry { version } = &package.source else {
+                continue;
+            };
+            let name = package.locator.ident.full_name();
+            let origin = package.locator.registry_origin();
+            let release = RegistryRelease {
+                name: name.clone(),
+                version: version.clone(),
+            };
+            if let Some(recorded) = positions
+                .get(&release)
+                .and_then(|position| releases.get_mut(*position))
+            {
+                let first = std::mem::replace(&mut recorded.origin, LockOrigin::Unrecorded);
+                recorded.origin = combined_origin(first, &origin);
+            } else {
+                positions.insert(release, releases.len());
+                releases.push(NameVersion {
+                    name,
                     version: version.clone(),
-                    origin: LockOrigin::Unrecorded,
-                }),
-                BerrySource::Workspace { .. } | BerrySource::Unregistered => None,
-            })
-            .collect()
+                    origin,
+                });
+            }
+        }
+        releases
+    }
+
+    /// Every descriptor range and locator reference the lock records, in document order.
+    pub(crate) fn references(&self) -> impl Iterator<Item = &str> {
+        self.packages.iter().flat_map(|package| {
+            package
+                .descriptors
+                .iter()
+                .map(|descriptor| descriptor.range.as_str())
+                .chain([package.locator.reference.as_str()])
+        })
     }
 
     /// The registry releases that only npm aliases resolve to: no descriptor of the release's own
@@ -827,6 +860,66 @@ impl Locator {
     }
 }
 
+impl Locator {
+    /// What an npm registry locator's reference proves about where Yarn fetches its archive.
+    ///
+    /// Without bindings, Yarn's npm fetcher requests the archive from the registry Yarn's
+    /// configuration routes the package's scope to, so the lock says only "the configured
+    /// registry" ([`LockOrigin::ConfiguredRegistry`]).
+    /// A lone `__archiveUrl` binding names the URL the archive is fetched from whatever the
+    /// configuration says ([`LockOrigin::Url`]).
+    /// Any other binding proves nothing ([`LockOrigin::Unrecorded`]).
+    /// See [`NpmSemverFetcher`][semver] and [`NpmHttpFetcher`][http].
+    ///
+    /// [semver]: https://github.com/yarnpkg/berry/blob/%40yarnpkg/cli/4.18.1/packages/plugin-npm/sources/NpmSemverFetcher.ts
+    /// [http]: https://github.com/yarnpkg/berry/blob/%40yarnpkg/cli/4.18.1/packages/plugin-npm/sources/NpmHttpFetcher.ts
+    fn registry_origin(&self) -> LockOrigin {
+        let Some((_, bindings)) = self.reference.split_once("::") else {
+            return LockOrigin::ConfiguredRegistry;
+        };
+        let mut parameters = bindings.split('&');
+        let (Some(parameter), None) = (parameters.next(), parameters.next()) else {
+            return LockOrigin::Unrecorded;
+        };
+        match parameter.split_once('=') {
+            Some((key, url)) if query_decode(key).as_deref() == Some(ARCHIVE_URL_BINDING) => {
+                query_decode(url).map_or(LockOrigin::Unrecorded, LockOrigin::Url)
+            }
+            _ => LockOrigin::Unrecorded,
+        }
+    }
+}
+
+/// The binding Yarn's npm resolver adds to a locator whose archive the registry serves from an
+/// unconventional URL.
+const ARCHIVE_URL_BINDING: &str = "__archiveUrl";
+
+/// Decodes one component of a binding query string as Node's `querystring.parse` does: `+` is a
+/// space, then `%XX` escapes are decoded.
+fn query_decode(component: &str) -> Option<String> {
+    percent_decode(&component.replace('+', " "))
+}
+
+/// The origin evidence of a release whose locators prove `first` and `second`.
+///
+/// The release earns an identity only when every locator does: either recording no origin, or a
+/// URL off the public registry, withholds it, and a locator that leaves the registry to Yarn's
+/// configuration keeps it provisional.
+fn combined_origin(first: LockOrigin, second: &LockOrigin) -> LockOrigin {
+    let public = |origin: &LockOrigin| match origin {
+        LockOrigin::Unrecorded => false,
+        LockOrigin::Url(url) => crate::npmrc::resolved_from_npmjs(url),
+        LockOrigin::ConfiguredRegistry => true,
+    };
+    if !public(&first) || !public(second) {
+        LockOrigin::Unrecorded
+    } else if first == LockOrigin::ConfiguredRegistry || *second == LockOrigin::ConfiguredRegistry {
+        LockOrigin::ConfiguredRegistry
+    } else {
+        first
+    }
+}
+
 impl std::fmt::Display for Locator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}@{}", self.ident.full_name(), self.reference)
@@ -871,7 +964,7 @@ impl<'a> ReferenceParts<'a> {
 
 /// Decodes `%XX` escapes as JavaScript's `decodeURIComponent` does, or `None` for a malformed
 /// escape or a result that is no UTF-8.
-fn percent_decode(text: &str) -> Option<String> {
+pub(crate) fn percent_decode(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;

@@ -198,6 +198,13 @@ impl SharedHttp {
         &self.inner.opts
     }
 
+    /// Returns the directory the client keeps its response cache in, which adapters may also use
+    /// for scratch state of their own.
+    #[must_use]
+    pub fn cache_dir(&self) -> &std::path::Path {
+        &self.inner.cache_dir
+    }
+
     fn semaphore_for(&self, host: &str) -> Arc<Semaphore> {
         let mut hosts = self
             .inner

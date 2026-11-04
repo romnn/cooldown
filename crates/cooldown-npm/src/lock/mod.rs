@@ -22,7 +22,7 @@ mod yarn_berry;
 pub use crate::manifest::workspaces::{WorkspaceDialect, WorkspaceManifests};
 pub use yarn::{UnattributedName, Unproven, UnprovenDeclaration, YarnBindings};
 
-pub(crate) use yarn_berry::{YarnBerry, berry_workspace_paths};
+pub(crate) use yarn_berry::{BerryLock, YarnBerry, berry_workspace_paths, percent_decode};
 
 use crate::version::{CeilingHold, RangeMatch, is_exact_npm_specifier, range_match};
 use cooldown_core::{CoreError, Result, ToolId};
@@ -57,6 +57,13 @@ pub trait NodeLock: Send + Sync + 'static {
     /// See [`EffectiveRegistryQuery`]; the default is the manager with no reliably parseable query
     /// (yarn classic, bun) or none wired yet (yarn Berry), whose identities never survive the feed.
     const EFFECTIVE_REGISTRY: EffectiveRegistryQuery = EffectiveRegistryQuery::Unavailable;
+
+    /// Whether the manager routes registry requests by npm's configuration (`.npmrc` and
+    /// `npm_config_*`), whose overrides then veto an advisory identity at read time.
+    ///
+    /// Yarn Berry reads none of it: its routing lives in its own configuration, which the `yarn`
+    /// adapter confirms when the advisory feed runs.
+    const NPMRC_ROUTING: bool = true;
 
     /// Whether the peer gate can tell which copy a member's peer contract binds to.
     ///
@@ -237,7 +244,9 @@ pub trait NodeLock: Send + Sync + 'static {
     ///
     /// The exact-pin guard (`ProtectedPins`) captures and judges this version.
     /// Default: the specifier itself when it spells an exact version (`1.2.3`, `=1.2.3`).
-    /// Yarn Berry also unwraps a same-name `npm:` reference (`npm:1.2.3`, `npm:chalk@1.2.3`).
+    /// Yarn also unwraps a same-name registry reference, each generation as its own resolver
+    /// splits it: Berry `npm:1.2.3` and `npm:chalk@1.2.3`, Classic `npm:chalk@1.2.3` and
+    /// `yarn:chalk@1.2.3`.
     #[must_use]
     fn install_pin<'a>(_dependency: &str, specifier: &'a str) -> Option<&'a str> {
         crate::version::exact_pin_version(specifier).map(|_| specifier)
@@ -597,6 +606,9 @@ pub enum FixedBinding {
     /// The lock records the copy from a `resolved` URL that is no registry tarball of it (yarn
     /// classic).
     UnrecognizedOrigin,
+    /// The member binds the registry copy through an `npm:` or `yarn:` reference to the
+    /// dependency's own name (yarn classic), a protocol reference no widen rewrites.
+    SelfAlias,
 }
 
 /// One importer's record of one direct dependency in `pnpm-lock.yaml`: the declared range and the
@@ -883,8 +895,9 @@ impl MemberIndex {
     }
 
     /// The members among [`members_for`](Self::members_for) whose own binding of `name` at
-    /// `version` is a registry release, sorted: the declarations an edit may move that copy
-    /// through, and the ones its pin and declared bound come from.
+    /// `version` is a registry release an edit of their declaration moves, sorted: the
+    /// declarations an edit may move that copy through, and the ones its declared bound comes
+    /// from.
     ///
     /// Outside npm and yarn classic every owner qualifies, since those indexes attribute registry
     /// bindings only.
@@ -2273,6 +2286,11 @@ impl NodeLock for Yarn {
                     .into(),
             )
         })
+    }
+
+    fn install_pin<'a>(dependency: &str, specifier: &'a str) -> Option<&'a str> {
+        yarn::same_name_constraint(dependency, specifier)
+            .filter(|constraint| crate::version::exact_pin_version(constraint).is_some())
     }
 
     fn alias_only_versions(content: &str) -> AliasOnlyVersions {

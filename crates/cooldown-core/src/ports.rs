@@ -315,6 +315,23 @@ pub trait ToolRead: Send + Sync {
     async fn lock_inputs(&self, _project: &Project) -> Result<Vec<Utf8PathBuf>> {
         Ok(Vec::new())
     }
+
+    /// Confirms that the inputs the last [`verify_lock_current`](ToolRead::verify_lock_current)
+    /// of `project` proved current still match the files on disk, once the caller has read the
+    /// graph that verdict covers.
+    ///
+    /// An adapter that verifies a copy of the project proves only the copy current, and the
+    /// graph is read from the live files afterwards, so this binds the two reads together.
+    /// The default confirms nothing, for adapters whose verification reads the live files
+    /// themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] when an input changed, appeared, or vanished between
+    /// the verification and this call.
+    async fn confirm_verified_inputs(&self, _project: &Project) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The registry-fetch port: classified candidate releases and the locked release for a dependency.

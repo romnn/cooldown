@@ -652,12 +652,16 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
 
         // Advisory identity needs positive origin evidence: the lock entry's own record — npm's and
         // yarn's `resolved` URL naming the public npm registry, or pnpm's registry-only resolution
-        // shape, whose registry the feed-time query then has to name (see
-        // `confirm_advisory_identities`).
+        // shape and Yarn Berry's binding-free npm locator, whose registry the feed-time query then
+        // has to name (see `confirm_advisory_identities`).
         // A format without a per-entry record (bun) grants nothing; the config layers can only veto
         // a granted identity, never substitute for the record.
-        let registry_overrides =
-            crate::npmrc::RegistryOverrides::read(&project.root, L::NATIVE_MIN_AGE_FILE);
+        // A manager that never reads npm's configuration (Yarn Berry) gets no veto from it.
+        let registry_overrides = if L::NPMRC_ROUTING {
+            crate::npmrc::RegistryOverrides::read(&project.root, L::NATIVE_MIN_AGE_FILE)
+        } else {
+            crate::npmrc::RegistryOverrides::none()
+        };
         let mut seen: HashMap<(String, String), usize> = HashMap::new();
         let mut deps: Vec<Dependency> = Vec::new();
         for NameVersion {
@@ -1067,8 +1071,9 @@ impl LandingBaseline {
 /// A direct candidate is not eligible either when a member binds its copy in a way no edit of its
 /// declaration is proven to move ([`MemberIndex::fixed_owners`]): a source of its own, a git
 /// dependency or a local or remote tarball, and for yarn classic a local path, a selector the root
-/// `resolutions` can rewrite, a name a workspace package carries, or an origin that is no registry
-/// tarball.
+/// `resolutions` can rewrite, a name a workspace package carries, an origin that is no registry
+/// tarball, or a registry reference to the name itself (`"chalk": "npm:chalk@^4.1.0"`), which no
+/// widen rewrites.
 /// The member declares it directly, but npm's exact pin would replace that source with a registry
 /// release, and no range the widen writes is proven to land one either.
 /// The row names each such member with its reason.
@@ -1202,6 +1207,9 @@ fn fixed_binding_detail(
         ),
         FixedBinding::UnrecognizedOrigin => format!(
             "{copy} is locked for {members} from a URL that is no registry tarball of it, so no manifest edit is proven to land a registry release in its place"
+        ),
+        FixedBinding::SelfAlias => format!(
+            "{copy} is declared for {members} through an `npm:` or `yarn:` reference to {name} itself, which cooldown never rewrites, so no manifest edit may move it"
         ),
     }
 }

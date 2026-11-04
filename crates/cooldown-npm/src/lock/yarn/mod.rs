@@ -25,6 +25,7 @@ use super::{
 };
 use crate::manifest::workspaces::{FieldSpecifier, WorkspaceManifests};
 use crate::version::is_exact_npm_specifier;
+use graph::RegistryReference;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub(super) mod graph;
@@ -53,6 +54,9 @@ const MAX_DEPTH: usize = 16;
 /// It is a registry copy, which an edit of the declaration moves, only on proof: a registry
 /// selector the root `resolutions` cannot rewrite, under a name no workspace package carries, with
 /// a `resolved` URL that is absent or a registry tarball of that version.
+/// A registry-protocol reference to the name itself (`npm:chalk@^4.1.0`) binds such a copy too,
+/// whatever workspace package carries the name, but no edit rewrites it, so the copy is fixed in
+/// place.
 /// Any other identified copy is still the member's, but fixed in place ([`FixedBinding`]), and a
 /// selector whose copy the lock does not identify binds none.
 pub struct YarnBindings {
@@ -62,9 +66,10 @@ pub struct YarnBindings {
 
 /// One dependency a member's manifest declares.
 pub(super) struct YarnDependency {
-    /// The constraint of each install field declaring it, `None` for one that is no string, as
-    /// the exact-pin check reads it: Classic's specifier, or Berry's specifier with a same-name
-    /// `npm:` reference unwrapped.
+    /// The constraint each install field declaring it puts on the dependency itself, as the
+    /// exact-pin check reads it: the specifier with a same-name registry reference unwrapped, split
+    /// the way each Yarn generation splits it, and `None` for one that is no string or an alias of
+    /// another package.
     pub(super) install: Vec<Option<String>>,
     pub(super) binding: YarnBinding,
 }
@@ -75,6 +80,10 @@ pub(super) enum YarnBinding {
     /// A registry copy of the dependency itself, at this version, which an edit of the declaration
     /// moves.
     Registry(String),
+    /// A registry copy of the dependency itself, at this version, which a Classic registry-protocol
+    /// reference to the dependency's own name binds (`npm:chalk@^4.1.0`), and which no edit of the
+    /// declaration moves, since no widen rewrites a protocol reference.
+    SelfAlias(String),
     /// The copy at this version the member's descriptor names, which no edit of the declaration is
     /// proven to move.
     Fixed {
@@ -197,7 +206,13 @@ impl YarnBindings {
                         let install = fields
                             .iter()
                             .filter(|declaration| declaration.field != "peerDependencies")
-                            .map(|declaration| declaration.specifier.clone())
+                            .map(|declaration| {
+                                declaration
+                                    .specifier
+                                    .as_deref()
+                                    .and_then(|specifier| same_name_constraint(name, specifier))
+                                    .map(str::to_string)
+                            })
                             .collect();
                         let binding = evidence.binding(path, name, fields);
                         (name.clone(), YarnDependency { install, binding })
@@ -214,11 +229,11 @@ impl YarnBindings {
     ///
     /// [`MemberResolution::Missing`] means the member's manifest declares no such dependency in
     /// any field.
-    /// Only a registry copy resolves.
+    /// Only a registry copy resolves, one a same-name registry reference binds included.
     /// A Berry declaration whose binding cannot be proven is [`MemberResolution::Unproven`].
-    /// A member the workspace does not list, a peer-only declaration, an alias, a local or
-    /// workspace binding, a copy fixed in place, and a Classic selector the lock does not identify
-    /// are [`MemberResolution::Unknown`].
+    /// A member the workspace does not list, a peer-only declaration, an alias of another package,
+    /// a local or workspace binding, any other copy fixed in place, and a Classic selector the lock
+    /// does not identify are [`MemberResolution::Unknown`].
     #[must_use]
     pub fn resolution(&self, member: &str, name: &str) -> MemberResolution<'_> {
         let Some(dependencies) = self.members.get(member) else {
@@ -226,7 +241,9 @@ impl YarnBindings {
         };
         match dependencies.get(name).map(|dependency| &dependency.binding) {
             None => MemberResolution::Missing,
-            Some(YarnBinding::Registry(version)) => MemberResolution::Resolved(version),
+            Some(YarnBinding::Registry(version) | YarnBinding::SelfAlias(version)) => {
+                MemberResolution::Resolved(version)
+            }
             Some(YarnBinding::Unproven(_)) => MemberResolution::Unproven,
             Some(
                 YarnBinding::Fixed { .. }
@@ -243,7 +260,9 @@ impl YarnBindings {
     #[must_use]
     pub fn bound_version(&self, member: &str, name: &str) -> Option<&str> {
         match &self.members.get(member)?.get(name)?.binding {
-            YarnBinding::Registry(version) | YarnBinding::Fixed { version, .. } => Some(version),
+            YarnBinding::Registry(version)
+            | YarnBinding::SelfAlias(version)
+            | YarnBinding::Fixed { version, .. } => Some(version),
             YarnBinding::Foreign
             | YarnBinding::Local
             | YarnBinding::PeerOnly
@@ -285,6 +304,8 @@ impl YarnBindings {
     /// per-member ownership; no importer record or split evidence is manufactured.
     /// A copy fixed in place keeps its member as a direct owner that may not edit it
     /// ([`MemberIndex::fixed_owners`]), so it neither pins nor bounds the copy.
+    /// A same-name registry reference is fixed in place too, but it binds a registry release of
+    /// the name, so it pins the copy like a registry owner.
     /// A copy is exact-pinned when every install declaration of every registry owner is exact.
     /// An alias, a local or workspace binding, a peer-only declaration, and an unidentified copy
     /// own nothing, though the declaration still enters the name inventory, so no other copy of
@@ -323,6 +344,16 @@ impl YarnBindings {
                 }
                 let version = match binding {
                     YarnBinding::Registry(version) => version,
+                    YarnBinding::SelfAlias(version) => {
+                        fixed_copies
+                            .entry((name.clone(), version.clone()))
+                            .or_default()
+                            .push(FixedOwner {
+                                member: path.clone(),
+                                reason: FixedBinding::SelfAlias,
+                            });
+                        version
+                    }
                     YarnBinding::Fixed { version, reason } => {
                         let copy = (name.clone(), version.clone());
                         declared_copies
@@ -393,9 +424,13 @@ impl BindingEvidence<'_> {
         let Some(selector) = effective_selector(&install) else {
             return YarnBinding::Unresolved;
         };
-        if selector.starts_with("npm:") {
+        // A registry-protocol reference installs the package it names, so one naming another
+        // package is an alias that binds no copy of the name.
+        let reference = graph::registry_reference(selector);
+        if reference.is_some_and(|RegistryReference { package, .. }| package != name) {
             return YarnBinding::Foreign;
         }
+        let self_alias = reference.is_some();
         // Yarn looks a dependency up under its bare name before the full selector, the spelling a
         // `--save` writes, so such a key may serve this declaration instead.
         if self.lock.descriptors.contains_key(name) {
@@ -433,13 +468,17 @@ impl BindingEvidence<'_> {
         // The first reason that keeps an edit of the declaration from moving the copy wins.
         // A resolution rewrites the selector Yarn resolves, and a workspace package of the name
         // may be linked instead of the copy, so neither is proven to follow a widened range.
+        // A same-name registry-protocol reference asks the registry for the name itself, so it is
+        // no source of its own, and Yarn links a workspace package only for a semver range its
+        // version satisfies, which such a reference never is, see
+        // https://github.com/yarnpkg/yarn/blob/v1.22.22/src/workspace-layout.js.
         let reason = if local.is_some() {
             Some(FixedBinding::LocalPath)
-        } else if !is_registry_specifier(selector) {
+        } else if !self_alias && !is_registry_specifier(selector) {
             Some(FixedBinding::OwnSource)
         } else if self.workspace.resolution_may_rewrite(name) {
             Some(FixedBinding::Resolutions)
-        } else if self.siblings.contains(name) {
+        } else if !self_alias && self.siblings.contains(name) {
             Some(FixedBinding::WorkspaceName)
         } else {
             match resolved {
@@ -453,8 +492,23 @@ impl BindingEvidence<'_> {
                 version: version.clone(),
                 reason,
             },
+            None if self_alias => YarnBinding::SelfAlias(version.clone()),
             None => YarnBinding::Registry(version.clone()),
         }
+    }
+}
+
+/// The constraint an install declaration of `dependency` as `specifier` puts on the dependency
+/// itself: the specifier, or the range inside a registry-protocol reference to `dependency`'s own
+/// name (`npm:chalk@1.2.3` for `chalk`).
+///
+/// `None` for a reference to another package, an alias that constrains no copy of `dependency`.
+/// The reference is split as Yarn Classic's registry resolver splits it
+/// ([`graph::registry_reference`]), so `npm:1.2.3` names a package `1.2.3`, unlike in Yarn Berry.
+pub(super) fn same_name_constraint<'a>(dependency: &str, specifier: &'a str) -> Option<&'a str> {
+    match graph::registry_reference(specifier) {
+        None => Some(specifier),
+        Some(RegistryReference { package, range }) => (package == dependency).then_some(range),
     }
 }
 

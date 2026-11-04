@@ -12,6 +12,9 @@
 //! - excluding a member drops exactly the rows only it owns;
 //! - `upgrade` refuses a Berry project without touching any of its files;
 //! - a Berry `yarn` never runs on a Classic lock, which it would silently migrate;
+//! - `check` takes Yarn's own verdict on the lock from an offline run in a copy, so a current
+//!   lock is evaluated, a stale one is refused unless waived, one Yarn cannot judge offline is
+//!   refused outright, and the project stays byte for byte as it was;
 //! - the age gate `sync` writes into `.yarnrc.yml` is the one Yarn applies: a release younger
 //!   than it is quarantined when resolved afresh, and a release cooldown exempts or admits is not.
 //!
@@ -863,6 +866,431 @@ fn a_berry_plugin_makes_every_binding_unproven() -> eyre::Result<()> {
                 && message.contains("so cooldown attributes no dependency to a workspace member")
         ),
         "{warnings:?}"
+    );
+    Ok(())
+}
+
+/// The kinds of the lock diagnostics in the envelope's `section` array.
+fn lock_kinds(envelope: &serde_json::Value, section: &str) -> Vec<String> {
+    envelope
+        .get(section)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|diagnostic| diagnostic.get("kind")?.as_str())
+        .filter(|kind| kind.contains("lock"))
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Every path below `root` with its kind, mode, modification time, and content or link target,
+/// so a rewrite with identical bytes still shows.
+///
+/// The fixture's `.git` anchor is left out: cooldown keeps its own run leases there.
+fn snapshot(root: &std::path::Path) -> eyre::Result<BTreeMap<String, String>> {
+    let mut entries = BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory)? {
+            let path = entry?.path();
+            if path == root.join(".git") {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(&path)?;
+            let modified = metadata.modified()?;
+            let shown = if metadata.is_symlink() {
+                format!("link {}", std::fs::read_link(&path)?.display())
+            } else if metadata.is_dir() {
+                pending.push(path.clone());
+                format!("dir {:?} {modified:?}", metadata.permissions())
+            } else {
+                let mut hasher = std::hash::DefaultHasher::new();
+                std::hash::Hash::hash(&std::fs::read(&path)?, &mut hasher);
+                format!(
+                    "file {:?} {modified:?} {:x}",
+                    metadata.permissions(),
+                    std::hash::Hasher::finish(&hasher)
+                )
+            };
+            let relative = path
+                .strip_prefix(root)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            entries.insert(relative, shown);
+        }
+    }
+    Ok(entries)
+}
+
+/// Copies the tree at `from` to `to`, links as links.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> eyre::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else if file_type.is_symlink() {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// `lock` with its `__metadata` schema changed from `from` to `to`, whatever line ending Yarn
+/// wrote, which is CRLF on Windows.
+fn with_schema(lock: &str, from: &str, to: &str) -> String {
+    let mut in_metadata = false;
+    let mut changed = false;
+    lock.split_inclusive('\n')
+        .map(|line| {
+            let content = line.trim_end_matches(['\r', '\n']);
+            let ending = &line[content.len()..];
+            if content == "__metadata:" {
+                in_metadata = true;
+            } else if in_metadata && !changed && content == format!("  version: {from}") {
+                changed = true;
+                return format!("  version: {to}{ending}");
+            } else if !content.starts_with(' ') {
+                in_metadata = false;
+            }
+            line.to_string()
+        })
+        .collect()
+}
+
+/// Runs `cooldown check --offline` with `extra`.
+fn check(fixture: &Fixture, extra: &[&str]) -> eyre::Result<Run> {
+    let mut args = vec!["check", "--offline"];
+    args.extend_from_slice(extra);
+    cooldown(fixture, &args)
+}
+
+/// A freshly seeded lock is current: `check` evaluates it with no lock diagnostic, and leaves
+/// every file of the project, Yarn's project-local cache included, exactly as it was, down to
+/// its modification time.
+/// For a lock of an older schema, Yarn rewrites the `.yarnrc.yml` of the project it runs in and
+/// re-resolves the lock's entries, which the offline run cannot, so the verdict is unknown, yet
+/// the project's own rc file stays untouched too.
+/// The control runs Yarn's own immutable install in place on a copy of the project, which the
+/// same snapshot sees change.
+#[test]
+fn check_proves_a_seeded_lock_current_without_touching_the_project() -> eyre::Result<()> {
+    let fixture = berry_workspace();
+    fixture.write(
+        ".yarnrc.yml",
+        "enableTelemetry: false\nenableGlobalCache: false\n",
+    );
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock(&fixture)?;
+    let before = snapshot(fixture.root())?;
+    assert!(
+        before.keys().any(|path| path.starts_with(".yarn/cache/")),
+        "the seed filled the project-local cache: {before:?}"
+    );
+
+    let checked = check(&fixture, &[])?;
+
+    assert!(
+        lock_kinds(&checked.envelope, "errors").is_empty()
+            && lock_kinds(&checked.envelope, "warnings").is_empty(),
+        "{:#}",
+        checked.envelope
+    );
+    assert_eq!(
+        changed(&before, &snapshot(fixture.root())?),
+        [] as [&str; 0]
+    );
+
+    // The schema Yarn 4.0 through 4.13 wrote, which Yarn 4.18.1 migrates the rc file for.
+    let lock = String::from_utf8(fixture.read_bytes("yarn.lock"))?;
+    let older = with_schema(&lock, "10", "8");
+    assert_ne!(older, lock);
+    fixture.write("yarn.lock", &older);
+    let before = snapshot(fixture.root())?;
+    let migrated = check(&fixture, &[])?;
+    assert_eq!(
+        lock_kinds(&migrated.envelope, "errors"),
+        ["lock_unknown"],
+        "{:#}",
+        migrated.envelope
+    );
+    assert_eq!(
+        changed(&before, &snapshot(fixture.root())?),
+        [] as [&str; 0]
+    );
+    fixture.write("yarn.lock", &lock);
+
+    // Control: the same install in place writes into the project.
+    let control = tempfile::tempdir()?;
+    copy_tree(fixture.root(), control.path())?;
+    let copied = snapshot(control.path())?;
+    // Resolve `yarn` as the harness does, since Windows installs it as `yarn.cmd`.
+    let output = std::process::Command::new(cooldown_adapter_util::resolve_program("yarn"))
+        .args(["install", "--immutable", "--mode=skip-build"])
+        .current_dir(control.path())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_ne!(
+        changed(&copied, &snapshot(control.path())?),
+        [] as [&str; 0]
+    );
+    Ok(())
+}
+
+/// The paths whose snapshot entry differs between `before` and `after`, appeared or vanished
+/// ones included.
+fn changed<'a>(
+    before: &'a BTreeMap<String, String>,
+    after: &'a BTreeMap<String, String>,
+) -> Vec<&'a str> {
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| before.get(*path) != after.get(*path))
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// A member that drops a dependency makes the lock stale, which Yarn proves offline: `check`
+/// refuses it, and `--allow-stale-lock` turns the refusal into a warning.
+#[test]
+fn a_dropped_member_dependency_is_stale_and_waivable() -> eyre::Result<()> {
+    let fixture = berry_workspace();
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock(&fixture)?;
+    fixture.write(
+        "packages/app/package.json",
+        r#"{ "name": "app", "version": "1.0.0", "dependencies": { "chalk": "4.1.0" } }"#,
+    );
+    let lock = fixture.read_bytes("yarn.lock");
+
+    let refused = check(&fixture, &[])?;
+    assert_eq!(
+        lock_kinds(&refused.envelope, "errors"),
+        ["stale_lock"],
+        "{:#}",
+        refused.envelope
+    );
+    assert_eq!(refused.code, Some(4));
+    let detail = messages(&refused.envelope, "errors").join("\n");
+    assert!(detail.contains("-    has-flag: \"npm:^4.0.0\""), "{detail}");
+
+    let waived = check(&fixture, &["--allow-stale-lock"])?;
+    assert!(
+        lock_kinds(&waived.envelope, "errors").is_empty(),
+        "{:#}",
+        waived.envelope
+    );
+    assert_eq!(lock_kinds(&waived.envelope, "warnings"), ["stale_lock"]);
+    assert_eq!(fixture.read_bytes("yarn.lock"), lock);
+    Ok(())
+}
+
+/// A new dependency the lock does not record needs the registry, which the offline run never
+/// reaches, so the lock's currency is unknown, and `--allow-stale-lock` does not waive that.
+#[test]
+fn a_dependency_needing_the_registry_is_unknown_and_not_waivable() -> eyre::Result<()> {
+    let fixture = berry_workspace();
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock(&fixture)?;
+    fixture.write(
+        "packages/app/package.json",
+        r#"{ "name": "app", "version": "1.0.0", "dependencies": { "chalk": "4.1.0", "has-flag": "^4.0.0", "is-odd": "^3.0.1" } }"#,
+    );
+
+    let refused = check(&fixture, &["--allow-stale-lock"])?;
+
+    assert_eq!(
+        lock_kinds(&refused.envelope, "errors"),
+        ["lock_unknown"],
+        "{:#}",
+        refused.envelope
+    );
+    assert_eq!(refused.code, Some(4));
+    let detail = messages(&refused.envelope, "errors").join("\n");
+    assert!(detail.contains("reached no verdict offline"), "{detail}");
+    Ok(())
+}
+
+/// A workspace below a `vendor` directory, and a `file:` folder whole, are inputs of the copy:
+/// the seeded lock is current only with both, and a narrowed directory or a file added to the
+/// folder makes it stale, since Yarn hashes the folder, permissions included, into its locator.
+#[test]
+fn every_workspace_and_local_folder_is_an_input() -> eyre::Result<()> {
+    let fixture = berry_workspace();
+    fixture
+        .write(
+            "package.json",
+            &indoc::formatdoc! {r#"
+                {{
+                  "name": "berry-root",
+                  "private": true,
+                  "packageManager": "yarn@{YARN}",
+                  "workspaces": ["packages/*", "packages/vendor/*"],
+                  "dependencies": {{ "chalk": "^4.1.0", "folder": "file:./folder" }}
+                }}
+            "#},
+        )
+        .write(
+            "packages/vendor/kept/package.json",
+            r#"{ "name": "kept", "version": "1.0.0", "dependencies": { "has-flag": "^4.0.0" } }"#,
+        )
+        .write(
+            "folder/package.json",
+            r#"{ "name": "folder", "version": "1.0.0" }"#,
+        )
+        .write("folder/index.js", "module.exports = 1;\n")
+        .write("folder/lib/util.js", "module.exports = 3;\n");
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock(&fixture)?;
+
+    let current = check(&fixture, &[])?;
+    assert!(
+        lock_kinds(&current.envelope, "errors").is_empty(),
+        "{:#}",
+        current.envelope
+    );
+
+    // Yarn hashes a directory's permission bits too, so narrowing one makes the lock stale.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let lib = fixture.root().join("folder/lib");
+        let mode = std::fs::metadata(&lib)?.permissions().mode();
+        std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o700))?;
+        let narrowed = check(&fixture, &[])?;
+        std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(mode))?;
+        assert_ne!(mode & 0o777, 0o700);
+        assert_eq!(
+            lock_kinds(&narrowed.envelope, "errors"),
+            ["stale_lock"],
+            "{:#}",
+            narrowed.envelope
+        );
+    }
+
+    fixture.write("folder/extra.js", "module.exports = 2;\n");
+    let stale = check(&fixture, &[])?;
+    assert_eq!(
+        lock_kinds(&stale.envelope, "errors"),
+        ["stale_lock"],
+        "{:#}",
+        stale.envelope
+    );
+    Ok(())
+}
+
+/// An rc file above the project is copied to its mirrored position: a lock seeded under a
+/// `packageExtensions` entry it declares is current, and removing the entry makes it stale.
+#[test]
+fn an_ancestor_rc_file_decides_the_verdict() -> eyre::Result<()> {
+    let fixture = Fixture::new().tag_independent();
+    fixture
+        .write(
+            "nested/project/package.json",
+            &indoc::formatdoc! {r#"
+                {{
+                  "name": "nested",
+                  "private": true,
+                  "packageManager": "yarn@{YARN}",
+                  "dependencies": {{ "has-flag": "^4.0.0" }}
+                }}
+            "#},
+        )
+        .write("nested/project/yarn.lock", "")
+        .write(
+            "nested/.yarnrc.yml",
+            indoc! {r#"
+                enableTelemetry: false
+                packageExtensions:
+                  "has-flag@*":
+                    dependencies:
+                      is-number: "^7.0.0"
+            "#},
+        );
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    // Resolve `yarn` as the harness does, since Windows installs it as `yarn.cmd`.
+    let seeded = std::process::Command::new(cooldown_adapter_util::resolve_program("yarn"))
+        .args(["install", "--mode=update-lockfile"])
+        .current_dir(fixture.root().join("nested/project"))
+        .output()?;
+    assert!(
+        seeded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seeded.stdout)
+    );
+
+    let current = cooldown_in(&fixture, "nested/project")?;
+    assert!(
+        lock_kinds(&current.envelope, "errors").is_empty(),
+        "{:#}",
+        current.envelope
+    );
+
+    fixture.write("nested/.yarnrc.yml", "enableTelemetry: false\n");
+    let stale = cooldown_in(&fixture, "nested/project")?;
+    assert_eq!(
+        lock_kinds(&stale.envelope, "errors"),
+        ["stale_lock"],
+        "{:#}",
+        stale.envelope
+    );
+    Ok(())
+}
+
+/// Runs `cooldown check --offline --json` pinned to the fixture's `directory`.
+fn cooldown_in(fixture: &Fixture, directory: &str) -> eyre::Result<Run> {
+    let output = fixture.cooldown_in(Some(directory), &["check", "--offline", "--json"]);
+    let envelope = serde_json::from_slice(&output.stdout).map_err(|err| {
+        eyre::eyre!(
+            "cooldown printed no JSON envelope ({err}); stderr: {}",
+            output.stderr_str()
+        )
+    })?;
+    Ok(Run {
+        code: output.status.code(),
+        envelope,
+    })
+}
+
+/// An rc file Yarn would refuse to parse makes the lock's currency unknown, and nothing runs.
+#[test]
+fn a_malformed_rc_file_is_unknown() -> eyre::Result<()> {
+    let fixture = berry_workspace();
+    if !runs_pinned_yarn(&fixture) {
+        return Ok(());
+    }
+    seed_lock(&fixture)?;
+    fixture.write(".yarnrc.yml", "enableTelemetry false\n  nodeLinker: [\n");
+
+    let refused = check(&fixture, &["--allow-stale-lock"])?;
+
+    assert_eq!(
+        lock_kinds(&refused.envelope, "errors"),
+        ["lock_unknown"],
+        "{:#}",
+        refused.envelope
     );
     Ok(())
 }

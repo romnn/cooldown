@@ -74,7 +74,8 @@ fn rows(deps: &[Dependency]) -> BTreeSet<String> {
 }
 
 /// A Berry project reaches the Berry reader: its rows are the lock's npm releases, each credited
-/// to the members whose own declarations bind it, and none carrying advisory identity.
+/// to the members whose own declarations bind it, and each carrying its provisional advisory
+/// identity.
 #[tokio::test]
 async fn a_berry_project_reads_its_registry_releases() -> eyre::Result<()> {
     let TempProject { _guard, project } = berry_project(&EVERY_SOURCE)?;
@@ -120,8 +121,12 @@ async fn a_berry_project_reads_its_registry_releases() -> eyre::Result<()> {
     assert_eq!(members("chalk", "4.1.2"), [".", "packages/a"]);
     assert_eq!(members("chalk", "4.1.0"), ["packages/b"]);
     assert_eq!(members("is-number", "6.0.0"), [] as [String; 0]);
+    // Every row is a binding-free `npm:` locator fetched from the configured registry, so each
+    // carries its identity provisionally until Yarn's routing confirms it at feed time.
     assert!(
-        graph.iter().all(|dep| dep.advisory_identity.is_none()),
+        graph
+            .iter()
+            .all(|dep| dep.advisory_identity.as_deref() == Some(dep.package.name.as_str())),
         "{graph:?}"
     );
     Ok(())
@@ -613,6 +618,264 @@ mod mutation {
                 "{lock:?}"
             );
         }
+        Ok(())
+    }
+}
+
+/// Berry verification and routing through the adapter, with a scripted fake `yarn` outside the
+/// project.
+#[cfg(unix)]
+mod verification {
+    use super::{TempProject, tool, yarn_project};
+    use crate::lock::yarn_berry_fixtures::{SCHEMA_FILES, SCHEMAS};
+    use crate::manifest::workspaces::YarnEnvironment;
+    use crate::yarn::YarnTool;
+    use crate::yarn::routing::captures::{
+        JSR_ENTRY, MIRROR_REGISTRY, PRIVATE_SCOPE, PUBLIC_REGISTRY,
+    };
+    use crate::yarn::verify::captures::{CURRENT, STALE_MEMBER};
+    use camino::{Utf8Path, Utf8PathBuf};
+    use color_eyre::eyre;
+    use cooldown_core::{CoreError, DepScope, LockStatus, Project, ToolRead};
+
+    /// A Berry project, a home directory, a scratch base, and a fake `yarn` whose answers live in
+    /// files beside it, so a test can change them between runs.
+    struct World {
+        /// Owns the project's temporary directory; dropping it deletes the project.
+        _project_guard: tempfile::TempDir,
+        /// Owns the directory around the project: home, scratch base, and fake.
+        _guard: tempfile::TempDir,
+        top: Utf8PathBuf,
+        project: Project,
+        /// Owns the adapter's HTTP cache.
+        _cache: tempfile::TempDir,
+        tool: YarnTool,
+    }
+
+    fn new_world() -> eyre::Result<World> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let lock = SCHEMAS
+            .last()
+            .ok_or_else(|| eyre::eyre!("the schema fixtures hold a lock"))?
+            .lock;
+        let files = SCHEMA_FILES.iter().map(|file| (file.path, file.contents));
+        let TempProject {
+            _guard: project_guard,
+            project,
+        } = yarn_project(files, lock)?;
+        let guard = tempfile::tempdir()?;
+        let top = Utf8PathBuf::from_path_buf(dunce::canonicalize(guard.path())?)
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let home = top.join("home");
+        std::fs::create_dir_all(&home)?;
+        let script = top.join("fake-yarn.sh");
+        std::fs::write(
+            &script,
+            indoc::formatdoc! {r#"
+                #!/bin/sh
+                echo "$* auto-pin=${{COREPACK_ENABLE_AUTO_PIN-}} network=${{YARN_ENABLE_NETWORK-}}" >> "{top}/yarn.log"
+                case "$1 $3" in
+                  "--version ") echo 4.18.1 ;;
+                  "install --mode=skip-build") cat "{top}/report.ndjson"; exit 1 ;;
+                  "config npmRegistryServer") cat "{top}/registry.json" || exit 1 ;;
+                  "config npmScopes") cat "{top}/scopes.json" || exit 1 ;;
+                esac
+            "#, top = top},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::write(top.join("report.ndjson"), CURRENT)?;
+        let (cache, tool) = tool()?;
+        let tool = tool.with_driver(script.as_str()).with_verification(
+            YarnEnvironment {
+                home: Some(home),
+                ..YarnEnvironment::default()
+            },
+            vec![top.join("tmp")],
+        );
+        Ok(World {
+            _project_guard: project_guard,
+            _guard: guard,
+            top,
+            project,
+            _cache: cache,
+            tool,
+        })
+    }
+
+    impl World {
+        fn answer(&self, file: &str, contents: &str) -> eyre::Result<()> {
+            std::fs::write(self.top.join(file), contents)?;
+            Ok(())
+        }
+
+        fn runs(&self, prefix: &str) -> usize {
+            self.logged(prefix).len()
+        }
+
+        /// Every logged run whose arguments start with `prefix`, with the settings it ran under.
+        fn logged(&self, prefix: &str) -> Vec<String> {
+            std::fs::read_to_string(self.top.join("yarn.log"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.starts_with(prefix))
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn write(&self, relative: &str, contents: &str) -> eyre::Result<()> {
+            write(&self.project.root.join(relative), contents)
+        }
+
+        async fn verify(&self) -> eyre::Result<LockStatus> {
+            Ok(self.tool.verify_lock_current(&self.project).await?.status)
+        }
+    }
+
+    fn write(path: &Utf8Path, contents: &str) -> eyre::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, contents)?;
+        Ok(())
+    }
+
+    fn assert_conflict(confirmed: &cooldown_core::Result<()>) {
+        assert!(
+            matches!(
+                confirmed,
+                Err(CoreError::LockConflict(message))
+                    if message.contains("changed while cooldown verified them")
+            ),
+            "{confirmed:?}"
+        );
+    }
+
+    /// A Berry lock verified current binds the inputs the copy held: confirming them unchanged
+    /// passes once, and a changed manifest, a new manifest, or a new home rc file between the
+    /// verification and the confirmation is a conflict.
+    #[tokio::test]
+    async fn a_verified_lock_binds_the_inputs_it_was_verified_against() -> eyre::Result<()> {
+        let world = new_world()?;
+        let project = &world.project;
+
+        // Unchanged inputs confirm, and the record is spent.
+        assert_eq!(world.verify().await?, LockStatus::Current);
+        world.tool.confirm_verified_inputs(project).await?;
+        world.tool.confirm_verified_inputs(project).await?;
+
+        // A member manifest edited meanwhile
+        assert_eq!(world.verify().await?, LockStatus::Current);
+        world.write(
+            "packages/b/package.json",
+            r#"{"name":"pkg-b","version":"1.0.0","dependencies":{"chalk":"4.1.2"}}"#,
+        )?;
+        assert_conflict(&world.tool.confirm_verified_inputs(project).await);
+
+        // A manifest that appeared meanwhile
+        assert_eq!(world.verify().await?, LockStatus::Current);
+        world.write("packages/c/package.json", r#"{"name":"pkg-c"}"#)?;
+        assert_conflict(&world.tool.confirm_verified_inputs(project).await);
+
+        // An rc file read in place that appeared meanwhile
+        assert_eq!(world.verify().await?, LockStatus::Current);
+        write(&world.top.join("home/.yarnrc.yml"), "nodeLinker: pnp\n")?;
+        assert_conflict(&world.tool.confirm_verified_inputs(project).await);
+
+        // A stale verdict binds nothing, so there is nothing to confirm.
+        world.answer("report.ndjson", STALE_MEMBER)?;
+        assert_eq!(world.verify().await?, LockStatus::Stale);
+        world.write("packages/d/package.json", r#"{"name":"pkg-d"}"#)?;
+        world.tool.confirm_verified_inputs(project).await?;
+        Ok(())
+    }
+
+    /// The identities a Berry lock grants survive where Yarn routes every package to the public
+    /// registry and are withheld behind a mirror; Yarn is asked once per project.
+    #[tokio::test]
+    async fn berry_identities_follow_yarns_routing() -> eyre::Result<()> {
+        // Public routing keeps every identity, asked once.
+        let world = new_world()?;
+        world.answer("registry.json", PUBLIC_REGISTRY)?;
+        world.answer("scopes.json", PRIVATE_SCOPE)?;
+        let mut deps = world
+            .tool
+            .dependencies(&world.project, DepScope::Graph)
+            .await?;
+        assert!(deps.iter().all(|dep| dep.advisory_identity.is_some()));
+        world
+            .tool
+            .confirm_advisory_identities(&world.project, &mut deps)
+            .await;
+        world
+            .tool
+            .confirm_advisory_identities(&world.project, &mut deps)
+            .await;
+        assert!(
+            deps.iter().all(|dep| dep.advisory_identity.is_some()),
+            "{deps:?}"
+        );
+        assert_eq!(world.runs("config get npmRegistryServer"), 1);
+        assert_eq!(world.runs("config get npmScopes"), 1);
+        // The queries run under the adapter's own driver settings, offline.
+        let queries = world.logged("config get");
+        assert!(
+            queries
+                .iter()
+                .all(|run| run.ends_with("auto-pin=0 network=0")),
+            "{queries:?}"
+        );
+
+        // A mirror withholds every identity that falls back to it.
+        let world = new_world()?;
+        world.answer("registry.json", MIRROR_REGISTRY)?;
+        world.answer("scopes.json", JSR_ENTRY)?;
+        let mut deps = world
+            .tool
+            .dependencies(&world.project, DepScope::Graph)
+            .await?;
+        world
+            .tool
+            .confirm_advisory_identities(&world.project, &mut deps)
+            .await;
+        assert!(
+            deps.iter().all(|dep| dep.advisory_identity.is_none()),
+            "{deps:?}"
+        );
+        Ok(())
+    }
+
+    /// A routing Yarn cannot report, or one a plugin may change, withholds every identity; a
+    /// plugin does so without asking Yarn at all.
+    #[tokio::test]
+    async fn an_unestablished_routing_withholds_every_identity() -> eyre::Result<()> {
+        // The query fails: the fake has no answers to print.
+        let world = new_world()?;
+        let mut deps = world
+            .tool
+            .dependencies(&world.project, DepScope::Graph)
+            .await?;
+        world
+            .tool
+            .confirm_advisory_identities(&world.project, &mut deps)
+            .await;
+        assert!(deps.iter().all(|dep| dep.advisory_identity.is_none()));
+        assert_eq!(world.runs("config get npmRegistryServer"), 1);
+
+        // A plugin is configured.
+        let world = new_world()?;
+        world.answer("registry.json", PUBLIC_REGISTRY)?;
+        world.answer("scopes.json", PRIVATE_SCOPE)?;
+        let mut deps = world
+            .tool
+            .dependencies(&world.project, DepScope::Graph)
+            .await?;
+        world.write(".yarnrc.yml", "plugins:\n  - .yarn/plugins/x.cjs\n")?;
+        world
+            .tool
+            .confirm_advisory_identities(&world.project, &mut deps)
+            .await;
+        assert!(deps.iter().all(|dep| dep.advisory_identity.is_none()));
+        assert_eq!(world.runs("config"), 0);
         Ok(())
     }
 }
