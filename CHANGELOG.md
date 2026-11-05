@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## v0.0.29
+
+- **uv candidates whose wheel tags changed get their upload times instead of `unknown_age`.**
+  A candidate was dated only by the wheel tags the lock records for the locked version, so a
+  release that retagged its wheels matched none of them and came out undated. That happens with
+  an abi3 or `requires-python` floor bump such as pymupdf 2.0's move from `cp310-abi3` to
+  `cp311-abi3`, a new manylinux or macOS baseline, or a move to or from pure-Python wheels.
+  `upgrade` therefore never adopted such a release. A candidate that no longer offers every wheel
+  tag the lock records is now dated by its newest file, which is never earlier than the files an
+  environment would install. The locked version itself stays undated when its file list lacks one
+  of its locked wheels, rather than borrowing an older file's upload time.
+
 ## v0.0.28
 
 - **The HTTP cache no longer lands in the working directory when `HOME` is unset.** Without
