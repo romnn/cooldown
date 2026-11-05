@@ -3,7 +3,7 @@
 //! native `[tool.uv]` cooldown config, and `uv`-driven resolution/apply.
 //! The core owns the verdict; uv only resolves/applies a window.
 
-use crate::artifact::published_at_for_artifacts;
+use crate::artifact::candidate_published_at;
 use crate::cutoff::{Cutoffs, package_cutoffs};
 use crate::lock::UvLock;
 use crate::manifest;
@@ -85,8 +85,7 @@ pub fn build_releases(
         .into_iter()
         .map(|mut release| {
             if matches!(fetch.artifacts, ArtifactScope::Environment) {
-                release.published_at =
-                    published_at_for_artifacts(&release.artifacts, &dep.artifacts);
+                release.published_at = candidate_published_at(&release.artifacts, &dep.artifacts);
             }
             release
         })
@@ -1175,6 +1174,97 @@ mod tests {
         assert_eq!(
             all_releases[0].published_at.unwrap().to_string(),
             "2026-06-05T00:00:00Z"
+        );
+    }
+
+    /// Regression for pymupdf 2.0, which raised its stable-ABI floor from cp310 to cp311.
+    ///
+    /// The lock at 1.28.2 records only `cp310-abi3-*` wheels, so no candidate wheel matches a
+    /// locked identity.
+    /// Every candidate must still be dated from its own files instead of coming out undated, which
+    /// would report it as `unknown_age` and keep `upgrade` from ever adopting it.
+    #[test]
+    fn build_releases_dates_candidates_whose_wheel_tags_changed() {
+        let lock = UvLock::parse(indoc! {r#"
+            [[package]]
+            name = "pymupdf"
+            version = "1.28.2"
+            source = { registry = "https://pypi.org/simple" }
+            sdist = { url = "https://x/pymupdf-1.28.2.tar.gz", upload-time = "2026-06-01T00:00:00Z" }
+            wheels = [
+                { url = "https://x/pymupdf-1.28.2-cp310-abi3-manylinux_2_28_x86_64.whl", upload-time = "2026-06-01T00:00:00Z" },
+                { url = "https://x/pymupdf-1.28.2-cp310-abi3-macosx_11_0_arm64.whl", upload-time = "2026-06-01T00:00:00Z" },
+                { url = "https://x/pymupdf-1.28.2-cp310-abi3-win_amd64.whl", upload-time = "2026-06-01T00:00:00Z" },
+            ]
+        "#})
+        .unwrap();
+        let project = Project {
+            root: Utf8PathBuf::from("."),
+            kind: UV_ID,
+            manifest: Utf8PathBuf::from("pyproject.toml"),
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        };
+        let dep = Dependency {
+            package: PackageId::new(UV_ID, "pymupdf", Some(PYPI.to_string())),
+            advisory_identity: Some("pymupdf".to_string()),
+            current: Version::new("1.28.2"),
+            current_quality: ReleaseQuality::Stable,
+            direct: true,
+            artifacts: lock.find("pymupdf", "1.28.2").unwrap().artifact_ids(),
+            graph_floor: None,
+            graph_ceiling: None,
+            declared_bound: None,
+            members: Vec::new(),
+            pinned: false,
+            hold_edges: Vec::new(),
+        };
+        let candidate = |version: &str, uploaded: &str| {
+            let files = [
+                format!("pymupdf-{version}-cp311-abi3-manylinux_2_28_x86_64.whl"),
+                format!("pymupdf-{version}-cp311-abi3-macosx_11_0_arm64.whl"),
+                format!("pymupdf-{version}-cp311-abi3-win_amd64.whl"),
+                format!("pymupdf-{version}.tar.gz"),
+            ];
+            RawRelease {
+                version: Version::new(version),
+                published_at: None,
+                yanked: false,
+                artifacts: files
+                    .iter()
+                    .map(|filename| RawArtifact {
+                        id: crate::artifact::artifact_id_from_filename(filename),
+                        published_at: Some(uploaded.parse::<Timestamp>().unwrap()),
+                        markers: Vec::new(),
+                    })
+                    .collect(),
+            }
+        };
+        let raw = vec![
+            candidate("2.0", "2026-10-19T00:00:00Z"),
+            candidate("2.1", "2026-11-02T00:00:00Z"),
+        ];
+        let fetch = FetchContext {
+            project: &project,
+            artifacts: ArtifactScope::Environment,
+        };
+
+        let releases = build_releases(dep.current.as_str(), raw, &dep, &fetch);
+
+        // Both candidates carry their own upload times, which the cooldown window then judges.
+        assert_eq!(
+            releases
+                .iter()
+                .map(|release| (
+                    release.version.as_str(),
+                    release.published_at.map(|time| time.to_string())
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("2.0", Some("2026-10-19T00:00:00Z".to_string())),
+                ("2.1", Some("2026-11-02T00:00:00Z".to_string())),
+            ]
         );
     }
 
