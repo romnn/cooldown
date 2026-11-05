@@ -191,6 +191,8 @@ impl Package {
 
     /// Newest upload time across the selected artifact identities, or across all files when
     /// `artifacts` is empty.
+    ///
+    /// `None` when `artifacts` names an identity this package does not record.
     #[must_use]
     pub fn published_at_for_artifacts(&self, artifacts: &[ArtifactId]) -> Option<Timestamp> {
         published_at_for_artifacts(&self.raw_artifacts(), artifacts)
