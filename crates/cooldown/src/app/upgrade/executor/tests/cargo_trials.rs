@@ -27,6 +27,10 @@ const CARGO: ToolId = ToolId("cargo");
 enum Resolver {
     Caret,
     AnchoredPair,
+    SnapshotFamily {
+        pinned_child: bool,
+        fresh_sibling: bool,
+    },
     PersistentParent {
         companions: u32,
         lower_conflicts: bool,
@@ -121,6 +125,14 @@ impl FakeCargo {
         versions: &BTreeMap<String, String>,
         plan: &Plan,
     ) -> cooldown_core::Result<()> {
+        if matches!(self.resolver, Resolver::SnapshotFamily { .. })
+            && (versions.get("parent") != versions.get("child")
+                || versions.get("parent") != versions.get("sibling"))
+        {
+            return Err(CoreError::UnacceptableResolve(
+                "the snapshot family must resolve together".to_string(),
+            ));
+        }
         if matches!(self.resolver, Resolver::AnchoredPair)
             && versions
                 .get("sibling")
@@ -186,9 +198,10 @@ impl FakeCargo {
 
     fn exact_child(&self, versions: &BTreeMap<String, String>) -> bool {
         match self.resolver {
-            Resolver::Caret | Resolver::HeldParent { .. } | Resolver::PersistentParent { .. } => {
-                false
-            }
+            Resolver::Caret
+            | Resolver::HeldParent { .. }
+            | Resolver::PersistentParent { .. }
+            | Resolver::SnapshotFamily { .. } => false,
             Resolver::AnchoredPair => versions
                 .get("parent")
                 .is_some_and(|version| version == "1.4.0"),
@@ -244,6 +257,24 @@ impl ToolRead for FakeCargo {
         let mut dependencies = Vec::new();
         for (name, version) in &versions {
             let mut dep = dependency(name, version);
+            if let Resolver::SnapshotFamily { pinned_child, .. } = self.resolver {
+                if name == "child" {
+                    dep.direct = true;
+                    dep.pinned = pinned_child;
+                }
+                let requirer = match name.as_str() {
+                    "child" => Some("parent"),
+                    "parent" => Some("sibling"),
+                    _ => None,
+                };
+                if let Some(requirer) = requirer {
+                    let requiring_version = versions
+                        .get(requirer)
+                        .ok_or_else(|| CoreError::NotFound(requirer.to_string()))?;
+                    dep.graph_ceiling = Some(Version::new(version));
+                    dep.hold_edges = vec![hold(requirer, requiring_version, version, true)];
+                }
+            }
             if name == "child" {
                 if self.exact_child(&versions) {
                     let parent = versions
@@ -427,6 +458,7 @@ impl ToolWrite for FakeCargo {
                         };
                         versions.insert("child".to_string(), child.to_string());
                     }
+                    Resolver::SnapshotFamily { .. } => {}
                 }
             }
         }
@@ -501,6 +533,19 @@ fn fixture_adapter(
             ("sibling".to_string(), siblings),
         ]),
     };
+    if let Resolver::SnapshotFamily { fresh_sibling, .. } = resolver {
+        // The next family is visible but has not matured under the fixture's fixed clock.
+        for name in ["parent", "child", "sibling"] {
+            fake.releases.insert(
+                name.to_string(),
+                vec![
+                    release("1.0.0", false),
+                    release("1.1.0", fresh_sibling && name == "sibling"),
+                    release("1.2.0", true),
+                ],
+            );
+        }
+    }
     if let Resolver::PersistentParent { companions, .. } = resolver {
         for index in 0..companions {
             fake.releases.insert(
@@ -531,6 +576,20 @@ fn fixture_with_edges(
             parent = "1"
         "#},
     )?;
+    if let Resolver::SnapshotFamily { pinned_child, .. } = resolver {
+        std::fs::write(
+            root.join("Cargo.toml"),
+            indoc::formatdoc! {r#"
+            [package]
+            name = "app"
+            version = "0.1.0"
+            [dependencies]
+            parent = "1.0.0"
+            sibling = "1.0.0"
+            child = "{}1.0.0"
+        "#, if pinned_child { "=" } else { "" }},
+        )?;
+    }
     let project = Project {
         root: root.clone(),
         kind: CARGO,
@@ -644,6 +703,123 @@ async fn preview_keeps_per_batch_edge_rows_with_a_duplicate_guard_baseline() -> 
         rebind.action
     );
     assert_eq!(std::fs::read(project.root.join("Cargo.lock"))?, before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn coordinated_snapshot_family_advances_only_to_the_matured_release() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(
+        Resolver::SnapshotFamily {
+            pinned_child: false,
+            fresh_sibling: false,
+        },
+        2,
+        true,
+    )?;
+    let manifest = std::fs::read(project.manifest.as_std_path())?;
+    let outcome = workspace.upgrade(&RunOpts::default()).await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    assert_eq!(outcome.items.iter().filter(|item| item.applied).count(), 3);
+    assert!(lock(&project)?.values().all(|version| version == "1.1.0"));
+    assert_eq!(std::fs::read(project.manifest.as_std_path())?, manifest);
+    let trials = std::fs::read_to_string(project.root.join("trials"))?;
+    assert!(
+        trials.lines().any(|line| line.contains("parent@1.1.0")
+            && line.contains("child@1.1.0")
+            && line.contains("sibling@1.1.0")),
+        "{trials}"
+    );
+    assert!(!trials.contains("@1.2.0"), "{trials}");
+    assert_clean(&workspace).await;
+
+    let settled = std::fs::read(project.root.join("Cargo.lock"))?;
+    let second = workspace.upgrade(&RunOpts::default()).await;
+    assert_eq!(second.exit, Exit::Ok, "{:?}", second.errors);
+    assert!(second.items.iter().all(|item| !item.applied));
+    assert_eq!(std::fs::read(project.root.join("Cargo.lock"))?, settled);
+    Ok(())
+}
+
+#[tokio::test]
+async fn coordinated_snapshot_family_preserves_an_authored_exact_pin() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(
+        Resolver::SnapshotFamily {
+            pinned_child: true,
+            fresh_sibling: false,
+        },
+        2,
+        true,
+    )?;
+    let before = std::fs::read(project.root.join("Cargo.lock"))?;
+    let outcome = workspace.upgrade(&RunOpts::default()).await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    assert!(outcome.items.iter().all(|item| !item.applied));
+    assert_eq!(std::fs::read(project.root.join("Cargo.lock"))?, before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn coordinated_snapshot_family_keeps_unselected_requirers_authoritative() -> eyre::Result<()>
+{
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(
+        Resolver::SnapshotFamily {
+            pinned_child: false,
+            fresh_sibling: false,
+        },
+        2,
+        true,
+    )?;
+    let before = std::fs::read(project.root.join("Cargo.lock"))?;
+    let outcome = workspace
+        .upgrade(&RunOpts {
+            package: vec![
+                cooldown_core::PatternGlob::new("parent")?,
+                cooldown_core::PatternGlob::new("child")?,
+            ],
+            ..RunOpts::default()
+        })
+        .await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    assert!(outcome.items.iter().all(|item| !item.applied));
+    assert_eq!(std::fs::read(project.root.join("Cargo.lock"))?, before);
+    // The unselected sibling caps the parent, which in turn keeps the child capped.
+    assert!(!project.root.join("trials").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn coordinated_snapshot_family_keeps_an_immature_requirer_authoritative() -> eyre::Result<()>
+{
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(
+        Resolver::SnapshotFamily {
+            pinned_child: false,
+            fresh_sibling: true,
+        },
+        2,
+        true,
+    )?;
+    let before = std::fs::read(project.root.join("Cargo.lock"))?;
+    let outcome = workspace.upgrade(&RunOpts::default()).await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    assert!(outcome.items.iter().all(|item| !item.applied));
+    assert_eq!(std::fs::read(project.root.join("Cargo.lock"))?, before);
+    assert!(!project.root.join("trials").exists());
     Ok(())
 }
 

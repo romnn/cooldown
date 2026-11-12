@@ -111,6 +111,64 @@ pub(super) fn sort_planned_changes(changes: &mut [Change]) {
     });
 }
 
+fn upgrade_ceiling_released(dep: &Dependency, moving: &HashSet<(String, String)>) -> bool {
+    if dep.graph_ceiling.is_none() {
+        return true;
+    }
+    let mut ceilings = dep
+        .hold_edges
+        .iter()
+        .filter(|edge| edge.kind == GraphHoldKind::Ceiling)
+        .peekable();
+    // Without attribution there is no proof that the current cap belongs to this batch.
+    ceilings.peek().is_some()
+        && ceilings.all(|edge| {
+            moving.contains(&(
+                edge.requirer.clone(),
+                edge.requirer_version.as_str().to_string(),
+            ))
+        })
+}
+
+/// Releases graph ceilings only when every pinning requirer is also planned to move.
+///
+/// Authored exact pins and declared bounds remain authoritative.
+/// The resolver validates the successor requirements jointly after planning.
+pub(super) fn upgrade_dependency(
+    dep: &Dependency,
+    moving: &HashSet<(String, String)>,
+) -> Dependency {
+    let mut effective = dep.clone();
+    if upgrade_ceiling_released(dep, moving) {
+        effective.graph_ceiling = None;
+    }
+    effective
+}
+
+/// Removes optimistic candidates whose cap still comes from a non-moving requirer.
+///
+/// Removing a held parent can hold its children in turn, so prune to a fixed point before
+/// constructing the plan.
+pub(super) fn coordinated_upgrade_nodes(
+    deps: &[Dependency],
+    mut moving: HashSet<(String, String)>,
+) -> HashSet<(String, String)> {
+    loop {
+        let held: Vec<_> = deps
+            .iter()
+            .filter(|dep| !upgrade_ceiling_released(dep, &moving))
+            .map(|dep| (dep.package.name.clone(), dep.current.as_str().to_string()))
+            .collect();
+        let previous = moving.len();
+        for node in held {
+            moving.remove(&node);
+        }
+        if moving.len() == previous {
+            return moving;
+        }
+    }
+}
+
 pub(super) fn plan_baseline_violations(
     violations: &HashSet<BaselineViolation>,
 ) -> Vec<BaselineViolation> {

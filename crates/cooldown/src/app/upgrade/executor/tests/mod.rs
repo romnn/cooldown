@@ -1,6 +1,6 @@
 use super::planning::{
     current_line_target, effective_hold, lower_adoptable_targets, plan_baseline_violations,
-    target_package,
+    target_package, upgrade_dependency,
 };
 use super::{
     BatchOutcome, CommittedBatch, PlanMode, TrialRollback, candidate_scope, collapse_applied_legs,
@@ -561,6 +561,33 @@ fn ceiling_edges_follow_their_requirers() {
         .compliant_holder
         .expect("the pinning requirer must be surfaced for the warning");
     assert_eq!(holder.requirer, "fresh-pinner");
+}
+
+#[test]
+fn upgrade_ceiling_requires_all_attributed_requirers_to_move() {
+    let mut child = dep("child", "1.0.0");
+    child.graph_ceiling = Some(child.current.clone());
+    child.graph_floor = Some(child.current.clone());
+    child.hold_edges = vec![
+        hold_edge("parent", "2.0.0", "1.0.0", GraphHoldKind::Ceiling),
+        hold_edge("parent", "3.0.0", "1.0.0", GraphHoldKind::Ceiling),
+    ];
+    let partial = violation_set(&[("parent", "2.0.0")]);
+    assert_eq!(
+        upgrade_dependency(&child, &partial).graph_ceiling,
+        child.graph_ceiling
+    );
+    let together = violation_set(&[("parent", "2.0.0"), ("parent", "3.0.0")]);
+    let effective = upgrade_dependency(&child, &together);
+    assert_eq!(effective.graph_ceiling, None);
+    assert_eq!(effective.graph_floor, child.graph_floor);
+
+    // Missing attribution cannot prove a cap will disappear with the moving parents.
+    child.hold_edges.clear();
+    assert_eq!(
+        upgrade_dependency(&child, &together).graph_ceiling,
+        child.graph_ceiling
+    );
 }
 
 fn change(name: &str, from: &str, to: &str) -> Change {
