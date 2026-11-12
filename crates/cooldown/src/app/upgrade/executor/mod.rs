@@ -9,9 +9,9 @@ use self::batch::{
 };
 pub(crate) use self::planning::target_package_for;
 use self::planning::{
-    EffectiveHold, candidate_scope, current_line_target, dep_resolve_ctx, effective_hold,
-    fix_change, is_downgrade, lower_adoptable_targets, plan_baseline_violations,
-    sort_planned_changes,
+    EffectiveHold, candidate_scope, coordinated_upgrade_nodes, current_line_target,
+    dep_resolve_ctx, effective_hold, fix_change, is_downgrade, lower_adoptable_targets,
+    plan_baseline_violations, sort_planned_changes, upgrade_dependency,
 };
 use self::report::{collapse_applied_legs, combine_lock_status, conflict_skip_message, plan_item};
 use self::transitive_gate::{
@@ -2016,6 +2016,49 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         Some(deps)
     }
 
+    fn upgrade_moving_nodes(
+        &self,
+        deps: &[Dependency],
+        fetched: &[FetchedRelease<Vec<Release>>],
+        rctx: &ResolveContext<'_>,
+    ) -> HashSet<(String, String)> {
+        // Old exact-pin edges cease to be authoritative when their requirers move in this batch.
+        // Start optimistically, then remove candidates whose pinning parents cannot move under
+        // the selected scope, manifest constraints, pins, or cooldown policy.
+        let potential: HashSet<_> = deps
+            .iter()
+            .map(|dep| (dep.package.name.clone(), dep.current.as_str().to_string()))
+            .collect();
+        let moving = fetched
+            .iter()
+            .filter_map(|fetched| {
+                let dep = &fetched.dependency;
+                let releases = fetched.result.as_ref().ok()?;
+                let effective = upgrade_dependency(dep, &potential);
+                let advised = self
+                    .advisories
+                    .as_ref()
+                    .and_then(|project| project.classify(self.ctx.reader, dep, releases));
+                let advisory_ctx = advised.as_ref().map(ClassifiedAdvisories::context);
+                let verdict = evaluate_advised(
+                    &effective,
+                    releases,
+                    advisory_ctx.as_ref(),
+                    &self.ctx.pctx.policy.layers,
+                    &dep_resolve_ctx(rctx, dep),
+                    self.ws.now(),
+                );
+                (verdict.status != Status::Held
+                    && verdict
+                        .adoptable_target
+                        .as_ref()
+                        .is_some_and(|target| *target != dep.current))
+                .then(|| (dep.package.name.clone(), dep.current.as_str().to_string()))
+            })
+            .collect();
+        coordinated_upgrade_nodes(deps, moving)
+    }
+
     async fn plan_upgrade_changes(&mut self, deps: &[Dependency]) -> Vec<Change> {
         self.ctx.progress.phase(format!(
             "fetching metadata for {} upgrade candidates",
@@ -2038,6 +2081,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             )
             .await;
         let advisories = self.advisories.clone();
+        let moving = self.upgrade_moving_nodes(deps, &fetched, &rctx);
         let mut planned = Vec::new();
         for FetchedRelease {
             dependency: dep,
@@ -2055,19 +2099,20 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .as_ref()
                 .and_then(|project| project.classify(self.ctx.reader, &dep, &releases));
             let advisory_ctx = advised.as_ref().map(ClassifiedAdvisories::context);
+            let effective = upgrade_dependency(&dep, &moving);
             let verdict = evaluate_advised(
-                &dep,
+                &effective,
                 &releases,
                 advisory_ctx.as_ref(),
                 &self.ctx.pctx.policy.layers,
                 &dep_resolve_ctx(&rctx, &dep),
                 self.ws.now(),
             );
-            self.record_held_back_ceiling(&dep, &releases, advisory_ctx.as_ref(), &rctx);
+            self.record_held_back_ceiling(&effective, &releases, advisory_ctx.as_ref(), &rctx);
             // Surface an adoptable cross-major update the user could take with `--major` (it would
             // otherwise vanish from a default run even though `outdated` lists it).
             self.record_held_back_major(
-                &dep,
+                &effective,
                 &releases,
                 advisory_ctx.as_ref(),
                 &rctx,

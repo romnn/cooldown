@@ -385,6 +385,8 @@ pub struct Dependency {
     /// releases exist; `evaluate` then reports it [`Status::Held`]. `None` means unbounded above (the
     /// common case — most deps can move up). A direct manifest pin is captured by
     /// [`pinned`](Self::pinned) instead; this field is for the *transitive* ceiling the graph imposes.
+    /// Upgrade planning may discount attributed caps whose requirers all have eligible co-planned
+    /// successors, leaving the resolver to validate their new requirements together.
     ///
     /// Invariant every adapter upholds: when set, this equals [`current`](Self::current) — an exact
     /// `==`/`=` pin forces the dependency to resolve to exactly that version, so an *active* ceiling is
@@ -413,7 +415,8 @@ pub struct Dependency {
     /// The attributed constraint edges behind [`graph_floor`](Self::graph_floor) and
     /// [`graph_ceiling`](Self::graph_ceiling), when the adapter can name each requirer. Empty when
     /// attribution is unavailable; the collapsed fields then remain the only graph constraint and
-    /// `fix` planning treats every hold as genuine. See [`GraphHoldEdge`].
+    /// planning treats every hold as genuine.
+    /// See [`GraphHoldEdge`].
     pub hold_edges: Vec<GraphHoldEdge>,
 }
 
@@ -426,9 +429,11 @@ pub struct Dependency {
 /// A hold contributed only by requirers that are themselves too-fresh violations is circular — the
 /// floor is conditioned on the very resolution being fixed — so the planner discounts those edges
 /// and plans the whole co-moving family; a hold from a compliant requirer is genuine and is
-/// reported with the requirer's name and requirement. Adapters that cannot attribute constraints
-/// leave [`Dependency::hold_edges`] empty, which disables discounting and preserves the collapsed
-/// behavior.
+/// reported with the requirer's name and requirement.
+/// Upgrade planning also discounts ceilings when every imposing requirer has an eligible
+/// successor in the same batch, while preserving authored pins and holds outside the batch.
+/// Adapters that cannot attribute constraints leave [`Dependency::hold_edges`] empty, which
+/// disables discounting and preserves the collapsed behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphHoldEdge {
     /// The requiring package's name (a resolved non-member node in the graph).
