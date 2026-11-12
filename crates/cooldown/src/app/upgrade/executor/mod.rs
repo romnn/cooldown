@@ -447,7 +447,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
     }
 
-    pub(super) async fn run(&mut self) -> ProjectRunStatus {
+    pub(super) fn run(&mut self) -> impl std::future::Future<Output = ProjectRunStatus> {
+        // Keep the executor's async state out of project orchestration and tracing wrappers.
+        Box::pin(self.run_inner())
+    }
+
+    async fn run_inner(&mut self) -> ProjectRunStatus {
         let guard = match self.ctx.write_guard().await {
             Ok(guard) => guard,
             Err(error) => {
@@ -1593,8 +1598,19 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     /// Runs a candidate landing and its transitive remediation before rejecting the graph.
-    #[tracing::instrument(skip_all, fields(project = %self.ctx.pctx.rel_path, tool = %self.ctx.pctx.tool))]
-    async fn try_upgrade_group_once(
+    fn try_upgrade_group_once(
+        &mut self,
+        changes: Vec<Change>,
+        policy_baseline: &HashSet<BaselineViolation>,
+        state: &mut TrialState,
+        rollback: &mut TrialRollback,
+    ) -> impl std::future::Future<Output = UpgradeTrialResult> {
+        // A trial is polled beneath fallback and reconciliation scopes; own its state once.
+        Box::pin(self.run_upgrade_trial(changes, policy_baseline, state, rollback))
+    }
+
+    #[tracing::instrument(name = "try_upgrade_group_once", skip_all, fields(project = %self.ctx.pctx.rel_path, tool = %self.ctx.pctx.tool))]
+    async fn run_upgrade_trial(
         &mut self,
         changes: Vec<Change>,
         policy_baseline: &HashSet<BaselineViolation>,

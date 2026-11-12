@@ -81,7 +81,8 @@ pub async fn run(cli: Cli, overrides: CliOverrides) -> Exit {
                 selected: &selected,
             },
         );
-        let result = run_inner(cli, overrides).await;
+        // Keep the command state out of every enclosing subscriber and runtime frame.
+        let result = Box::pin(run_inner(cli, overrides)).await;
         let error = result.as_ref().err().map(ToString::to_string);
         let exit = match result {
             Ok(exit) => exit,
@@ -193,7 +194,7 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
     let setup_command = setup::SetupCommand::for_command(&cli.command).ok_or_else(|| {
         CoreError::System("workspace-free command reached workspace setup".to_string())
     })?;
-    let prepared = setup::prepare_run(global, &overrides, setup_command).await?;
+    let prepared = Box::pin(setup::prepare_run(global, &overrides, setup_command)).await?;
     let repo_root = prepared.repo_root;
     cooldown_core::trace::Event::Workspace {
         repository: repo_root.as_str(),
@@ -258,7 +259,8 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
         progress_project_tools.truncate(1);
     }
     opts.progress.start_run(&progress_project_tools);
-    let result = commands::dispatch(
+    // Dispatch owns a large command future; store it once instead of copying it through spans.
+    let result = Box::pin(commands::dispatch(
         cli.command,
         commands::CommandContext {
             ws: &ws,
@@ -268,7 +270,7 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
             generated_at: &generated_at,
             pre_sync_warnings: &pre_sync_warnings,
         },
-    )
+    ))
     .await;
     opts.progress.finish_run();
 

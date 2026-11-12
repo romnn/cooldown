@@ -63,7 +63,9 @@ dependency-policy result.
 already written when a run is interrupted. Files and HTTP bodies are emitted in bounded chunks.
 Native stdout and stderr are emitted as they arrive, including partial output before interruption
 or timeout; drivers retain their existing output buffer for parsing. Recording never accumulates
-the complete run history in memory. Correlation uses scoped operation IDs and parent IDs across
+the complete run history in memory. Large command, project, and resolver-trial futures are
+heap-pinned at orchestration boundaries so nested tracing wrappers do not multiply their stack
+footprint. Correlation uses scoped operation IDs and parent IDs across
 overlapping projects and resolver attempts; timestamps alone are insufficient. The CLI uses a
 run-scoped tracing subscriber and owns the single buffered file writer. A complete run has an
 explicit terminal record, and an interrupted or abruptly terminated recording must not be mistaken
