@@ -3423,12 +3423,58 @@ fn guard_resolved_copies(
             .any(|(id, info)| info.name == *name && info.source == *source && graph.is_direct(id))
         {
             let versions = versions_for_name(&after_copies, &identity).join(" and ");
+            let remedy = direct_split_remedy(graph, &identity, before_copies.get(&identity));
             return Err(CoreError::UnacceptableResolve(format!(
-                "would resolve direct dependency {name} at another incompatible line ({versions}); upgrade {name} with it"
+                "would resolve direct dependency {name} at another incompatible line ({versions}); {remedy}"
             )));
         }
     }
     Ok(())
+}
+
+fn direct_split_remedy(
+    graph: &ResolvedGraph,
+    identity: &(Option<String>, String),
+    before: Option<&BTreeSet<String>>,
+) -> String {
+    let (source, name) = identity;
+    let retained: HashSet<&String> = graph
+        .packages
+        .iter()
+        .filter(|(_, info)| {
+            info.name == *name
+                && info.source == *source
+                && before.is_some_and(|versions| {
+                    versions.iter().any(|version| {
+                        compatibility_line(version) == compatibility_line(&info.version)
+                    })
+                })
+        })
+        .map(|(id, _)| id)
+        .collect();
+    let requirers: BTreeSet<String> = graph
+        .edges
+        .iter()
+        .filter(|(id, dependencies)| {
+            !graph.generated_roots.contains(*id)
+                && dependencies
+                    .iter()
+                    .any(|dependency| retained.contains(dependency))
+        })
+        .filter_map(|(id, _)| graph.packages.get(id))
+        .map(|info| format!("{} {}", info.name, info.version))
+        .collect();
+    let attribution = if requirers.is_empty() {
+        "a dependency retains the old line".to_string()
+    } else {
+        format!(
+            "the old line is retained by {}",
+            requirers.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    };
+    format!(
+        "{attribution}; align the retaining dependents' requirements and compatible releases, or keep this candidate held"
+    )
 }
 
 fn versions_for_name(
@@ -3774,7 +3820,8 @@ mod tests {
         .expect_err("authored dep cannot gain an incompatible line");
         assert!(matches!(error, CoreError::UnacceptableResolve(ref detail)
             if detail.contains("direct dependency dep") && detail.contains("1.0.0 and 2.0.0")
-            && detail.contains("upgrade dep with it")));
+            && detail.contains("retained by app 0.1.0")
+            && detail.contains("keep this candidate held")));
 
         // A pre-existing split does not authorize replacing one line with a new incompatible one.
         let standing = duplicate_guard_lock(&[("dep", "1.0.0"), ("dep", "3.0.0")])?;
@@ -3800,6 +3847,78 @@ mod tests {
             Some(&graph),
             &cooldown_core::SingleCopyPolicy::default(),
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_guard_names_retainers_when_the_direct_dependency_moves() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(tmp.path()).ok_or_else(|| eyre::eyre!("utf8 root"))?;
+        let mut graph = hakari_workspace(root);
+        graph.generated_roots.insert("hack".to_string());
+        // The authored edge moves to the new line, while two registry packages keep the old one.
+        graph.packages.insert(
+            "new-dep".to_string(),
+            crate::cargocmd::PkgInfo {
+                name: "dep".to_string(),
+                version: "2.0.0".to_string(),
+                source: Some(crate::cargocmd::CRATES_IO_SOURCE.to_string()),
+                path: String::new(),
+            },
+        );
+        graph
+            .edges
+            .insert("app".to_string(), vec!["new-dep".to_string()]);
+        for name in ["retainer-z", "retainer-a"] {
+            graph.packages.insert(
+                name.to_string(),
+                crate::cargocmd::PkgInfo {
+                    name: name.to_string(),
+                    version: "3.0.0".to_string(),
+                    source: Some(crate::cargocmd::CRATES_IO_SOURCE.to_string()),
+                    path: String::new(),
+                },
+            );
+            graph
+                .edges
+                .insert(name.to_string(), vec!["dep".to_string()]);
+        }
+        // A source-distinct namesake must not be blamed for retaining the registry copy.
+        graph.packages.insert(
+            "private-dep".to_string(),
+            crate::cargocmd::PkgInfo {
+                name: "dep".to_string(),
+                version: "1.0.0".to_string(),
+                source: Some("registry+https://private.example/index".to_string()),
+                path: String::new(),
+            },
+        );
+        graph
+            .edges
+            .insert("orphan".to_string(), vec!["private-dep".to_string()]);
+        let before = duplicate_guard_lock(&[("dep", "1.0.0")])?;
+        let after = duplicate_guard_lock(&[("dep", "1.0.0"), ("dep", "2.0.0")])?;
+        let error = guard_resolved_copies(
+            Some(&before),
+            &after,
+            Some(&graph),
+            &cooldown_core::SingleCopyPolicy::default(),
+        )
+        .expect_err("the direct upgrade must not add an incompatible copy");
+        let CoreError::UnacceptableResolve(detail) = error else {
+            eyre::bail!("unexpected rejection: {error}");
+        };
+        assert!(
+            detail.contains("retained by retainer-a 3.0.0, retainer-z 3.0.0"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("align the retaining dependents' requirements and compatible releases")
+        );
+        assert!(detail.contains("keep this candidate held"));
+        assert!(!detail.contains("upgrade dep with it"));
+        assert!(!detail.contains("hack 0.1.0"));
+        assert!(!detail.contains("orphan 2.0.0"));
         Ok(())
     }
 
@@ -4123,7 +4242,10 @@ mod tests {
             .await
             .expect_err("settled authored sibling split must trigger candidate isolation");
         assert!(matches!(error, CoreError::UnacceptableResolve(detail)
-            if detail.contains("direct dependency beta") && detail.contains("2.3.0 and 3.0.0")));
+            if detail.contains("direct dependency beta") && detail.contains("2.3.0 and 3.0.0")
+            && detail.contains("retained by app 0.1.0")
+            && detail.contains("keep this candidate held")
+            && !detail.contains("keep beta held")));
         assert!(tool.guards_duplicate_copies());
         Ok(())
     }
