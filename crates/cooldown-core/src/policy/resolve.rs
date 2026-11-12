@@ -209,7 +209,14 @@ pub fn resolve(layers: &[PolicyLayer], query: &ResolveQuery<'_>, now: Timestamp)
         advisory_floor_origin: advisory_floor.map(|floor| floor.origin),
     };
 
-    Resolution { window, trace }
+    let resolution = Resolution { window, trace };
+    crate::trace::Event::PolicyResolved {
+        query,
+        evaluation_at: now,
+        resolution: &resolution,
+    }
+    .emit();
+    resolution
 }
 
 /// The floor that would still clamp the advisory *security* window: `bypass-floor` is resolved

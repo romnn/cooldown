@@ -178,6 +178,45 @@ fn build_releases(current: &str, raw: Vec<RawRelease>) -> Vec<Release> {
 
 #[async_trait]
 impl<L: JavaLayout> ToolRead for JavaTool<L> {
+    fn version_command(&self) -> Option<cooldown_core::trace::ToolVersionCommand> {
+        Some(cooldown_core::trace::ToolVersionCommand {
+            program: self.driver.program().to_string(),
+            arguments: vec!["--version".into()],
+        })
+    }
+
+    fn evidence(&self, project: &Project) -> Result<cooldown_core::trace::Evidence> {
+        use cooldown_core::trace::GraphCoverage;
+        let mut evidence = cooldown_adapter_util::evidence::native(
+            project,
+            L::LOCKFILE,
+            GraphCoverage::Inventory {
+                reason: "native declarations or pins do not contain the full resolved graph".into(),
+            },
+            &[
+                "settings.gradle",
+                "settings.gradle.kts",
+                "build.gradle",
+                "build.gradle.kts",
+                "gradle.properties",
+                ".mvn/maven.config",
+                ".mvn/jvm.config",
+            ],
+        );
+        cooldown_adapter_util::evidence::ancestors(&mut evidence, &project.root, &[]);
+        cooldown_adapter_util::evidence::environment(
+            &mut evidence,
+            &[
+                "JAVA_HOME",
+                "MAVEN_OPTS",
+                "MAVEN_ARGS",
+                "GRADLE_USER_HOME",
+                "GRADLE_OPTS",
+            ],
+        );
+        Ok(evidence)
+    }
+
     fn id(&self) -> ToolId {
         L::ID
     }

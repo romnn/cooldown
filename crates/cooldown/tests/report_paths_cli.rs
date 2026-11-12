@@ -29,6 +29,7 @@ fn cooldown_json(directory: &tempfile::TempDir, args: &[&str]) -> eyre::Result<s
     // An empty cache keeps `--offline` from answering any release, so the run stays hermetic.
     let cache = tempfile::tempdir()?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_cooldown"));
+    command.env("COOLDOWN_NO_TRACE", "true");
     // The user's own `COOLDOWN_*` settings and global config could narrow detection, such as a
     // `tool` filter that skips the fixture project, so neither reaches the run.
     // Windows matches variable names regardless of case, so the prefix is compared the same way.

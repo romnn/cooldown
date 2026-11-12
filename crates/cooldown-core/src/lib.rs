@@ -17,6 +17,7 @@ pub mod mutation;
 pub mod policy;
 pub mod ports;
 pub mod redact;
+pub mod trace;
 
 pub use advisory::{
     Advisory, AdvisoryContext, AdvisoryFetch, AdvisoryId, AdvisoryMode, AdvisoryPolicy,

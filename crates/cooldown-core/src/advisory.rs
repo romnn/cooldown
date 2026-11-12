@@ -579,7 +579,7 @@ fn is_beginning(version: &str) -> bool {
 ///
 /// Every field is optional so a layer only overrides what it names; [`resolve_advisory_policy`]
 /// combines the layers per field.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct AdvisoryPolicy {
     /// Whether the feed is consulted at all (off unless some layer turns it on).
     pub enabled: Option<bool>,
@@ -827,7 +827,7 @@ impl PolicyAccumulator {
 }
 
 /// Why a row is security-relevant and what the policy did about it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SecurityRelevance {
     /// The advisories the row's version fixes (candidate side: adopting it resolves them; pin
     /// side: the locked version is their fix).

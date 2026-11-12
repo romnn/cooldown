@@ -25,6 +25,12 @@ impl Default for Uv {
 }
 
 impl Uv {
+    /// The executable selected for this driver, including any explicit override.
+    #[must_use]
+    pub fn program(&self) -> &str {
+        &self.bin
+    }
+
     /// Creates a handle to the `uv` binary, honouring the `COOLDOWN_UV` override.
     #[must_use]
     pub fn new() -> Self {

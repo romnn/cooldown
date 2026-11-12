@@ -46,7 +46,7 @@ impl SetupCommand {
             Command::Explain { .. } => Some(Self::Explain),
             Command::Config { .. } => Some(Self::Config),
             Command::Sync => Some(Self::Sync),
-            Command::Init | Command::Schema | Command::Recover => None,
+            Command::Init | Command::Schema | Command::Recover | Command::Prune { .. } => None,
         }
     }
 

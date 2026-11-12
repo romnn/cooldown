@@ -25,7 +25,7 @@ use jiff::Timestamp;
 /// not properties of the [`Dependency`] itself: the tool, project, major scope, and whether an
 /// upgrade may rewrite explicit declared bounds. It is `Copy`, so it is cheap to pass by value or
 /// reference.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct ResolveContext<'a> {
     /// The tool being evaluated, used to build the [`ResolveQuery`]
     /// for each candidate.
@@ -82,12 +82,7 @@ pub struct CeilingHold {
     pub security: Option<crate::advisory::SecurityRelevance>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct CeilingFilters {
-    declared_bound: bool,
-    max_major: bool,
-    latest_tag: bool,
-}
+use crate::trace::CandidateFilters as CeilingFilters;
 
 impl CeilingFilters {
     fn standard(ctx: &ResolveContext<'_>) -> Self {
@@ -585,6 +580,92 @@ fn evaluate_with_filters(
     now: Timestamp,
     filters: CeilingFilters,
 ) -> Verdict {
+    let verdict = evaluate_filtered(dep, releases, advisory, layers, ctx, now, filters);
+    crate::trace::Event::Evaluation {
+        project: ctx.project.as_str(),
+        dependency: dep,
+        releases,
+        context: ctx,
+        evaluation_at: now,
+        decision: crate::trace::Decision::Upgrade(&verdict),
+        filters: Some(filters),
+    }
+    .emit();
+    verdict
+}
+
+fn eligibility_rejection(
+    release: &Release,
+    dep: &Dependency,
+    current_major: &MajorKey,
+    ctx: &ResolveContext<'_>,
+    now: Timestamp,
+) -> Option<crate::trace::ReleaseFilter> {
+    use crate::trace::ReleaseFilter;
+    if !quality_eligible(release, dep.current_quality) {
+        Some(ReleaseFilter::Quality)
+    } else if !major_eligible(release, current_major, ctx.allow_major) {
+        Some(ReleaseFilter::Major)
+    } else if release.yanked {
+        Some(ReleaseFilter::Yanked)
+    } else if release.version != dep.current && !visible_at(release, now) {
+        Some(ReleaseFilter::NotPublished)
+    } else {
+        None
+    }
+}
+
+fn release_passes(
+    dep: &Dependency,
+    release: &Release,
+    ctx: &ResolveContext<'_>,
+    reason: Option<crate::trace::ReleaseFilter>,
+) -> bool {
+    if let Some(reason) = reason {
+        crate::trace::Event::ReleaseFiltered {
+            project: ctx.project.as_str(),
+            dependency: dep,
+            release,
+            reason,
+        }
+        .emit();
+    }
+    reason.is_none()
+}
+
+impl CeilingFilters {
+    fn rejection(
+        self,
+        release: &Release,
+        dep: &Dependency,
+        max_major: Option<&MaxMajorPick>,
+        latest_tagged: bool,
+    ) -> Option<crate::trace::ReleaseFilter> {
+        use crate::trace::ReleaseFilter;
+        if !within_max_major(release, max_major) {
+            Some(ReleaseFilter::MaxMajor)
+        } else if self.declared_bound
+            && dep.declared_bound.is_some()
+            && release.beyond_declared_bound
+        {
+            Some(ReleaseFilter::DeclaredBound)
+        } else if latest_tagged && release.beyond_latest_tag {
+            Some(ReleaseFilter::DistTag)
+        } else {
+            None
+        }
+    }
+}
+
+fn evaluate_filtered(
+    dep: &Dependency,
+    releases: &[Release],
+    advisory: Option<&AdvisoryContext<'_>>,
+    layers: &[PolicyLayer],
+    ctx: &ResolveContext<'_>,
+    now: Timestamp,
+    filters: CeilingFilters,
+) -> Verdict {
     debug_assert!(
         releases.is_sorted_by(|a, b| a.order <= b.order),
         "releases must be sorted ascending by ReleaseOrder"
@@ -634,11 +715,13 @@ fn evaluate_with_filters(
     // dated after `now`), current included, so `latest` is well-defined even when up to date.
     let eligible: Vec<&Release> = releases
         .iter()
-        .filter(|r| {
-            quality_eligible(r, dep.current_quality)
-                && major_eligible(r, &current_major, ctx.allow_major)
-                && !r.yanked
-                && (r.version == dep.current || visible_at(r, now))
+        .filter(|release| {
+            release_passes(
+                dep,
+                release,
+                ctx,
+                eligibility_rejection(release, dep, &current_major, ctx, now),
+            )
         })
         .collect();
 
@@ -653,14 +736,16 @@ fn evaluate_with_filters(
     let candidates: Vec<Candidate> = eligible
         .iter()
         .copied()
-        .filter(|r| {
-            r.order > current_order
-                && ceiling_order.is_none_or(|c| r.order <= *c)
-                && within_max_major(r, max_major.as_ref())
-                && !(filters.declared_bound
-                    && dep.declared_bound.is_some()
-                    && r.beyond_declared_bound)
-                && !(latest_tagged.is_some() && r.beyond_latest_tag)
+        .filter(|release| {
+            use crate::trace::ReleaseFilter;
+            let reason = if release.order <= current_order {
+                Some(ReleaseFilter::CurrentOrOlder)
+            } else if ceiling_order.is_some_and(|ceiling| release.order > *ceiling) {
+                Some(ReleaseFilter::GraphCeiling)
+            } else {
+                filters.rejection(release, dep, max_major.as_ref(), latest_tagged.is_some())
+            };
+            release_passes(dep, release, ctx, reason)
         })
         .filter_map(|r| classify_candidate(r, current, dep, advisory, layers, ctx, now))
         .collect();
@@ -990,19 +1075,30 @@ pub fn check_pin_advised(
     let graph_held = matches!(&dep.graph_floor, Some(v) if *v == locked.version)
         || matches!(&dep.graph_ceiling, Some(v) if *v == locked.version);
 
-    PinVerdict {
+    let verdict = PinVerdict {
         status,
         window,
         graph_held,
         graph_floor: dep.graph_floor.clone(),
         published_at: locked.published_at,
         security,
+    };
+    crate::trace::Event::Evaluation {
+        project: ctx.project.as_str(),
+        dependency: dep,
+        releases: std::slice::from_ref(locked),
+        context: ctx,
+        evaluation_at: now,
+        decision: crate::trace::Decision::Pin(&verdict),
+        filters: None,
     }
+    .emit();
+    verdict
 }
 
 /// The downgrade plan for one dependency under `fix`: whether its currently-locked version violates
 /// the cooldown and, if so, the newest already-matured version to roll back to.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FixVerdict {
     /// The current pin's [`check_pin`] verdict. Only [`Status::CurrentInCooldown`] needs fixing;
     /// [`PinVerdict::graph_held`] means the graph itself requires the too-fresh version, so `fix`
@@ -1040,6 +1136,28 @@ pub fn evaluate_fix(
 /// With `advisory` absent this is exactly [`evaluate_fix`].
 #[must_use]
 pub fn evaluate_fix_advised(
+    dep: &Dependency,
+    releases: &[Release],
+    advisory: Option<&AdvisoryContext<'_>>,
+    layers: &[PolicyLayer],
+    ctx: &ResolveContext<'_>,
+    now: Timestamp,
+) -> FixVerdict {
+    let verdict = evaluate_fix_inner(dep, releases, advisory, layers, ctx, now);
+    crate::trace::Event::Evaluation {
+        project: ctx.project.as_str(),
+        dependency: dep,
+        releases,
+        context: ctx,
+        evaluation_at: now,
+        decision: crate::trace::Decision::Fix(&verdict),
+        filters: None,
+    }
+    .emit();
+    verdict
+}
+
+fn evaluate_fix_inner(
     dep: &Dependency,
     releases: &[Release],
     advisory: Option<&AdvisoryContext<'_>>,

@@ -63,6 +63,7 @@ fn check_allowing_stale_lock(
     // An empty cache keeps `--offline` from answering any release, so the run stays hermetic.
     let cache = tempfile::tempdir()?;
     let output = Command::new(env!("CARGO_BIN_EXE_cooldown"))
+        .env("COOLDOWN_NO_TRACE", "true")
         .current_dir(directory.path())
         .env("XDG_CACHE_HOME", cache.path())
         .env("COOLDOWN_PNPM", directory.path().join("fake-pnpm.sh"))

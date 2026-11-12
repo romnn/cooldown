@@ -49,6 +49,12 @@ fn case_variants(inherited: impl IntoIterator<Item = OsString>, names: &[&str]) 
 }
 
 impl NodeCmd {
+    /// The executable selected for this driver, including any explicit override.
+    #[must_use]
+    pub fn program(&self) -> &str {
+        &self.bin
+    }
+
     /// Creates a handle to `bin`, honouring the `COOLDOWN_<BIN>` override.
     #[must_use]
     pub fn new(bin: &str) -> Self {

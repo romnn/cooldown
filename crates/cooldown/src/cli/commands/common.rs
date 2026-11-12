@@ -13,6 +13,16 @@ where
     I: Serialize,
     F: FnOnce() -> String,
 {
+    if cooldown_core::trace::enabled() {
+        match serde_json::to_value(env) {
+            Ok(report) => {
+                cooldown_core::trace::Event::Report { report: &report }.emit();
+            }
+            Err(err) => {
+                tracing::error!(target: cooldown_core::trace::TARGET, error = %err, "report serialization failed");
+            }
+        }
+    }
     if json {
         let json = render::to_json(env)
             .map_err(|error| CoreError::Serialization(format!("serialize JSON output: {error}")))?;

@@ -33,7 +33,9 @@ pub(crate) async fn dispatch(command: Command, ctx: CommandContext<'_>) -> Resul
             clippy::unreachable,
             reason = "schema/init are dispatched before any workspace exists"
         )]
-        Command::Schema | Command::Init | Command::Recover => unreachable!("handled earlier"),
+        Command::Schema | Command::Init | Command::Recover | Command::Prune { .. } => {
+            unreachable!("handled earlier")
+        }
     }
 }
 

@@ -247,6 +247,19 @@ pub(super) fn plan(
 }
 
 impl Plan {
+    pub(super) fn evidence_paths(&self) -> Vec<Utf8PathBuf> {
+        let mut paths: std::collections::BTreeSet<_> = self.in_place.keys().cloned().collect();
+        for entry in self.entries.values() {
+            match entry {
+                Entry::File { source } | Entry::Screened { source, .. } => {
+                    paths.insert(source.clone());
+                }
+                Entry::Directory { .. } | Entry::Link { .. } => {}
+            }
+        }
+        paths.into_iter().collect()
+    }
+
     /// The source of every file and directory the copy holds, in the copy's order, an empty
     /// directory of a `file:` folder included.
     pub(super) fn copied_sources(&self) -> Vec<Utf8PathBuf> {
@@ -328,6 +341,7 @@ impl Plan {
     /// permissions.
     /// Directory permissions are applied once the tree is complete, deepest first, since a
     /// directory Yarn would archive read-only could not otherwise be filled.
+    #[tracing::instrument(name = "yarn_stage_inputs", skip_all, fields(project = %self.root, materialized = tree.is_some()))]
     fn copy(&self, tree: Option<&Utf8Path>) -> Result<Copied> {
         let mut digest = Digester::default();
         let mut directories = Vec::new();
@@ -352,6 +366,13 @@ impl Plan {
                     if let Some(destination) = &destination {
                         write_file(destination, &bytes, permissions.clone())?;
                     }
+                    cooldown_core::trace::artifact(
+                        cooldown_core::trace::ArtifactSource::File {
+                            path: source.as_str(),
+                            role: cooldown_core::trace::InputRole::ResolverInput,
+                        },
+                        &bytes,
+                    );
                     digest.record(Record::File(mode(&permissions)), relative, &bytes);
                 }
                 Entry::Screened { source, bytes } => {
@@ -362,6 +383,13 @@ impl Plan {
                     if let Some(destination) = &destination {
                         write_file(destination, bytes, permissions.clone())?;
                     }
+                    cooldown_core::trace::artifact(
+                        cooldown_core::trace::ArtifactSource::File {
+                            path: source.as_str(),
+                            role: cooldown_core::trace::InputRole::ResolverInput,
+                        },
+                        bytes,
+                    );
                     digest.record(Record::File(mode(&permissions)), relative, bytes);
                 }
                 Entry::Link { target, directory } => {
@@ -388,7 +416,16 @@ impl Plan {
                 return Ok(Copied::Changed(changed(&self.root, path)));
             }
             match bytes {
-                Some(bytes) => digest.record(Record::InPlace, path, &bytes),
+                Some(bytes) => {
+                    cooldown_core::trace::artifact(
+                        cooldown_core::trace::ArtifactSource::File {
+                            path: path.as_str(),
+                            role: cooldown_core::trace::InputRole::ResolverInput,
+                        },
+                        &bytes,
+                    );
+                    digest.record(Record::InPlace, path, &bytes);
+                }
                 None => digest.record(Record::Absent, path, &[]),
             }
         }

@@ -3,25 +3,39 @@ use crate::app::Exit;
 use crate::cli::{Cli, CliOverrides};
 use camino::Utf8PathBuf;
 use cooldown_core::CoreError;
+use std::sync::Arc;
+use tracing::instrument::WithSubscriber as _;
 
-/// Install the tracing subscriber that writes to stderr.
+/// Builds independent console and run-recording layers.
 ///
 /// `RUST_LOG`, when set and non-empty, is honored verbatim as a full `EnvFilter` directive (the
 /// standard Rust escape hatch); otherwise the `--log-level` / `COOLDOWN_LOG` selection drives it.
-/// Idempotent: a second call is a no-op (so tests that build a CLI can't double-install).
-fn init_logging(level: super::LogLevel) {
-    use tracing_subscriber::{EnvFilter, fmt};
+/// The subscriber is scoped to one run so concurrent library callers cannot share trace files.
+fn logging(
+    level: super::LogLevel,
+    recorder: Option<Arc<crate::trace::Recorder>>,
+) -> tracing::Dispatch {
+    use tracing_subscriber::filter::filter_fn;
+    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
     let directive = match std::env::var("RUST_LOG") {
         Ok(value) if !value.is_empty() => value,
         _ => level.directive(),
     };
     let filter = EnvFilter::try_new(&directive).unwrap_or_else(|_| EnvFilter::new("off"));
-    let _ = fmt()
-        .with_env_filter(filter)
+    let console = fmt::layer()
         .with_writer(std::io::stderr)
         .with_target(false)
-        .try_init();
+        .with_filter(filter_fn(|metadata| {
+            metadata.target() != cooldown_core::trace::TARGET
+        }))
+        .with_filter(filter);
+    let recording = recorder.map(|recorder| {
+        crate::trace::TraceLayer::new(recorder).with_filter(filter_fn(|metadata| {
+            metadata.target().starts_with("cooldown")
+        }))
+    });
+    tracing::Dispatch::new(tracing_subscriber::registry().with(console).with(recording))
 }
 
 /// Run a parsed [`Cli`], returning the process [`Exit`].
@@ -29,14 +43,121 @@ fn init_logging(level: super::LogLevel) {
 /// Any [`CoreError`] that escapes the dispatch is printed to stderr and mapped to an exit by its
 /// kind, so this function itself is infallible.
 pub async fn run(cli: Cli, overrides: CliOverrides) -> Exit {
-    init_logging(cli.global.log_level);
-    match run_inner(cli, overrides).await {
-        Ok(exit) => exit,
-        Err(error) => {
-            tracing::debug!(error = %error, "run failed");
-            eprintln!("error: {error}");
-            exit_for_error(&error)
+    let directory = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let selected = cli
+        .global
+        .dir
+        .as_ref()
+        .map_or_else(|| directory.clone(), |selected| directory.join(selected));
+    let trace_command = match &cli.command {
+        Command::Upgrade { .. } => Some(crate::trace::TraceCommand::Upgrade),
+        Command::Fix { .. } => Some(crate::trace::TraceCommand::Fix),
+        Command::Outdated { .. } => Some(crate::trace::TraceCommand::Outdated),
+        _ => None,
+    }
+    .filter(|_| !cli.global.no_trace);
+    let recorder = trace_command.and_then(|command| {
+        match crate::trace::Recorder::start(
+            &selected,
+            command,
+            cli.global
+                .trace_dir
+                .as_deref()
+                .map(camino::Utf8Path::as_std_path),
+        ) {
+            Ok(recorder) => Some(recorder),
+            Err(err) => {
+                eprintln!("cooldown: warning: cannot record run trace: {err}");
+                None
+            }
         }
+    });
+    let subscriber = logging(cli.global.log_level, recorder.clone());
+    async move {
+        record_invocation(
+            &cli.command,
+            InvocationPaths {
+                directory: &directory,
+                selected: &selected,
+            },
+        );
+        let result = run_inner(cli, overrides).await;
+        let error = result.as_ref().err().map(ToString::to_string);
+        let exit = match result {
+            Ok(exit) => exit,
+            Err(error) => {
+                tracing::debug!(error = %error, "run failed");
+                eprintln!("error: {error}");
+                exit_for_error(&error)
+            }
+        };
+        cooldown_core::trace::Event::RunFinished {
+            exit_code: if cooldown_core::interrupt::requested() {
+                130
+            } else {
+                u8::try_from(exit.code()).unwrap_or(4)
+            },
+            interrupted: cooldown_core::interrupt::requested(),
+            error: error.as_deref(),
+        }
+        .emit();
+        if let Some(recorder) = recorder {
+            recorder.finish();
+        }
+        exit
+    }
+    .with_subscriber(subscriber)
+    .await
+}
+
+#[derive(Clone, Copy)]
+struct InvocationPaths<'a> {
+    directory: &'a std::path::Path,
+    selected: &'a std::path::Path,
+}
+
+fn record_invocation(command: &Command, paths: InvocationPaths<'_>) {
+    if cooldown_core::trace::enabled() {
+        cooldown_core::trace::Event::RunStarted {
+            command: command_name(command),
+            version: env!("CARGO_PKG_VERSION"),
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+            directory: &paths.directory.to_string_lossy(),
+        }
+        .emit();
+        let arguments: Vec<String> = std::env::args_os()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        let environment: Vec<_> = std::env::vars_os()
+            .filter_map(|(name, value)| {
+                let name = name.to_string_lossy();
+                (name.starts_with("COOLDOWN_")
+                    || matches!(
+                        name.as_ref(),
+                        "PATH"
+                            | "HOME"
+                            | "USERPROFILE"
+                            | "TMPDIR"
+                            | "TEMP"
+                            | "TMP"
+                            | "XDG_CONFIG_HOME"
+                            | "XDG_CACHE_HOME"
+                            | "APPDATA"
+                            | "LOCALAPPDATA"
+                    ))
+                .then(|| cooldown_core::trace::EnvironmentOverride {
+                    name: name.into_owned(),
+                    value: Some(value.to_string_lossy().into_owned()),
+                })
+            })
+            .collect();
+        cooldown_core::trace::Event::Invocation {
+            arguments: &arguments,
+            environment: &environment,
+            selected_directory: &paths.selected.to_string_lossy(),
+        }
+        .emit();
     }
 }
 
@@ -49,6 +170,7 @@ fn exit_for_error(error: &CoreError) -> Exit {
     }
 }
 
+#[tracing::instrument(name = "command", skip_all, fields(command = command_name(&cli.command)))]
 async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError> {
     let global = &cli.global;
 
@@ -73,11 +195,17 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
     })?;
     let prepared = setup::prepare_run(global, &overrides, setup_command).await?;
     let repo_root = prepared.repo_root;
+    cooldown_core::trace::Event::Workspace {
+        repository: repo_root.as_str(),
+    }
+    .emit();
     let ws = prepared.ws;
     let opts = prepared.opts;
     // `--json` is itself config-resolvable, so color and the no-tool output key off the
     // resolved value rather than the raw flag. `--color` then forces/suppresses (default: auto).
     let color = global.color.resolve(opts.json);
+
+    ws.trace_initial().await;
 
     if ws.is_empty() {
         opts.progress.finish_run();
@@ -103,6 +231,10 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
     let mut pre_sync_warnings = Vec::new();
     if global.sync && !opts.dry_run && pre_syncs(&cli.command) {
         let synced = ws.sync(&opts).await;
+        if cooldown_core::trace::enabled() {
+            let report = serde_json::json!({ "command": "sync", "phase": "before_command", "exitCode": synced.exit.code(), "summary": synced.summary, "items": synced.items, "warnings": synced.warnings, "errors": synced.errors });
+            cooldown_core::trace::Event::Report { report: &report }.emit();
+        }
         if !synced.exit.is_ok() {
             opts.progress.finish_run();
             for warning in &synced.warnings {
@@ -139,6 +271,7 @@ async fn run_inner(cli: Cli, overrides: CliOverrides) -> Result<Exit, CoreError>
     )
     .await;
     opts.progress.finish_run();
+
     result
 }
 
@@ -185,6 +318,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Config { .. } => "config",
         Command::Init => "init",
         Command::Schema => "schema",
+        Command::Prune { .. } => "prune",
         Command::Recover => "recover",
         Command::Sync => "sync",
     }

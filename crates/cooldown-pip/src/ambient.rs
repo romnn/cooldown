@@ -18,7 +18,7 @@ use std::path::PathBuf;
 /// splice another requirements file into every pip invocation (including cooldown's own install
 /// verification), and that file can carry install-wide index options — so their mere presence
 /// is routing, without following the file they name.
-const ENV_ROUTING_VARS: [&str; 6] = [
+pub(crate) const ENV_ROUTING_VARS: [&str; 6] = [
     "PIP_INDEX_URL",
     "PIP_EXTRA_INDEX_URL",
     "PIP_NO_INDEX",
@@ -36,6 +36,41 @@ pub(crate) fn reroutes(lockfile: &Utf8Path) -> bool {
         || config_files(&|key| std::env::var_os(key))
             .iter()
             .any(|path| config_file_routes(path))
+}
+
+pub(crate) fn evidence_paths(lockfile: &Utf8Path) -> Vec<Utf8PathBuf> {
+    let mut visited = HashSet::new();
+    let mut pending = vec![lockfile.to_owned()];
+    let mut paths = config_files(&|key| std::env::var_os(key))
+        .into_iter()
+        .filter_map(|path| Utf8PathBuf::from_path_buf(path).ok())
+        .collect::<Vec<_>>();
+    for name in ["PIP_REQUIREMENT", "PIP_CONSTRAINT"] {
+        if let Some(value) = std::env::var_os(name) {
+            pending.extend(
+                value
+                    .to_string_lossy()
+                    .split_whitespace()
+                    .map(|value| lockfile.parent().unwrap_or(Utf8Path::new(".")).join(value)),
+            );
+        }
+    }
+    while let Some(path) = pending.pop() {
+        let canonical = path.canonicalize_utf8().unwrap_or_else(|_| path.clone());
+        if !visited.insert(canonical) {
+            continue;
+        }
+        paths.push(path.clone());
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            for raw in content.lines() {
+                let line = raw.split('#').next().unwrap_or("").trim();
+                if let Some(target) = crate::lock::line_include_target(line) {
+                    pending.push(path.parent().unwrap_or(Utf8Path::new(".")).join(target));
+                }
+            }
+        }
+    }
+    paths
 }
 
 fn env_routes(get: &dyn Fn(&str) -> Option<OsString>) -> bool {

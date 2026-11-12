@@ -55,6 +55,8 @@ recovery_options! {
         "no_gitignore",
         "log_level",
         "no_progress",
+        "no_trace",
+        "trace_dir",
         "dir",
         "json",
         "color",

@@ -330,6 +330,12 @@ pub(in crate::cli) enum Command {
     Init,
     /// Print the machine-readable JSON schema for `--json` output.
     Schema,
+    /// Remove old inactive run traces and disposable HTTP cache entries.
+    Prune {
+        /// Remove artifacts older than this age, preserving active runs and publication trust.
+        #[arg(long, value_name = "DURATION", default_value = "30d")]
+        older_than: String,
+    },
     /// Recover interrupted Cargo project state without performing any other mutation.
     ///
     /// Recovery currently supports Cargo only.
@@ -491,6 +497,12 @@ pub(in crate::cli) struct GlobalArgs {
         env = "COOLDOWN_LOG"
     )]
     pub(in crate::cli) log_level: LogLevel,
+    /// Disable the diagnostic run trace recorded for upgrade, fix, and outdated.
+    #[arg(long = "no-trace", global = true, env = "COOLDOWN_NO_TRACE")]
+    pub(in crate::cli) no_trace: bool,
+    /// Store traces in this directory instead of the user configuration directory.
+    #[arg(long = "trace-dir", global = true, env = "COOLDOWN_TRACE_DIR")]
+    pub(in crate::cli) trace_dir: Option<Utf8PathBuf>,
     /// Suppress human-facing progress. `--quiet` is an alias for agentic callers that only want the
     /// final report; redirected stderr otherwise receives plain, non-colored progress lines.
     #[arg(long = "no-progress", visible_alias = "quiet", global = true)]

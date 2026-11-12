@@ -18,7 +18,7 @@ pub type Result<T, E = CoreError> = std::result::Result<T, E>;
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// How an external tool process terminated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ToolTermination {
     /// The process exited with a numeric exit code.
     ExitCode(i32),

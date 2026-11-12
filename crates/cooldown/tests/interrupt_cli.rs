@@ -13,6 +13,11 @@ use std::time::{Duration, Instant};
 /// with the interrupted status instead of waiting on the pipes forever.
 #[test]
 fn a_signal_stops_the_package_manager_tree_and_exits_130() -> eyre::Result<()> {
+    interrupted_command("check", false)?;
+    interrupted_command("outdated", true)
+}
+
+fn interrupted_command(command: &str, recorded: bool) -> eyre::Result<()> {
     let directory = tempfile::tempdir()?;
     let root = directory.path();
     // A `.git` marks the repository root, so discovery stays inside the temporary directory.
@@ -49,6 +54,7 @@ fn a_signal_stops_the_package_manager_tree_and_exits_130() -> eyre::Result<()> {
         indoc! {r#"
             #!/bin/sh
             echo $$ > "$(dirname "$0")/pnpm-started"
+            echo native-process-started
             sleep 300 &
             echo $! > "$(dirname "$0")/descendant"
             wait
@@ -57,9 +63,12 @@ fn a_signal_stops_the_package_manager_tree_and_exits_130() -> eyre::Result<()> {
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
 
     let mut cooldown = Command::new(env!("CARGO_BIN_EXE_cooldown"))
+        .env("COOLDOWN_NO_TRACE", "false")
+        .env_remove("COOLDOWN_TRACE_DIR")
+        .env("XDG_CONFIG_HOME", root.join("trace-config"))
         .current_dir(root)
         .env("COOLDOWN_PNPM", &fake)
-        .args(["check", "--tool", "pnpm", "--offline", "--no-progress"])
+        .args([command, "--tool", "pnpm", "--offline", "--no-progress"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -67,7 +76,7 @@ fn a_signal_stops_the_package_manager_tree_and_exits_130() -> eyre::Result<()> {
 
     // Interrupt only once the package manager and its descendant are running.
     let started = Instant::now();
-    while !root.join("descendant").exists() {
+    while !root.join("descendant").exists() || (recorded && !output_recorded(root)?) {
         if started.elapsed() > Duration::from_mins(1) {
             let _ = cooldown.kill();
             eyre::bail!("the fake package manager never started");
@@ -105,5 +114,59 @@ fn a_signal_stops_the_package_manager_tree_and_exits_130() -> eyre::Result<()> {
     #[expect(unsafe_code, reason = "probing a process needs the libc call")]
     let alive = unsafe { libc::kill(descendant, 0) } == 0;
     assert!(!alive, "no descendant of the package manager survives");
+    if recorded {
+        assert_interrupted_trace(root)?;
+    }
     Ok(())
+}
+
+fn assert_interrupted_trace(root: &std::path::Path) -> eyre::Result<()> {
+    let traces = root.join("trace-config/cooldown/traces");
+    let trace = std::fs::read_dir(traces)?
+        .next()
+        .ok_or_else(|| eyre::eyre!("missing interrupted trace"))??;
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(trace.path())?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    let terminal = records.last().ok_or_else(|| eyre::eyre!("empty trace"))?;
+    assert_eq!(
+        terminal
+            .pointer("/event/kind")
+            .and_then(serde_json::Value::as_str),
+        Some("run_finished")
+    );
+    assert_eq!(
+        terminal
+            .pointer("/event/exitCode")
+            .and_then(serde_json::Value::as_u64),
+        Some(130)
+    );
+    assert_eq!(
+        terminal
+            .pointer("/event/interrupted")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert!(records.iter().any(|record| {
+        record
+            .pointer("/event/kind")
+            .is_some_and(|kind| kind == "command_finished")
+    }));
+    Ok(())
+}
+
+fn output_recorded(root: &std::path::Path) -> eyre::Result<bool> {
+    let directory = root.join("trace-config").join("cooldown").join("traces");
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    for entry in entries {
+        if std::fs::read_to_string(entry?.path())?.contains("native-process-started") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

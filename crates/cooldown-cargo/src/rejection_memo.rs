@@ -314,11 +314,14 @@ impl RejectionMemo {
         if !key.cacheable {
             return None;
         }
-        self.entries
+        let result = self
+            .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(key)
-            .cloned()
+            .cloned();
+        tracing::trace!(project = %key.original_root, changes = ?key.changes, inputs = ?key.inputs, cache_hit = result.is_some(), "cargo rejection memo lookup");
+        result
     }
 
     pub(crate) fn insert(&self, key: MemoKey, rejection: MemoRejection) {

@@ -403,6 +403,7 @@ impl Fixture {
             |dir| self.dir.path().join(dir),
         );
         let output = Command::new(exe)
+            .env("COOLDOWN_NO_TRACE", "true")
             .current_dir(self.dir.path())
             .envs(self.pnpm_env())
             .envs(self.run_horizon())
@@ -426,6 +427,7 @@ impl Fixture {
         let started = Instant::now();
         let exe = env!("CARGO_BIN_EXE_cooldown");
         let mut command = Command::new(exe);
+        command.env("COOLDOWN_NO_TRACE", "true");
         command
             .current_dir(self.dir.path())
             .envs(self.pnpm_env())

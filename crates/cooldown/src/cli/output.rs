@@ -6,6 +6,10 @@ pub(in crate::cli) fn stdout(text: &str) -> Result<(), CoreError> {
 }
 
 pub(in crate::cli) fn stdout_line(text: &str) -> Result<(), CoreError> {
+    cooldown_core::trace::artifact(
+        cooldown_core::trace::ArtifactSource::Output,
+        text.as_bytes(),
+    );
     let mut out = std::io::stdout().lock();
     if let Err(error) = out
         .write_all(text.as_bytes())
@@ -17,6 +21,7 @@ pub(in crate::cli) fn stdout_line(text: &str) -> Result<(), CoreError> {
 }
 
 fn write_stdout(bytes: &[u8]) -> Result<(), CoreError> {
+    cooldown_core::trace::artifact(cooldown_core::trace::ArtifactSource::Output, bytes);
     match std::io::stdout().lock().write_all(bytes) {
         Ok(()) => Ok(()),
         Err(error) => handle_stdout_error(error),

@@ -163,6 +163,7 @@ fn cooldown_json(
     // every row it reports comes from the lock alone.
     let cache = tempfile::tempdir()?;
     let output = Command::new(env!("CARGO_BIN_EXE_cooldown"))
+        .env("COOLDOWN_NO_TRACE", "true")
         .current_dir(directory.path())
         .env("XDG_CACHE_HOME", cache.path())
         .args(args)
@@ -382,6 +383,7 @@ mod check {
         let home = scratch.path().join("home");
         std::fs::create_dir_all(&home)?;
         let output = Command::new(env!("CARGO_BIN_EXE_cooldown"))
+            .env("COOLDOWN_NO_TRACE", "true")
             .current_dir(project.path())
             .env("COOLDOWN_YARN", &script)
             .env("HOME", &home)

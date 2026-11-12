@@ -121,15 +121,22 @@ impl UpgradeCtx<'_> {
         &self,
     ) -> cooldown_core::Result<Option<super::lock::ProjectAccessWriteGuard>> {
         match &self.access {
-            ProjectExecution::Source => super::lock::ProjectAccessWriteGuard::acquire_async(
-                self.repo_root,
-                &self.pctx.project.root,
-                &self.reader.lease_family(&self.pctx.project),
-                self.pctx.tool,
-                self.writer.sync_scope() == cooldown_core::SyncScope::Repo,
-            )
-            .await
-            .map(Some),
+            ProjectExecution::Source => {
+                let mut guard = super::lock::ProjectAccessWriteGuard::acquire_async(
+                    self.repo_root,
+                    &self.pctx.project.root,
+                    &self.reader.lease_family(&self.pctx.project),
+                    self.pctx.tool,
+                    self.writer.sync_scope() == cooldown_core::SyncScope::Repo,
+                )
+                .await?;
+                guard.observe(
+                    self.reader,
+                    &self.pctx.project,
+                    cooldown_core::trace::SnapshotPhase::BeforeMutation,
+                );
+                Ok(Some(guard))
+            }
             ProjectExecution::Copy | ProjectExecution::Isolated(_) => Ok(None),
         }
     }
@@ -220,6 +227,7 @@ impl Workspace {
     ///
     /// A project in `current_at_start` whose lock the run has staled since is refreshed first,
     /// and a `fix` pass gates what the refresh resolved before the requested `mode` runs.
+    #[tracing::instrument(name = "project", skip_all, fields(project = %pctx.rel_path, tool = %pctx.tool))]
     async fn run_plan_project(
         &self,
         pctx: &super::ProjectCtx,
@@ -552,7 +560,7 @@ impl Workspace {
         opts: &RunOpts,
     ) -> cooldown_core::Result<(IsolatedAccessGuard, Vec<Diagnostic>)> {
         let (guard, recovery_warnings) = if opts.mutates_source() {
-            let guard = super::lock::ProjectAccessWriteGuard::acquire_async(
+            let mut guard = super::lock::ProjectAccessWriteGuard::acquire_async(
                 self.repo_root(),
                 &pctx.project.root,
                 &self.lease_family(pctx),
@@ -563,6 +571,13 @@ impl Workspace {
             let recovery = writer
                 .recover_pending_mutation(&pctx.project, guard.coordination())
                 .await?;
+            if let Some(reader) = self.adapter(pctx.tool) {
+                guard.observe(
+                    reader,
+                    &pctx.project,
+                    cooldown_core::trace::SnapshotPhase::BeforeMutation,
+                );
+            }
             let diagnostics =
                 super::recovery_diagnostics(recovery, pctx.tool, pctx.rel_path.as_str());
             (IsolatedAccessGuard::Write(guard), diagnostics)

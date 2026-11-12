@@ -23,6 +23,7 @@ name = "cooldown"
 path = "src/main.rs"
 
 [dependencies]
+cooldown-adapter-util.workspace = true
 cooldown-core.workspace = true
 cooldown-toml-util.workspace = true
 cooldown-registry.workspace = true
@@ -45,7 +46,7 @@ camino.workspace = true
 dunce.workspace = true
 jiff.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 toml.workspace = true
 futures.workspace = true
 globset.workspace = true
@@ -60,7 +61,6 @@ same-file.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
-cooldown-adapter-util.workspace = true
 cooldown-core.workspace = true
 cooldown-render.workspace = true
 async-trait.workspace = true
@@ -68,3 +68,6 @@ jiff.workspace = true
 camino.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }

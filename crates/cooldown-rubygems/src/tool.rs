@@ -71,6 +71,36 @@ fn build_releases(current: &str, raw: Vec<RawRelease>) -> Vec<Release> {
 
 #[async_trait]
 impl ToolRead for BundlerTool {
+    fn version_command(&self) -> Option<cooldown_core::trace::ToolVersionCommand> {
+        Some(cooldown_core::trace::ToolVersionCommand {
+            program: self.bundle.program().to_string(),
+            arguments: vec!["--version".into()],
+        })
+    }
+
+    fn evidence(&self, project: &Project) -> Result<cooldown_core::trace::Evidence> {
+        use cooldown_core::trace::GraphCoverage;
+        let mut evidence = cooldown_adapter_util::evidence::native(
+            project,
+            "Gemfile.lock",
+            GraphCoverage::Resolved,
+            &[".ruby-version", ".bundle/config"],
+        );
+        cooldown_adapter_util::evidence::ancestors(&mut evidence, &project.root, &[]);
+        cooldown_adapter_util::evidence::environment(
+            &mut evidence,
+            &[
+                "BUNDLE_GEMFILE",
+                "BUNDLE_PATH",
+                "BUNDLE_WITHOUT",
+                "BUNDLE_WITH",
+                "GEM_HOME",
+                "GEM_PATH",
+            ],
+        );
+        Ok(evidence)
+    }
+
     fn id(&self) -> ToolId {
         BUNDLER_ID
     }

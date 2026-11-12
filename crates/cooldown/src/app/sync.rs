@@ -54,7 +54,8 @@ struct RepoSyncAccess {
 }
 
 /// What happened when syncing one project's native config.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SyncStatus {
     /// The native config was rewritten to match the policy.
     Written,
@@ -80,7 +81,7 @@ impl SyncStatus {
 }
 
 /// One project's sync result.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SyncItem {
     /// The tool whose native config was synced.
     pub tool: String,
@@ -98,7 +99,7 @@ pub struct SyncItem {
 }
 
 /// Per-status counts across all synced projects.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct SyncSummary {
     /// Projects whose native config was rewritten.
     pub written: usize,
@@ -320,6 +321,13 @@ impl Workspace {
                 .await
                 .map_err(|err| diag_from_error(&err, tool, &project, None))?;
             warnings.extend(access.recovery);
+            let _evidence = self.adapter(tool).and_then(|reader| {
+                super::evidence::Session::start(
+                    reader,
+                    &pctx.project,
+                    cooldown_core::trace::SnapshotPhase::BeforeMutation,
+                )
+            });
             if writer.requires_sync_admission_evaluation(&pctx.project) {
                 policy.admitted_versions = match self
                     .sync_admitted_versions(pctx, opts, &window, warnings)
@@ -407,6 +415,18 @@ impl Workspace {
                 .await
             {
                 Ok(_access) => {
+                    let _evidence: Vec<_> = projects
+                        .iter()
+                        .filter_map(|project| {
+                            self.adapter(tool).and_then(|reader| {
+                                super::evidence::Session::start(
+                                    reader,
+                                    &project.project,
+                                    cooldown_core::trace::SnapshotPhase::BeforeMutation,
+                                )
+                            })
+                        })
+                        .collect();
                     writer
                         .write_repo_native(self.repo_root(), &policy, opts.dry_run)
                         .await

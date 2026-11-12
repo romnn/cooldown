@@ -1085,7 +1085,7 @@ impl Workspace {
         kind: LockRefreshKind,
     ) -> cooldown_core::Result<LockRefresh> {
         progress.phase("refreshing lock state");
-        let guard = ProjectAccessWriteGuard::acquire_async(
+        let mut guard = ProjectAccessWriteGuard::acquire_async(
             self.repo_root(),
             &pctx.project.root,
             &self.lease_family(pctx),
@@ -1097,6 +1097,13 @@ impl Workspace {
             .recover_pending_mutation(&pctx.project, guard.coordination())
             .await?;
         let recovery = recovery_diagnostics(recovery, pctx.tool, pctx.rel_path.as_str());
+        if let Some(reader) = self.adapter(pctx.tool) {
+            guard.observe(
+                reader,
+                &pctx.project,
+                cooldown_core::trace::SnapshotPhase::BeforeMutation,
+            );
+        }
         let report = match kind {
             LockRefreshKind::Stale => writer.refresh_lock(&pctx.project).await,
             LockRefreshKind::Conflicted => writer.refresh_conflicted_lock(&pctx.project).await,
@@ -1113,8 +1120,17 @@ impl Workspace {
         &self,
         pctx: &ProjectCtx,
     ) -> cooldown_core::Result<ProjectAccessReadGuard> {
+        self.project_read_guard_phase(pctx, cooldown_core::trace::SnapshotPhase::Observed)
+            .await
+    }
+
+    pub(crate) async fn project_read_guard_phase(
+        &self,
+        pctx: &ProjectCtx,
+        phase: cooldown_core::trace::SnapshotPhase,
+    ) -> cooldown_core::Result<ProjectAccessReadGuard> {
         let writer = self.mutator(pctx.tool);
-        let guard = ProjectAccessReadGuard::acquire_async(
+        let mut guard = ProjectAccessReadGuard::acquire_async(
             self.repo_root(),
             &pctx.project.root,
             &self.lease_family(pctx),
@@ -1124,6 +1140,9 @@ impl Workspace {
         .await?;
         if let Some(writer) = writer {
             writer.ensure_no_pending_mutation(&pctx.project).await?;
+        }
+        if let Some(reader) = self.adapter(pctx.tool) {
+            guard.observe(reader, &pctx.project, phase);
         }
         Ok(guard)
     }
@@ -1259,6 +1278,12 @@ impl Workspace {
         opts: &RunOpts,
     ) -> cooldown_core::Result<ScopedDependencies> {
         let deps = adapter.dependencies(&pctx.project, scope).await?;
+        cooldown_core::trace::Event::Dependencies {
+            project: pctx.project.root.as_str(),
+            tool: pctx.tool.as_str(),
+            dependencies: &deps,
+        }
+        .emit();
         let mut scoped = Self::scope_dependencies(pctx, opts, deps);
         if !scoped.excluded_members.is_empty() {
             adapter

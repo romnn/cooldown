@@ -27,7 +27,9 @@
 mod age_gate;
 mod executable;
 mod mutate;
+mod prune;
 mod routing;
+pub use prune::prune_cache;
 mod verify;
 
 use crate::lock::{NodeLock, Yarn, YarnBerry, is_yarn_berry_lock};
@@ -404,6 +406,44 @@ enum Admitted {
 
 #[async_trait]
 impl ToolRead for YarnTool {
+    fn evidence(&self, project: &Project) -> Result<cooldown_core::trace::Evidence> {
+        let mut evidence = self.classic.evidence(project)?;
+        match verify::evidence_paths(project, &self.verify_context()) {
+            Ok(paths) => evidence.inputs.extend(paths.into_iter().map(|path| {
+                cooldown_core::trace::EvidenceInput {
+                    path,
+                    role: cooldown_core::trace::InputRole::ResolverInput,
+                }
+            })),
+            Err(err) => evidence.limitations.push(err.to_string()),
+        }
+        evidence
+            .inputs
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        evidence
+            .inputs
+            .dedup_by(|left, right| left.path == right.path);
+        evidence
+            .environment
+            .extend(
+                self.yarn_environment()
+                    .variables
+                    .into_iter()
+                    .map(|variable| cooldown_core::trace::EnvironmentOverride {
+                        name: variable.name,
+                        value: Some(variable.value),
+                    }),
+            );
+        Ok(evidence)
+    }
+
+    fn version_command(&self) -> Option<cooldown_core::trace::ToolVersionCommand> {
+        Some(cooldown_core::trace::ToolVersionCommand {
+            program: self.driver.program().to_string(),
+            arguments: vec!["--version".into()],
+        })
+    }
+
     fn id(&self) -> ToolId {
         Yarn::ID
     }

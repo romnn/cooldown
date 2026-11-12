@@ -41,3 +41,6 @@ pub type BunTool = NpmTool<Bun>;
 pub type NpmCliTool = NpmTool<Npm>;
 /// The pnpm adapter (`pnpm-lock.yaml`).
 pub type PnpmTool = NpmTool<Pnpm>;
+
+/// Removes abandoned Yarn verification copies from cooldown's cache.
+pub use yarn::prune_cache as prune_yarn_cache;

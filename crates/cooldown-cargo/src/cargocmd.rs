@@ -1296,6 +1296,12 @@ impl Default for Cargo {
 }
 
 impl Cargo {
+    /// The executable selected for this driver, including any explicit override.
+    #[must_use]
+    pub fn program(&self) -> &str {
+        &self.bin
+    }
+
     /// Creates a `Cargo` wrapper, honoring the `COOLDOWN_CARGO` binary override.
     ///
     /// Equivalent to [`Cargo::default`].

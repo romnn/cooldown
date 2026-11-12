@@ -465,6 +465,67 @@ fn read_lock<L: NodeLock>(project: &Project) -> Result<String> {
 
 #[async_trait]
 impl<L: NodeLock> ToolRead for NpmTool<L> {
+    fn evidence(&self, project: &Project) -> Result<cooldown_core::trace::Evidence> {
+        use cooldown_core::trace::{EvidenceInput, GraphCoverage, InputRole};
+        let mut evidence = cooldown_adapter_util::evidence::native(
+            project,
+            L::LOCKFILE,
+            GraphCoverage::Resolved,
+            &[
+                ".npmrc",
+                ".pnpmfile.cjs",
+                "pnpm-workspace.yaml",
+                ".yarnrc",
+                ".yarnrc.yml",
+                "npm-shrinkwrap.json",
+            ],
+        );
+        cooldown_adapter_util::evidence::ancestors(
+            &mut evidence,
+            &project.root,
+            &[".npmrc", ".yarnrc", ".yarnrc.yml"],
+        );
+        let mut members = locked_member_paths::<L>(project).unwrap_or_else(|err| {
+            evidence.limitations.push(err.to_string());
+            BTreeSet::new()
+        });
+        if let Some(workspace) = workspace_manifests::<L>(project) {
+            members.extend(workspace.members().map(|(path, _)| path.to_string()));
+            if let Some(reason) = workspace.unavailable_reason() {
+                evidence.limitations.push(reason.to_string());
+            }
+        }
+        for member in members {
+            evidence.inputs.push(EvidenceInput {
+                path: project.root.join(member).join("package.json"),
+                role: InputRole::Manifest,
+            });
+        }
+        evidence.limitations.push(
+            "lifecycle scripts and ambient runtime environment can read additional inputs".into(),
+        );
+        cooldown_adapter_util::evidence::environment(
+            &mut evidence,
+            &[
+                "NPM_CONFIG_USERCONFIG",
+                "npm_config_userconfig",
+                "NPM_CONFIG_REGISTRY",
+                "npm_config_registry",
+                "NODE_OPTIONS",
+                "COREPACK_HOME",
+                "PNPM_HOME",
+            ],
+        );
+        Ok(evidence)
+    }
+
+    fn version_command(&self) -> Option<cooldown_core::trace::ToolVersionCommand> {
+        Some(cooldown_core::trace::ToolVersionCommand {
+            program: self.cmd.program().to_string(),
+            arguments: vec!["--version".into()],
+        })
+    }
+
     fn id(&self) -> ToolId {
         L::ID
     }

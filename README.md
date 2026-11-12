@@ -61,6 +61,11 @@ cooldown fix           # remediate: downgrade too-fresh deps to a matured versio
 `cooldown upgrade --dry-run` previews the plan without touching the lock — only versions that have
 already cleared their cooldown window are proposed.
 
+`upgrade`, `fix`, and `outdated` record local JSON Lines traces for debugging. Use `--trace-dir PATH`
+to choose their directory or `--no-trace` to disable recording. `cooldown prune` removes inactive
+traces and disposable cache files older than 30 days (`--older-than` / `--dry-run` customize it).
+See [run traces](docs/content/docs/traces.md) for storage locations and the event format.
+
 Cargo reuses identical resolver rejections within a run by default. Use the global
 `--no-memo` flag or `COOLDOWN_NO_MEMO=true` to retry every Cargo attempt while keeping
 HTTP caching. `--fresh` (alias `--no-cache`) disables both HTTP caching and the rejection memo.
@@ -330,6 +335,10 @@ crates/
 
 Adding a tool is one new crate implementing the ports, registered in one line — no change to
 the core, render, the config schema, or any other adapter.
+
+Architecture decisions live in [`adr/`](adr/). Each numbered record states its status and date,
+the context, the decision, its consequences, and references. The first record covers
+[default run traces](adr/0001-default-run-traces.md).
 
 ## Security model
 

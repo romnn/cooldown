@@ -91,6 +91,7 @@ where
                     .or_insert_with(|| Arc::new(OnceCell::new())),
             )
         };
+        tracing::trace!(cache_hit = cell.initialized(), "release cache lookup");
         cell.get_or_try_init(|| async {
             self.resolved.fetch_add(1, Ordering::Relaxed);
             resolve().await

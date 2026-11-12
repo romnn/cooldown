@@ -204,6 +204,34 @@ pub trait ToolRead: Send + Sync {
     /// Returns a [`CoreError`] if the manifest or lock cannot be read or parsed.
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>>;
 
+    /// The adapter's configured version-only invocation, when it has a native driver.
+    fn version_command(&self) -> Option<crate::trace::ToolVersionCommand> {
+        None
+    }
+
+    /// Declares exact native inputs and graph sources for a diagnostic snapshot.
+    ///
+    /// This is a filesystem-only inventory: it must not resolve, refresh, or mutate a project.
+    /// The application streams these inputs while holding its existing project access lease.
+    /// The default identifies only the manifest and explicitly declines complete coverage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError`] when input ownership cannot be established.
+    fn evidence(&self, project: &Project) -> Result<crate::trace::Evidence> {
+        Ok(crate::trace::Evidence {
+            inputs: vec![crate::trace::EvidenceInput {
+                path: project.manifest.clone(),
+                role: crate::trace::InputRole::Manifest,
+            }],
+            graphs: Vec::new(),
+            limitations: vec![
+                "this adapter does not declare a complete diagnostic input inventory".into(),
+            ],
+            environment: Vec::new(),
+        })
+    }
+
     /// Non-fatal observations about `project`'s manifests that a reporting command surfaces as
     /// warnings beside the rows [`dependencies`](Self::dependencies) returned — never anything
     /// that changes a row, a candidate, or a gate.

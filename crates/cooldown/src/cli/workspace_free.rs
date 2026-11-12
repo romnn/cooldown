@@ -6,7 +6,7 @@ use cooldown_core::CoreError;
 use cooldown_render as render;
 use indoc::indoc;
 
-/// Handle the commands that need neither a workspace nor the network (`schema`, `init`).
+/// Handle the commands that need neither a workspace nor the network (`schema`, `init`, `prune`).
 ///
 /// Returns `Some` with the command's result when `command` is one of those; `None` otherwise, so
 /// the caller proceeds to build a workspace. `sync` is NOT here — it needs the detected projects to
@@ -25,14 +25,51 @@ pub(in crate::cli) fn run_workspace_free(
                 }),
         ),
         Command::Init => Some(cmd_init(global)),
+        Command::Prune { older_than } => Some(cmd_prune(global, older_than)),
         _ => None,
     }
+}
+
+fn cmd_prune(global: &GlobalArgs, older_than: &str) -> Result<Exit, CoreError> {
+    let result = crate::trace::prune::run(
+        older_than,
+        global.dry_run,
+        global
+            .trace_dir
+            .as_deref()
+            .map(camino::Utf8Path::as_std_path),
+    )?;
+    let report = serde_json::json!({ "command": "prune", "ok": true, "summary": result });
+    cooldown_core::trace::Event::Report { report: &report }.emit();
+    if global.json {
+        super::output::stdout_line(&report.to_string())?;
+    } else {
+        super::output::stdout_line(&format!(
+            "{} {} trace(s), {} HTTP cache file(s), and {} Yarn scratch file(s); {} active trace(s) preserved{}",
+            if result.dry_run {
+                "would prune"
+            } else {
+                "pruned"
+            },
+            result.traces,
+            result.cache.files,
+            result.yarn.files,
+            result.active_traces,
+            if result.cache.busy || result.yarn.busy {
+                "; cache in use, skipped"
+            } else {
+                ""
+            },
+        ))?;
+    }
+    Ok(Exit::Ok)
 }
 
 fn cmd_init(global: &GlobalArgs) -> Result<Exit, CoreError> {
     let dir = global.dir.clone().unwrap_or_else(|| Utf8PathBuf::from("."));
     let path = dir.join(discovery::CONFIG_FILE);
     if path.exists() {
+        tracing::warn!(path = %path, "refusing to clobber existing config");
         eprintln!("refusing to clobber existing {path}");
         return Ok(Exit::Usage);
     }

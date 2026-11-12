@@ -15,7 +15,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 
 /// Environment variables that redirect uv's index resolution; any of them being set at all is a
 /// veto — even one naming PyPI signals index routing this module does not model further.
-const ENV_INDEX_VARS: [&str; 6] = [
+pub(crate) const ENV_INDEX_VARS: [&str; 6] = [
     "UV_DEFAULT_INDEX",
     "UV_INDEX",
     "UV_INDEX_URL",
@@ -59,27 +59,30 @@ pub(crate) fn reroutes(root: &Utf8Path) -> bool {
     {
         return true;
     }
+    match config_paths(root) {
+        Ok(files) => files.iter().any(|path| config_declares_index(path)),
+        Err(NonUtf8Path) => true,
+    }
+}
+
+pub(crate) fn config_paths(root: &Utf8Path) -> Result<Vec<Utf8PathBuf>, NonUtf8Path> {
     let mut files: Vec<Utf8PathBuf> = root.ancestors().map(|dir| dir.join("uv.toml")).collect();
     if let Some(explicit) = std::env::var_os("UV_CONFIG_FILE") {
-        let Ok(path) = explicit.into_string() else {
-            return true; // an uninspectable config override cannot pass as clean
-        };
+        let path = explicit.into_string().map_err(|_| NonUtf8Path)?;
         files.push(Utf8PathBuf::from(path));
     }
-    match user_config_dir() {
-        Ok(Some(dir)) => files.push(dir.join("uv").join("uv.toml")),
-        Ok(None) => {}
-        Err(NonUtf8Path) => return true,
+    if let Some(dir) = user_config_dir()? {
+        files.push(dir.join("uv").join("uv.toml"));
     }
     for dir in system_config_dirs() {
         files.push(dir.join("uv").join("uv.toml"));
     }
-    files.iter().any(|path| config_declares_index(path))
+    Ok(files)
 }
 
 /// A config location whose path exists but is not UTF-8: it cannot be inspected, so the caller
 /// must treat it as routing.
-struct NonUtf8Path;
+pub(crate) struct NonUtf8Path;
 
 /// `$XDG_CONFIG_HOME`, else `%APPDATA%` on Windows, else `~/.config` — where uv looks for its
 /// user-level `uv.toml`.

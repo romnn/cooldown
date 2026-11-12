@@ -19,20 +19,22 @@ const MIX_LOCK: &str = indoc! {r#"
     }
 "#};
 
-/// A run with no repository marker anywhere above it falls back to `$HOME` as the root, and a
-/// `HOME` spelled through a `..` component still bounds the cascade of a project below it, so the
-/// intermediate layer between the workdir and the project is collected.
+/// A repository at the home directory bounds the cascade of a project below it, including when
+/// `HOME` is spelled through a `..` component, so the intermediate layer between the workdir and
+/// the project is collected exactly once.
 ///
 /// The `..` spelling stands in for a symlinked home directory, and on Windows the plain spelling
 /// is a second alias of the verbatim form the workdir resolves to, so the test needs no symlink
 /// privilege on either platform.
 #[test]
-fn a_home_fallback_root_spelled_differently_collects_every_layer() -> eyre::Result<()> {
+fn a_home_repository_root_spelled_differently_collects_every_layer() -> eyre::Result<()> {
     let directory = tempfile::tempdir()?;
     let base = directory.path();
     let workdir = base.join("home").join("work");
     let project = workdir.join("apps").join("web");
     std::fs::create_dir_all(&project)?;
+    // A configured temp directory may have its own Git ancestor; this fixture owns its boundary.
+    std::fs::create_dir(base.join("home").join(".git"))?;
     std::fs::create_dir_all(base.join("other"))?;
     std::fs::write(project.join("mix.exs"), MIX_EXS)?;
     std::fs::write(project.join("mix.lock"), MIX_LOCK)?;
@@ -47,6 +49,7 @@ fn a_home_fallback_root_spelled_differently_collects_every_layer() -> eyre::Resu
 
     let cache = tempfile::tempdir()?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_cooldown"));
+    command.env("COOLDOWN_NO_TRACE", "true");
     // The user's own `COOLDOWN_*` settings could narrow detection, so none reaches the run.
     // Windows matches variable names regardless of case, so the prefix is compared the same way.
     for (name, _) in std::env::vars_os() {

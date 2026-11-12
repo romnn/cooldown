@@ -84,6 +84,41 @@ impl GoTool {
 
 #[async_trait]
 impl ToolRead for GoTool {
+    fn version_command(&self) -> Option<cooldown_core::trace::ToolVersionCommand> {
+        Some(cooldown_core::trace::ToolVersionCommand {
+            program: self.go.program().to_string(),
+            arguments: vec!["version".into()],
+        })
+    }
+
+    fn evidence(&self, project: &Project) -> Result<cooldown_core::trace::Evidence> {
+        use cooldown_core::trace::GraphCoverage;
+        let mut evidence = cooldown_adapter_util::evidence::native(project, "go.mod", GraphCoverage::Inventory { reason: "module requirements omit resolved dependency bindings; native go graph output is captured when read".into() }, &["go.sum", "go.work", "go.work.sum"]);
+        cooldown_adapter_util::evidence::ancestors(
+            &mut evidence,
+            &project.root,
+            &["go.work", "go.work.sum"],
+        );
+        cooldown_adapter_util::evidence::environment(
+            &mut evidence,
+            &[
+                "GOPROXY",
+                "GOSUMDB",
+                "GOPRIVATE",
+                "GONOPROXY",
+                "GONOSUMDB",
+                "GOTOOLCHAIN",
+                "GOFLAGS",
+                "GOWORK",
+                "GOENV",
+                "GOOS",
+                "GOARCH",
+                "CGO_ENABLED",
+            ],
+        );
+        Ok(evidence)
+    }
+
     fn id(&self) -> ToolId {
         GO_ID
     }

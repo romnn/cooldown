@@ -8,6 +8,7 @@ use std::process::Command;
 fn recovery_setup_error_honors_json_output() -> eyre::Result<()> {
     let directory = tempfile::tempdir()?;
     let output = Command::new(env!("CARGO_BIN_EXE_cooldown"))
+        .env("COOLDOWN_NO_TRACE", "true")
         .current_dir(directory.path())
         .args(["recover", "--tool", "npm", "--json", "--no-progress"])
         .output()?;
@@ -66,6 +67,7 @@ fn clean_cargo_project_recovers_as_unchanged() -> eyre::Result<()> {
         "#},
     )?;
     let output = Command::new(env!("CARGO_BIN_EXE_cooldown"))
+        .env("COOLDOWN_NO_TRACE", "true")
         .args(["recover", "--cargo", "--json", "--no-progress", "-C"])
         .arg(directory.path())
         .output()?;
@@ -117,6 +119,7 @@ fn non_git_recovery_evidence_fails_closed() -> eyre::Result<()> {
     std::fs::write(directory.path().join(cooldown_cargo::RECOVERY_MARKER), "{}")?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_cooldown"))
+        .env("COOLDOWN_NO_TRACE", "true")
         .args(["recover", "--cargo", "--json", "--no-progress", "-C"])
         .arg(directory.path())
         .output()?;
