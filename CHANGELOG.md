@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **A uv upgrade held by the project's own constraint names that constraint.** A package held
+  by `[tool.uv] constraint-dependencies` or `override-dependencies`, such as `onnxruntime==1.31.0`,
+  was reported as conflicting with whichever package happened to pull it in, even when that
+  package admits the newer release. The held row and `outdated`'s blocked reason now name the
+  constraint and `pyproject.toml`, as a pin or declared-bound hold. A hold nothing explains is no
+  longer blamed on a package merely because it is the only one that depends on the candidate. An
+  upgrade no longer raises a dependency's own requirement past such a constraint, which made the
+  resolve fail, and an override now releases the pins and bounds it replaces, as it does in uv.
+
 - **A pnpm upgrade of a declared package is no longer held by an undeclared copy of it.** When the
   graph also held a copy of the same name on another line, such as `globals` 16 under a dependency
   beside a declared `globals` 17, that copy's own planned move counted as a second target, so the
