@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **A pnpm upgrade of a declared package is no longer held by an undeclared copy of it.** When the
+  graph also held a copy of the same name on another line, such as `globals` 16 under a dependency
+  beside a declared `globals` 17, that copy's own planned move counted as a second target, so the
+  declared in-range upgrade was held as a multi-version split. The declared copy now lands. The
+  undeclared copy keeps its own row, and is reported applied when the update moved it to its
+  target.
+
 - **Go upgrades leave a module's commit pins in place.** A planned upgrade whose new version
   requires a newer commit of a module the project requires directly at a pseudo-version, such as
   `kustomize` raising a deliberately held `k8s.io/kube-openapi`, could move that pin and break the

@@ -406,3 +406,101 @@ fn outdated_marks_a_cross_line_multi_version_bump_blocked_not_adoptable() {
         upgrade.applied_names()
     );
 }
+
+/// A single project declaring `semver` on the v7 line, plus `make-dir` 3.1.0, whose own
+/// `semver ^6.0.0` requirement keeps an undeclared v6 copy in the graph.
+/// Seeded below the freeze, the declared copy has its own in-range move (`7.3.8` → `7.5.4`) and
+/// the undeclared one another (`6.3.0` → `6.3.1`).
+const DECLARED_AND_UNDECLARED_PACKAGE_JSON: &str = indoc::indoc! {r#"
+    {
+      "name": "cooldown-pnpm-declared-and-undeclared",
+      "version": "0.1.0",
+      "private": true,
+      "dependencies": {
+        "make-dir": "3.1.0",
+        "semver": "^7.3.8"
+      }
+    }
+"#};
+
+/// The version every `semver@<version>:` package key in `lock` names.
+fn semver_copies(lock: &[u8]) -> std::collections::BTreeSet<String> {
+    String::from_utf8_lossy(lock)
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("semver@")?.strip_suffix(':'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The undeclared copy's own move must not hold the declared copy's in-range upgrade: the two
+/// lines are decided separately, so the declared `semver` lands.
+/// pnpm's update of the declared name re-resolves the undeclared v6 copy within its own range too,
+/// which lands that copy's own target, so both moves are reported applied.
+#[test]
+fn an_undeclared_copy_on_another_line_does_not_hold_the_declared_upgrade() {
+    let fixture = Fixture::pnpm().tag_independent();
+    fixture.write("package.json", DECLARED_AND_UNDECLARED_PACKAGE_JSON);
+    fixture.write(".npmrc", NPMRC);
+    seed_lock(&fixture, SEED);
+    let seeded = fixture.read_bytes("pnpm-lock.yaml");
+    assert_eq!(
+        importer_resolved(&seeded, ".", "semver").as_deref(),
+        Some("7.3.8"),
+        "seed sanity: the declared copy"
+    );
+    assert!(
+        semver_copies(&seeded).contains("6.3.0"),
+        "seed sanity: make-dir keeps an undeclared v6 copy, got {:?}",
+        semver_copies(&seeded)
+    );
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--freeze", FREEZE])
+            .stderr_str()
+    );
+    assert_pnpm_lock_current(&upgrade);
+
+    // The declared copy lands its in-range target.
+    let after = fixture.read_bytes("pnpm-lock.yaml");
+    assert_eq!(
+        importer_resolved(&after, ".", "semver").as_deref(),
+        Some("7.5.4"),
+        "the declared copy must land, report: {:?}",
+        upgrade.items()
+    );
+    // The undeclared copy advanced within its own line, to its own planned target.
+    assert_eq!(
+        semver_copies(&after),
+        ["6.3.1".to_string(), "7.5.4".to_string()].into(),
+        "the undeclared copy stays on the v6 line"
+    );
+    let mut applied: Vec<String> = upgrade
+        .items()
+        .iter()
+        .filter(|item| {
+            item.get("name").and_then(serde_json::Value::as_str) == Some("semver")
+                && item.get("applied").and_then(serde_json::Value::as_bool) == Some(true)
+        })
+        .filter_map(|item| {
+            let from = item.get("from")?.as_str()?;
+            let to = item.get("to")?.as_str()?;
+            Some(format!("{from} -> {to}"))
+        })
+        .collect();
+    applied.sort();
+    assert_eq!(
+        applied,
+        ["6.3.0 -> 6.3.1", "7.3.8 -> 7.5.4"],
+        "both copies' moves are credited, each once, report: {:?}",
+        upgrade.items()
+    );
+
+    // Converged: a second run moves nothing.
+    let second = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert_eq!(second.summary_applied(), 0, "second run must be a no-op");
+    assert_eq!(after, fixture.read_bytes("pnpm-lock.yaml"));
+}
