@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Registry connections no longer trust distrusted intermediate certificates.** cooldown's TLS
+  stack now uses `rustls-webpki` 0.103.16 and `webpki-root-certs` 1.0.11, which fix
+  RUSTSEC-2026-0382 and RUSTSEC-2026-0383.
+
 - **A pnpm upgrade of a declared package is no longer held by an undeclared copy of it.** When the
   graph also held a copy of the same name on another line, such as `globals` 16 under a dependency
   beside a declared `globals` 17, that copy's own planned move counted as a second target, so the
