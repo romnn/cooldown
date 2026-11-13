@@ -3266,8 +3266,9 @@ const HORIZON_PROBE_AS_OF: CargoAsOf = CargoAsOf {
 /// Every cargo fixture relies on cargo honoring its horizon, both in the commands the fixture runs
 /// itself and in those cooldown runs for it: `pest_stack_guard = "1"` resolves to 1.0.0 as of
 /// 2026-11-01, not to the 1.0.1 the live index serves.
-/// A toolchain whose cargo renames or drops the unstable `min-publish-age` fails here, rather than
-/// letting every fixture silently resolve against the live index.
+/// A toolchain whose cargo renames or drops `min-publish-age`, or a cooldown that stops honoring
+/// `COOLDOWN_CARGO_MIN_PUBLISH_AGE`, fails here, rather than letting every fixture silently resolve
+/// against the live index.
 #[test]
 fn cargo_resolves_as_of_the_fixture_horizon() {
     skip_if_missing!("cargo");
@@ -3291,7 +3292,7 @@ fn cargo_resolves_as_of_the_fixture_horizon() {
             cargo_lock_versions_of("pest_stack_guard", &fixture.read_bytes("Cargo.lock")),
             ["1.0.0"],
             "{phase} must resolve as of the horizon; does this cargo still honor \
-             `CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE`?"
+             `min-publish-age`?"
         );
     };
 
@@ -3306,4 +3307,247 @@ fn cargo_resolves_as_of_the_fixture_horizon() {
     let refreshed = fixture.cooldown_json(&["check", "--latest", "--lock"]);
     assert!(refreshed.ok(), "{:?}", refreshed.error_messages());
     horizon_held("cooldown's own lock refresh");
+}
+
+/// A crate manifest depending on `pest_stack_guard = "1"`, whose 1.0.0 (2026-10-26) and 1.0.1
+/// (2026-11-03) give the native-age tests one release on each side of a fixture horizon.
+const NATIVE_AGE_MANIFEST: &str = indoc! {r#"
+    [package]
+    name = "cargo-native-age"
+    version = "0.1.0"
+    edition = "2021"
+
+    [dependencies]
+    pest_stack_guard = "1"
+"#};
+
+/// A crates.io publish age older than every `pest_stack_guard` release for years to come, so
+/// cargo enforcing it refuses each one, whatever crates.io has published since.
+const UNREACHABLE_CARGO_AGE: &str = indoc! {r#"
+    [registries.crates-io]
+    min-publish-age = "100 months"
+"#};
+
+/// The `window` of the outdated row for `name`, as `(minAgeDays, source)`.
+fn outdated_window(envelope: &Envelope, name: &str) -> Option<(f64, String)> {
+    let window = envelope.items().iter().find_map(|item| {
+        (item.get("name").and_then(serde_json::Value::as_str) == Some(name))
+            .then(|| item.get("window").cloned())
+            .flatten()
+    })?;
+    let days = window.get("minAgeDays")?.as_f64()?;
+    let source = window.get("source")?.as_str()?.to_owned();
+    Some((days, source))
+}
+
+/// Cargo's own `min-publish-age` is the project's native cooldown policy: with no `cooldown.toml`,
+/// `outdated` judges against it instead of the built-in seven days.
+#[test]
+fn cargo_min_publish_age_is_native_policy() {
+    skip_if_missing!("cargo");
+    let fixture = Fixture::cargo(HORIZON_PROBE_AS_OF);
+    fixture
+        .write("Cargo.toml", NATIVE_AGE_MANIFEST)
+        .write("src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+
+    // The age goes in after seeding, since a crates.io key would shadow the seed horizon.
+    fixture.write(".cargo/config.toml", UNREACHABLE_CARGO_AGE);
+    let outdated = fixture.cooldown_json(&["outdated"]);
+    assert!(outdated.ok(), "{:?}", outdated.error_messages());
+    assert_eq!(
+        outdated_window(&outdated, "pest_stack_guard"),
+        Some((3000.0, "native".to_owned())),
+        "cargo's 100-month age must govern the window"
+    );
+
+    // An explicit cooldown window outranks the native layer, as for every other tool.
+    let overridden = fixture.cooldown_json(&["outdated", "--min-age", "3d"]);
+    assert_eq!(
+        outdated_window(&overridden, "pest_stack_guard").map(|(days, _)| days),
+        Some(3.0)
+    );
+
+    // An explicit zero is cargo's opt-out, so it governs as a zero window rather than vanishing
+    // in favor of the built-in seven days.
+    fixture.write(
+        ".cargo/config.toml",
+        "[registries.crates-io]\nmin-publish-age = \"0\"\n",
+    );
+    let opted_out = fixture.cooldown_json(&["outdated"]);
+    assert!(opted_out.ok(), "{:?}", opted_out.error_messages());
+    assert_eq!(
+        outdated_window(&opted_out, "pest_stack_guard"),
+        Some((0.0, "native".to_owned()))
+    );
+}
+
+/// cooldown enforces cargo's age itself and lifts it from the cargo commands it runs, so a native
+/// age stricter than cooldown's policy cannot make cargo refuse a target the policy admits.
+///
+/// The run is deliberately unbounded: a fixture horizon reaches cooldown through
+/// `COOLDOWN_CARGO_MIN_PUBLISH_AGE`, which replaces the very override under test.
+/// The assertions hold for whatever crates.io serves, because cargo refuses every release under
+/// the 100-month age; a control run with the age forced back on shows the move needs it lifted.
+#[test]
+fn cooldown_lands_past_a_stricter_cargo_publish_age() {
+    skip_if_missing!("cargo");
+    let fixture = Fixture::new();
+    fixture
+        .write("Cargo.toml", NATIVE_AGE_MANIFEST)
+        .write("src/lib.rs", "");
+    let unbounded = "the override under test only applies without a fixture horizon";
+    fixture
+        .run_unbounded(unbounded, "cargo", &["generate-lockfile"], &[])
+        .expect_success();
+    fixture
+        .run_unbounded(
+            unbounded,
+            "cargo",
+            &["update", "-p", "pest_stack_guard", "--precise", "1.0.0"],
+            &[],
+        )
+        .expect_success();
+    fixture.write(".cargo/config.toml", UNREACHABLE_CARGO_AGE);
+
+    // Bare cargo refuses to move the crate under the age.
+    let refused = fixture.run_unbounded(
+        "proving cargo enforces the age on its own",
+        "cargo",
+        &["update", "-p", "pest_stack_guard", "--precise", "1.0.1"],
+        &[],
+    );
+    assert!(
+        !refused.status.success() && refused.stderr_str().contains("minimum age"),
+        "cargo must enforce the native age: {}",
+        refused.stderr_str()
+    );
+
+    // Control: with the age forced back onto cooldown's own cargo commands, the move needs a
+    // release cargo refuses (pest_stack_guard 1.0.1 pins a newer psm), so nothing lands.
+    let forced = fixture.cooldown_json_env(
+        &["upgrade", "--min-age", "1d"],
+        &[("COOLDOWN_CARGO_MIN_PUBLISH_AGE", "100 months")],
+    );
+    assert_eq!(
+        cargo_lock_versions_of("pest_stack_guard", &fixture.read_bytes("Cargo.lock")),
+        ["1.0.0"],
+        "the scenario must need the age lifted: {:?}",
+        forced.warning_messages()
+    );
+
+    // cooldown, told to use a one-day window, lands a newer release once the age is lifted.
+    let upgraded = fixture.cooldown_json(&["upgrade", "--min-age", "1d"]);
+    assert!(upgraded.ok(), "{:?}", upgraded.error_messages());
+    let landed = cargo_lock_versions_of("pest_stack_guard", &fixture.read_bytes("Cargo.lock"));
+    assert!(
+        landed.len() == 1 && landed.iter().all(|version| version != "1.0.0"),
+        "cooldown must move pest_stack_guard off 1.0.0 despite cargo's age, got {landed:?}"
+    );
+}
+
+/// `sync` writes the repo-wide window into the cargo config file cargo actually reads, so a bare
+/// cargo command honors it, and warns when cargo's resolver switch would ignore it.
+#[test]
+fn sync_writes_a_publish_age_bare_cargo_honors() {
+    skip_if_missing!("cargo");
+    // A modern layout, and one where the extensionless `.cargo/config` shadows `config.toml`
+    for (existing, written) in [
+        (None, ".cargo/config.toml"),
+        (Some(".cargo/config"), ".cargo/config"),
+    ] {
+        let fixture = Fixture::cargo(HORIZON_PROBE_AS_OF);
+        fixture
+            .write("Cargo.toml", NATIVE_AGE_MANIFEST)
+            .write("src/lib.rs", "")
+            .write("cooldown.toml", "min-age = \"3000d\"\n");
+        if let Some(existing) = existing {
+            fixture.write(existing, "[net]\nretry = 2\n");
+        }
+        fixture
+            .run_tool("cargo", &["generate-lockfile"], &[])
+            .expect_success();
+
+        let synced = fixture
+            .cooldown(&["sync", "--tool", "cargo"])
+            .expect_success();
+        let config = String::from_utf8_lossy(&fixture.read_bytes(written)).into_owned();
+        assert!(
+            config.contains(r#"min-publish-age = "3000 days""#),
+            "unexpected {written} after sync:\n{config}\n{}",
+            synced.stderr_str()
+        );
+        if existing.is_some() {
+            assert!(
+                config.contains("retry = 2"),
+                "sync must keep {written}: {config}"
+            );
+            assert!(
+                !fixture.root().join(".cargo/config.toml").exists(),
+                "sync must not write a config.toml cargo ignores"
+            );
+        }
+
+        // A second sync finds nothing to change.
+        let again = fixture.cooldown_json(&["sync", "--tool", "cargo"]);
+        assert_eq!(
+            again
+                .first_item()
+                .and_then(|item| item.get("status").cloned()),
+            Some(serde_json::json!("unchanged"))
+        );
+
+        // A bare cargo resolve now refuses every release, as the synced age demands.
+        std::fs::remove_file(fixture.root().join("Cargo.lock")).expect("remove the seeded lock");
+        let refused = fixture.run_unbounded(
+            "proving the synced age binds cargo regardless of registry history",
+            "cargo",
+            &["generate-lockfile"],
+            &[],
+        );
+        assert!(
+            !refused.status.success() && refused.stderr_str().contains("minimum age"),
+            "bare cargo must honor the synced age: {}",
+            refused.stderr_str()
+        );
+    }
+}
+
+/// With cargo's resolver switch set to `allow`, the synced age has no effect on a bare cargo, so
+/// `sync` writes it but says so.
+///
+/// The fixture has no horizon, because a horizon pins the switch to `deny` and would mask the
+/// file under test; sync itself resolves nothing.
+#[test]
+fn sync_warns_when_cargo_ignores_publish_ages() {
+    skip_if_missing!("cargo");
+    let fixture = Fixture::new();
+    fixture
+        .write("Cargo.toml", NATIVE_AGE_MANIFEST)
+        .write("src/lib.rs", "")
+        .write(
+            ".cargo/config.toml",
+            "[resolver]\nincompatible-publish-age = \"allow\"\n",
+        );
+    fixture
+        .run_unbounded(
+            "the seed only makes the project detectable",
+            "cargo",
+            &["generate-lockfile"],
+            &[],
+        )
+        .expect_success();
+
+    let synced = fixture.cooldown_json(&["sync", "--tool", "cargo"]);
+    assert!(synced.ok(), "{:?}", synced.error_messages());
+    assert!(
+        synced
+            .warning_messages()
+            .iter()
+            .any(|message| message.contains("incompatible-publish-age")),
+        "{:?}",
+        synced.warning_messages()
+    );
 }

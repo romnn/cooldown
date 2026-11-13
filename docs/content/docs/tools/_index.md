@@ -220,7 +220,34 @@ Publish times come from each registry's own metadata — GOPROXY `@v/<ver>.info`
 
 ## Registries and native cooldowns
 
-Some ecosystems already ship a native cooldown — uv's `exclude-newer`, pnpm's `minimumReleaseAge`, yarn's `npmMinimalAgeGate`. Where one exists, [`cooldown sync`]({{< relref "../commands/other.md" >}}) (or the global `--sync` flag) writes the resolved policy *down* into that native config, so `cooldown.toml` stays the single source of truth and the native tool sees the same window you set once.
+Some ecosystems already ship a native cooldown — uv's `exclude-newer`, pnpm's `minimumReleaseAge`, yarn's `npmMinimalAgeGate`, Cargo's `min-publish-age`. Where one exists, [`cooldown sync`]({{< relref "../commands/other.md" >}}) (or the global `--sync` flag) writes the resolved policy *down* into that native config, so `cooldown.toml` stays the single source of truth and the native tool sees the same window you set once.
+
+### Cargo's own publish age
+
+Cargo 1.100 and newer can skip crates.io releases younger than a configured age.
+cooldown reads that age as the project's native cooldown, the way Cargo itself resolves it for a
+command run in the project:
+
+- `registries.crates-io.min-publish-age` wins over `registry.global-min-publish-age`, whichever
+  file or variable sets them.
+- The nearest `.cargo/config` (or `.cargo/config.toml` when there is no `config`) in the project's
+  ancestors wins, and the Cargo home's file ranks last.
+- `CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE` overrides a file's global age.
+- `resolver.incompatible-publish-age = "allow"` (or `CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow`)
+  switches Cargo's enforcement off, so cooldown reads no age either.
+
+A `min-age` under `[package.metadata.cooldown]` or `[workspace.metadata.cooldown]` in `Cargo.toml`
+speaks for cooldown directly and wins over Cargo's age.
+Like every native window, it ranks below `cooldown.toml` and the command line; see
+[`--fail-on-stricter-native`]({{< relref "../commands/check.md" >}}) to fail when a policy overrides
+a stricter one.
+An age set in a file brought in through Cargo's `include` is not seen.
+
+cooldown applies the window itself and runs its own cargo commands without Cargo's crates.io age, so
+a stricter native age never makes Cargo refuse a version the policy admits.
+Ages for other registries are left to Cargo.
+To give cooldown's own cargo commands a crates.io age anyway, set `COOLDOWN_CARGO_MIN_PUBLISH_AGE`
+in Cargo's spelling (`"14 days"`); it bounds what Cargo can resolve but is not read as policy.
 
 ## Several ecosystems at once
 

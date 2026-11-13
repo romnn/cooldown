@@ -2,10 +2,9 @@
 version: "3"
 
 vars:
-  # Pinned rather than `latest`: the 0.23.4 image's zig wrapper consumes `-dead_strip` as the
-  # `-exported_symbols_list` file when linking an Apple cdylib (pep440_rs declares one), so the
-  # darwin release builds fail there; 0.23.2 is the image the last good release used.
-  ZIGBUILD_IMAGE: ghcr.io/rust-cross/cargo-zigbuild:0.23.2
+  # Pinned rather than `latest`: a new image can break a target's link, as 0.23.4 did for the
+  # Apple cdylib pep440_rs declares, so bump it only after `task build:goreleaser` passes on it.
+  ZIGBUILD_IMAGE: ghcr.io/rust-cross/cargo-zigbuild:0.24.1
   GORELEASER_VERSION: "2.17.0"
 
 tasks:
@@ -42,11 +41,14 @@ tasks:
     cmds:
       # The image ships zig, cargo-zigbuild, rust and every release target; only goreleaser
       # is missing. safe.directory: the bind-mounted repo is owned by another uid.
+      # Since Rust 1.100, the gnullvm targets leave libunwind to clang's `--unwindlib`, which
+      # zig ignores, so the ARM64 Windows link needs `-lunwind` spelled out.
       # prettier-ignore
       - >-
         docker run --rm
         -e GITHUB_TOKEN -e TAP_GITHUB_TOKEN
         -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)"
+        -e "CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_RUSTFLAGS=-C link-arg=-lunwind"
         {{.DOCKER_ENV}}
         -v "${PWD}:/workspace" -w /workspace
         {{.ZIGBUILD_IMAGE}}

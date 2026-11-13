@@ -175,9 +175,10 @@ pub(crate) async fn prepare_run(
     invocation
         .progress()
         .phase("loading baseline and run scope");
-    // The repo-root cascade (no native layer) lets `sync` resolve a repo-wide window once for
-    // repo-scoped adapters (uv's root `uv.toml`) without borrowing any project's layers.
-    let repo_layers = policy::repo_layers(&configs, &shared, &repo_root)?;
+    // The repo-root cascades let `sync` resolve a repo-wide window once for repo-scoped adapters
+    // (uv's root `uv.toml`, Cargo's root `.cargo/config.toml`) without borrowing any project's
+    // layers.
+    let repo_cascades = policy::repo_cascades(&assembly, &ctxs).await?;
 
     let baseline = Baseline::load(&repo_root.join(crate::app::baseline::BASELINE_FILE))?;
     let ws = Workspace::new(
@@ -186,8 +187,9 @@ pub(crate) async fn prepare_run(
         now,
         baseline,
         repo_root.clone(),
-        repo_layers,
+        repo_cascades.shared,
     )
+    .with_repo_tool_layers(repo_cascades.per_tool)
     // The OSV feed shares the adapters' HTTP client (cache, per-host budget, offline/fresh
     // modes).
     // Wiring it unconditionally is harmless: nothing is fetched unless a project's

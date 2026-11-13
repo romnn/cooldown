@@ -2,8 +2,10 @@
 //! resolved graph via `cargo metadata`, classified releases from
 //! the crates.io sparse index, and `cargo`-driven apply/build.
 //!
-//! Cargo has no publish-date cutoff flag (no `--exclude-newer` equivalent), so the cooldown window
-//! is realized entirely in [`cooldown_core`].
+//! The cooldown window is realized entirely in [`cooldown_core`]: cargo's own crates.io publish age
+//! is read as native policy and kept out of the cargo commands this adapter runs (see the
+//! `publish_age` module), because a resolver cutoff applied mid-apply can refuse a version the plan
+//! still needs.
 //! The crates.io sparse index supplies publish times, the core computes each crate's
 //! newest-within-window target, and this adapter applies those targets as concrete
 //! `cargo update --precise <version>` pins.
@@ -31,7 +33,8 @@ use crate::lockfile::{
     CargoLock, DeclaredEndpoints, PlannedNodeMove, SlotKey, SourcedSlotKey, rewrite_planned_nodes,
 };
 use crate::manifest;
-use crate::native::parse_native;
+use crate::native::native_policy_layer;
+use crate::publish_age::CargoEnvironment;
 use crate::rejection_memo::{
     MemoKey, MemoMetadataMode, MemoOperation, MemoRejection, RejectionEffect, RejectionMemo,
 };
@@ -45,9 +48,9 @@ use cooldown_core::{
     FetchContext, GeneratedMembers, LockStatus, LockVerifyReport, MemberRef, MutationExecution,
     NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation, Project,
     ProjectMutationFile, ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder,
-    ReleaseQuality, ResolveInputs, Result, RewriteMode, SkipReason, Skipped, TargetFallback,
-    ToolId, ToolRead, ToolTermination, ToolWrite, UpdateKind, VerifyReport, Version,
-    fs::RecoveryAuthority,
+    ReleaseQuality, ResolveInputs, ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped,
+    SyncReport, SyncScope, TargetFallback, ToolId, ToolRead, ToolTermination, ToolWrite,
+    UpdateKind, VerifyReport, Version, fs::RecoveryAuthority,
 };
 use cooldown_registry::SharedHttp;
 use sha2::{Digest as _, Sha256};
@@ -537,7 +540,11 @@ impl ToolRead for CargoTool {
     }
 
     async fn native_policy(&self, project: &Project) -> Result<Option<NativePolicyLayer>> {
-        parse_native(&project.manifest)
+        native_policy_layer(
+            &project.root,
+            &project.manifest,
+            &CargoEnvironment::current(),
+        )
     }
 
     async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport> {
@@ -3565,6 +3572,32 @@ fn reached_after(
 impl ToolWrite for CargoTool {
     fn mutation_tool(&self) -> ToolId {
         CARGO_ID
+    }
+
+    fn sync_scope(&self) -> SyncScope {
+        SyncScope::Repo
+    }
+
+    async fn write_repo_native(
+        &self,
+        repo_root: &Utf8Path,
+        policy: &ResolvedPolicy,
+        dry_run: bool,
+    ) -> Result<SyncReport> {
+        crate::publish_age::write_repo_native(
+            repo_root,
+            policy,
+            &CargoEnvironment::current(),
+            dry_run,
+        )
+    }
+
+    async fn repo_native_policy(&self, repo_root: &Utf8Path) -> Result<Option<NativePolicyLayer>> {
+        native_policy_layer(
+            repo_root,
+            &repo_root.join(crate::CARGO_MANIFEST),
+            &CargoEnvironment::current(),
+        )
     }
 
     fn supports_transitive_advance(&self) -> bool {

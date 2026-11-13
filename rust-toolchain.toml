@@ -3,5 +3,5 @@
 # A floating `stable` would let a new release change lints or behavior on one side only, and CI
 # reads this channel to install the identical toolchain.
 [toolchain]
-channel = "1.99.1"
+channel = "1.100.0"
 components = ["clippy", "rustfmt"]

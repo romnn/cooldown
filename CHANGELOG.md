@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Cargo's native `min-publish-age` is supported.** Cargo 1.100 stabilized publish-age filtering.
+  cooldown now reads the crates.io age Cargo would apply to a project
+  (`registries.crates-io.min-publish-age`, `registry.global-min-publish-age` or
+  `CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE`) as its native cooldown window, below `cooldown.toml`
+  and the command line. `cooldown sync` writes the repository window into the root
+  `.cargo/config.toml` (or the `.cargo/config` Cargo reads instead), so a plain `cargo update`
+  honors it too. cooldown's own cargo commands run without that age, so a stricter native age no
+  longer makes Cargo refuse a version cooldown is pinning.
+
 ## v0.0.29
 
 - **uv candidates whose wheel tags changed get their upload times instead of `unknown_age`.**
