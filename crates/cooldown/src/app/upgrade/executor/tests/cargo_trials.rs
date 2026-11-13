@@ -746,10 +746,15 @@ async fn coordinated_snapshot_family_advances_only_to_the_matured_release() -> e
 
 #[test]
 fn upgrade_trials_fit_a_small_thread_stack() -> eyre::Result<()> {
-    // Windows CLI execution has less stack than Rust's default test threads.
-    // Leave headroom for the CLI and native driver around this complete resolver trial.
+    // Windows debug frames need more stack than Unix ones; both budgets are below test defaults.
+    // The stricter Unix budget reproduced the regression before trial futures were heap-pinned.
+    let stack_bytes = if cfg!(windows) {
+        1024 * 1024
+    } else {
+        256 * 1024
+    };
     std::thread::Builder::new()
-        .stack_size(256 * 1024)
+        .stack_size(stack_bytes)
         .spawn(|| -> eyre::Result<()> {
             let CargoFixture {
                 directory: _directory,
