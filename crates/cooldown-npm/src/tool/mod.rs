@@ -2343,11 +2343,26 @@ impl<L: NodeLock> NpmTool<L> {
         // Workspace member manifests are read from disk here — still pre-apply state — because the
         // lock is not authoritative for a local package's peer contracts.
         let lock = journaled_lock::<L>(journal);
-        let evidence = PeerEvidence::gather::<L>(Some(&project.root), lock, plan);
+        // A transitive candidate the advance pass holds never reaches the joint resolve, so it is
+        // split off first: the peer gate then neither holds it for a contract its copy never moves
+        // against, nor lets it exempt or blame anything, and the landing report cannot credit it
+        // with another copy's move.
+        let TransitivePartition {
+            attempted,
+            held: transitive_held,
+        } = if L::supports_whole_graph_resolve() {
+            transitive_partition::<L>(plan, lock)?
+        } else {
+            TransitivePartition {
+                attempted: plan.clone(),
+                held: Vec::new(),
+            }
+        };
+        let evidence = PeerEvidence::gather::<L>(Some(&project.root), lock, &attempted);
         let PeerPartition {
             retained: plan,
             skipped: peer_held,
-        } = partition_peer_held::<L>(plan, &evidence);
+        } = partition_peer_held::<L>(&attempted, &evidence);
         // A manager with a native joint resolve (pnpm) re-resolves the whole importer graph
         // jointly (peer verification may reject candidates and re-resolve) and reports the full
         // before/after lock diff, so a candidate can never silently move another package and
@@ -2370,6 +2385,7 @@ impl<L: NodeLock> NpmTool<L> {
             .await?
         };
         report.skipped.extend(peer_held);
+        settle_transitive_holds::<L>(project, lock, transitive_held, &mut report)?;
         Ok(report)
     }
 
@@ -2655,25 +2671,28 @@ impl<L: NodeLock> NpmTool<L> {
             if rejected(change) {
                 continue;
             }
-            let moved = candidate_moved(name, &before, &after, &before_members, &after_members);
             // A transitive candidate the advance pass held (importer-owned name, duplicated graph
-            // copies, no override scope) was never handed to the resolver; its truthful hold row
-            // replaces both the generic conflict verdict and — for a duplicate copy whose newest
-            // line already sits at the target — the silent no-op the newest-copy projection would
-            // otherwise produce.
-            let advance_hold = advance
+            // copies, no override scope) was never handed to the resolver, so its truthful hold
+            // row is its verdict.
+            // It is decided before the landing checks, which judge the name's newest copy: another
+            // copy's move would otherwise credit it as applied, or a duplicate copy already at the
+            // target would make it a silent no-op.
+            // `apply_with_runner` splits these off before the resolve; this keeps a direct caller
+            // truthful too.
+            if let Some(hold) = advance
                 .get(&advance_key(change))
-                .and_then(|verdict| verdict.hold_skip(change));
+                .and_then(|verdict| verdict.hold_skip(change))
+            {
+                report.skipped.push(hold);
+                continue;
+            }
+            let moved = candidate_moved(name, &before, &after, &before_members, &after_members);
             if reached(&after, &after_members, change) {
                 if moved {
                     report.applied.push(change.clone());
-                } else if let Some(hold) = advance_hold {
-                    report.skipped.push(hold);
                 }
                 // Otherwise: reached its target without a net lock move because a duplicate copy
                 // of the same name is at the target — a no-op, neither applied nor held.
-            } else if let Some(hold) = advance_hold {
-                report.skipped.push(hold);
             } else if multi_version.contains(name) {
                 report.skipped.push(multi_version_hold(
                     change,
@@ -3466,6 +3485,118 @@ fn transitive_override_pins(
     pins
 }
 
+/// A plan split by the transitive-advance verdicts ([`transitive_partition`]).
+struct TransitivePartition {
+    /// The plan without the held transitive candidates; every other plan setting passes through.
+    attempted: Plan,
+    /// The truthful hold row of each transitive candidate the advance pass holds.
+    held: Vec<Skipped>,
+}
+
+/// Splits off the transitive candidates whose advance verdict holds them
+/// ([`TransitiveAdvance::hold_skip`]), judged against the pre-apply `lock`.
+/// A verdict depends only on that lock and the change itself, so splitting before any other
+/// partition matches what the joint resolve would decide for the change.
+fn transitive_partition<L: NodeLock>(
+    plan: &Plan,
+    lock: Option<&str>,
+) -> Result<TransitivePartition> {
+    let advance = transitive_advance_verdicts::<L>(plan, lock, &excluded_paths(plan))?;
+    let mut attempted = Vec::with_capacity(plan.changes.len());
+    let mut hold_rows = Vec::new();
+    for change in &plan.changes {
+        match advance
+            .get(&advance_key(change))
+            .and_then(|verdict| verdict.hold_skip(change))
+        {
+            Some(row) => hold_rows.push(row),
+            None => attempted.push(change.clone()),
+        }
+    }
+    Ok(TransitivePartition {
+        attempted: Plan {
+            changes: attempted,
+            ..plan.clone()
+        },
+        held: hold_rows,
+    })
+}
+
+/// Reports each split-off transitive hold ([`transitive_partition`]) against the lock the apply
+/// settled on.
+///
+/// Holding a candidate keeps it out of the resolve, but it does not freeze its copy: pnpm updating
+/// the declared copy of the same name re-resolves an undeclared copy within its own range too.
+/// A hold that provably landed ([`line_landed`]) becomes an applied row, replacing the anonymous
+/// collateral row the name-level diff may have recorded for the same move.
+/// Every other hold keeps its row.
+fn settle_transitive_holds<L: NodeLock>(
+    project: &Project,
+    before: Option<&str>,
+    held: Vec<Skipped>,
+    report: &mut ApplyReport,
+) -> Result<()> {
+    if held.is_empty() {
+        return Ok(());
+    }
+    let before = before
+        .map(resolved_version_lines::<L>)
+        .transpose()?
+        .unwrap_or_default();
+    let path = project.root.join(L::LOCKFILE);
+    let after = match std::fs::read_to_string(&path) {
+        Ok(content) => resolved_version_lines::<L>(&content)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(error) => return Err(CoreError::Filesystem(format!("{path}: {error}"))),
+    };
+    for hold in held {
+        if !line_landed(&before, &after, &hold.change) {
+            report.skipped.push(hold);
+            continue;
+        }
+        let change = hold.change;
+        report.applied.retain(|row| {
+            !(row.package == change.package
+                && row.from == change.from
+                && row.to == change.to
+                && !row.direct
+                && row.members.is_empty())
+        });
+        report.applied.push(change);
+    }
+    Ok(())
+}
+
+/// Whether the resolved versions `before` and `after` the resolve prove that `change`'s own copy
+/// moved to its target.
+///
+/// The lock names versions, not which parent's copy each is, so only an unambiguous line counts:
+/// `from`'s major line held exactly one copy, at `from`, and holds exactly one copy after, at or
+/// beyond the target.
+/// With several copies on one line, another copy reaching the target, or the old copy vanishing
+/// beside a copy already at it, proves nothing about this one, which keeps its hold row.
+fn line_landed(
+    before: &HashMap<String, BTreeSet<String>>,
+    after: &HashMap<String, BTreeSet<String>>,
+    change: &Change,
+) -> bool {
+    let name = change.package.name.as_str();
+    let line = version::major_key(change.from.as_str()).0;
+    let on_line = |lines: &HashMap<String, BTreeSet<String>>| -> Vec<String> {
+        lines
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|version| version::major_key(version).0 == line)
+            .cloned()
+            .collect()
+    };
+    let before_copies = on_line(before);
+    let after_copies = on_line(after);
+    matches!(before_copies.as_slice(), [only] if only == change.from.as_str())
+        && matches!(after_copies.as_slice(), [landed] if satisfies_target(change, landed))
+}
+
 /// [`partition_catalog_managed`] against the pre-apply lock, with the run's excluded importers left
 /// out of both the catalog evidence and the managed index.
 fn catalog_partition<L: NodeLock>(
@@ -3943,8 +4074,13 @@ pub(crate) struct HeldSplits {
 /// `devDependencies` beside a caret under `dependencies`) is visible only there, and the widen
 /// would rewrite it too.
 /// Without a `root`, or with a declaring manifest that cannot be read, the name stays held.
-/// Only a declared (direct) change is confirmed this way: a transitive copy of the same name has
-/// no declaring manifest and is held by its own transitive verdict.
+///
+/// Only declared (direct) changes decide a split.
+/// A transitive change is never exact-pinned through an importer: its own advance verdict
+/// ([`TransitiveAdvance`]) either scopes it to its major line or holds it, and holds it whenever an
+/// importer declares the name.
+/// Counting its target, or judging it against the importers' ranges, would let an undeclared copy
+/// on another line hold a declared change that lands on its own.
 ///
 /// A name one joint pin lands outright ([`SplitVerdict::Joint`]) is held all the same when one of
 /// its declaring manifests pins it exactly, in any install field, to a version excluding the target
@@ -3974,7 +4110,7 @@ pub(crate) fn held_splits<L: NodeLock>(
         names: HashSet::new(),
         reasons: HashMap::new(),
     };
-    for change in &plan.changes {
+    for change in plan.changes.iter().filter(|change| change.direct) {
         let name = change.package.name.as_str();
         let target = change.to.as_str();
         if targets.get(name).is_some_and(|targets| targets.len() > 1) {
@@ -3995,9 +4131,6 @@ pub(crate) fn held_splits<L: NodeLock>(
                 hold => hold,
             },
             SplitVerdict::Held(hold) => Some(hold),
-            // A copy no importer declares has no manifest to confirm, and its own transitive
-            // verdict holds it; only the declared copy decides whether the name is held.
-            SplitVerdict::CeilingWiden if !change.direct => continue,
             SplitVerdict::CeilingWiden => match root {
                 Some(root) => match manifest_ceiling_hold(root, change) {
                     None => continue,
@@ -4047,11 +4180,12 @@ fn manifest_pin_hold(root: &Utf8Path, change: &Change) -> Option<SplitHold> {
     }
 }
 
-/// Every distinct target the plan names per package, ascending — several when the lines of a split
-/// name each advance within themselves.
+/// Every distinct target the plan's direct changes name per package, ascending — several when the
+/// declared lines of a split name each advance within themselves.
+/// Transitive targets are left out; see [`held_splits`].
 fn planned_targets(plan: &Plan) -> HashMap<&str, BTreeSet<&str>> {
     let mut targets: HashMap<&str, BTreeSet<&str>> = HashMap::new();
-    for change in &plan.changes {
+    for change in plan.changes.iter().filter(|change| change.direct) {
         targets
             .entry(change.package.name.as_str())
             .or_default()
@@ -9040,6 +9174,295 @@ mod whole_graph_tests {
         Ok((lock, plan))
     }
 
+    /// Where a fixture's two `globals` copies sit: the root's declared copy and an undeclared copy
+    /// under `parent`, each with its planned move, plus where the scripted resolve settles the
+    /// undeclared copy.
+    struct CopyLayout {
+        range: &'static str,
+        declared_from: &'static str,
+        declared_to: &'static str,
+        undeclared_from: &'static str,
+        undeclared_to: &'static str,
+        undeclared_settled: &'static str,
+        /// The root's own `peerDependencies` range for `globals`, when it declares one.
+        peer: Option<&'static str>,
+    }
+
+    /// The issue's layout: the root declares `globals` `^17.9.0` (17.11.0 → 17.13.0), an
+    /// undeclared copy sits at 16.4.0 (→ 16.5.0), and the root's peer contract admits the declared
+    /// copy before and after its move but not the undeclared copy's target.
+    fn issue_layout(undeclared_settled: &'static str) -> CopyLayout {
+        CopyLayout {
+            range: "^17.9.0",
+            declared_from: "17.11.0",
+            declared_to: "17.13.0",
+            undeclared_from: "16.4.0",
+            undeclared_to: "16.5.0",
+            undeclared_settled,
+            peer: Some(">=16.4.0 <16.5.0 || ^17.0.0"),
+        }
+    }
+
+    /// A project laid out as `layout` with a scripted pnpm that settles the declared copy at its
+    /// target and the undeclared one where the layout says.
+    struct UndeclaredCopy {
+        #[expect(dead_code, reason = "dropping the guard deletes the project directory")]
+        directory: tempfile::TempDir,
+        root: Utf8PathBuf,
+        tool: NpmTool<Pnpm>,
+        /// The root's planned upgrade.
+        declared: Change,
+        /// The undeclared copy's planned advance.
+        undeclared: Change,
+    }
+
+    impl UndeclaredCopy {
+        fn plan(&self) -> Plan {
+            Plan {
+                changes: vec![self.declared.clone(), self.undeclared.clone()],
+                ..Plan::default()
+            }
+        }
+    }
+
+    fn undeclared_copy(layout: &CopyLayout) -> eyre::Result<UndeclaredCopy> {
+        let (directory, root) = tempdir_root()?;
+        let mut lock = workspace(
+            &root,
+            &[Importer {
+                path: ".",
+                name: "app",
+                deps: vec![
+                    ("globals", layout.range, layout.declared_from),
+                    ("parent", "^1.0.0", "1.0.0"),
+                ],
+            }],
+        )?;
+        lock.push_str(&package_entry("globals", layout.undeclared_from));
+        // The settled lock moves the declared copy inside `packages:`; the snapshots binding the
+        // undeclared copy to `parent` follow in both.
+        let snapshots = formatdoc! {"
+
+            snapshots:
+              parent@1.0.0:
+                dependencies:
+                  globals: {}
+        ", layout.undeclared_from};
+        let settled = moved(
+            &lock,
+            ".",
+            "globals",
+            (layout.range, layout.declared_from),
+            (layout.range, layout.declared_to),
+        ) + &snapshots;
+        let settled = settled
+            .replace(
+                &format!("globals@{}", layout.undeclared_from),
+                &format!("globals@{}", layout.undeclared_settled),
+            )
+            .replace(
+                &format!("globals: {}", layout.undeclared_from),
+                &format!("globals: {}", layout.undeclared_settled),
+            );
+        lock.push_str(&snapshots);
+        std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+        std::fs::write(root.join("settled.yaml"), settled)?;
+        let mut manifest = serde_json::json!({
+            "name": "app",
+            "dependencies": { "globals": layout.range, "parent": "^1.0.0" },
+        });
+        if let Some(peer) = layout.peer {
+            manifest["peerDependencies"] = serde_json::json!({ "globals": peer });
+        }
+        std::fs::write(root.join("package.json"), manifest.to_string())?;
+        let script = fake_pnpm(
+            &root,
+            indoc! {r#"
+                  *"--frozen-lockfile"*) exit 0 ;;
+                  *" update "*|*"install"*)
+                    cp settled.yaml pnpm-lock.yaml; exit 0 ;;
+            "#},
+        )?;
+        Ok(UndeclaredCopy {
+            directory,
+            tool: tool_with(&script)?,
+            root,
+            declared: change(
+                "globals",
+                layout.declared_from,
+                layout.declared_to,
+                &[("app", ".")],
+            ),
+            undeclared: Change {
+                direct: false,
+                ..change("globals", layout.undeclared_from, layout.undeclared_to, &[])
+            },
+        })
+    }
+
+    /// Asserts the declared copy landed alone and the undeclared copy carries exactly its own
+    /// importer-owned hold row.
+    fn assert_undeclared_copy_held(fixture: &UndeclaredCopy, report: &ApplyReport) {
+        assert_eq!(report.applied, vec![fixture.declared.clone()], "{report:?}");
+        let rows: Vec<&Skipped> = report
+            .skipped
+            .iter()
+            .filter(|skip| skip.change == fixture.undeclared)
+            .collect();
+        assert_eq!(rows.len(), 1, "{report:?}");
+        assert_eq!(rows[0].reason, SkipReason::MultiVersionHeld);
+        assert!(
+            rows[0]
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("importers declare globals")),
+            "{report:?}"
+        );
+    }
+
+    /// An undeclared copy on another line of a name the root declares keeps its own hold: it neither
+    /// holds the declared copy's in-range upgrade, nor is credited with that copy's move, nor is
+    /// peer-held for a contract its copy never moves against.
+    #[tokio::test]
+    async fn an_undeclared_copy_on_another_line_leaves_the_declared_upgrade_alone()
+    -> eyre::Result<()> {
+        let fixture = undeclared_copy(&issue_layout("16.4.0"))?;
+
+        let report = apply(&fixture.tool, &project(&fixture.root), fixture.plan()).await?;
+
+        assert_undeclared_copy_held(&fixture, &report);
+        assert!(
+            report
+                .skipped
+                .iter()
+                .all(|skip| skip.reason != SkipReason::PeerHeld),
+            "{report:?}"
+        );
+        Ok(())
+    }
+
+    /// Holding the undeclared copy keeps it out of the resolve but does not freeze it: when updating
+    /// the declared copy also moves it to its target, its move landed and is reported applied, once.
+    #[tokio::test]
+    async fn an_undeclared_copy_the_declared_update_moves_is_reported_applied() -> eyre::Result<()>
+    {
+        let fixture = undeclared_copy(&issue_layout("16.5.0"))?;
+
+        let report = apply(&fixture.tool, &project(&fixture.root), fixture.plan()).await?;
+
+        assert_eq!(
+            report.applied,
+            vec![fixture.declared.clone(), fixture.undeclared.clone()],
+            "{report:?}"
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .all(|skip| skip.change.package.name != "globals"),
+            "{report:?}"
+        );
+        Ok(())
+    }
+
+    /// When the undeclared copy is the name's newest line, the name-level diff records its move as an
+    /// anonymous collateral row; crediting the planned advance replaces that row instead of
+    /// reporting the move twice.
+    #[tokio::test]
+    async fn a_landed_undeclared_copy_on_the_newest_line_is_reported_once() -> eyre::Result<()> {
+        let fixture = undeclared_copy(&CopyLayout {
+            range: "^16.4.0",
+            declared_from: "16.4.0",
+            declared_to: "16.5.0",
+            undeclared_from: "17.11.0",
+            undeclared_to: "17.13.0",
+            undeclared_settled: "17.13.0",
+            peer: None,
+        })?;
+
+        let report = apply(&fixture.tool, &project(&fixture.root), fixture.plan()).await?;
+
+        assert_eq!(
+            report.applied,
+            vec![fixture.declared.clone(), fixture.undeclared.clone()],
+            "{report:?}"
+        );
+        Ok(())
+    }
+
+    /// Only an unambiguous line proves a held copy landed: with several copies on one major line,
+    /// another copy's move, or the old copy vanishing beside one already at the target, credits
+    /// nothing.
+    #[test]
+    fn only_an_unambiguous_line_proves_a_held_copy_landed() {
+        let lines = |versions: &[&str]| {
+            HashMap::from([(
+                "host".to_string(),
+                versions
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<BTreeSet<_>>(),
+            )])
+        };
+        let held = |from: &str, to: &str| Change {
+            direct: false,
+            ..change("host", from, to, &[])
+        };
+
+        // One copy on the line before and after, at the target.
+        assert!(line_landed(
+            &lines(&["2.0.0", "1.0.0"]),
+            &lines(&["2.1.0", "1.2.0"]),
+            &held("1.0.0", "1.2.0"),
+        ));
+        // Two copies on the line: one reaching the target says nothing about the other.
+        let before = lines(&["2.0.0", "1.0.0", "1.1.0"]);
+        let after = lines(&["2.1.0", "1.0.1", "1.2.0"]);
+        assert!(!line_landed(&before, &after, &held("1.0.0", "1.2.0")));
+        assert!(!line_landed(&before, &after, &held("1.1.0", "1.2.0")));
+        // The old copy vanishing beside a copy already at the target.
+        assert!(!line_landed(
+            &lines(&["1.0.0", "1.2.0"]),
+            &lines(&["1.2.0"]),
+            &held("1.0.0", "1.2.0"),
+        ));
+        // A single copy that moved short of the target.
+        assert!(!line_landed(
+            &lines(&["1.0.0"]),
+            &lines(&["1.1.0"]),
+            &held("1.0.0", "1.2.0"),
+        ));
+    }
+
+    /// The joint resolve's report judges a held transitive candidate by its hold before any landing
+    /// check, so a caller that hands it in is never told another copy's move landed it.
+    #[tokio::test]
+    async fn the_joint_resolve_report_never_credits_a_held_transitive_copy() -> eyre::Result<()> {
+        let fixture = undeclared_copy(&issue_layout("16.4.0"))?;
+        let project = project(&fixture.root);
+        let plan = fixture.plan();
+        let journal = fixture.tool.mutation_journal(&project, &plan).await?;
+        let evidence = PeerEvidence::gather::<Pnpm>(
+            Some(&fixture.root),
+            journaled_lock::<Pnpm>(&journal),
+            &plan,
+        );
+
+        let report = fixture
+            .tool
+            .apply_whole_graph(
+                &project,
+                &plan,
+                &journal,
+                &evidence,
+                &ProtectedPins::default(),
+            )
+            .await?;
+
+        assert_undeclared_copy_held(&fixture, &report);
+        Ok(())
+    }
+
     /// A release-age exclusion query pnpm itself fails is a broken environment, not a resolver
     /// verdict, so the apply fails before the update instead of holding the candidate.
     #[tokio::test]
@@ -12329,6 +12752,34 @@ mod whole_graph_tests {
             assert!(!detail.contains("not every declared range"), "{detail}");
         }
         assert_eq!(legs(&root), [] as [String; 0]);
+        Ok(())
+    }
+
+    /// Only declared changes decide a split: a transitive change of an undeclared copy on another
+    /// line neither adds a second target nor is judged against the importer's range.
+    #[test]
+    fn a_transitive_copy_does_not_split_a_declared_name() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        let lock = workspace(
+            &root,
+            &[Importer {
+                path: ".",
+                name: "app",
+                deps: vec![("globals", "^17.9.0", "17.11.0")],
+            }],
+        )?;
+        let plan = Plan {
+            changes: vec![
+                change("globals", "17.11.0", "17.13.0", &[("app", ".")]),
+                Change {
+                    direct: false,
+                    ..change("globals", "16.4.0", "16.5.0", &[])
+                },
+            ],
+            ..Plan::default()
+        };
+        let held = held_splits::<Pnpm>(Some(&root), Some(&lock), &plan);
+        assert!(!held.names.contains("globals"), "{:?}", held.names);
         Ok(())
     }
 
