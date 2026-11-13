@@ -14,6 +14,7 @@ use tracing::instrument::WithSubscriber as _;
 fn logging(
     level: super::LogLevel,
     recorder: Option<Arc<crate::trace::Recorder>>,
+    detail: cooldown_core::trace::Detail,
 ) -> tracing::Dispatch {
     use tracing_subscriber::filter::filter_fn;
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -30,11 +31,7 @@ fn logging(
             metadata.target() != cooldown_core::trace::TARGET
         }))
         .with_filter(filter);
-    let recording = recorder.map(|recorder| {
-        crate::trace::TraceLayer::new(recorder).with_filter(filter_fn(|metadata| {
-            metadata.target().starts_with("cooldown")
-        }))
-    });
+    let recording = recorder.map(|recorder| crate::trace::TraceLayer::recording(recorder, detail));
     tracing::Dispatch::new(tracing_subscriber::registry().with(console).with(recording))
 }
 
@@ -56,6 +53,11 @@ pub async fn run(cli: Cli, overrides: CliOverrides) -> Exit {
         _ => None,
     }
     .filter(|_| !cli.global.no_trace);
+    let detail = if cli.global.full_trace {
+        cooldown_core::trace::Detail::Full
+    } else {
+        cooldown_core::trace::Detail::Compact
+    };
     let recorder = trace_command.and_then(|command| {
         match crate::trace::Recorder::start(
             &selected,
@@ -64,6 +66,7 @@ pub async fn run(cli: Cli, overrides: CliOverrides) -> Exit {
                 .trace_dir
                 .as_deref()
                 .map(camino::Utf8Path::as_std_path),
+            detail,
         ) {
             Ok(recorder) => Some(recorder),
             Err(err) => {
@@ -72,7 +75,7 @@ pub async fn run(cli: Cli, overrides: CliOverrides) -> Exit {
             }
         }
     });
-    let subscriber = logging(cli.global.log_level, recorder.clone());
+    let subscriber = logging(cli.global.log_level, recorder.clone(), detail);
     async move {
         record_invocation(
             &cli.command,
@@ -118,13 +121,14 @@ struct InvocationPaths<'a> {
 }
 
 fn record_invocation(command: &Command, paths: InvocationPaths<'_>) {
-    if cooldown_core::trace::enabled() {
+    if let Some(detail) = cooldown_core::trace::Detail::current() {
         cooldown_core::trace::Event::RunStarted {
             command: command_name(command),
             version: env!("CARGO_PKG_VERSION"),
             os: std::env::consts::OS,
             arch: std::env::consts::ARCH,
             directory: &paths.directory.to_string_lossy(),
+            detail,
         }
         .emit();
         let arguments: Vec<String> = std::env::args_os()

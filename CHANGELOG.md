@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Run traces are compressed and compact by default.** A large `upgrade --major` run could write a
+  trace of more than 12 GB. Traces are now zstd-compressed on a background thread (`.jsonl.zst`,
+  readable with `zstd -dc`), and by default each distinct release list is recorded once and
+  referred to, rejected releases are summarized in their evaluation, and identical native command
+  output is recorded once. On this repository, an `upgrade --major` trace shrinks from 280 MB to
+  under 2 MB. `--full-trace` (or `COOLDOWN_FULL_TRACE`) records everything as it happens, still
+  compressed. `cooldown prune` also removes the uncompressed traces of earlier versions.
+
 - **A pnpm upgrade of a declared package is no longer held by an undeclared copy of it.** When the
   graph also held a copy of the same name on another line, such as `globals` 16 under a dependency
   beside a declared `globals` 17, that copy's own planned move counted as a second target, so the

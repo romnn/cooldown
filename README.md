@@ -61,8 +61,9 @@ cooldown fix           # remediate: downgrade too-fresh deps to a matured versio
 `cooldown upgrade --dry-run` previews the plan without touching the lock — only versions that have
 already cleared their cooldown window are proposed.
 
-`upgrade`, `fix`, and `outdated` record local JSON Lines traces for debugging. Use `--trace-dir PATH`
-to choose their directory or `--no-trace` to disable recording. `cooldown prune` removes inactive
+`upgrade`, `fix`, and `outdated` record local, zstd-compressed JSON Lines traces for debugging.
+Use `--trace-dir PATH` to choose their directory, `--full-trace` to record everything instead of the
+compact default, or `--no-trace` to disable recording. `cooldown prune` removes inactive
 traces and disposable cache files older than 30 days (`--older-than` / `--dry-run` customize it).
 See [run traces](docs/content/docs/traces.md) for storage locations and the event format.
 
@@ -338,7 +339,8 @@ the core, render, the config schema, or any other adapter.
 
 Architecture decisions live in [`adr/`](adr/). Each numbered record states its status and date,
 the context, the decision, its consequences, and references. The first record covers
-[default run traces](adr/0001-default-run-traces.md).
+[default run traces](adr/0001-default-run-traces.md), and the second their
+[compression and compact default](adr/0002-compressed-compact-traces.md).
 
 ## Security model
 
