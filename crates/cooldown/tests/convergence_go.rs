@@ -489,3 +489,137 @@ fn upgrade_moves_every_module_in_a_multi_module_repo() {
         );
     }
 }
+
+/// The cutoff for the commit-pin test: `sigs.k8s.io/kustomize/api` and `kyaml` v0.21.2 (published
+/// 2026-09-30) are matured, v0.21.3 (2026-10-08, which needs Go 1.27) is not.
+const FREEZE_COMMIT_PIN: &str = "2026-10-05T00:00:00Z";
+
+/// The `k8s.io/kube-openapi` commit the commit-pin fixture requires directly.
+/// kustomize v0.21.1 requires this commit too, while v0.21.2 requires the 2026-07 commit
+/// `v0.0.0-20260721132016-d427ff9ee9ad`.
+const KUBE_OPENAPI_PIN: &str = "v0.0.0-20241212222426-2c72e554b1e7";
+
+const COMMIT_PIN_MAIN: &str = indoc::indoc! {r#"
+    package main
+
+    import (
+    	"k8s.io/kube-openapi/pkg/validation/spec"
+    	"sigs.k8s.io/kustomize/api/types"
+    )
+
+    func main() {
+    	_ = spec.Schema{}
+    	_ = types.Kustomization{}
+    }
+"#};
+
+/// A project that requires `k8s.io/kube-openapi` directly at a commit and imports both modules, so
+/// tidy keeps both requirements direct.
+fn commit_pin_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write(
+        "go.mod",
+        &indoc::formatdoc! {"
+            module example.com/cooldown-go-commit-pin
+
+            go 1.24.0
+
+            require (
+            	k8s.io/kube-openapi {KUBE_OPENAPI_PIN}
+            	sigs.k8s.io/kustomize/api v0.21.1
+            )
+        "},
+    );
+    fixture.write("main.go", COMMIT_PIN_MAIN);
+    fixture
+        .run_tool("go", &["mod", "tidy"], &[("GOFLAGS", "")])
+        .expect_success();
+    fixture
+}
+
+/// Runs the kustomize-only upgrade the commit-pin tests share, with `envs` added to cooldown's
+/// environment.
+fn upgrade_kustomize(fixture: &Fixture, envs: &[(&str, &str)]) -> support::Envelope {
+    fixture.cooldown_json_env(
+        &[
+            "upgrade",
+            "--freeze",
+            FREEZE_COMMIT_PIN,
+            "--package",
+            "sigs.k8s.io/kustomize/*",
+        ],
+        envs,
+    )
+}
+
+/// Both kustomize candidates are held for the kube-openapi pin, and `go.mod` is unchanged.
+fn assert_commit_pin_held(fixture: &Fixture, report: &support::Envelope, go_mod_before: &[u8]) {
+    assert!(report.ok(), "a held candidate is not a failure");
+    assert_eq!(
+        report
+            .item_field_str("sigs.k8s.io/kustomize/api", "to")
+            .as_deref(),
+        Some("v0.21.2"),
+        "the cutoff matures v0.21.2 only, so the held target is not the Go 1.27 release v0.21.3"
+    );
+
+    // Both candidates are held, and each says which pin it would have moved.
+    for name in ["sigs.k8s.io/kustomize/api", "sigs.k8s.io/kustomize/kyaml"] {
+        let detail = report.skip_detail_for(name).unwrap_or_default();
+        assert!(
+            detail.contains("k8s.io/kube-openapi") && detail.contains(KUBE_OPENAPI_PIN),
+            "{name} must be held for moving the kube-openapi pin, got {detail:?}"
+        );
+    }
+    assert!(
+        report.applied_names().is_empty(),
+        "nothing lands, got {:?}",
+        report.applied_names()
+    );
+    assert_eq!(
+        go_mod_before,
+        fixture.read_bytes("go.mod"),
+        "go.mod keeps the pin and every other requirement"
+    );
+}
+
+/// A planned upgrade that would drag a directly required commit pin to another commit is held,
+/// leaving the pin where the project put it.
+/// Commit pins are never upgrade candidates, so nothing else stops a dependent's minimum
+/// requirement from moving one, and the moved commit can be API-incompatible with the rest of the
+/// build (kube-openapi's later commits switch to `structured-merge-diff/v7`).
+#[test]
+fn upgrade_holds_a_candidate_that_would_move_a_direct_commit_pin() {
+    skip_if_missing!("go");
+    let fixture = commit_pin_fixture();
+    let go_mod_before = fixture.read_bytes("go.mod");
+    assert_eq!(
+        go_mod_pins(&go_mod_before)
+            .get("k8s.io/kube-openapi")
+            .map(String::as_str),
+        Some(KUBE_OPENAPI_PIN),
+        "seed sanity: the direct commit pin"
+    );
+
+    // Scope the run to kustomize, so the only candidates are the two modules whose v0.21.2 raises
+    // kube-openapi's minimum requirement.
+    let report = upgrade_kustomize(&fixture, &[]);
+    assert_commit_pin_held(&fixture, &report, &go_mod_before);
+}
+
+/// A `GOFLAGS` saved with `go env -w` reaches every `go` command even when the environment does not
+/// set one.
+/// An editing flag there makes `go mod edit -json` report a `go.mod` without the pin, while
+/// `go get` ignores it and moves the pin all the same, so cooldown must neutralize saved flags too.
+#[test]
+fn upgrade_holds_a_commit_pin_that_saved_goflags_would_hide() {
+    skip_if_missing!("go");
+    let fixture = commit_pin_fixture();
+    let go_mod_before = fixture.read_bytes("go.mod");
+    fixture.write("goenv", "GOFLAGS=-droprequire=k8s.io/kube-openapi\n");
+    let goenv = fixture.root().join("goenv");
+    let goenv = goenv.to_str().expect("UTF-8 fixture path");
+
+    let report = upgrade_kustomize(&fixture, &[("GOENV", goenv)]);
+    assert_commit_pin_held(&fixture, &report, &go_mod_before);
+}

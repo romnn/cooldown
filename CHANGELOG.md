@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Go upgrades leave a module's commit pins in place.** A planned upgrade whose new version
+  requires a newer commit of a module the project requires directly at a pseudo-version, such as
+  `kustomize` raising a deliberately held `k8s.io/kube-openapi`, could move that pin and break the
+  build. Such a candidate is now held, naming the pin and the commit it would have moved to. Modules
+  an upgrade moves as a side effect are also reported as direct when the project requires them
+  directly.
+
+- **cooldown's `go` commands ignore flags saved with `go env -w`.** cooldown already ran `go`
+  without an inherited `GOFLAGS`, but Go then applied a `GOFLAGS` saved in its configuration file
+  instead. A saved `-mod=mod` could make a read such as `outdated` rewrite `go.sum`, and a saved
+  editing flag could hide a requirement from cooldown.
+
 - **Cargo's native `min-publish-age` is supported.** Cargo 1.100 stabilized publish-age filtering.
   cooldown now reads the crates.io age Cargo would apply to a project
   (`registries.crates-io.min-publish-age`, `registry.global-min-publish-age` or
