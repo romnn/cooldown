@@ -3,6 +3,7 @@
 //! layer is always empty — policy comes from `cooldown.toml`/global/CLI.
 
 pub mod gocmd;
+mod gomod;
 mod mutation;
 pub mod proxy;
 pub mod semver;

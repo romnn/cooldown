@@ -1,12 +1,12 @@
 use crate::gocmd::Go;
+use crate::gomod::{self, GoModFacts, Require};
 use crate::mutation;
 use crate::semver;
-use camino::Utf8Path;
 use cooldown_core::{
-    ApplyReport, Change, PackageId, Plan, Project, ProjectMutationJournal, Result, SkipReason,
-    Skipped, UpdateKind, Version,
+    ApplyReport, Change, CoreError, PackageId, Plan, Project, ProjectMutationJournal, Result,
+    SkipReason, Skipped, UpdateKind, Version,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::GO_ID;
 
@@ -25,20 +25,13 @@ pub(super) async fn apply(
         return Ok(report);
     }
 
-    // The pre-apply `go.mod` requires, taken from the journal (`mutation_journal` captured `go.mod`
-    // before the re-resolve). The whole-graph `go get` emits one consistent `go.mod`; the report is
-    // the diff of this snapshot against the result, so *every* net version change is surfaced — the
-    // planned moves, the MVS floor-raises another candidate forced, and the indirect churn `go mod
-    // tidy` introduced. A missing/unparsable snapshot leaves `before` empty, so a module that moved
-    // is still reported (never silent).
-    let before = journal
-        .files()
-        .iter()
-        .find(|file| file.path() == Utf8Path::new("go.mod"))
-        .and_then(cooldown_core::ProjectMutationFile::contents)
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .map(parse_requires)
-        .unwrap_or_default();
+    // The pre-apply `go.mod` requires, read before the re-resolve touches the file (the journal holds
+    // the same bytes for restoring). The whole-graph `go get` emits one consistent `go.mod`; the
+    // report is the diff of this snapshot against the result, so *every* net version change is
+    // surfaced — the planned moves, the MVS floor-raises another candidate forced, and the indirect
+    // churn `go mod tidy` introduced. Go parses both snapshots itself (see `gomod`).
+    let before = read_go_mod(go, project).await?;
+    let protected = protected_pins(&before, plan);
 
     // The whole graph is settled in one MVS pass: every planned `module@version` target is handed to
     // a single `go get`, so Go runs one joint resolve over the entire graph rather than a sequence of
@@ -75,8 +68,18 @@ pub(super) async fn apply(
     go.mod_tidy(&project.root).await?;
 
     // The resolved `go.mod` requires after the joint resolve + tidy.
-    let after = parse_requires(&std::fs::read_to_string(project.root.join("go.mod"))?);
-    let planned: std::collections::HashSet<&str> = plan
+    let after = read_go_mod(go, project).await?;
+
+    // A direct commit pin the plan did not name must stay on its commit.
+    // The check runs after tidy, because tidy can raise a floor `go get` never loaded (a new test
+    // dependency of an upgraded module, say), and before any report is built, so the caller restores
+    // the journal and isolates the candidate that moved the pin.
+    let moves = moved_pins(&protected, &before, &after);
+    if !moves.is_empty() {
+        return Err(CoreError::UnacceptableResolve(describe_pin_moves(&moves)));
+    }
+
+    let planned: HashSet<&str> = plan
         .changes
         .iter()
         .map(|change| change.package.name.as_str())
@@ -87,7 +90,7 @@ pub(super) async fn apply(
     // "Reached" respects the move's direction: a forward candidate must land at or above its target,
     // a downgrade at or below it.
     for change in &plan.changes {
-        if reached(&after, change) {
+        if reached(&after.requires, change) {
             report.applied.push(change.clone());
         } else {
             report.skipped.push(graph_ceiling_hold(change));
@@ -100,12 +103,19 @@ pub(super) async fn apply(
     // closes the silent-drift gap the per-change loop left: `go mod tidy` and MVS floor-raises could
     // move modules the old per-change report never recorded.
     let mut collateral: Vec<Change> = before
+        .requires
         .iter()
         .filter(|(name, _)| !planned.contains(name.as_str()))
         .filter_map(|(name, from)| {
-            let to = after.get(name)?;
-            (semver::compare(from, to) != std::cmp::Ordering::Equal)
-                .then(|| collateral_change(name, from, to))
+            let to = &after.requires.get(name)?.version;
+            (semver::compare(&from.version, to) != std::cmp::Ordering::Equal).then(|| {
+                collateral_change(CollateralMove {
+                    name,
+                    from: &from.version,
+                    to,
+                    direct: !from.indirect,
+                })
+            })
         })
         .collect();
     collateral.sort_by(|a, b| a.package.name.cmp(&b.package.name));
@@ -113,12 +123,17 @@ pub(super) async fn apply(
     Ok(report)
 }
 
+/// The project's `go.mod` as Go parses it.
+async fn read_go_mod(go: &Go, project: &Project) -> Result<GoModFacts> {
+    gomod::from_json(&go.mod_edit_json(&project.root).await?)
+}
+
 /// Whether a planned candidate landed at or beyond its target in `after`, respecting the move's
 /// direction: a forward move must reach at/above its target, a downgrade at/below it. A module the
 /// resolve dropped from the requires (no entry) counts as not reached.
-fn reached(after: &HashMap<String, String>, change: &Change) -> bool {
+fn reached(after: &HashMap<String, Require>, change: &Change) -> bool {
     after.get(&change.package.name).is_some_and(|landed| {
-        let ordering = semver::compare(landed, change.to.as_str());
+        let ordering = semver::compare(&landed.version, change.to.as_str());
         if change.downgrade {
             ordering != std::cmp::Ordering::Greater
         } else {
@@ -143,121 +158,461 @@ fn graph_ceiling_hold(change: &Change) -> Skipped {
     }
 }
 
+/// A module the joint resolve moved without the plan naming it, as [`collateral_change`] reports it.
+#[derive(Clone, Copy)]
+struct CollateralMove<'a> {
+    name: &'a str,
+    from: &'a str,
+    to: &'a str,
+    /// Whether the pre-apply `go.mod` required the module directly (no `// indirect` marker).
+    direct: bool,
+}
+
 /// A net version change `apply` derived from the before/after `go.mod` diff for a module the plan
 /// did not itself name — collateral movement the joint MVS resolve (or `go mod tidy`) forced.
 /// Reported so no module's version change is ever silent: an indirect floor raised by another
 /// candidate, or a tidy-driven indirect change, surfaces as its own report row.
-fn collateral_change(name: &str, from: &str, to: &str) -> Change {
-    let downgrade = semver::compare(to, from) == std::cmp::Ordering::Less;
+fn collateral_change(moved: CollateralMove<'_>) -> Change {
+    let downgrade = semver::compare(moved.to, moved.from) == std::cmp::Ordering::Less;
     Change {
-        package: PackageId::new(GO_ID, name.to_string(), None),
-        from: Version::new(from.to_string()),
-        to: Version::new(to.to_string()),
-        // A collateral move is transitive consistency churn, not a directly-declared bump; its kind
-        // is informational only and `Minor` is the neutral label the renderer shows.
+        package: PackageId::new(GO_ID, moved.name.to_string(), None),
+        from: Version::new(moved.from.to_string()),
+        to: Version::new(moved.to.to_string()),
+        // A collateral move is consistency churn, not a planned bump; its kind is informational only
+        // and `Minor` is the neutral label the renderer shows.
         kind: UpdateKind::Minor,
         downgrade,
-        direct: false,
+        direct: moved.direct,
         members: Vec::new(),
     }
 }
 
-/// The `module path → version` map of every `require` directive in a `go.mod`, the symmetric
-/// before/after snapshot `apply` diffs. Both the single-line form (`require path v1.2.3`) and the
-/// grouped block (`require ( … )`) are handled; an inline `// indirect` marker and trailing comments
-/// are ignored. `go` owns the canonical `go.mod` format, so this reads only the requires the diff
-/// needs.
-fn parse_requires(go_mod: &str) -> HashMap<String, String> {
-    let mut requires = HashMap::new();
-    let mut in_block = false;
-    for raw in go_mod.lines() {
-        let line = strip_comment(raw).trim();
-        if line.is_empty() {
-            continue;
-        }
-        if in_block {
-            if line == ")" {
-                in_block = false;
-            } else if let Some(RequirePair { path, version }) = parse_require_pair(line) {
-                requires.insert(path, version);
+/// A direct requirement at a pseudo-version that the plan does not name: a commit the project chose
+/// deliberately.
+/// Policy holds every commit pin (`commit_pin_verdict` in `cooldown-core`), so no plan moves one,
+/// and only another candidate's minimum requirement can; the apply refuses that.
+struct ProtectedPin<'a> {
+    path: &'a str,
+    version: &'a str,
+}
+
+/// The commit pins of the pre-apply `go.mod` that the apply must leave on their commit.
+///
+/// A requirement qualifies when it is direct, at a pseudo-version, and not named by `plan`, under its
+/// planned path or, for a cross-major move, its old path.
+/// Indirect requirements are left out: their versions are whatever the dependents require.
+/// Whether a pin is protected never depends on which other candidates share the trial, so candidate
+/// isolation cannot lose an upgrade to it.
+fn protected_pins<'a>(before: &'a GoModFacts, plan: &Plan) -> Vec<ProtectedPin<'a>> {
+    let planned: HashSet<String> = plan
+        .changes
+        .iter()
+        .flat_map(|change| {
+            std::iter::once(change.package.name.clone()).chain(mutation::old_import_path(change))
+        })
+        .collect();
+    let mut pins: Vec<ProtectedPin<'a>> = before
+        .requires
+        .iter()
+        .filter(|(path, require)| {
+            !require.indirect
+                && semver::is_pseudo(&require.version)
+                && !planned.contains(path.as_str())
+        })
+        .map(|(path, require)| ProtectedPin {
+            path,
+            version: &require.version,
+        })
+        .collect();
+    pins.sort_by(|a, b| a.path.cmp(b.path));
+    pins
+}
+
+/// A protected commit pin the resolve moved.
+struct PinMove<'a> {
+    path: &'a str,
+    from: &'a str,
+    to: &'a str,
+}
+
+/// The protected pins `after` requires at any other version: another commit, a release or a
+/// prerelease, in either direction.
+///
+/// Two version changes leave the module's source where it was and are not moves:
+///
+/// - A pin `after` no longer requires: nothing imports the module any more, so no version of it
+///   reaches the build.
+/// - A change between two versions that the same `replace` of `before` serves, such as the
+///   placeholder pseudo-version Go writes for a local replacement.
+///   The replacement is looked up as Go selects it, so a rule for exactly the pinned version wins
+///   over a rule for every version.
+fn moved_pins<'a>(
+    protected: &[ProtectedPin<'a>],
+    before: &GoModFacts,
+    after: &'a GoModFacts,
+) -> Vec<PinMove<'a>> {
+    protected
+        .iter()
+        .filter_map(|pin| {
+            let landed = after.requires.get(pin.path)?;
+            if landed.version == pin.version {
+                return None;
             }
-            continue;
-        }
-        if line == "require (" {
-            in_block = true;
-        } else if let Some(rest) = line.strip_prefix("require ")
-            && let Some(RequirePair { path, version }) = parse_require_pair(rest.trim())
-        {
-            requires.insert(path, version);
-        }
-    }
-    requires
+            if before.same_replacement(pin.path, pin.version, &landed.version) {
+                return None;
+            }
+            Some(PinMove {
+                path: pin.path,
+                from: pin.version,
+                to: &landed.version,
+            })
+        })
+        .collect()
 }
 
-/// Drop a trailing `//` line comment (e.g. ` // indirect`), keeping the directive text.
-fn strip_comment(line: &str) -> &str {
-    match line.find("//") {
-        Some(index) => &line[..index],
-        None => line,
-    }
-}
-
-/// One `require` directive's module path and pinned version, parsed by [`parse_require_pair`].
-struct RequirePair {
-    /// The required module path (the directive's first whitespace-separated field).
-    path: String,
-    /// The pinned version, validated as a `v`-prefixed Go semver string.
-    version: String,
-}
-
-/// Parse a `module/path v1.2.3` pair into a [`RequirePair`].
-/// Returns `None` for a malformed line (no second field, or a second field that is not a valid Go
-/// version).
-fn parse_require_pair(line: &str) -> Option<RequirePair> {
-    let mut fields = line.split_whitespace();
-    let path = fields.next()?;
-    let version = fields.next()?;
-    semver::is_valid(version).then(|| RequirePair {
-        path: path.to_string(),
-        version: version.to_string(),
-    })
+fn describe_pin_moves(moves: &[PinMove<'_>]) -> String {
+    let moves: Vec<String> = moves
+        .iter()
+        .map(|moved| format!("{} from commit {} to {}", moved.path, moved.from, moved.to))
+        .collect();
+    format!(
+        "the resolve moved a direct requirement pinned to a commit: {}",
+        moves.join(", ")
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const PINNED: &str = "v0.0.0-20240101000000-aaaaaaaaaaaa";
+    const OTHER_COMMIT: &str = "v0.0.0-20250101000000-bbbbbbbbbbbb";
+
+    /// One requirement of a test `go.mod`.
+    struct Requirement<'a> {
+        path: &'a str,
+        version: &'a str,
+        indirect: bool,
+    }
+
+    fn direct<'a>(path: &'a str, version: &'a str) -> Requirement<'a> {
+        Requirement {
+            path,
+            version,
+            indirect: false,
+        }
+    }
+
+    fn indirect<'a>(path: &'a str, version: &'a str) -> Requirement<'a> {
+        Requirement {
+            path,
+            version,
+            indirect: true,
+        }
+    }
+
+    /// A `replace` rule as `go mod edit -json` prints it; `old_version` is `None` for a rule that
+    /// replaces every version.
+    fn replace(path: &str, old_version: Option<&str>, target: &str) -> serde_json::Value {
+        let old = match old_version {
+            Some(version) => serde_json::json!({"Path": path, "Version": version}),
+            None => serde_json::json!({"Path": path}),
+        };
+        serde_json::json!({"Old": old, "New": {"Path": target}})
+    }
+
+    /// What `go mod edit -json` prints for a `go.mod` with these requirements and replacements.
+    fn go_mod_json(requires: &[Requirement<'_>], replaces: &[serde_json::Value]) -> String {
+        let requires: Vec<serde_json::Value> = requires
+            .iter()
+            .map(|require| {
+                serde_json::json!({
+                    "Path": require.path,
+                    "Version": require.version,
+                    "Indirect": require.indirect,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "Module": {"Path": "example.com/demo"},
+            "Go": "1.24",
+            "Require": requires,
+            "Replace": replaces,
+        })
+        .to_string()
+    }
+
+    fn facts(requires: &[Requirement<'_>], replaces: &[serde_json::Value]) -> GoModFacts {
+        gomod::from_json(&go_mod_json(requires, replaces)).expect("valid go mod edit -json output")
+    }
+
+    fn plan_moving(name: &str) -> Plan {
+        Plan {
+            changes: vec![Change {
+                package: PackageId::new(GO_ID, name, None),
+                from: Version::new("v0.21.1"),
+                to: Version::new("v0.21.2"),
+                kind: UpdateKind::Patch,
+                downgrade: false,
+                direct: true,
+                members: Vec::new(),
+            }],
+            ..Plan::default()
+        }
+    }
+
+    fn protected_paths(before: &GoModFacts, plan: &Plan) -> Vec<String> {
+        protected_pins(before, plan)
+            .iter()
+            .map(|pin| pin.path.to_string())
+            .collect()
+    }
+
     #[test]
-    fn parse_requires_reads_block_and_single_forms_dropping_indirect_marker() {
-        let go_mod = "module example.com/demo\n\n\
-            go 1.24\n\n\
-            require example.com/single v1.2.3\n\n\
-            require (\n\
-            \texample.com/foo v1.4.0\n\
-            \texample.com/bar v0.9.1 // indirect\n\
-            \tk8s.io/api v0.30.2\n\
-            )\n";
-        let requires = parse_requires(go_mod);
-        assert_eq!(
-            requires.get("example.com/single").map(String::as_str),
-            Some("v1.2.3")
+    fn protected_pins_are_the_unplanned_direct_commits() {
+        let before = facts(
+            &[
+                direct("example.com/pinned", PINNED),
+                indirect("example.com/indirect-pin", PINNED),
+                direct("example.com/tagged", "v1.2.3"),
+                direct("example.com/planned", PINNED),
+            ],
+            &[],
         );
-        assert_eq!(
-            requires.get("example.com/foo").map(String::as_str),
-            Some("v1.4.0")
+        let plan = plan_moving("example.com/planned");
+        assert_eq!(protected_paths(&before, &plan), ["example.com/pinned"]);
+    }
+
+    #[test]
+    fn a_cross_major_plan_does_not_protect_the_module_it_moves_off() {
+        // The plan names the module under its target path, so the old path must be exempt too.
+        let before = facts(&[direct("example.com/foo", PINNED)], &[]);
+        let plan = Plan {
+            changes: vec![Change {
+                package: PackageId::new(GO_ID, "example.com/foo/v2", None),
+                from: Version::new(PINNED),
+                to: Version::new("v2.0.0"),
+                kind: UpdateKind::Major,
+                downgrade: false,
+                direct: true,
+                members: Vec::new(),
+            }],
+            ..Plan::default()
+        };
+        assert_eq!(protected_paths(&before, &plan), Vec::<String>::new());
+    }
+
+    #[test]
+    fn any_version_change_moves_a_protected_pin() {
+        let before = facts(
+            &[
+                direct("example.com/to-commit", PINNED),
+                direct("example.com/to-release", PINNED),
+                direct("example.com/to-prerelease", PINNED),
+                direct("example.com/kept", PINNED),
+                direct("example.com/dropped", PINNED),
+            ],
+            &[],
         );
-        // The `// indirect` marker is stripped; the require itself is still captured.
-        assert_eq!(
-            requires.get("example.com/bar").map(String::as_str),
-            Some("v0.9.1")
+        let after = facts(
+            &[
+                direct("example.com/to-commit", OTHER_COMMIT),
+                direct("example.com/to-release", "v1.0.0"),
+                direct("example.com/to-prerelease", "v1.0.0-rc.1"),
+                direct("example.com/kept", PINNED),
+            ],
+            &[],
         );
+        let protected = protected_pins(&before, &Plan::default());
+        let moves = moved_pins(&protected, &before, &after);
+        let moved_paths: Vec<&str> = moves.iter().map(|pin_move| pin_move.path).collect();
+        // Another commit, a release and a prerelease all move the pin; an unchanged pin and a pin
+        // nothing requires any more do not.
         assert_eq!(
-            requires.get("k8s.io/api").map(String::as_str),
-            Some("v0.30.2")
+            moved_paths,
+            [
+                "example.com/to-commit",
+                "example.com/to-prerelease",
+                "example.com/to-release"
+            ]
         );
-        // Non-require directives are ignored.
-        assert!(!requires.contains_key("example.com/demo"));
-        assert!(!requires.contains_key("go"));
+    }
+
+    /// The paths `moved_pins` reports when `example.com/pinned` moves from [`PINNED`] to
+    /// [`OTHER_COMMIT`] under the given `replace` rules.
+    fn moved_under(replaces: &[serde_json::Value]) -> Vec<String> {
+        let before = facts(&[direct("example.com/pinned", PINNED)], replaces);
+        let after = facts(&[direct("example.com/pinned", OTHER_COMMIT)], replaces);
+        let protected = protected_pins(&before, &Plan::default());
+        moved_pins(&protected, &before, &after)
+            .iter()
+            .map(|pin_move| pin_move.path.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_move_the_same_replacement_serves_leaves_the_source_in_place() {
+        // An unversioned replacement serves both versions, as for Go's local-replacement
+        // placeholder, so the source does not change.
+        assert_eq!(
+            moved_under(&[replace("example.com/pinned", None, "../local fork")]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_move_that_changes_the_effective_replacement_is_a_move() {
+        // Without a replacement the required version selects the source.
+        assert_eq!(moved_under(&[]), ["example.com/pinned"]);
+
+        // A rule for exactly the pinned version stops serving the module once it moves.
+        assert_eq!(
+            moved_under(&[replace("example.com/pinned", Some(PINNED), "../pinned")]),
+            ["example.com/pinned"]
+        );
+
+        // That rule wins over a rule for every version, so moving off it switches the source from
+        // `../pinned fork` to `../default`.
+        assert_eq!(
+            moved_under(&[
+                replace("example.com/pinned", None, "../default"),
+                replace("example.com/pinned", Some(PINNED), "../pinned fork"),
+            ]),
+            ["example.com/pinned"]
+        );
+    }
+
+    #[test]
+    fn a_pin_move_names_the_module_and_both_versions() {
+        let moves = [PinMove {
+            path: "k8s.io/kube-openapi",
+            from: PINNED,
+            to: OTHER_COMMIT,
+        }];
+        assert_eq!(
+            describe_pin_moves(&moves),
+            format!(
+                "the resolve moved a direct requirement pinned to a commit: \
+                 k8s.io/kube-openapi from commit {PINNED} to {OTHER_COMMIT}"
+            )
+        );
+    }
+
+    /// A project whose `go.mod` holds `example.com/pinned` on a commit and requires
+    /// `example.com/tagged` directly, plus a scripted `go`.
+    /// `go mod edit -json` prints the current state, `go get` changes nothing, and `go mod tidy`
+    /// switches the state to `tidied`, a `go mod edit -json` document.
+    #[cfg(unix)]
+    struct ScriptedProject {
+        #[expect(dead_code, reason = "dropping the guard deletes the project directory")]
+        directory: tempfile::TempDir,
+        project: Project,
+        go: Go,
+    }
+
+    #[cfg(unix)]
+    fn scripted_project(tidied: &str) -> color_eyre::eyre::Result<ScriptedProject> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir()?;
+        let root = camino::Utf8PathBuf::from_path_buf(directory.path().to_path_buf())
+            .map_err(|path| color_eyre::eyre::eyre!("non-UTF-8 path {}", path.display()))?;
+        std::fs::write(root.join("go.mod"), "module example.com/demo\n")?;
+        std::fs::write(
+            root.join("go.mod.json"),
+            tidied_go_mod(PINNED, "v1.0.0", "v0.21.1"),
+        )?;
+        std::fs::write(root.join("go.mod.tidied.json"), tidied)?;
+        let script = root.join("go");
+        std::fs::write(
+            &script,
+            indoc::indoc! {r#"
+                #!/bin/sh
+                case "$1 $2" in
+                  "mod edit") cat go.mod.json ;;
+                  "mod tidy") cp go.mod.tidied.json go.mod.json ;;
+                  get\ *) ;;
+                  *) exit 1 ;;
+                esac
+            "#},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let project = Project {
+            root: root.clone(),
+            kind: GO_ID,
+            manifest: root.join("go.mod"),
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        };
+        Ok(ScriptedProject {
+            directory,
+            project,
+            go: Go::with_program(script.as_str()),
+        })
+    }
+
+    /// The scripted project's `go mod edit -json` with the given versions of its three requirements.
+    #[cfg(unix)]
+    fn tidied_go_mod(pinned: &str, tagged: &str, upgraded: &str) -> String {
+        go_mod_json(
+            &[
+                direct("example.com/pinned", pinned),
+                direct("example.com/tagged", tagged),
+                direct("example.com/upgraded", upgraded),
+            ],
+            &[],
+        )
+    }
+
+    /// `go get` can leave a commit pin alone while `go mod tidy` raises it afterwards, for example
+    /// for a new test dependency of an upgraded module, so the pin is checked after tidy.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_commit_pin_that_tidy_moves_rejects_the_apply() -> color_eyre::eyre::Result<()> {
+        let scripted = scripted_project(&tidied_go_mod(OTHER_COMMIT, "v1.0.0", "v0.21.2"))?;
+        let plan = plan_moving("example.com/upgraded");
+        let journal = mutation::mutation_journal(&scripted.project.root, &plan)?;
+
+        let result = apply(&scripted.go, &scripted.project, &plan, &journal).await;
+
+        // The move refuses the resolve, naming the pin and both commits, so recovery holds the
+        // candidate that moved it.
+        let Err(CoreError::UnacceptableResolve(detail)) = result else {
+            color_eyre::eyre::bail!("expected an unacceptable resolve, got {result:?}");
+        };
+        assert!(
+            detail.contains(&format!(
+                "example.com/pinned from commit {PINNED} to {OTHER_COMMIT}"
+            )),
+            "{detail}"
+        );
+        Ok(())
+    }
+
+    /// An unplanned move of a tagged direct requirement is reported as a direct collateral row.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_moved_direct_requirement_is_a_direct_collateral_row() -> color_eyre::eyre::Result<()>
+    {
+        let scripted = scripted_project(&tidied_go_mod(PINNED, "v1.1.0", "v0.21.2"))?;
+        let plan = plan_moving("example.com/upgraded");
+        let journal = mutation::mutation_journal(&scripted.project.root, &plan)?;
+
+        let report = apply(&scripted.go, &scripted.project, &plan, &journal).await?;
+
+        let names: Vec<&str> = report
+            .applied
+            .iter()
+            .map(|change| change.package.name.as_str())
+            .collect();
+        assert_eq!(names, ["example.com/upgraded", "example.com/tagged"]);
+        assert!(
+            report.applied.iter().all(|change| change.direct),
+            "the collateral row keeps the requirement direct: {:?}",
+            report.applied
+        );
+        Ok(())
     }
 
     #[test]
@@ -266,7 +621,12 @@ mod tests {
         // collateral row, not silent.
         let from = "v0.30.1";
         let to = "v0.30.2";
-        let change = collateral_change("k8s.io/apimachinery", from, to);
+        let change = collateral_change(CollateralMove {
+            name: "k8s.io/apimachinery",
+            from,
+            to,
+            direct: false,
+        });
         assert_eq!(change.package.name, "k8s.io/apimachinery");
         assert_eq!(change.from.as_str(), from);
         assert_eq!(change.to.as_str(), to);
@@ -275,8 +635,24 @@ mod tests {
     }
 
     #[test]
+    fn collateral_change_keeps_a_direct_requirement_direct() {
+        let change = collateral_change(CollateralMove {
+            name: "k8s.io/kube-openapi",
+            from: PINNED,
+            to: "v1.0.0",
+            direct: true,
+        });
+        assert!(change.direct);
+    }
+
+    #[test]
     fn collateral_change_marks_a_forced_regression_as_a_downgrade() {
-        let change = collateral_change("k8s.io/api", "v0.31.0", "v0.30.2");
+        let change = collateral_change(CollateralMove {
+            name: "k8s.io/api",
+            from: "v0.31.0",
+            to: "v0.30.2",
+            direct: false,
+        });
         assert!(change.downgrade);
     }
 
@@ -362,7 +738,13 @@ mod tests {
     #[test]
     fn reached_respects_move_direction() {
         let mut after = HashMap::new();
-        after.insert("k8s.io/api".to_string(), "v0.30.2".to_string());
+        after.insert(
+            "k8s.io/api".to_string(),
+            Require {
+                version: "v0.30.2".to_string(),
+                indirect: false,
+            },
+        );
 
         let forward = Change {
             package: PackageId::new(GO_ID, "k8s.io/api", None),

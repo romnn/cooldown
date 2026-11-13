@@ -176,6 +176,13 @@ impl Go {
         Self::default()
     }
 
+    /// A driver bound to `bin`, for tests that substitute a scripted `go`.
+    /// The scripts are shell scripts, so only Unix tests use it.
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_program(bin: impl Into<String>) -> Self {
+        Go { bin: bin.into() }
+    }
+
     async fn output(
         &self,
         dir: &Utf8Path,
@@ -190,10 +197,14 @@ impl Go {
             // `GOFLAGS=-mod=mod` (via .env, a dotenv loaded by their task runner, or `go env -w`),
             // which would turn cooldown's *read* commands (`go list -m`, `go mod graph`) into
             // lock-mutating ones — they would rewrite go.sum just to report what is outdated.
+            // A saved editing flag such as `-droprequire` would also make `go mod edit -json` report
+            // a `go.mod` that is not on disk.
             // cooldown drives `-mod` explicitly where it needs it (the `-modfile` version probe runs
-            // `-mod=mod` against a throwaway copy), so clearing the inherited value keeps reads
-            // read-only and leaves the project's go.mod/go.sum untouched.
-            .env_remove("GOFLAGS")
+            // `-mod=mod` against a throwaway copy), so neutralizing the value keeps reads read-only
+            // and leaves the project's go.mod/go.sum untouched.
+            // Go falls back to the `go env -w` value when GOFLAGS is unset or empty, so it is set to
+            // a single space instead: present in the environment, yet holding no flags.
+            .env("GOFLAGS", " ")
             .current_dir(dir.as_std_path());
         let result = supervised_output(&mut command, &self.bin, || {
             format!("{} {}", self.bin, args.join(" "))
@@ -412,6 +423,17 @@ impl Go {
         let mut args = vec!["get"];
         args.extend(specs.iter().map(String::as_str));
         self.run(dir, &args).await.map(|_| ())
+    }
+
+    /// `go mod edit -json`: Go's own parse of the project's `go.mod`, as JSON.
+    /// It reads the file without writing it or resolving anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ToolSpawn`] if `go` fails to spawn, or [`CoreError::Tool`] if it exits
+    /// non-zero, for example on a `go.mod` it cannot parse.
+    pub async fn mod_edit_json(&self, dir: &Utf8Path) -> Result<String, CoreError> {
+        self.run(dir, &["mod", "edit", "-json"]).await
     }
 
     /// `go mod tidy` — prune/add indirects and sync `go.sum`.
