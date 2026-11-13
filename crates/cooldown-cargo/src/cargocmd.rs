@@ -1,5 +1,6 @@
 //! Thin wrappers around the project's own `cargo` binary (resolution/apply engine only).
 
+use crate::publish_age::{CRATES_IO_AGE_KEY, CargoEnvironment, PublishAgeSettings, parse_age};
 use camino::Utf8Path;
 use cooldown_adapter_util::{resolve_program, supervised_output};
 use cooldown_core::{
@@ -1282,15 +1283,22 @@ struct RawNodeDep {
 ///
 /// The binary defaults to `cargo` but can be overridden via the `COOLDOWN_CARGO`
 /// environment variable (resolved once in [`Cargo::default`]).
+///
+/// Every command runs without the crates.io publish age cargo is configured with, because cooldown
+/// enforces that age itself and a hard resolver cutoff breaks its stepwise apply.
+/// `COOLDOWN_CARGO_MIN_PUBLISH_AGE` sets the crates.io age these commands use instead, in cargo's
+/// own grammar, and is not read as policy.
 #[derive(Clone)]
 pub struct Cargo {
     bin: String,
+    min_publish_age: Option<String>,
 }
 
 impl Default for Cargo {
     fn default() -> Self {
         Cargo {
             bin: std::env::var("COOLDOWN_CARGO").unwrap_or_else(|_| "cargo".to_string()),
+            min_publish_age: std::env::var("COOLDOWN_CARGO_MIN_PUBLISH_AGE").ok(),
         }
     }
 }
@@ -1315,7 +1323,38 @@ impl Cargo {
     /// consumers (the script-driven widen tests), which need a shell to run the fake.
     #[cfg(all(test, unix))]
     pub(crate) fn with_bin(bin: impl Into<String>) -> Self {
-        Cargo { bin: bin.into() }
+        Cargo {
+            bin: bin.into(),
+            min_publish_age: None,
+        }
+    }
+
+    /// The crates.io publish age a command run in `dir` must override, if any.
+    ///
+    /// Without an explicit `COOLDOWN_CARGO_MIN_PUBLISH_AGE`, the override is a zero age, and only
+    /// when cargo would otherwise enforce one, so a project without an age passes cargo no extra
+    /// configuration (older cargo warns about keys it does not know).
+    fn crates_io_age_override(&self, dir: &Utf8Path) -> Result<Option<String>, CoreError> {
+        self.crates_io_age_override_in(dir, &CargoEnvironment::current())
+    }
+
+    fn crates_io_age_override_in(
+        &self,
+        dir: &Utf8Path,
+        env: &CargoEnvironment,
+    ) -> Result<Option<String>, CoreError> {
+        if let Some(age) = &self.min_publish_age {
+            parse_age(age).map_err(|reason| {
+                CoreError::Config(format!(
+                    "COOLDOWN_CARGO_MIN_PUBLISH_AGE {age:?} is invalid: {reason}"
+                ))
+            })?;
+            return Ok(Some(age.clone()));
+        }
+        let enforced = PublishAgeSettings::discover(dir, env)?
+            .effective_crates_io_age()?
+            .filter(|effective| !effective.age.is_zero());
+        Ok(enforced.map(|_| "0".to_owned()))
     }
 
     async fn output(
@@ -1323,6 +1362,15 @@ impl Cargo {
         dir: &Utf8Path,
         args: &[&str],
     ) -> Result<std::process::Output, CoreError> {
+        let age_config = self
+            .crates_io_age_override(dir)?
+            .map(|age| format!("{}=\"{age}\"", CRATES_IO_AGE_KEY.join(".")));
+        let args: Vec<&str> = age_config
+            .iter()
+            .flat_map(|config| ["--config", config.as_str()])
+            .chain(args.iter().copied())
+            .collect();
+        let args = args.as_slice();
         tracing::debug!(bin = self.bin, args = ?args, dir = %dir, "spawn cargo");
         let started = std::time::Instant::now();
         let result = supervised_output(
@@ -1885,6 +1933,61 @@ mod tests {
     use super::*;
     use color_eyre::eyre;
     use indoc::{formatdoc, indoc};
+
+    /// cooldown lifts cargo's crates.io age from its own commands only where cargo would enforce
+    /// one, and an explicit `COOLDOWN_CARGO_MIN_PUBLISH_AGE` replaces it everywhere.
+    #[test]
+    fn crates_io_age_override_follows_the_effective_age() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let dir = camino::Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("non-UTF-8 temp dir"))?;
+        let env = CargoEnvironment::default();
+        let plain = Cargo {
+            bin: "cargo".to_owned(),
+            min_publish_age: None,
+        };
+
+        // No configured age: cargo runs exactly as asked.
+        assert_eq!(plain.crates_io_age_override_in(dir, &env)?, None);
+
+        // A configured zero needs no lift.
+        std::fs::create_dir_all(dir.join(".cargo"))?;
+        std::fs::write(
+            dir.join(".cargo/config.toml"),
+            "[registry]\nglobal-min-publish-age = \"0\"\n",
+        )?;
+        assert_eq!(plain.crates_io_age_override_in(dir, &env)?, None);
+
+        // A configured age is lifted with a zero crates.io age.
+        std::fs::create_dir_all(dir.join(".cargo"))?;
+        std::fs::write(
+            dir.join(".cargo/config.toml"),
+            "[registry]\nglobal-min-publish-age = \"14 days\"\n",
+        )?;
+        assert_eq!(
+            plain.crates_io_age_override_in(dir, &env)?.as_deref(),
+            Some("0")
+        );
+
+        // An explicit age wins over the lift and is validated in cargo's grammar.
+        let explicit = Cargo {
+            min_publish_age: Some("90 minutes".to_owned()),
+            ..plain.clone()
+        };
+        assert_eq!(
+            explicit.crates_io_age_override_in(dir, &env)?.as_deref(),
+            Some("90 minutes")
+        );
+        let invalid = Cargo {
+            min_publish_age: Some("90m".to_owned()),
+            ..plain
+        };
+        std::assert_matches!(
+            invalid.crates_io_age_override_in(dir, &env),
+            Err(CoreError::Config(_))
+        );
+        Ok(())
+    }
 
     /// The two refusals share the `stale_lock` kind but not the remedy: a lock generated from
     /// scratch resolves everything to its newest release, so the absent-lock text has to carry the

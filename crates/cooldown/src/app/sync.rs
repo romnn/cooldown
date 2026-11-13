@@ -1,8 +1,7 @@
 //! `sync` — write the resolved cooldown policy into each project's native config (uv
-//! `exclude-newer`, …), so `cooldown.toml` is the single source of truth and even a bare `uv sync`
-//! someone runs by hand still respects the window.
-//! Tools without a native cooldown concept (Go,
-//! Cargo) report `unsupported`; nothing is written for them.
+//! `exclude-newer`, cargo `min-publish-age`, …), so `cooldown.toml` is the single source of truth
+//! and even a bare `uv sync` someone runs by hand still respects the window.
+//! Tools without a native cooldown concept (Go) report `unsupported`; nothing is written for them.
 
 use super::lock::{ProjectReadGuard, ProjectWriteGuard, RepoToolReadGuard, RepoToolWriteGuard};
 use super::{Exit, RunOpts, Workspace, diag_from_error, recovery_diagnostics};
@@ -397,14 +396,14 @@ impl Workspace {
         // The `.` project keeps it to the bare default window — the only thing a single native
         // field can carry.
         let window =
-            native_default_window(self.repo_layers(), tool, Utf8Path::new("."), self.now());
+            native_default_window(self.repo_layers(tool), tool, Utf8Path::new("."), self.now());
         let policy = ResolvedPolicy {
             admitted_versions: Some(Vec::new()),
             default_window: Some(window.clone()),
             exempt_packages: Vec::new(),
             withheld_exemptions: Vec::new(),
             package_windows: cooldown_core::package_windows(
-                self.repo_layers(),
+                self.repo_layers(tool),
                 tool,
                 Utf8Path::new("."),
                 self.now(),

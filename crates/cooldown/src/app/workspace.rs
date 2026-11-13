@@ -762,6 +762,9 @@ pub struct Workspace {
     /// The repo-root policy cascade (no native layer), used to resolve a repo-wide window once for
     /// [`cooldown_core::SyncScope::Repo`] adapters without borrowing any project's layers.
     repo_layers: Vec<PolicyLayer>,
+    /// The repo-root cascade, native layer included, of each repo-scoped tool whose repo root
+    /// carries native policy; it replaces [`repo_layers`](Self::repo_layers) for that tool.
+    repo_tool_layers: HashMap<ToolId, Vec<PolicyLayer>>,
     pub(crate) baseline: Baseline,
     /// The run-scoped release resolver every fetch routes through, so a package shared across
     /// workspace members or re-resolved across `upgrade` fixpoint rounds hits the registry once.
@@ -931,6 +934,7 @@ impl Workspace {
             now,
             repo_root,
             repo_layers,
+            repo_tool_layers: HashMap::new(),
             baseline,
             release_cache: Box::new(ReleaseCache::new()),
             advisory_source: None,
@@ -970,9 +974,20 @@ impl Workspace {
         &self.repo_root
     }
 
-    /// The repo-root policy cascade (no native layer) for resolving a repo-wide window.
-    pub(crate) fn repo_layers(&self) -> &[PolicyLayer] {
-        &self.repo_layers
+    /// The repo-root policy cascade `tool` resolves a repo-wide window against, with the repo
+    /// root's native layer when the tool has one.
+    pub(crate) fn repo_layers(&self, tool: ToolId) -> &[PolicyLayer] {
+        self.repo_tool_layers
+            .get(&tool)
+            .unwrap_or(&self.repo_layers)
+    }
+
+    /// Supplies the repo-root cascades of the repo-scoped tools whose repo root carries native
+    /// policy, keyed by tool.
+    #[must_use]
+    pub fn with_repo_tool_layers(mut self, layers: HashMap<ToolId, Vec<PolicyLayer>>) -> Self {
+        self.repo_tool_layers = layers;
+        self
     }
 
     /// The per-project contexts in this workspace.

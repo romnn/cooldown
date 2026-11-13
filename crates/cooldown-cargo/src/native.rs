@@ -1,6 +1,32 @@
+use crate::publish_age::{CargoEnvironment, PublishAgeSettings};
 use camino::Utf8Path;
 use cooldown_core::{CoreError, NativePolicyLayer, NativeRule, RawWindow, Result, Selector};
 use cooldown_toml_util::read_toml_file;
+
+/// The native policy of a Cargo project whose commands run in `root`.
+///
+/// `[package.metadata.cooldown]` / `[workspace.metadata.cooldown]` in `manifest` speaks for
+/// cooldown directly, so it wins over the publish age cargo itself would apply to crates.io, which
+/// fills in only when the manifest sets no `min-age`.
+pub(crate) fn native_policy_layer(
+    root: &Utf8Path,
+    manifest: &Utf8Path,
+    env: &CargoEnvironment,
+) -> Result<Option<NativePolicyLayer>> {
+    if let Some(layer) = parse_native(manifest)? {
+        return Ok(Some(layer));
+    }
+    let Some(effective) = PublishAgeSettings::discover(root, env)?.effective_crates_io_age()?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(NativePolicyLayer {
+        rules: vec![NativeRule {
+            selector: Selector::Default,
+            window: RawWindow::RelativeDuration(effective.age),
+        }],
+    }))
+}
 
 /// Parse `[package.metadata.cooldown]` / `[workspace.metadata.cooldown]` `min-age` into a native rule.
 pub(crate) fn parse_native(manifest: &Utf8Path) -> Result<Option<NativePolicyLayer>> {

@@ -12,8 +12,8 @@
 //! other, which frozen suites decouple via [`Fixture::tag_independent`]. Tests assert invariants
 //! (convergence, no-silent-change, cross-command agreement), never hard-coded versions.
 //!
-//! Cargo has no publish-date cutoff of its own, so `--freeze` bounds only what cooldown adopts:
-//! a precise pin still lets cargo float a dependency to whatever crates.io published since.
+//! Cargo has no publish-date cutoff, only a publish age, so `--freeze` bounds only what cooldown
+//! adopts: a precise pin still lets cargo float a dependency to whatever crates.io published since.
 //! A cargo fixture therefore carries a [`CargoAsOf`], which bounds every cargo process it starts
 //! and every cargo process cooldown starts for it to the releases published by a fixed instant.
 //! A command that must see the live registry says so through [`Fixture::run_unbounded`].
@@ -63,27 +63,33 @@ pub struct CargoAsOf {
     pub run: &'static str,
 }
 
-/// The environment that bounds a cargo process to the crates.io releases published by `as_of`.
+/// The cargo publish age that bounds a cargo process to the crates.io releases published by
+/// `as_of`.
 ///
-/// Cargo's unstable `min-publish-age` takes an age, not an instant, so the age is recomputed for
-/// every process and rounded up to whole minutes, which keeps the horizon at or before `as_of`
-/// when the process starts.
+/// Cargo's `min-publish-age` takes an age, not an instant, so the age is recomputed for every
+/// process and rounded up to whole minutes, which keeps the horizon at or before `as_of` when the
+/// process starts.
 /// Every cargo process cooldown starts inherits the age, so its horizon trails `as_of` by the time
 /// the run has taken.
 /// Cargo exempts the versions a lock already carries.
-fn cargo_as_of_env(as_of: &str) -> Vec<(&'static str, String)> {
+fn cargo_as_of_age(as_of: &str) -> String {
     let instant: jiff::Timestamp = as_of
         .parse()
         .unwrap_or_else(|err| panic!("cargo as-of `{as_of}` is not an RFC 3339 instant: {err}"));
     let age = jiff::Timestamp::now().duration_since(instant).as_secs();
     assert!(age >= 0, "cargo as-of `{as_of}` lies in the future");
     let minutes = (age + 59) / 60;
+    format!("{minutes} minutes")
+}
+
+/// The environment that bounds a cargo process the fixture runs itself to `as_of`.
+///
+/// The resolver switch is pinned to `deny` so an ambient `allow` cannot lift the horizon.
+fn cargo_as_of_env(as_of: &str) -> Vec<(&'static str, String)> {
     vec![
-        ("RUSTC_BOOTSTRAP", "1".to_owned()),
-        ("CARGO_UNSTABLE_MIN_PUBLISH_AGE", "true".to_owned()),
         (
             "CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE",
-            format!("{minutes} minutes"),
+            cargo_as_of_age(as_of),
         ),
         ("CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE", "deny".to_owned()),
     ]
@@ -497,9 +503,19 @@ impl Fixture {
     }
 
     /// The environment that bounds the cargo processes cooldown starts to the run horizon.
+    ///
+    /// The horizon travels through cooldown's own age override rather than cargo's environment,
+    /// because cooldown reads cargo's configured age as policy and lifts it from its own commands.
+    /// The resolver switch is pinned to `deny`, as for the fixture's own commands, so an ambient
+    /// `allow` cannot lift the horizon.
     fn run_horizon(&self) -> Vec<(&'static str, String)> {
         self.cargo_as_of
-            .map(|as_of| cargo_as_of_env(as_of.run))
+            .map(|as_of| {
+                vec![
+                    ("COOLDOWN_CARGO_MIN_PUBLISH_AGE", cargo_as_of_age(as_of.run)),
+                    ("CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE", "deny".to_owned()),
+                ]
+            })
             .unwrap_or_default()
     }
 }
@@ -716,7 +732,8 @@ pub struct Envelope {
 }
 
 impl Envelope {
-    fn items(&self) -> &[serde_json::Value] {
+    /// The envelope's `items`, empty when it has none.
+    pub fn items(&self) -> &[serde_json::Value] {
         self.value
             .get("items")
             .and_then(serde_json::Value::as_array)

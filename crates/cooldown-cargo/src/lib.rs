@@ -1,7 +1,8 @@
 //! The Rust/Cargo tool adapter: `Cargo.lock`/`cargo metadata` for the resolved graph,
-//! crates.io sparse-index publish times, and `cargo`-driven resolution/apply. Cargo has no native
-//! cooldown engine, so verdicts are computed in the core; cargo is used only to resolve/apply a
-//! chosen window. `[package.metadata.cooldown]` is read as a native config layer.
+//! crates.io sparse-index publish times, and `cargo`-driven resolution/apply. Verdicts are computed
+//! in the core; cargo is used only to resolve/apply a chosen window. `[package.metadata.cooldown]`
+//! and cargo's own crates.io `min-publish-age` are read as a native config layer, and `sync` writes
+//! the repository window back as that age.
 
 pub mod cargocmd;
 mod edges;
@@ -11,6 +12,7 @@ mod manifest;
 mod native;
 mod ownership;
 mod publication;
+mod publish_age;
 mod rejection_memo;
 mod staging;
 #[cfg(test)]

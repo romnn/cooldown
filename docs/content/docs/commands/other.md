@@ -267,6 +267,39 @@ uv reads only the nearest configuration file, so a project below the repository 
 cooldown's own commands still pin the policy for such a project on the command line, but a plain
 `uv lock` there follows that project's `[tool.uv]` table, which `sync` does not write.
 
+### Cargo
+
+For Cargo 1.100 or newer, `sync` writes the default window as crates.io's publish age into the
+repository root's Cargo configuration, so a plain `cargo update` skips releases younger than the
+window too:
+
+```toml
+# .cargo/config.toml, as written by `cooldown sync`
+[registries.crates-io]
+min-publish-age = "2 weeks"
+```
+
+The file is the one Cargo actually reads: an existing `.cargo/config` shadows `.cargo/config.toml`,
+so `sync` writes into it instead.
+Every other setting in the file is kept, and an equal age spelled differently, such as
+`"14 days"` for two weeks, is left as written.
+Cargo reads configuration from every ancestor directory, so the repository-root file reaches every
+Cargo project below it that sets no age of its own.
+
+Cargo has one age per registry and nothing more, so `sync` cannot write everything a policy says:
+
+- A `freeze` or an opt-out leaves the existing age alone, with a warning.
+- A package rule has no Cargo equivalent, so a plain cargo command applies the default age to that
+  package too; `sync` names those packages in a warning.
+- Cargo enforces no age at all while `resolver.incompatible-publish-age` is `allow`; `sync` writes
+  the age anyway and warns that Cargo will ignore it.
+
+cooldown enforces the window itself and never lets Cargo apply its age inside cooldown's own runs:
+a cutoff Cargo applied mid-upgrade could refuse a version that cooldown still needs on the way to
+its target.
+See [Cargo's own publish age]({{< relref "../tools/_index.md" >}}#cargos-own-publish-age) for how
+cooldown reads it.
+
 ## `recover`
 
 Settle Cargo project state left by an interrupted cooldown mutation, then stop without resolving

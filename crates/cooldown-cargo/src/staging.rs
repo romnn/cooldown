@@ -443,7 +443,8 @@ struct CargoConfigEnvironment {
 }
 
 fn cargo_config_environment() -> Result<CargoConfigEnvironment> {
-    let cargo_home = match std::env::var_os("CARGO_HOME") {
+    // Cargo treats an empty `CARGO_HOME` as unset.
+    let cargo_home = match std::env::var_os("CARGO_HOME").filter(|home| !home.is_empty()) {
         Some(path) => Some((utf8_path(std::path::PathBuf::from(path))?, true)),
         // Cargo's default home follows the platform home directory, which on Windows is the
         // user profile rather than `HOME`.

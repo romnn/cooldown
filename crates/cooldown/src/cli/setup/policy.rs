@@ -10,6 +10,7 @@ use cooldown_core::{
     window_exclude_newer,
 };
 use jiff::Timestamp;
+use std::collections::{HashMap, HashSet};
 
 pub(super) struct SharedLayers {
     global: Option<PolicyLayer>,
@@ -47,25 +48,29 @@ pub(super) fn build_shared_layers(
 /// The repo-root policy cascade, used to resolve a repo-wide window without borrowing any one
 /// project's layers.
 ///
-/// Mirrors [`assemble_ctx`]'s layer order — builtin default, global, repo cascade, explicit, env,
-/// CLI — but is anchored at `repo_root` and omits the [`Origin::Native`] layer: there is no project
-/// manifest at the repo root to read native config from. `sync` resolves a repo-scoped adapter's
-/// single repo-level window against this once, regardless of project count.
+/// Mirrors [`assemble_ctx`]'s layer order — builtin default, global, native, repo cascade,
+/// explicit, env, CLI — but is anchored at `repo_root`.
+/// `native` is the repo root's own [`Origin::Native`] layer for one tool (see
+/// [`RepoCascades::per_tool`]); without one, the cascade serves every repo-scoped tool alike.
+/// `sync` resolves a repo-scoped adapter's single repo-level window against this once, regardless
+/// of project count.
 ///
 /// # Errors
 ///
 /// Returns [`CoreError::Filesystem`]/[`CoreError::Config`] if a discovered `cooldown.toml` cannot be
 /// read or parsed.
-pub(super) fn repo_layers(
+fn repo_layers(
     configs: &ConfigSources,
     shared: &SharedLayers,
     repo_root: &Utf8Path,
+    native: Option<PolicyLayer>,
 ) -> Result<Vec<PolicyLayer>, CoreError> {
     let project_config = configs.project_config(repo_root)?;
     let mut layers: Vec<PolicyLayer> = vec![builtin_default_layer()];
     if let Some(layer) = &shared.global {
         layers.push(layer.clone());
     }
+    layers.extend(native);
     layers.extend(project_config.policy_layers);
     for layer in [&shared.explicit, &shared.env, &shared.cli]
         .into_iter()
@@ -74,6 +79,72 @@ pub(super) fn repo_layers(
         layers.push(layer.clone());
     }
     Ok(layers)
+}
+
+/// The repo-root policy cascades a run resolves repo-wide windows against.
+pub(super) struct RepoCascades {
+    /// The native-free cascade every repo-scoped tool without its own entry uses.
+    pub(super) shared: Vec<PolicyLayer>,
+    /// The cascade, repo-root native layer included, of each repo-scoped tool whose repo-level
+    /// native file is also native policy.
+    ///
+    /// Without it, `sync` would overwrite a stricter native value with a weaker default resolved
+    /// over a cascade that never saw it.
+    pub(super) per_tool: HashMap<ToolId, Vec<PolicyLayer>>,
+}
+
+/// Builds the [`RepoCascades`] for the tools of the detected `projects`.
+///
+/// Only tools that took part in detection are asked for repo-root native policy, so an unselected
+/// tool's native config can neither fail the run nor be read at all.
+///
+/// # Errors
+///
+/// Returns [`CoreError`] if the repo lease cannot be taken, a native config is invalid, or a
+/// `cooldown.toml` cannot be read.
+pub(super) async fn repo_cascades(
+    assembly: &ProjectAssembly<'_>,
+    projects: &[ProjectCtx],
+) -> Result<RepoCascades, CoreError> {
+    let shared = repo_layers(assembly.configs, assembly.shared, assembly.repo_root, None)?;
+    let per_tool = repo_native_layers(assembly, projects.iter().map(|ctx| ctx.tool)).await?;
+    Ok(RepoCascades { shared, per_tool })
+}
+
+/// The repo-root cascade of every given repo-scoped tool whose repo root carries native policy.
+async fn repo_native_layers(
+    assembly: &ProjectAssembly<'_>,
+    tools: impl IntoIterator<Item = ToolId>,
+) -> Result<HashMap<ToolId, Vec<PolicyLayer>>, CoreError> {
+    let mut cascades = HashMap::new();
+    if assembly.no_native {
+        return Ok(cascades);
+    }
+    for tool in tools.into_iter().collect::<HashSet<_>>() {
+        let Some(writer) = assembly
+            .adapters
+            .writer(tool)
+            .filter(|writer| writer.sync_scope() == SyncScope::Repo)
+        else {
+            continue;
+        };
+        let native = {
+            let _repo_guard = RepoToolReadGuard::acquire(assembly.repo_root, tool)?;
+            writer.repo_native_policy(assembly.repo_root).await?
+        };
+        if let Some(native) = native {
+            cascades.insert(
+                tool,
+                repo_layers(
+                    assembly.configs,
+                    assembly.shared,
+                    assembly.repo_root,
+                    Some(normalize_native(native)),
+                )?,
+            );
+        }
+    }
+    Ok(cascades)
 }
 
 pub(super) async fn assemble_projects(

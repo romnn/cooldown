@@ -1238,7 +1238,7 @@ pub trait ToolWrite: Send + Sync {
     /// Where this adapter's native cooldown config lives, which decides how `sync` drives it.
     ///
     /// The default [`SyncScope::None`] is correct for tools without any native cooldown concept
-    /// (Go, Cargo): `sync` writes nothing for them. Adapters whose native config is per-project
+    /// (Go): `sync` writes nothing for them. Adapters whose native config is per-project
     /// override to [`SyncScope::Project`] (and implement [`write_native`](ToolWrite::write_native));
     /// adapters whose native config is a single repo-level file override to [`SyncScope::Repo`] (and
     /// implement [`write_repo_native`](ToolWrite::write_repo_native)).
@@ -1268,6 +1268,23 @@ pub trait ToolWrite: Send + Sync {
         _dry_run: bool,
     ) -> Result<SyncReport> {
         Ok(SyncReport::Unsupported)
+    }
+
+    /// The native policy that governs the repo root itself, which a [`SyncScope::Repo`] adapter's
+    /// repo-wide window resolves against.
+    ///
+    /// It ranks where a project's [`native_policy`](ToolRead::native_policy) does, below the
+    /// cooldown config cascade.
+    /// It matters when the repo-level file [`write_repo_native`](ToolWrite::write_repo_native)
+    /// writes is also a native input: without it, a policy that only sets the built-in default
+    /// would overwrite the stricter native value it was resolved over.
+    /// The default returns `None`, for adapters whose repo-level file is not read back as policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`] if the native config cannot be read or is invalid.
+    async fn repo_native_policy(&self, _repo_root: &Utf8Path) -> Result<Option<NativePolicyLayer>> {
+        Ok(None)
     }
 
     /// The files this adapter's resolver preview reads from a heuristic throwaway project copy.
@@ -1379,13 +1396,14 @@ impl ResolveInputs {
 /// Where a tool's native cooldown config lives, which decides how `sync` drives it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncScope {
-    /// No native cooldown config at all (e.g. Go, Cargo); `sync` writes nothing.
+    /// No native cooldown config at all (e.g. Go); `sync` writes nothing.
     None,
     /// Native config lives in each project's own manifest; `sync` writes it per project via
     /// [`ToolWrite::write_native`].
     Project,
-    /// A single repo-level native file (e.g. uv's root `uv.toml`); `sync` writes it exactly once per
-    /// repo via [`ToolWrite::write_repo_native`].
+    /// A single repo-level native file (e.g. uv's root `uv.toml`, Cargo's root
+    /// `.cargo/config.toml`); `sync` writes it exactly once per repo via
+    /// [`ToolWrite::write_repo_native`].
     Repo,
 }
 
