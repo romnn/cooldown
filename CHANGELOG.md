@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **The pnpm report credits a transitive upgrade only when its own copy moved.** A name can
+  resolve to several copies, and the report judged each planned move by the name's newest copy.
+  `inline-style-parser` 0.2.7 → 0.2.9 was reported applied while `style-to-object` 1.0.14 still
+  resolved 0.2.7 and only a new copy used 0.2.9, and the real `seroval` 1.6.11 → 1.6.12 move of the
+  copy `solid-js` binds was hidden behind the root's 1.7.4 → 1.7.5. Each move is now read from the
+  lock's edges into the copy: a copy that advanced for only some dependents, or whose target copy
+  was added for others, is held with a detail naming who moved and who stayed, and every copy's
+  own move is its own row. A dependent's change the lock cannot pair is reported as a new
+  `unpaired_move` warning, so `schemaVersion` is now `8`.
+
 - **Registry connections no longer trust distrusted intermediate certificates.** cooldown's TLS
   stack now uses `rustls-webpki` 0.103.16 and `webpki-root-certs` 1.0.11, which fix
   RUSTSEC-2026-0382 and RUSTSEC-2026-0383.
