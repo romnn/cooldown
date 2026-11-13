@@ -279,11 +279,19 @@ impl Go {
     pub async fn list_versions(
         &self,
         dir: &Utf8Path,
-        paths: &[String],
     ) -> Result<HashMap<String, Vec<String>>, CoreError> {
-        // The caller names the dependency module paths, never `all`: `go list -m -versions all`
-        // also tries to resolve versions for the local main module (and any local-path
-        // replacements), which have no published versions, so the whole command fails.
+        // Target the actual dependency module paths, never `all`: `go list -m -versions all` also
+        // tries to resolve versions for the local main module (and any local-path replacements),
+        // which have no published versions, so the whole command fails. Resolve the dependency
+        // paths first, then ask Go for just their versions.
+        let modules = self.list_modules(dir).await?;
+        let mut paths: Vec<String> = modules
+            .iter()
+            .filter(|module| !module.main && !module.is_local_replace())
+            .map(|module| module.effective_path().to_string())
+            .collect();
+        paths.sort();
+        paths.dedup();
         if paths.is_empty() {
             return Ok(HashMap::new());
         }

@@ -47,7 +47,7 @@ pub(super) async fn dependencies(
 /// left out.
 /// In workspace mode the workspace's other modules take part in version selection, so one module's
 /// `go.mod` no longer names every module its build compiles, and every module stays.
-pub(super) async fn build_modules(go: &Go, project: &Project) -> Result<Vec<GoModule>> {
+async fn build_modules(go: &Go, project: &Project) -> Result<Vec<GoModule>> {
     let modules = go.list_modules(&project.root).await?;
     let facts = gomod::from_json(&go.mod_edit_json(&project.root).await?)?;
     if !facts.requires_every_build_module() || go.workspace_file(&project.root).await?.is_some() {
@@ -58,19 +58,6 @@ pub(super) async fn build_modules(go: &Go, project: &Project) -> Result<Vec<GoMo
         .into_iter()
         .filter(|module| module.main || facts.requires.contains_key(&module.path))
         .collect())
-}
-
-/// The published dependency paths of the project's build, for `go list -m -versions`.
-pub(super) async fn version_list_paths(go: &Go, project: &Project) -> Result<Vec<String>> {
-    let mut paths: Vec<String> = build_modules(go, project)
-        .await?
-        .iter()
-        .filter(|module| !module.main && !module.is_local_replace())
-        .map(|module| module.effective_path().to_string())
-        .collect();
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
 }
 
 pub(super) async fn locked_release(proxy: &GoProxy, dep: &Dependency) -> Result<Release> {
@@ -235,14 +222,6 @@ mod tests {
                 "example.com/direct",
                 "example.com/indirect",
                 "example.com/fork"
-            ]
-        );
-        assert_eq!(
-            version_list_paths(&graph.go, &graph.project).await?,
-            [
-                "example.com/direct",
-                "example.com/fork",
-                "example.com/indirect"
             ]
         );
         Ok(())

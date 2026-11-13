@@ -678,6 +678,8 @@ fn a_module_only_the_graph_holds_is_neither_listed_nor_planned() {
     let outdated = fixture.cooldown_json(&["outdated", "--freeze", FREEZE, "--transitive"]);
     let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE, "--dry-run"]);
     for (command, report) in [("outdated", &outdated), ("upgrade", &upgrade)] {
+        assert!(report.ok(), "{command} failed: {report:?}");
+        assert_eq!(report.summary_errors(), 0, "{command}: {report:?}");
         let names = report.item_names();
         assert!(
             names.contains("github.com/stretchr/testify"),

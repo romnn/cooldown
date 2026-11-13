@@ -193,14 +193,13 @@ async fn drop_foreign_declarations(
         selectable && release.version != dep.current
     };
     // An up-to-date module has nothing to check, so it costs no request.
-    if !raw.iter().any(|(path, release)| checked(path, release))
-        || proxy
-            .declared_path(module, dep.current.as_str())
-            .await?
-            .as_deref()
-            != Some(module)
-    {
+    if !raw.iter().any(|(path, release)| checked(path, release)) {
         return Ok(raw);
+    }
+    match proxy.declared_path(module, dep.current.as_str()).await {
+        Ok(declared) if declared.as_deref() == Some(module) => {}
+        Err(err) if err.is_transient() => return Err(err),
+        Ok(_) | Err(_) => return Ok(raw),
     }
     let checks = raw.iter().map(|(path, release)| async move {
         if !checked(path, release) {

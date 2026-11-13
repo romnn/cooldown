@@ -71,11 +71,12 @@ impl GoTool {
         if let Some(map) = cache.get(&project.root) {
             return Arc::clone(map);
         }
-        let versions = match graph::version_list_paths(&self.go, project).await {
-            Ok(paths) => self.go.list_versions(&project.root, &paths).await,
-            Err(err) => Err(err),
-        };
-        let map = Arc::new(versions.unwrap_or_default());
+        let map = Arc::new(
+            self.go
+                .list_versions(&project.root)
+                .await
+                .unwrap_or_default(),
+        );
         cache.insert(project.root.clone(), Arc::clone(&map));
         map
     }
