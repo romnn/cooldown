@@ -2,6 +2,7 @@
 //! resolver/apply outcomes.
 
 mod driver;
+pub mod evidence;
 pub use driver::{Driver, program_on_path, resolve_program, supervised_output};
 
 use camino::Utf8Path;

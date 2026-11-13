@@ -41,6 +41,10 @@ fn repo_root_from(start: &Utf8Path, home: Option<Utf8PathBuf>) -> Utf8PathBuf {
     if let Some(c) = nearest_with_config {
         return c;
     }
+    home_fallback_root(start, home)
+}
+
+fn home_fallback_root(start: &Utf8Path, home: Option<Utf8PathBuf>) -> Utf8PathBuf {
     // The walk climbs a canonical workdir, so its markers are canonical; `HOME` is spelled however
     // the environment spells it, through a symlink or, on Windows, without the verbatim prefix.
     // Every consumer compares the root against canonical paths, so the fallback must match them.
@@ -415,10 +419,17 @@ impl ConfigSources {
 
 fn read_document(path: &Utf8Path, origin: Origin) -> Result<Option<LoadedConfigFile>, CoreError> {
     match std::fs::read_to_string(path) {
-        Ok(content) => Ok(Some(LoadedConfigFile {
-            document: ConfigDocument::parse(&content, &origin)?,
-            origin,
-        })),
+        Ok(content) => {
+            cooldown_core::trace::Event::Configuration {
+                path: path.as_str(),
+                content: &content,
+            }
+            .emit();
+            Ok(Some(LoadedConfigFile {
+                document: ConfigDocument::parse(&content, &origin)?,
+                origin,
+            }))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(CoreError::Filesystem(format!("{path}: {e}"))),
     }
@@ -1009,9 +1020,9 @@ mod tests {
         std::fs::create_dir_all(base.join("other")).expect("other dir");
         let home = base.join("other").join("..").join("home");
 
-        // Nothing above the temporary directory marks a repository, so the walk falls back.
+        // Exercise the fallback directly so a Git ancestor of the temp directory cannot select it.
         assert_eq!(
-            repo_root_from(&workdir, Some(home)),
+            home_fallback_root(&workdir, Some(home)),
             Utf8PathBuf::from_path_buf(
                 std::fs::canonicalize(base.join("home")).expect("canonical home")
             )

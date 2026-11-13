@@ -199,7 +199,8 @@ impl<'a> Lanes<'a> {
             let _permit = permits.acquire().await.ok();
             let mut outputs = Vec::with_capacity(lane.projects.len());
             for LaneProject { index, project, .. } in lane.projects {
-                outputs.push((index, work(project).await));
+                // Project futures can be large; keep lane/join polling frames independent of them.
+                outputs.push((index, Box::pin(work(project)).await));
             }
             outputs
         }))

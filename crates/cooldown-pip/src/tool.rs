@@ -231,6 +231,58 @@ fn build_releases(current: &str, raw: Vec<RawRelease>) -> Vec<Release> {
 
 #[async_trait]
 impl<L: PyLayout> ToolRead for PyTool<L> {
+    fn version_command(&self) -> Option<cooldown_core::trace::ToolVersionCommand> {
+        Some(cooldown_core::trace::ToolVersionCommand {
+            program: self.driver.program().to_string(),
+            arguments: vec!["--version".into()],
+        })
+    }
+
+    fn evidence(&self, project: &Project) -> Result<cooldown_core::trace::Evidence> {
+        use cooldown_core::trace::GraphCoverage;
+        let mut evidence = cooldown_adapter_util::evidence::native(
+            project,
+            L::LOCKFILE,
+            if L::ID == Pip::ID {
+                GraphCoverage::Inventory {
+                    reason: "requirements pins omit dependency edges".into(),
+                }
+            } else {
+                GraphCoverage::Resolved
+            },
+            &[
+                "pip.conf",
+                "pip.ini",
+                "poetry.toml",
+                "setup.cfg",
+                "setup.py",
+            ],
+        );
+        cooldown_adapter_util::evidence::ancestors(&mut evidence, &project.root, &[]);
+        if L::ID == Pip::ID {
+            evidence.inputs.extend(
+                crate::ambient::evidence_paths(&project.root.join(L::LOCKFILE))
+                    .into_iter()
+                    .map(|path| cooldown_core::trace::EvidenceInput {
+                        path,
+                        role: cooldown_core::trace::InputRole::ResolverInput,
+                    }),
+            );
+        }
+        evidence
+            .limitations
+            .push("executable build backends and setup.py may read additional inputs".into());
+        cooldown_adapter_util::evidence::environment(
+            &mut evidence,
+            &crate::ambient::ENV_ROUTING_VARS,
+        );
+        cooldown_adapter_util::evidence::environment(
+            &mut evidence,
+            &["PIP_CONFIG_FILE", "POETRY_CONFIG_DIR", "VIRTUAL_ENV"],
+        );
+        Ok(evidence)
+    }
+
     fn id(&self) -> ToolId {
         L::ID
     }

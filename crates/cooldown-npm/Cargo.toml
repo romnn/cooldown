@@ -12,6 +12,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+tracing.workspace = true
 cooldown-core.workspace = true
 cooldown-adapter-util.workspace = true
 cooldown-registry.workspace = true

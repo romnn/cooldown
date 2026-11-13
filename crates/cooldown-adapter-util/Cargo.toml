@@ -16,6 +16,10 @@ cooldown-core.workspace = true
 camino.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+process-wrap.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+indoc.workspace = true

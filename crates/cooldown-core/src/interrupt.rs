@@ -90,6 +90,13 @@ pub struct ChildRegistration {
     pid: u32,
 }
 
+impl ChildRegistration {
+    /// Stops this registered process group when its supervising future is cancelled.
+    pub fn kill(&self) {
+        kill(self.pid);
+    }
+}
+
 impl Drop for ChildRegistration {
     fn drop(&mut self) {
         children().remove(&self.pid);

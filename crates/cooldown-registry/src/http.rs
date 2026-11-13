@@ -121,6 +121,12 @@ struct Inner {
     publish: Arc<PublishStore>,
     hosts: Mutex<HashMap<String, Arc<Semaphore>>>,
     pacers: Mutex<HashMap<String, Arc<HostPacer>>>,
+    // This shared lease excludes pruning for the lifetime of every cloned HTTP client.
+    #[expect(
+        dead_code,
+        reason = "the open file holds a shared cache-maintenance lock until the last client drops"
+    )]
+    cache_lease: Option<std::fs::File>,
 }
 
 /// A per-host request pacer: requests to the host start at least `interval` apart, so a strict
@@ -171,6 +177,7 @@ impl SharedHttp {
             .build()
             .map_err(|e| CoreError::System(format!("build http client: {e}")))?;
         let publish = Arc::new(PublishStore::load(&cache_dir));
+        let cache_lease = crate::cache::protect_from_prune(&cache_dir);
         Ok(SharedHttp {
             inner: Arc::new(Inner {
                 client,
@@ -179,6 +186,7 @@ impl SharedHttp {
                 publish,
                 hosts: Mutex::new(HashMap::new()),
                 pacers: Mutex::new(HashMap::new()),
+                cache_lease,
             }),
         })
     }
@@ -283,7 +291,38 @@ impl SharedHttp {
             .await
     }
 
+    #[tracing::instrument(name = "registry_request", skip_all, fields(url, cache_key))]
     async fn request(
+        &self,
+        url: &str,
+        cache_key: &str,
+        ttl: Duration,
+        request: RequestKind<'_>,
+    ) -> Result<HttpResponse, CoreError> {
+        if let Some(body) = request.body() {
+            cooldown_core::trace::artifact(
+                cooldown_core::trace::ArtifactSource::HttpRequest { url },
+                body.as_bytes(),
+            );
+        }
+        let result = self.request_inner(url, cache_key, ttl, request).await;
+        if let Ok(response) = &result {
+            cooldown_core::trace::artifact(
+                cooldown_core::trace::ArtifactSource::Http {
+                    key: cache_key,
+                    status: response.status,
+                    from_cache: response.from_cache,
+                    stale: response.stale,
+                },
+                response.body.as_bytes(),
+            );
+        } else if let Err(err) = &result {
+            tracing::debug!(error = %err, "registry request failed");
+        }
+        result
+    }
+
+    async fn request_inner(
         &self,
         url: &str,
         cache_key: &str,

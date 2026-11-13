@@ -91,6 +91,7 @@ pub(crate) struct RejectedChange {
     pub(crate) error: cooldown_core::CoreError,
 }
 
+#[tracing::instrument(name = "resolver_trial", skip_all, fields(project = %environment))]
 async fn apply_checked(
     writer: &dyn ToolWrite,
     mutation: &PreparedMutation,
@@ -108,13 +109,47 @@ async fn apply_checked(
     } else {
         None
     };
+    cooldown_core::trace::Event::Mutation {
+        project: environment.as_str(),
+        transition: cooldown_core::trace::Mutation::TrialStarted {
+            changes: &mutation.plan().changes,
+        },
+    }
+    .emit();
     let attempt = writer
         .apply_with_observer(mutation, observer)
         .await
         .map_err(ApplyFailure::RestoreConflict)?;
-    attempt
+    let outcome = attempt
         .into_outcome_for(mutation)
-        .map_err(ApplyFailure::RestoreConflict)
+        .map_err(ApplyFailure::RestoreConflict)?;
+    let transition = match &outcome {
+        cooldown_core::ApplyAttemptOutcome::Finished {
+            report: Ok(report), ..
+        } => cooldown_core::trace::Mutation::Accepted {
+            changes: &report.applied,
+        },
+        cooldown_core::ApplyAttemptOutcome::Finished {
+            report: Err(err), ..
+        } => {
+            let reason = err.to_string();
+            cooldown_core::trace::Event::Mutation {
+                project: environment.as_str(),
+                transition: cooldown_core::trace::Mutation::Rejected { reason: &reason },
+            }
+            .emit();
+            return Ok(outcome);
+        }
+        cooldown_core::ApplyAttemptOutcome::PendingRecovery { detail } => {
+            cooldown_core::trace::Mutation::Rejected { reason: detail }
+        }
+    };
+    cooldown_core::trace::Event::Mutation {
+        project: environment.as_str(),
+        transition,
+    }
+    .emit();
+    Ok(outcome)
 }
 
 /// Apply `plan` via `writer`, recovering from an atomic joint-resolve failure by holding only the

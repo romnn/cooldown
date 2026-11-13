@@ -69,6 +69,123 @@ pub async fn supervised_output(
     tool: &str,
     invocation: impl FnOnce() -> String,
 ) -> Result<std::process::Output> {
+    observed_output(command, tool, invocation, InvocationKind::Native).await
+}
+
+#[derive(Clone, Copy)]
+enum InvocationKind {
+    Native,
+    VersionQuery,
+}
+
+async fn observed_output(
+    command: &mut Command,
+    tool: &str,
+    invocation: impl FnOnce() -> String,
+    kind: InvocationKind,
+) -> Result<std::process::Output> {
+    let observation = cooldown_core::trace::enabled().then(|| {
+        let operation = cooldown_core::trace::operation_id();
+        let native = command.as_std();
+        let arguments: Vec<String> = native
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        let environment: Vec<_> = native
+            .get_envs()
+            .map(|(name, value)| cooldown_core::trace::EnvironmentOverride {
+                name: name.to_string_lossy().into_owned(),
+                value: value.map(|value| value.to_string_lossy().into_owned()),
+            })
+            .collect();
+        cooldown_core::trace::Event::CommandStarted {
+            operation,
+            tool,
+            program: &native.get_program().to_string_lossy(),
+            arguments: &arguments,
+            directory: native.get_current_dir().and_then(Path::to_str),
+            environment: &environment,
+        }
+        .emit();
+        CommandObservation {
+            completed: false,
+            operation,
+            started: std::time::Instant::now(),
+        }
+    });
+    let operation = observation
+        .as_ref()
+        .map(|observation| observation.operation);
+    let result = supervised_output_inner(command, tool, invocation, operation, kind).await;
+    if let Some(mut observation) = observation {
+        let termination = result
+            .as_ref()
+            .ok()
+            .map(|output| ToolTermination::from_exit_status(output.status));
+        let error = result.as_ref().err().map(ToString::to_string).or_else(|| {
+            cooldown_core::interrupt::requested().then(|| {
+                cooldown_core::interrupt::interrupted(&format!("running `{tool}`")).to_string()
+            })
+        });
+        observation.completed = true;
+        cooldown_core::trace::Event::CommandFinished {
+            operation: observation.operation,
+            duration_us: cooldown_core::trace::duration_us(observation.started.elapsed()),
+            exit_code: result.as_ref().ok().and_then(|output| output.status.code()),
+            termination,
+            error: error.as_deref(),
+        }
+        .emit();
+    }
+    if cooldown_core::interrupt::requested() {
+        return Err(cooldown_core::interrupt::interrupted(&format!(
+            "running `{tool}`"
+        )));
+    }
+    result
+}
+
+struct CommandObservation {
+    completed: bool,
+    operation: u64,
+    started: std::time::Instant,
+}
+
+impl Drop for CommandObservation {
+    fn drop(&mut self) {
+        if !self.completed {
+            cooldown_core::trace::Event::CommandFinished {
+                operation: self.operation,
+                duration_us: cooldown_core::trace::duration_us(self.started.elapsed()),
+                exit_code: None,
+                termination: None,
+                error: Some("command future was cancelled before output collection completed"),
+            }
+            .emit();
+        }
+    }
+}
+
+struct RunningChild {
+    registration: cooldown_core::interrupt::ChildRegistration,
+    completed: bool,
+}
+
+impl Drop for RunningChild {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.registration.kill();
+        }
+    }
+}
+
+async fn supervised_output_inner(
+    command: &mut Command,
+    tool: &str,
+    invocation: impl FnOnce() -> String,
+    operation: Option<u64>,
+    kind: InvocationKind,
+) -> Result<std::process::Output> {
     let activity = || format!("running `{tool}`");
     cooldown_core::interrupt::ensure_not_requested(&activity())?;
     #[cfg(unix)]
@@ -77,23 +194,48 @@ pub async fn supervised_output(
         tool: tool.to_string(),
         detail: format!("`{}`: {error}", invocation()),
     };
-    let child = command
+    command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(spawn_error)?;
-    let registration = child.id().map(cooldown_core::interrupt::register_child);
-    let waited = child.wait_with_output().await;
+        .kill_on_drop(true);
+    let mut child = match kind {
+        InvocationKind::Native => command
+            .spawn()
+            .map(|child| Box::new(child) as Box<dyn process_wrap::tokio::ChildWrapper>),
+        InvocationKind::VersionQuery => spawn_version_query(command),
+    }
+    .map_err(spawn_error)?;
+    let mut registration = child.id().map(|pid| RunningChild {
+        registration: cooldown_core::interrupt::register_child(pid),
+        completed: false,
+    });
+    let stdout = child.stdout().take();
+    let stderr = child.stderr().take();
+    let waited = tokio::try_join!(
+        child.wait(),
+        read_output(
+            stdout,
+            operation.map(|operation| cooldown_core::trace::ArtifactSource::Stdout { operation })
+        ),
+        read_output(
+            stderr,
+            operation.map(|operation| cooldown_core::trace::ArtifactSource::Stderr { operation })
+        ),
+    )
+    .map(|(status, stdout, stderr)| std::process::Output {
+        status,
+        stdout,
+        stderr,
+    });
+    if let Some(registration) = &mut registration {
+        registration.completed = waited.is_ok();
+    }
     drop(registration);
     let output = waited.map_err(|error| CoreError::ToolSpawn {
         tool: tool.to_string(),
         detail: format!("waiting for `{tool}`: {error}"),
     })?;
-    if cooldown_core::interrupt::requested() {
-        return Err(cooldown_core::interrupt::interrupted(&activity()));
-    }
     Ok(output)
 }
 
@@ -154,6 +296,122 @@ fn supported_windows_extensions(path_extensions: &OsStr) -> Vec<OsString> {
         .collect()
 }
 
+#[cfg(not(windows))]
+fn spawn_version_query(
+    command: &mut Command,
+) -> std::io::Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
+    command
+        .spawn()
+        .map(|child| Box::new(child) as Box<dyn process_wrap::tokio::ChildWrapper>)
+}
+
+#[cfg(windows)]
+fn spawn_version_query(
+    command: &mut Command,
+) -> std::io::Result<Box<dyn process_wrap::tokio::ChildWrapper>> {
+    use process_wrap::tokio::{CommandWrap, JobObject, KillOnDrop};
+    let program = command.as_std().get_program().to_owned();
+    let original = std::mem::replace(command, Command::new(program));
+    let mut wrapped = CommandWrap::from(original);
+    let spawned = wrapped.wrap(KillOnDrop).wrap(JobObject).spawn();
+    *command = wrapped.into_command();
+    // Job assignment temporarily suspends creation; a reused builder must not inherit suspension.
+    command.creation_flags(0);
+    spawned
+}
+
+struct OutputCapture {
+    artifact: Option<u64>,
+    bytes: u64,
+    completed: bool,
+}
+
+impl OutputCapture {
+    fn start(source: Option<cooldown_core::trace::ArtifactSource<'_>>) -> Self {
+        let artifact = source.map(|source| {
+            let artifact = cooldown_core::trace::operation_id();
+            cooldown_core::trace::Event::ArtifactStarted {
+                artifact,
+                snapshot: None,
+                source,
+                size: None,
+            }
+            .emit();
+            artifact
+        });
+        Self {
+            artifact,
+            bytes: 0,
+            completed: false,
+        }
+    }
+
+    fn chunk(&mut self, bytes: &[u8]) {
+        if let Some(artifact) = self.artifact {
+            cooldown_core::trace::Event::ArtifactChunk {
+                artifact,
+                offset: self.bytes,
+                content: cooldown_core::trace::Content::from_bytes(bytes),
+            }
+            .emit();
+        }
+        self.bytes += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    }
+
+    fn finish(&mut self, outcome: cooldown_core::trace::ArtifactOutcome<'_>) {
+        if let Some(artifact) = self.artifact {
+            cooldown_core::trace::Event::ArtifactFinished {
+                artifact,
+                bytes: self.bytes,
+                outcome,
+            }
+            .emit();
+        }
+        self.completed = true;
+    }
+}
+
+impl Drop for OutputCapture {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.finish(cooldown_core::trace::ArtifactOutcome::Failed {
+                reason: "stream capture cancelled before EOF",
+            });
+        }
+    }
+}
+
+async fn read_output<R: tokio::io::AsyncRead + Unpin>(
+    stream: Option<R>,
+    source: Option<cooldown_core::trace::ArtifactSource<'_>>,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+    let mut capture = OutputCapture::start(source);
+    let mut output = Vec::new();
+    if let Some(mut stream) = stream {
+        let mut buffer = vec![0; 64 * 1024];
+        loop {
+            match stream.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(count) => {
+                    if let Some(bytes) = buffer.get(..count) {
+                        capture.chunk(bytes);
+                        output.extend_from_slice(bytes);
+                    }
+                }
+                Err(err) => {
+                    capture.finish(cooldown_core::trace::ArtifactOutcome::Failed {
+                        reason: &err.to_string(),
+                    });
+                    return Err(err);
+                }
+            }
+        }
+    }
+    capture.finish(cooldown_core::trace::ArtifactOutcome::Complete);
+    Ok(output)
+}
+
 /// A handle to one package manager binary (e.g. `bundle`, `mix`, `mvn`). The binary defaults to
 /// its given name on `PATH` and is overridable via `COOLDOWN_<BIN>` (e.g. `COOLDOWN_BUNDLE`), with
 /// any `-` in the name normalised to `_`; reproducible builds and the test suite use the override
@@ -189,16 +447,22 @@ impl Driver {
         &self.bin
     }
 
-    async fn output(&self, dir: &Utf8Path, args: &[String]) -> Result<std::process::Output> {
+    async fn output(
+        &self,
+        dir: &Utf8Path,
+        args: &[String],
+        kind: InvocationKind,
+    ) -> Result<std::process::Output> {
         // `--log-level trace` documents itself as covering subprocess argv; this is the one spawn
         // point every adapter driver funnels through, so the promise is kept here.
         tracing::trace!(tool = %self.bin, %dir, args = %args.join(" "), "spawning subprocess");
-        let out = supervised_output(
+        let out = observed_output(
             Command::new(resolve_program(&self.bin))
                 .args(args)
                 .current_dir(dir.as_std_path()),
             &self.bin,
             || format!("{} {}", self.bin, args.join(" ")),
+            kind,
         )
         .await?;
         if !out.status.success() {
@@ -219,7 +483,7 @@ impl Driver {
     /// Returns [`CoreError::ToolSpawn`] if the binary cannot be spawned, or [`CoreError::Tool`] if
     /// it exits non-zero (e.g. an unsatisfiable pin — a resolver conflict).
     pub async fn run(&self, dir: &Utf8Path, args: &[String]) -> Result<()> {
-        let out = self.output(dir, args).await?;
+        let out = self.output(dir, args, InvocationKind::Native).await?;
         if out.status.success() {
             Ok(())
         } else {
@@ -238,7 +502,28 @@ impl Driver {
     /// Returns [`CoreError::ToolSpawn`] if the binary cannot be spawned, or [`CoreError::Tool`] if
     /// it exits non-zero.
     pub async fn stdout(&self, dir: &Utf8Path, args: &[String]) -> Result<String> {
-        let out = self.output(dir, args).await?;
+        self.stdout_kind(dir, args, InvocationKind::Native).await
+    }
+
+    /// Collects diagnostic version output, protecting Windows descendants when its future is cancelled.
+    ///
+    /// The caller supplies a deadline; ordinary driver commands retain their native process lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same spawn and non-zero exit errors as [`Self::stdout`].
+    pub async fn version_stdout(&self, dir: &Utf8Path, args: &[String]) -> Result<String> {
+        self.stdout_kind(dir, args, InvocationKind::VersionQuery)
+            .await
+    }
+
+    async fn stdout_kind(
+        &self,
+        dir: &Utf8Path,
+        args: &[String],
+        kind: InvocationKind,
+    ) -> Result<String> {
+        let out = self.output(dir, args, kind).await?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         } else {
@@ -262,7 +547,7 @@ impl Driver {
         args: &[String],
         ok_detail: &str,
     ) -> Result<VerifyReport> {
-        let out = self.output(dir, args).await?;
+        let out = self.output(dir, args, InvocationKind::Native).await?;
         Ok(VerifyReport {
             ok: out.status.success(),
             detail: if out.status.success() {
@@ -280,6 +565,59 @@ mod tests {
     use super::find_exact;
     use super::find_with_extensions;
     use std::ffi::OsStr;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancelling_a_wrapper_stops_its_windows_descendant() -> cooldown_core::Result<()> {
+        use std::time::Duration;
+        let directory = tempfile::tempdir()?;
+        let marker = directory.path().join("descendant.txt");
+        let marker_argument = marker.to_string_lossy().replace('\'', "''");
+        let script = indoc::formatdoc! {r#"
+            $start = New-Object System.Diagnostics.ProcessStartInfo
+            $start.FileName = 'powershell'
+            $start.Arguments = '-NoProfile -NonInteractive -Command "Start-Sleep -Seconds 120"'
+            $start.UseShellExecute = $false
+            $child = [System.Diagnostics.Process]::Start($start)
+            Set-Content -LiteralPath '{marker_argument}' -Value $child.Id
+            Start-Sleep -Seconds 120
+        "#};
+        let mut command = tokio::process::Command::new("powershell");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            super::observed_output(
+                &mut command,
+                "powershell",
+                || "powershell descendant fixture".into(),
+                super::InvocationKind::VersionQuery,
+            ),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the supervised wrapper must reach cancellation"
+        );
+        let pid = std::fs::read_to_string(marker)?
+            .trim()
+            .parse::<u32>()
+            .map_err(|err| cooldown_core::CoreError::System(err.to_string()))?;
+        let probe = format!(
+            "Wait-Process -Id {pid} -Timeout 5 -ErrorAction SilentlyContinue; if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }} else {{ exit 0 }}"
+        );
+        let mut command = tokio::process::Command::new("powershell");
+        command
+            .args(["-NoProfile", "-NonInteractive", "-Command", &probe])
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(15), command.output())
+            .await
+            .map_err(|err| cooldown_core::CoreError::System(err.to_string()))??;
+        assert!(
+            output.status.success(),
+            "the descendant must be stopped by job closure"
+        );
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]

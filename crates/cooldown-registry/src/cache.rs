@@ -11,6 +11,120 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+pub(crate) fn protect_from_prune(cache_dir: &Path) -> Option<std::fs::File> {
+    let path = cache_dir.join("maintenance.lock");
+    let opened = std::fs::create_dir_all(cache_dir).and_then(|()| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .or_else(|_| std::fs::File::open(&path))
+    });
+    match opened.and_then(|file| file.lock_shared().map(|()| file)) {
+        Ok(file) => Some(file),
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = %err, "cache maintenance protection unavailable");
+            None
+        }
+    }
+}
+
+/// The bounded result of pruning disposable HTTP entries.
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrunedCache {
+    /// Old owned entries removed, or selected by a dry run.
+    pub files: usize,
+    /// Their total size in bytes.
+    pub bytes: u64,
+    /// Whether a live cache user prevented pruning.
+    pub busy: bool,
+}
+
+/// Removes old HTTP entries while preserving publication trust and active cache users.
+///
+/// The maintenance lock is exclusive and non-blocking; a busy cache is skipped.
+/// Only correctly named, parseable cache entries are eligible, never symbolic links.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Filesystem`] for an unreadable cache directory or failed deletion.
+pub fn prune(
+    cache_dir: &Path,
+    cutoff: std::time::SystemTime,
+    dry_run: bool,
+) -> Result<PrunedCache, CoreError> {
+    let directory = cache_dir.join("http");
+    match std::fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Ok(PrunedCache::default()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(PrunedCache::default()),
+        Err(err) => return Err(err.into()),
+    }
+    let Some(_lease) = prune_lease(cache_dir)? else {
+        return Ok(PrunedCache {
+            busy: true,
+            ..PrunedCache::default()
+        });
+    };
+    let mut result = PrunedCache::default();
+    for entry in std::fs::read_dir(&directory)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if !entry.file_type()?.is_file()
+            || !metadata.modified().is_ok_and(|modified| modified < cutoff)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json")
+            || name.len() != 16
+            || !name.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            continue;
+        }
+        let bytes = std::fs::read(&path)?;
+        let Ok(cached) = serde_json::from_slice::<CacheEntry>(&bytes) else {
+            continue;
+        };
+        if entry_path(cache_dir, &cached.url) != path {
+            continue;
+        }
+        if !dry_run {
+            std::fs::remove_file(&path)?;
+        }
+        result.files += 1;
+        result.bytes = result.bytes.saturating_add(metadata.len());
+    }
+    Ok(result)
+}
+
+/// Tries to exclude active cache clients for adapter-owned disposable cache maintenance.
+///
+/// A busy cache returns `None`; the returned file keeps exclusive access until dropped.
+///
+/// # Errors
+///
+/// Returns the filesystem error when the maintenance file cannot be opened or locked.
+pub fn prune_lease(cache_dir: &Path) -> Result<Option<std::fs::File>, CoreError> {
+    let lease = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(cache_dir.join("maintenance.lock"))?;
+    match lease.try_lock() {
+        Ok(()) => Ok(Some(lease)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(err)) => Err(err.into()),
+    }
+}
+
 /// A cached HTTP response with provenance: the URL, when it was fetched, and its `ETag`.
 ///
 /// Serialized one-per-file under the cache directory (see [`read_entry`] and [`write_entry`]).
@@ -224,6 +338,41 @@ impl PublishStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prune_respects_live_clients_and_preserves_publish_trust() -> Result<(), CoreError> {
+        let directory = tempfile::tempdir()?;
+        let cache = directory.path();
+        let entry = CacheEntry {
+            url: "https://example.invalid/package".into(),
+            fetched_at: "2026-01-01T00:00:00Z".into(),
+            etag: None,
+            status: 200,
+            body: "package data".into(),
+            request_body: None,
+        };
+        write_entry(cache, &entry)?;
+        let trust = cache.join("publish-times.json");
+        std::fs::write(&trust, "trust evidence")?;
+        let unrelated = cache.join("http").join("unknown.json");
+        std::fs::write(&unrelated, "{}")?;
+        let cutoff = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        let client = protect_from_prune(cache);
+        assert!(client.is_some());
+        assert!(prune(cache, cutoff, false)?.busy);
+        drop(client);
+        assert_eq!(
+            prune(cache, std::time::SystemTime::UNIX_EPOCH, false)?.files,
+            0
+        );
+        assert_eq!(prune(cache, cutoff, true)?.files, 1);
+        assert!(entry_path(cache, &entry.url).exists());
+        assert_eq!(prune(cache, cutoff, false)?.files, 1);
+        assert!(!entry_path(cache, &entry.url).exists());
+        assert!(trust.exists());
+        assert!(unrelated.exists());
+        Ok(())
+    }
 
     #[test]
     fn publish_floor_rejects_backdating() {

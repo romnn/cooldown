@@ -417,6 +417,22 @@ impl DenoTool {
 
 #[async_trait]
 impl ToolRead for DenoTool {
+    fn evidence(&self, project: &Project) -> Result<cooldown_core::trace::Evidence> {
+        Ok(cooldown_adapter_util::evidence::native(
+            project,
+            "deno.lock",
+            cooldown_core::trace::GraphCoverage::Resolved,
+            &["deno.json", "deno.jsonc", "import_map.json"],
+        ))
+    }
+
+    fn version_command(&self) -> Option<cooldown_core::trace::ToolVersionCommand> {
+        Some(cooldown_core::trace::ToolVersionCommand {
+            program: self.cmd.program().to_string(),
+            arguments: vec!["--version".into()],
+        })
+    }
+
     fn id(&self) -> ToolId {
         DENO_ID
     }

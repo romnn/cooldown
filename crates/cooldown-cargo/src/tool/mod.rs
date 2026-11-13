@@ -388,6 +388,61 @@ fn derive_locked_release(dep: &Dependency, releases: &[Release]) -> Option<Relea
 
 #[async_trait]
 impl ToolRead for CargoTool {
+    fn version_command(&self) -> Option<cooldown_core::trace::ToolVersionCommand> {
+        Some(cooldown_core::trace::ToolVersionCommand {
+            program: self.cargo.program().to_string(),
+            arguments: vec!["--version".into()],
+        })
+    }
+
+    fn evidence(&self, project: &Project) -> Result<cooldown_core::trace::Evidence> {
+        use cooldown_core::trace::GraphCoverage;
+        let mut evidence = cooldown_adapter_util::evidence::native(
+            project,
+            "Cargo.lock",
+            GraphCoverage::Resolved,
+            &["rust-toolchain", "rust-toolchain.toml"],
+        );
+        cooldown_adapter_util::evidence::ancestors(
+            &mut evidence,
+            &project.root,
+            &[".cargo/config", ".cargo/config.toml"],
+        );
+        let candidates =
+            cooldown_adapter_util::evidence::candidates(&project.root, &["Cargo.toml"])?;
+        let directories: Vec<_> = candidates
+            .into_iter()
+            .filter_map(|path| path.parent().map(Utf8Path::to_owned))
+            .collect();
+        for member in crate::ownership::workspace_member_directories(&project.root, &directories) {
+            evidence.inputs.push(cooldown_core::trace::EvidenceInput {
+                path: member.join("Cargo.toml"),
+                role: cooldown_core::trace::InputRole::Manifest,
+            });
+        }
+        let (local, ambient) = crate::staging::cargo_config_dirs(&project.root)?;
+        let config_dirs = local.union(&ambient).cloned().collect();
+        for path in crate::staging::cargo_config_paths(&config_dirs)? {
+            evidence.inputs.push(cooldown_core::trace::EvidenceInput {
+                path,
+                role: cooldown_core::trace::InputRole::Configuration,
+            });
+        }
+        evidence.limitations.push("build scripts, external sources and Cargo config includes may read further inputs; actual native metadata and validated mutation inputs are recorded when consumed".into());
+        cooldown_adapter_util::evidence::environment(
+            &mut evidence,
+            &[
+                "CARGO_HOME",
+                "CARGO_BUILD_TARGET",
+                "RUSTFLAGS",
+                "CARGO_ENCODED_RUSTFLAGS",
+                "RUSTUP_TOOLCHAIN",
+                "CARGO_UNSTABLE_LOCKFILE_PATH",
+            ],
+        );
+        Ok(evidence)
+    }
+
     fn id(&self) -> ToolId {
         CARGO_ID
     }

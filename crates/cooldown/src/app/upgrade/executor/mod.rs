@@ -447,7 +447,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
     }
 
-    pub(super) async fn run(&mut self) -> ProjectRunStatus {
+    pub(super) fn run(&mut self) -> impl std::future::Future<Output = ProjectRunStatus> {
+        // Keep the executor's async state out of project orchestration and tracing wrappers.
+        Box::pin(self.run_inner())
+    }
+
+    async fn run_inner(&mut self) -> ProjectRunStatus {
         let guard = match self.ctx.write_guard().await {
             Ok(guard) => guard,
             Err(error) => {
@@ -1299,6 +1304,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// stay unmerged — the caller decides whether this trial is the one that commits — and an
     /// aborted trial retains all outcomes until the caller knows whether restoring the outer
     /// baseline succeeded.
+    #[tracing::instrument(skip_all, fields(project = %self.ctx.pctx.rel_path, tool = %self.ctx.pctx.tool))]
     async fn try_upgrade_group(
         &mut self,
         changes: Vec<Change>,
@@ -1310,11 +1316,20 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .await
     }
 
+    fn observe_fallback(&self, change: &Change) {
+        cooldown_core::trace::Event::Mutation {
+            project: self.ctx.pctx.project.root.as_str(),
+            transition: cooldown_core::trace::Mutation::Fallback { change },
+        }
+        .emit();
+    }
+
     /// Retries the rejected candidates' alternative targets on top of the accepted set, as the
     /// writer's [`TargetFallback`] selects them.
     ///
     /// Every trial starts from the restored pre-lock baseline and keeps every accepted target,
     /// so a fallback can only add to what lands.
+    #[tracing::instrument(skip_all, fields(project = %self.ctx.pctx.rel_path, tool = %self.ctx.pctx.tool))]
     async fn select_upgrade_fallbacks(
         &mut self,
         accepted: Vec<Change>,
@@ -1336,6 +1351,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
     }
 
+    #[tracing::instrument(skip_all, fields(project = %self.ctx.pctx.rel_path, tool = %self.ctx.pctx.tool))]
     async fn select_lower_line_fallbacks(
         &mut self,
         mut accepted: Vec<Change>,
@@ -1382,6 +1398,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                         continue;
                     }
                     let alternative = candidate.alternatives.get(attempt);
+                    if let Some(change) = alternative {
+                        self.observe_fallback(change);
+                    }
                     has_alternative |= alternative.is_some();
                     retry.push(alternative.unwrap_or(&candidate.original).clone());
                 }
@@ -1456,6 +1475,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// keeps the major target held with its original reason beside the applied in-line row.
     /// A rejected candidate without an alternative is never re-pushed: retrying a target the
     /// resolver already refused could only fail the trial its siblings depend on.
+    #[tracing::instrument(skip_all, fields(project = %self.ctx.pctx.rel_path, tool = %self.ctx.pctx.tool))]
     async fn select_current_line_fallbacks(
         &mut self,
         mut accepted: Vec<Change>,
@@ -1485,6 +1505,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             );
             if retry.len() == accepted.len() {
                 continue;
+            }
+            for change in retry
+                .iter()
+                .filter(|change| !contains_upgrade(&accepted, change))
+            {
+                self.observe_fallback(change);
             }
             let result = self
                 .try_upgrade_group_once(
@@ -1572,7 +1598,19 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     /// Runs a candidate landing and its transitive remediation before rejecting the graph.
-    async fn try_upgrade_group_once(
+    fn try_upgrade_group_once(
+        &mut self,
+        changes: Vec<Change>,
+        policy_baseline: &HashSet<BaselineViolation>,
+        state: &mut TrialState,
+        rollback: &mut TrialRollback,
+    ) -> impl std::future::Future<Output = UpgradeTrialResult> {
+        // A trial is polled beneath fallback and reconciliation scopes; own its state once.
+        Box::pin(self.run_upgrade_trial(changes, policy_baseline, state, rollback))
+    }
+
+    #[tracing::instrument(name = "try_upgrade_group_once", skip_all, fields(project = %self.ctx.pctx.rel_path, tool = %self.ctx.pctx.tool))]
+    async fn run_upgrade_trial(
         &mut self,
         changes: Vec<Change>,
         policy_baseline: &HashSet<BaselineViolation>,
@@ -1944,6 +1982,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// contributes a warning and no rows, exactly as it does on the isolated path.
     /// The same lock met on a [`GraphRead::Replan`] stays an error, because by then the trial has
     /// moved the project's state and a silent skip would hide it.
+    #[tracing::instrument(skip_all, fields(project = %self.ctx.pctx.rel_path, tool = %self.ctx.pctx.tool))]
     async fn scoped_deps(&mut self, read: GraphRead) -> Option<Vec<Dependency>> {
         let mut scope = candidate_scope(self.mode);
         // Graph-wide *upgrade* planning is additionally gated on the engine: advancing a
@@ -2497,6 +2536,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
     /// The rounds of [`fix_to_fixpoint`](Self::fix_to_fixpoint), split out so every exit —
     /// settled, terminated, or the round backstop — flows through exactly one report collapse.
+    #[tracing::instrument(skip_all, fields(project = %self.ctx.pctx.rel_path, tool = %self.ctx.pctx.tool))]
     async fn run_fix_rounds(
         &mut self,
         mut deps: Vec<Dependency>,
@@ -2582,6 +2622,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// put under `zbus_names`), and that unblocking raises no *new* violation — so re-arming on new
     /// violations alone would stop after one round and leave the now-plannable violation fresh, for
     /// the final residual gate to then roll the whole batch back.
+    #[tracing::instrument(skip_all, fields(project = %self.ctx.pctx.rel_path, tool = %self.ctx.pctx.tool))]
     async fn reconcile_to_fixpoint(
         &mut self,
         state: &mut TrialState,
@@ -2684,6 +2725,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// the change each one describes; a note whose change never verifiably lands is dropped
     /// with the batch, so a rejected apply or a restored batch cannot publish a claim about a
     /// mutation that never happened.
+    #[tracing::instrument(skip_all, fields(project = %self.ctx.pctx.rel_path, tool = %self.ctx.pctx.tool))]
     async fn apply_batch_with_rollback(
         &mut self,
         changes: Vec<Change>,
@@ -2869,6 +2911,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
     }
 
+    #[tracing::instrument(skip_all, fields(project = %self.ctx.pctx.rel_path, tool = %self.ctx.pctx.tool))]
     async fn verify_batch_graph(
         &mut self,
         outcome: &mut BatchOutcome,
@@ -3156,6 +3199,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         from.fixes.iter().any(|id| !landed_fixes.contains(id))
     }
 
+    #[tracing::instrument(skip_all, fields(project = %self.ctx.pctx.rel_path, tool = %self.ctx.pctx.tool))]
     async fn verify_apply_report(
         &self,
         report: ApplyReport,
@@ -3328,6 +3372,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         self.mode.transitive_mode()
     }
 
+    #[tracing::instrument(skip_all, fields(project = %self.ctx.pctx.rel_path, tool = %self.ctx.pctx.tool))]
     async fn read_reconcile_deps(&self) -> cooldown_core::Result<Vec<Dependency>> {
         // A scoped upgrade can float transitives that do not match `--package`; reconcile is the
         // safety pass over the post-apply graph, so it must see the raw graph like `graph_violations`.
@@ -3385,6 +3430,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
     }
 
+    #[tracing::instrument(skip_all, fields(project = %self.ctx.pctx.rel_path, tool = %self.ctx.pctx.tool))]
     async fn finalize(&mut self) -> MutationFlow {
         let mut terminal = false;
         self.ctx.progress.phase("verifying final lock state");

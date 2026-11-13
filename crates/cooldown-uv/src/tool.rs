@@ -167,6 +167,106 @@ fn project_name(manifest: &Utf8Path) -> Result<Option<String>> {
 
 #[async_trait]
 impl ToolRead for UvTool {
+    fn version_command(&self) -> Option<cooldown_core::trace::ToolVersionCommand> {
+        Some(cooldown_core::trace::ToolVersionCommand {
+            program: self.uv.program().to_string(),
+            arguments: vec!["--version".into()],
+        })
+    }
+
+    fn evidence(&self, project: &Project) -> Result<cooldown_core::trace::Evidence> {
+        use cooldown_core::trace::GraphCoverage;
+        let mut evidence = cooldown_adapter_util::evidence::native(
+            project,
+            "uv.lock",
+            GraphCoverage::Resolved,
+            &["uv.toml", ".python-version"],
+        );
+        cooldown_adapter_util::evidence::ancestors(
+            &mut evidence,
+            &project.root,
+            &["uv.toml", "pyproject.toml"],
+        );
+        for path in cooldown_adapter_util::evidence::candidates(
+            &project.root,
+            &["pyproject.toml", "uv.toml", ".python-version"],
+        )? {
+            evidence.inputs.push(cooldown_core::trace::EvidenceInput {
+                path,
+                role: cooldown_core::trace::InputRole::Manifest,
+            });
+        }
+        if let Ok(lock) = read_lock(project) {
+            for package in &lock.packages {
+                if let Some(source) = &package.source {
+                    for relative in [&source.editable, &source.directory, &source.path]
+                        .into_iter()
+                        .flatten()
+                    {
+                        let path = project.root.join(relative);
+                        let path = if path.is_dir() {
+                            path.join("pyproject.toml")
+                        } else {
+                            path
+                        };
+                        evidence.inputs.push(cooldown_core::trace::EvidenceInput {
+                            path,
+                            role: cooldown_core::trace::InputRole::ResolverInput,
+                        });
+                    }
+                }
+            }
+        }
+        evidence
+            .limitations
+            .push("dynamic Python build backends may read additional source files".into());
+        cooldown_adapter_util::evidence::environment(
+            &mut evidence,
+            &[
+                "UV_CONFIG_FILE",
+                "XDG_CONFIG_DIRS",
+                "APPDATA",
+                "PROGRAMDATA",
+                "UV_EXCLUDE_NEWER",
+                "UV_EXCLUDE_NEWER_PACKAGE",
+                "UV_NO_CONFIG",
+                "UV_PYTHON",
+            ],
+        );
+        cooldown_adapter_util::evidence::environment(
+            &mut evidence,
+            &crate::ambient::ENV_INDEX_VARS,
+        );
+        match crate::ambient::config_paths(&project.root) {
+            Ok(paths) => {
+                let directory = std::env::current_dir()?;
+                let directory = Utf8PathBuf::from_path_buf(directory).map_err(|path| {
+                    cooldown_core::CoreError::PathEncoding(format!(
+                        "ambient uv configuration base is not UTF-8: {}",
+                        path.display()
+                    ))
+                })?;
+                for path in paths {
+                    // Routing reads relative to cooldown; native uv reads relative to the project.
+                    if !path.is_absolute() {
+                        evidence.inputs.push(cooldown_core::trace::EvidenceInput {
+                            path: project.root.join(&path),
+                            role: cooldown_core::trace::InputRole::Configuration,
+                        });
+                    }
+                    evidence.inputs.push(cooldown_core::trace::EvidenceInput {
+                        path: directory.join(path),
+                        role: cooldown_core::trace::InputRole::Configuration,
+                    });
+                }
+            }
+            Err(_) => evidence
+                .limitations
+                .push("uv ambient config includes a non-UTF-8 path".into()),
+        }
+        Ok(evidence)
+    }
+
     fn id(&self) -> ToolId {
         UV_ID
     }

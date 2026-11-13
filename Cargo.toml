@@ -106,6 +106,8 @@ sha2 = "0.11.0"
 same-file = "1"
 dunce = "1"
 winapi-util = "0.1"
+windows-sys = "0.61.2"
+process-wrap = { version = "10.0.1", default-features = false, features = ["tokio1", "job-object", "kill-on-drop"] }
 libc = "0.2"
 rustix = { version = "1", features = ["process"] }
 pep440_rs = "0.7"

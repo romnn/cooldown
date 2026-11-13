@@ -72,6 +72,34 @@ fn build_releases(current: &str, raw: Vec<RawRelease>) -> Vec<Release> {
 
 #[async_trait]
 impl ToolRead for SwiftTool {
+    fn version_command(&self) -> Option<cooldown_core::trace::ToolVersionCommand> {
+        Some(cooldown_core::trace::ToolVersionCommand {
+            program: self.swift.program().to_string(),
+            arguments: vec!["--version".into()],
+        })
+    }
+
+    fn evidence(&self, project: &Project) -> Result<cooldown_core::trace::Evidence> {
+        use cooldown_core::trace::GraphCoverage;
+        let mut evidence = cooldown_adapter_util::evidence::native(
+            project,
+            "Package.resolved",
+            GraphCoverage::Inventory {
+                reason: "Package.resolved records pins without dependency edges".into(),
+            },
+            &[
+                ".swiftpm/configuration/registries.json",
+                ".swiftpm/configuration/mirrors.json",
+            ],
+        );
+        cooldown_adapter_util::evidence::ancestors(&mut evidence, &project.root, &[]);
+        cooldown_adapter_util::evidence::environment(
+            &mut evidence,
+            &["SWIFT_EXEC", "DEVELOPER_DIR", "SDKROOT"],
+        );
+        Ok(evidence)
+    }
+
     fn id(&self) -> ToolId {
         SWIFT_ID
     }

@@ -263,6 +263,14 @@ pub(super) async fn copy_current(
     Ok(Err(relabel(&detail, &copy.copy_root)))
 }
 
+pub(super) fn evidence_paths(project: &Project, context: &Context) -> Result<Vec<Utf8PathBuf>> {
+    let lock = std::fs::read_to_string(project.root.join(LOCKFILE))?;
+    match stage::plan(&project.root, &lock, &context.environment, &context.bases)? {
+        Planned::Ready(plan) => Ok(plan.evidence_paths()),
+        Planned::Declined(reason) => Err(CoreError::Config(reason)),
+    }
+}
+
 /// Every file and directory a verification of `project` copies from the source, so a copy that
 /// holds them has what Yarn reads for the project: its manifests, each `file:` folder whole, each
 /// rc file between the project and the copy's boundary, and the rest [`stage`] names.

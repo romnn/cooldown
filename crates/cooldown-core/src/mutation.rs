@@ -178,6 +178,15 @@ impl MutationBaseline {
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
                 Err(err) => return Err(CoreError::Filesystem(format!("{absolute}: {err}"))),
             };
+            if let Some(bytes) = &contents {
+                crate::trace::artifact(
+                    crate::trace::ArtifactSource::File {
+                        path: absolute.as_str(),
+                        role: crate::trace::InputRole::ResolverInput,
+                    },
+                    bytes,
+                );
+            }
             files.push(BaselineFile {
                 path: path.to_owned(),
                 contents,
@@ -365,6 +374,13 @@ impl ProjectInputFile {
             )));
         }
         let permissions = final_file_metadata.permissions();
+        crate::trace::artifact(
+            crate::trace::ArtifactSource::File {
+                path: path.as_str(),
+                role: crate::trace::InputRole::ResolverInput,
+            },
+            &bytes,
+        );
         visit(path, &bytes, &permissions)?;
         Ok(ProjectInputFile {
             path: path.to_owned(),
@@ -675,6 +691,31 @@ impl ProjectMutationJournal {
     /// Returns a filesystem error if validation or restoration cannot read, replace, or remove a
     /// file.
     pub fn restore_if_unchanged(&self, expected: &ProjectMutationState) -> Result<()> {
+        let project = self.project.path().as_str();
+        crate::trace::Event::Mutation {
+            project,
+            transition: crate::trace::Mutation::RollbackStarted,
+        }
+        .emit();
+        let result = self.restore_if_unchanged_inner(expected);
+        match &result {
+            Ok(()) => crate::trace::Event::Mutation {
+                project,
+                transition: crate::trace::Mutation::RolledBack,
+            }
+            .emit(),
+            Err(err) => crate::trace::Event::Mutation {
+                project,
+                transition: crate::trace::Mutation::RollbackFailed {
+                    reason: &err.to_string(),
+                },
+            }
+            .emit(),
+        }
+        result
+    }
+
+    fn restore_if_unchanged_inner(&self, expected: &ProjectMutationState) -> Result<()> {
         self.project.ensure_same(&expected.project)?;
         self.project.validate_live()?;
         let root = self.project.path();
@@ -718,6 +759,31 @@ impl ProjectMutationJournal {
     /// Returns a [`CoreError`] if the project identity changed or a file cannot
     /// be restored safely.
     pub fn restore(&self) -> Result<()> {
+        let project = self.project.path().as_str();
+        crate::trace::Event::Mutation {
+            project,
+            transition: crate::trace::Mutation::RollbackStarted,
+        }
+        .emit();
+        let result = self.restore_inner();
+        match &result {
+            Ok(()) => crate::trace::Event::Mutation {
+                project,
+                transition: crate::trace::Mutation::RolledBack,
+            }
+            .emit(),
+            Err(err) => crate::trace::Event::Mutation {
+                project,
+                transition: crate::trace::Mutation::RollbackFailed {
+                    reason: &err.to_string(),
+                },
+            }
+            .emit(),
+        }
+        result
+    }
+
+    fn restore_inner(&self) -> Result<()> {
         self.project.validate_live()?;
         if !valid_mutation_files(&self.files) {
             return Err(CoreError::Filesystem(
@@ -774,6 +840,13 @@ impl ProjectMutationFile {
             )));
         }
         require_single_link(&file, &final_opened, &path)?;
+        crate::trace::artifact(
+            crate::trace::ArtifactSource::File {
+                path: path.as_str(),
+                role: crate::trace::InputRole::ResolverInput,
+            },
+            &bytes,
+        );
         ProjectMutationFile::from_snapshot(
             rel.to_owned(),
             Some(bytes),

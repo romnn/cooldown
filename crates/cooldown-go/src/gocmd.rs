@@ -162,6 +162,12 @@ impl Default for Go {
 }
 
 impl Go {
+    /// The executable selected for this driver, including any explicit override.
+    #[must_use]
+    pub fn program(&self) -> &str {
+        &self.bin
+    }
+
     /// Creates a driver bound to the `go` binary, honoring the `COOLDOWN_GO` override.
     ///
     /// Equivalent to [`Go::default`].

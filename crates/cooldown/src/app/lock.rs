@@ -76,6 +76,8 @@ pub(crate) struct RepoToolWriteGuard {
 /// Holds every shared lease needed to read one project's package-manager state.
 #[derive(Debug)]
 pub(crate) struct ProjectAccessReadGuard {
+    // Field order captures final evidence before either access lease is released.
+    evidence: Option<super::evidence::Session>,
     #[expect(dead_code, reason = "the field keeps the repository read lease alive")]
     repo: Option<RepoToolReadGuard>,
     project: ProjectReadGuard,
@@ -84,6 +86,8 @@ pub(crate) struct ProjectAccessReadGuard {
 /// Holds every exclusive/shared lease needed to mutate one project's package-manager state.
 #[derive(Debug)]
 pub(crate) struct ProjectAccessWriteGuard {
+    // Field order captures final evidence before either access lease is released.
+    evidence: Option<super::evidence::Session>,
     #[expect(dead_code, reason = "the field keeps the repository read lease alive")]
     repo: Option<RepoToolReadGuard>,
     project: ProjectWriteGuard,
@@ -165,6 +169,15 @@ where
 }
 
 impl ProjectAccessReadGuard {
+    pub(crate) fn observe(
+        &mut self,
+        reader: &dyn cooldown_core::ToolRead,
+        project: &cooldown_core::Project,
+        phase: cooldown_core::trace::SnapshotPhase,
+    ) {
+        self.evidence = super::evidence::Session::start(reader, project, phase);
+    }
+
     /// [`acquire`](Self::acquire) off the async runtime: the wait for a foreign holder runs in
     /// the blocking pool, so sibling lanes keep running and releasing their own leases.
     pub(crate) async fn acquire_async(
@@ -193,7 +206,11 @@ impl ProjectAccessReadGuard {
             .then(|| RepoToolReadGuard::acquire(repo_root, tool))
             .transpose()?;
         let project = ProjectReadGuard::acquire(root, family)?;
-        Ok(ProjectAccessReadGuard { repo, project })
+        Ok(ProjectAccessReadGuard {
+            evidence: None,
+            repo,
+            project,
+        })
     }
 
     /// Returns the coordination identity captured by the project read lease.
@@ -203,6 +220,15 @@ impl ProjectAccessReadGuard {
 }
 
 impl ProjectAccessWriteGuard {
+    pub(crate) fn observe(
+        &mut self,
+        reader: &dyn cooldown_core::ToolRead,
+        project: &cooldown_core::Project,
+        phase: cooldown_core::trace::SnapshotPhase,
+    ) {
+        self.evidence = super::evidence::Session::start(reader, project, phase);
+    }
+
     /// [`acquire`](Self::acquire) off the async runtime; see
     /// [`ProjectAccessReadGuard::acquire_async`].
     pub(crate) async fn acquire_async(
@@ -231,7 +257,11 @@ impl ProjectAccessWriteGuard {
             .then(|| RepoToolReadGuard::acquire(repo_root, tool))
             .transpose()?;
         let project = ProjectWriteGuard::acquire(root, family)?;
-        Ok(ProjectAccessWriteGuard { repo, project })
+        Ok(ProjectAccessWriteGuard {
+            evidence: None,
+            repo,
+            project,
+        })
     }
 
     /// Returns the coordination identity captured by the project write lease.

@@ -201,6 +201,38 @@ fn build_releases(current: &str, raw: Vec<RawRelease>) -> Vec<Release> {
 
 #[async_trait]
 impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
+    fn version_command(&self) -> Option<cooldown_core::trace::ToolVersionCommand> {
+        Some(cooldown_core::trace::ToolVersionCommand {
+            program: self.driver.program().to_string(),
+            arguments: vec!["--version".into()],
+        })
+    }
+
+    fn evidence(&self, project: &Project) -> Result<cooldown_core::trace::Evidence> {
+        use cooldown_core::trace::GraphCoverage;
+        let mut evidence = cooldown_adapter_util::evidence::native(
+            project,
+            L::LOCKFILE,
+            GraphCoverage::Inventory {
+                reason: "native lock retains its original platform-specific package evidence"
+                    .into(),
+            },
+            &[
+                "environment.yml",
+                "environment.yaml",
+                "pixi.toml",
+                "pyproject.toml",
+                ".condarc",
+            ],
+        );
+        cooldown_adapter_util::evidence::ancestors(&mut evidence, &project.root, &[]);
+        cooldown_adapter_util::evidence::environment(
+            &mut evidence,
+            &["CONDARC", "CONDA_PREFIX", "CONDA_SUBDIR", "PIXI_HOME"],
+        );
+        Ok(evidence)
+    }
+
     fn id(&self) -> ToolId {
         L::ID
     }

@@ -7,7 +7,7 @@ use std::fmt;
 
 /// Where a policy value comes from, lowest → highest authority when compared by layer index in a
 /// [`PolicyStack`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum Origin {
     /// The built-in `min-age = 7d` default.
     Default,
@@ -70,9 +70,11 @@ impl fmt::Display for Origin {
 const GLOB_SYNTAX: [char; 7] = ['*', '?', '[', ']', '{', '}', '\\'];
 
 /// A compiled glob with its original pattern preserved for display/equality.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(transparent)]
 pub struct PatternGlob {
     raw: String,
+    #[serde(skip)]
     matcher: globset::GlobMatcher,
 }
 
@@ -185,7 +187,7 @@ impl Eq for PatternGlob {}
 ///
 /// Specificity descends from a tool-qualified package through an unqualified package, registry,
 /// project, tool, and finally the default.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum Selector {
     /// Matches every package; the catch-all with the lowest specificity.
     Default,
@@ -290,7 +292,7 @@ impl<'a> RuleRank<'a> {
 }
 
 /// A resolved window: a rolling minimum age, the explicit opt-out, or an absolute cutoff.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum WindowSpec {
     /// A rolling minimum release age.
     MinAge(SignedDuration),
@@ -365,7 +367,7 @@ pub fn window_exclude_newer(spec: &WindowSpec) -> Option<String> {
 
 /// Per-kind windows mapping the `min-age` table field-for-field. A fixed-field struct: no `Ord` on
 /// `UpdateKind`, no heap alloc.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ByKind {
     /// The bare `min-age` window, used as the per-kind fallback and for an already-locked pin.
     pub default: Option<WindowSpec>,
@@ -403,7 +405,7 @@ impl ByKind {
 }
 
 /// A single config rule: a selector and the values it sets.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Rule {
     /// What the rule applies to.
     pub selector: Selector,
@@ -447,7 +449,7 @@ impl Rule {
 }
 
 /// One layer of policy from a single origin.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PolicyLayer {
     /// Where this layer's policy came from, which fixes its authority in a [`PolicyStack`].
     pub origin: Origin,
@@ -486,7 +488,7 @@ impl PolicyLayer {
 }
 
 /// The full layered policy for one project, plus the monotone-combined `strict_native`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PolicyStack {
     /// Low → high authority: `[Default, Global, Native, RepoCascade…, Config, Env, Cli]`.
     pub layers: Vec<PolicyLayer>,
@@ -496,7 +498,7 @@ pub struct PolicyStack {
 
 /// Whether to resolve the bare window (the locked pin), the effective project default, or a
 /// per-kind candidate window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ResolveKind {
     /// The `check` gate: an already-locked version has no from→to kind, so it uses the bare
     /// `min-age`.
@@ -511,7 +513,7 @@ pub enum ResolveKind {
 }
 
 /// A resolution query: which package, in which tool/registry/project, for which kind.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct ResolveQuery<'a> {
     /// The tool the package belongs to.
     pub tool: ToolId,
@@ -526,7 +528,7 @@ pub struct ResolveQuery<'a> {
 }
 
 /// One step of an `explain` derivation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TraceStep {
     /// The layer that contributed this step.
     pub layer: Origin,
@@ -543,7 +545,7 @@ pub struct TraceStep {
 }
 
 /// The resolved window plus the field-by-field trace `explain` prints.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Resolution {
     /// The window selected for the query.
     pub window: ResolvedWindow,
@@ -552,7 +554,7 @@ pub struct Resolution {
 }
 
 /// The window selected for a package, with provenance and any floor clamp / exemption.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ResolvedWindow {
     /// The selected window before any floor clamp.
     pub spec: WindowSpec,

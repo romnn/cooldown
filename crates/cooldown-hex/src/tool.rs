@@ -71,6 +71,29 @@ fn build_releases(current: &str, raw: Vec<RawRelease>) -> Vec<Release> {
 
 #[async_trait]
 impl ToolRead for HexTool {
+    fn version_command(&self) -> Option<cooldown_core::trace::ToolVersionCommand> {
+        Some(cooldown_core::trace::ToolVersionCommand {
+            program: self.mix.program().to_string(),
+            arguments: vec!["--version".into()],
+        })
+    }
+
+    fn evidence(&self, project: &Project) -> Result<cooldown_core::trace::Evidence> {
+        use cooldown_core::trace::GraphCoverage;
+        let mut evidence = cooldown_adapter_util::evidence::native(
+            project,
+            "mix.lock",
+            GraphCoverage::Resolved,
+            &["config/config.exs", "config/runtime.exs"],
+        );
+        cooldown_adapter_util::evidence::ancestors(&mut evidence, &project.root, &[]);
+        cooldown_adapter_util::evidence::environment(
+            &mut evidence,
+            &["HEX_HOME", "HEX_MIRROR", "MIX_ENV", "MIX_HOME"],
+        );
+        Ok(evidence)
+    }
+
     fn id(&self) -> ToolId {
         HEX_ID
     }

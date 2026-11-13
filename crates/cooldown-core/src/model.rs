@@ -67,7 +67,8 @@ impl fmt::Display for Version {
 /// Two releases share a major when their `MajorKey`s are equal. Because the token is only
 /// ever tested for equality, the tool is free to encode the major however it likes
 /// (e.g. `"1"`, `"v2"`, the module path for a Go `/vN` major).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(transparent)]
 pub struct MajorKey(
     /// The opaque major identifier; only compared for equality.
     pub String,
@@ -79,7 +80,8 @@ pub struct MajorKey(
 /// Ordering follows the natural lexicographic ordering of the byte vector, which the
 /// tool constructs so that "newer" sorts greater. Tokens from different packages are
 /// not comparable in any meaningful way.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(transparent)]
 pub struct ReleaseOrder(
     /// The opaque ordering bytes; sorted lexicographically, newest greatest.
     pub Vec<u8>,
@@ -188,7 +190,7 @@ impl serde::Serialize for ToolId {
 
 /// A fully-qualified package identity: which tool, the package name, and (optionally) the
 /// registry/index it resolves from.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct PackageId {
     /// The tool the package belongs to.
     pub tool: ToolId,
@@ -284,7 +286,7 @@ pub struct ArtifactId(
 /// A classified release. The `published_at` aggregate is the newest upload over the *selected*
 /// artifacts (environment-relevant, else all), but `None` if **any** selected artifact's time is
 /// unknown — conservative: a partially-known release is never treated as mature.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Release {
     /// The release's display version.
     pub version: Version,
@@ -335,7 +337,7 @@ pub struct Release {
 /// dependencies, `current_quality == locked_release(dep, ctx).quality` (the adapter derives both from
 /// the same lock entry). `graph_floor` is the lowest version the resolved graph permits (MVS floor /
 /// a `=` pin), read from the lock.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Dependency {
     /// The dependency's package identity.
     pub package: PackageId,
@@ -434,7 +436,7 @@ pub struct Dependency {
 /// successor in the same batch, while preserving authored pins and holds outside the batch.
 /// Adapters that cannot attribute constraints leave [`Dependency::hold_edges`] empty, which
 /// disables discounting and preserves the collapsed behavior.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GraphHoldEdge {
     /// The requiring package's name (a resolved non-member node in the graph).
     pub requirer: String,
@@ -452,7 +454,7 @@ pub struct GraphHoldEdge {
 }
 
 /// The direction a [`GraphHoldEdge`] constrains its dependency.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum GraphHoldKind {
     /// The edge's requirement imposes a lower bound (contributes to [`Dependency::graph_floor`]).
     Floor,
@@ -495,7 +497,7 @@ pub enum Status {
 
 /// The per-candidate verdict. The decision is per candidate — a patch can be adoptable while a
 /// major still cools.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Candidate {
     /// The candidate version.
     pub version: Version,
@@ -544,7 +546,7 @@ pub enum CooldownHorizon {
 }
 
 /// The aggregate verdict for a dependency over its candidate set.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Verdict {
     /// The aggregate status over the candidate set.
     pub status: Status,
@@ -610,7 +612,7 @@ impl Verdict {
 /// The verdict over the currently-locked release (the `check` gate). `graph_held`/`graph_floor`
 /// annotate a violation the resolved graph forces, so it can be baselined deliberately rather than
 /// silently passed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PinVerdict {
     /// The verdict over the currently-locked release.
     pub status: Status,
@@ -748,7 +750,7 @@ pub enum DepScope {
 }
 
 /// A single planned version change.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Change {
     /// The package being changed.
     pub package: PackageId,

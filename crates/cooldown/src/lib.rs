@@ -9,5 +9,6 @@ mod report_path;
 mod scan;
 #[cfg(test)]
 mod test_support;
+mod trace;
 
 pub use app::Exit;

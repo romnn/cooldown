@@ -744,6 +744,43 @@ async fn coordinated_snapshot_family_advances_only_to_the_matured_release() -> e
     Ok(())
 }
 
+#[test]
+fn upgrade_trials_fit_a_small_thread_stack() -> eyre::Result<()> {
+    // Windows debug frames need more stack than Unix ones; both budgets are below test defaults.
+    // The stricter Unix budget reproduced the regression before trial futures were heap-pinned.
+    let stack_bytes = if cfg!(windows) {
+        1024 * 1024
+    } else {
+        256 * 1024
+    };
+    std::thread::Builder::new()
+        .stack_size(stack_bytes)
+        .spawn(|| -> eyre::Result<()> {
+            let CargoFixture {
+                directory: _directory,
+                workspace,
+                project,
+            } = fixture(
+                Resolver::SnapshotFamily {
+                    pinned_child: false,
+                    fresh_sibling: false,
+                },
+                2,
+                true,
+            )?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let outcome = runtime.block_on(workspace.upgrade(&RunOpts::default()));
+            assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+            assert_eq!(outcome.items.iter().filter(|item| item.applied).count(), 3);
+            assert!(lock(&project)?.values().all(|version| version == "1.1.0"));
+            Ok(())
+        })?
+        .join()
+        .map_err(|_| eyre::eyre!("small-stack upgrade thread panicked"))?
+}
+
 #[tokio::test]
 async fn coordinated_snapshot_family_preserves_an_authored_exact_pin() -> eyre::Result<()> {
     let CargoFixture {
