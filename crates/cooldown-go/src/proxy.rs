@@ -161,6 +161,27 @@ impl GoProxy {
         }))
     }
 
+    /// The module path that the `go.mod` of `module` at `version` declares (`@v/<version>.mod`).
+    ///
+    /// The response is immutable and cached long.
+    /// Returns `None` when no proxy serves the file, or when its `module` directive is not a single
+    /// plain path (see [`gomod::declared_module_path`](crate::gomod::declared_module_path)).
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport-level [`CoreError`] (see [`list`](Self::list)).
+    pub async fn declared_path(
+        &self,
+        module: &str,
+        version: &str,
+    ) -> Result<Option<String>, CoreError> {
+        let suffix = format!("{}/@v/{}.mod", Self::escape(module), Self::escape(version));
+        let Some(body) = self.get_first(&suffix, ttl::IMMUTABLE).await? else {
+            return Ok(None);
+        };
+        Ok(crate::gomod::declared_module_path(&body).map(str::to_string))
+    }
+
     /// Fetches `@latest`: the proxy's notion of the module's latest version.
     ///
     /// Used as a fallback when [`list`](Self::list) returns no tagged versions. Returns

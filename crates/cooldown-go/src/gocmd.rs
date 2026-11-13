@@ -279,19 +279,11 @@ impl Go {
     pub async fn list_versions(
         &self,
         dir: &Utf8Path,
+        paths: &[String],
     ) -> Result<HashMap<String, Vec<String>>, CoreError> {
-        // Target the actual dependency module paths, never `all`: `go list -m -versions all` also
-        // tries to resolve versions for the local main module (and any local-path replacements),
-        // which have no published versions, so the whole command fails. Resolve the dependency
-        // paths first, then ask Go for just their versions.
-        let modules = self.list_modules(dir).await?;
-        let mut paths: Vec<String> = modules
-            .iter()
-            .filter(|module| !module.main && !module.is_local_replace())
-            .map(|module| module.effective_path().to_string())
-            .collect();
-        paths.sort();
-        paths.dedup();
+        // The caller names the dependency module paths, never `all`: `go list -m -versions all`
+        // also tries to resolve versions for the local main module (and any local-path
+        // replacements), which have no published versions, so the whole command fails.
         if paths.is_empty() {
             return Ok(HashMap::new());
         }
@@ -423,6 +415,19 @@ impl Go {
         let mut args = vec!["get"];
         args.extend(specs.iter().map(String::as_str));
         self.run(dir, &args).await.map(|_| ())
+    }
+
+    /// The workspace file `go` uses in `dir` (`go env GOWORK`), or `None` outside workspace mode,
+    /// including when `GOWORK=off` disables it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ToolSpawn`] if `go` fails to spawn, or [`CoreError::Tool`] if it exits
+    /// non-zero.
+    pub async fn workspace_file(&self, dir: &Utf8Path) -> Result<Option<String>, CoreError> {
+        let stdout = self.run(dir, &["env", "GOWORK"]).await?;
+        let value = stdout.trim();
+        Ok((!value.is_empty() && value != "off").then(|| value.to_string()))
     }
 
     /// `go mod edit -json`: Go's own parse of the project's `go.mod`, as JSON.

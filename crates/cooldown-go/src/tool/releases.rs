@@ -142,6 +142,8 @@ pub(super) async fn releases(
         }
     }
 
+    let mut raw = drop_foreign_declarations(proxy, dep, timing_floor, raw).await?;
+
     // Ensure the current pin is present so the core can locate its order.
     if !raw
         .iter()
@@ -163,6 +165,61 @@ pub(super) async fn releases(
     }
 
     Ok(build_releases(current, raw))
+}
+
+/// `raw` without the releases whose `go.mod` declares a module path other than the one they are
+/// listed under.
+///
+/// Go refuses such a version ("module declares its path as … but was required as …"), so it can
+/// never land, and planning must pick the newest version that can.
+/// A path change need not be permanent, so every release planning can select is checked: on the
+/// dependency's own path, the versions from `timing_floor` up (the same ones whose publish time is
+/// fetched); on another major's path, all of them.
+///
+/// Nothing is dropped unless the current version's `go.mod` declares the dependency's own path.
+/// A module served under another path, such as a fork a `replace` points at, keeps its upstream's
+/// `module` line in every version, and Go accepts that.
+/// A version whose `go.mod` cannot be fetched or read stays, and the apply has the last word on it.
+async fn drop_foreign_declarations(
+    proxy: &GoProxy,
+    dep: &Dependency,
+    timing_floor: &str,
+    raw: Vec<(String, RawRelease)>,
+) -> Result<Vec<(String, RawRelease)>> {
+    let module = dep.package.name.as_str();
+    let checked = |path: &str, release: &RawRelease| {
+        let selectable = path != module
+            || semver::compare(release.version.as_str(), timing_floor) != Ordering::Less;
+        selectable && release.version != dep.current
+    };
+    // An up-to-date module has nothing to check, so it costs no request.
+    if !raw.iter().any(|(path, release)| checked(path, release))
+        || proxy
+            .declared_path(module, dep.current.as_str())
+            .await?
+            .as_deref()
+            != Some(module)
+    {
+        return Ok(raw);
+    }
+    let checks = raw.iter().map(|(path, release)| async move {
+        if !checked(path, release) {
+            return Ok(true);
+        }
+        match proxy.declared_path(path, release.version.as_str()).await {
+            Ok(declared) => Ok(declared.is_none_or(|declared| declared == *path)),
+            Err(err) if err.is_transient() => Err(err),
+            Err(_) => Ok(true),
+        }
+    });
+    let keeps = futures::future::join_all(checks).await;
+    let mut kept = Vec::with_capacity(raw.len());
+    for (entry, keep) in raw.into_iter().zip(keeps) {
+        if keep? {
+            kept.push(entry);
+        }
+    }
+    Ok(kept)
 }
 
 /// Build the module's own-path [`RawRelease`]s, fetching publish times only for `timing_floor` and

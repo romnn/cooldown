@@ -627,3 +627,203 @@ async fn releases_discover_lower_major_paths_for_cross_major_downgrade() {
         .expect("v1.9.0 present");
     assert_eq!(v1.major.0, "");
 }
+
+/// A [`GoTool`] whose proxy is `server`, with a fresh HTTP cache.
+struct ProxiedTool {
+    tool: GoTool,
+    #[expect(
+        dead_code,
+        reason = "dropping the guard deletes the HTTP cache directory"
+    )]
+    cache: tempfile::TempDir,
+    #[expect(dead_code, reason = "dropping the guard deletes the project directory")]
+    repo: tempfile::TempDir,
+    project: Project,
+}
+
+fn proxied_tool(server: &TestServer) -> eyre::Result<ProxiedTool> {
+    let cache = tempfile::tempdir()?;
+    let http = SharedHttp::new(cache.path(), HttpOptions::default())?;
+    let tool = GoTool::new(crate::proxy::GoProxy::new(
+        http,
+        vec![ProxyBase {
+            url: server.base_url.clone(),
+            fallback_on_errors: false,
+        }],
+    ));
+    let repo = tempfile::tempdir()?;
+    let root = Utf8PathBuf::from_path_buf(repo.path().to_path_buf())
+        .map_err(|path| eyre::eyre!("non-UTF-8 path {}", path.display()))?;
+    let project = project(&root);
+    Ok(ProxiedTool {
+        tool,
+        cache,
+        repo,
+        project,
+    })
+}
+
+/// Proxy routes serving `module` at `versions`, each `(version, declared module path)`: a `.info`
+/// for every version, and a `.mod` declaring that path unless it is `None`.
+fn declaring_routes(
+    module: &str,
+    versions: &[(&str, Option<&str>)],
+) -> HashMap<String, (u16, &'static str)> {
+    let mut list: String = versions
+        .iter()
+        .map(|(version, _)| *version)
+        .collect::<Vec<_>>()
+        .join("\n");
+    list.push('\n');
+    let mut routes = HashMap::from([(format!("/{module}/@v/list"), (200, leak(list)))]);
+    for (version, declared) in versions {
+        routes.insert(
+            format!("/{module}/@v/{version}.info"),
+            (
+                200,
+                leak(format!(
+                    r#"{{"Version":"{version}","Time":"2026-01-01T00:00:00Z"}}"#
+                )),
+            ),
+        );
+        if let Some(declared) = declared {
+            routes.insert(
+                format!("/{module}/@v/{version}.mod"),
+                (200, leak(format!("module {declared}\n\ngo 1.22\n"))),
+            );
+        }
+    }
+    routes
+}
+
+/// The test server serves `&'static str` bodies.
+fn leak(body: String) -> &'static str {
+    Box::leak(body.into_boxed_str())
+}
+
+fn release_versions(releases: &[Release]) -> Vec<&str> {
+    releases.iter().map(|r| r.version.as_str()).collect()
+}
+
+/// `github.com/google/cel-go` v0.32.0 declares `cel.dev/cel-go`, so `go get` refuses it.
+/// Planning must see the versions around it, including a later one back on the original path.
+#[tokio::test]
+async fn a_version_whose_go_mod_declares_another_path_is_not_a_release() -> eyre::Result<()> {
+    let mut routes = declaring_routes(
+        "example.com/mod",
+        &[
+            ("v0.29.2", Some("example.com/mod")),
+            ("v0.30.0", None),
+            ("v0.31.0", Some("example.com/mod")),
+            ("v0.32.0", Some("example.dev/mod")),
+            ("v0.33.0", Some("example.com/mod")),
+        ],
+    );
+    // A higher major's path is checked against its own path.
+    routes.extend(declaring_routes(
+        "example.com/mod/v2",
+        &[
+            ("v2.0.0", Some("example.com/mod/v2")),
+            ("v2.1.0", Some("example.dev/mod/v2")),
+        ],
+    ));
+    let server = TestServer::new(routes);
+    let proxied = proxied_tool(&server)?;
+
+    let releases = proxied
+        .tool
+        .releases(
+            &dep("example.com/mod", "v0.29.2"),
+            &fetch_ctx(&proxied.project),
+            CandidateScope::AllowCrossMajor,
+        )
+        .await?;
+
+    // The foreign declarations are gone; a version without a readable `go.mod` stays.
+    assert_eq!(
+        release_versions(&releases),
+        ["v0.29.2", "v0.30.0", "v0.31.0", "v0.33.0", "v2.0.0"]
+    );
+    Ok(())
+}
+
+/// A downgrade can select a version below the current one, so those are checked down to the graph
+/// floor too.
+#[tokio::test]
+async fn a_foreign_declaration_below_the_current_version_is_not_a_downgrade_target()
+-> eyre::Result<()> {
+    let server = TestServer::new(declaring_routes(
+        "example.com/mod",
+        &[
+            ("v0.31.0", Some("example.com/mod")),
+            ("v0.32.0", Some("example.dev/mod")),
+            ("v0.33.0", Some("example.com/mod")),
+        ],
+    ));
+    let proxied = proxied_tool(&server)?;
+    let mut too_fresh = dep("example.com/mod", "v0.33.0");
+    too_fresh.graph_floor = Some(Version::new("v0.31.0"));
+
+    let releases = proxied
+        .tool
+        .releases(
+            &too_fresh,
+            &fetch_ctx(&proxied.project),
+            CandidateScope::CurrentMajorOnly,
+        )
+        .await?;
+
+    assert_eq!(release_versions(&releases), ["v0.31.0", "v0.33.0"]);
+    Ok(())
+}
+
+/// A fork that a `replace` points at keeps its upstream's `module` line, which Go accepts.
+#[tokio::test]
+async fn a_module_whose_current_version_declares_another_path_keeps_every_release()
+-> eyre::Result<()> {
+    let server = TestServer::new(declaring_routes(
+        "example.com/fork",
+        &[
+            ("v1.0.0", Some("example.com/upstream")),
+            ("v1.1.0", Some("example.com/upstream")),
+        ],
+    ));
+    let proxied = proxied_tool(&server)?;
+
+    let releases = proxied
+        .tool
+        .releases(
+            &dep("example.com/fork", "v1.0.0"),
+            &fetch_ctx(&proxied.project),
+            CandidateScope::CurrentMajorOnly,
+        )
+        .await?;
+
+    assert_eq!(release_versions(&releases), ["v1.0.0", "v1.1.0"]);
+    Ok(())
+}
+
+/// An up-to-date module has no other release to check, so the path check fetches nothing: the
+/// current version's `.mod` answers 500, which would fail the call if it were requested.
+#[tokio::test]
+async fn an_up_to_date_module_fetches_no_go_mod() -> eyre::Result<()> {
+    let mut routes = declaring_routes("example.com/mod", &[("v1.0.0", None), ("v1.2.0", None)]);
+    routes.insert(
+        "/example.com/mod/@v/v1.2.0.mod".to_string(),
+        (500, "the current version must not be checked"),
+    );
+    let server = TestServer::new(routes);
+    let proxied = proxied_tool(&server)?;
+
+    let releases = proxied
+        .tool
+        .releases(
+            &dep("example.com/mod", "v1.2.0"),
+            &fetch_ctx(&proxied.project),
+            CandidateScope::CurrentMajorOnly,
+        )
+        .await?;
+
+    assert_eq!(release_versions(&releases), ["v1.0.0", "v1.2.0"]);
+    Ok(())
+}
