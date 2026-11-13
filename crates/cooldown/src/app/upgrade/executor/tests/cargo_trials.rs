@@ -44,6 +44,15 @@ enum Resolver {
     HeldParent {
         sibling_newest: u32,
     },
+    /// Holds `sibling` at every target, and `parent` too unless `coupled` and the plan leaves
+    /// `sibling` out, attesting each hold that does not depend on the plan when `attests`.
+    PersistentPair {
+        coupled: bool,
+        attests: bool,
+    },
+    /// Offers `parent` only on its next major, which stays held, while the transitive `child` it
+    /// requires has a matured release on its own line.
+    MajorParent,
 }
 
 struct FakeCargo {
@@ -196,11 +205,54 @@ impl FakeCargo {
         Ok(())
     }
 
+    /// The holds an attesting resolver reports as independent of the rest of its plan.
+    fn independent_holds(&self, skipped: &[Skipped]) -> Vec<Change> {
+        // A coupled parent's hold depends on the planned sibling, so only the sibling's is
+        // attested.
+        match self.resolver {
+            Resolver::PersistentPair {
+                attests: true,
+                coupled,
+            } => skipped
+                .iter()
+                .filter(|item| !coupled || item.change.package.name == "sibling")
+                .map(|item| item.change.clone())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The changes a [`Resolver::PersistentPair`] or [`Resolver::MajorParent`] holds.
+    fn held_pair(&self, plan: &Plan) -> Vec<Skipped> {
+        let sibling_planned = plan
+            .changes
+            .iter()
+            .any(|change| change.package.name == "sibling");
+        let held: &[&str] = match self.resolver {
+            Resolver::PersistentPair { coupled, .. } if coupled && !sibling_planned => &["sibling"],
+            Resolver::PersistentPair { .. } => &["parent", "sibling"],
+            Resolver::MajorParent => &["parent"],
+            _ => return Vec::new(),
+        };
+        plan.changes
+            .iter()
+            .filter(|change| held.contains(&change.package.name.as_str()))
+            .map(|change| Skipped {
+                change: change.clone(),
+                reason: SkipReason::ResolverConflict,
+                offending: None,
+                detail: Some(format!("{} is held by holder", change.package.name)),
+            })
+            .collect()
+    }
+
     fn exact_child(&self, versions: &BTreeMap<String, String>) -> bool {
         match self.resolver {
             Resolver::Caret
             | Resolver::HeldParent { .. }
             | Resolver::PersistentParent { .. }
+            | Resolver::PersistentPair { .. }
+            | Resolver::MajorParent
             | Resolver::SnapshotFamily { .. } => false,
             Resolver::AnchoredPair => versions
                 .get("parent")
@@ -275,7 +327,12 @@ impl ToolRead for FakeCargo {
                     dep.hold_edges = vec![hold(requirer, requiring_version, version, true)];
                 }
             }
-            if name == "child" {
+            if name == "child" && matches!(self.resolver, Resolver::MajorParent) {
+                let parent = versions
+                    .get("parent")
+                    .ok_or_else(|| CoreError::NotFound("parent".to_string()))?;
+                dep.hold_edges = vec![hold("parent", parent, "1.0.0", false)];
+            } else if name == "child" {
                 if self.exact_child(&versions) {
                     let parent = versions
                         .get("parent")
@@ -430,6 +487,7 @@ impl ToolWrite for FakeCargo {
                 });
             }
         }
+        skipped.extend(self.held_pair(plan));
         for change in &plan.changes {
             if skipped
                 .iter()
@@ -450,6 +508,8 @@ impl ToolWrite for FakeCargo {
                     | Resolver::RefuseLower { .. }
                     | Resolver::CoupledPatchFrom(_)
                     | Resolver::HeldParent { .. }
+                    | Resolver::PersistentPair { .. }
+                    | Resolver::MajorParent
                     | Resolver::PersistentParent { .. } => {
                         let child = if self.exact_child(&versions) {
                             "1.1.0"
@@ -469,6 +529,7 @@ impl ToolWrite for FakeCargo {
         )?;
         Ok(ApplyReport {
             applied,
+            independent_holds: self.independent_holds(&skipped),
             skipped,
             edge_rebinds: self.edge_rebinds_on_apply.clone(),
             ..Default::default()
@@ -511,7 +572,9 @@ fn fixture_adapter(
         vec![release("1.0.0", false), release("1.4.0", false)]
     } else if matches!(
         resolver,
-        Resolver::CoupledPatchFrom(_) | Resolver::HeldParent { .. }
+        Resolver::CoupledPatchFrom(_)
+            | Resolver::HeldParent { .. }
+            | Resolver::PersistentPair { .. }
     ) {
         parents.clone()
     } else {
@@ -545,6 +608,16 @@ fn fixture_adapter(
                 ],
             );
         }
+    }
+    if matches!(resolver, Resolver::MajorParent) {
+        fake.releases.insert(
+            "parent".to_string(),
+            vec![release("1.0.0", false), release("2.0.0", false)],
+        );
+        fake.releases.insert(
+            "child".to_string(),
+            vec![release("1.0.0", false), release("1.1.0", false)],
+        );
     }
     if let Resolver::PersistentParent { companions, .. } = resolver {
         for index in 0..companions {
@@ -1192,6 +1265,148 @@ async fn persistent_blocker_in_two_hundred_candidates_has_bounded_fallback() -> 
         .collect();
     assert_eq!(fallback.len(), 3, "{trials}");
     assert!(trials.lines().count() <= 6, "{trials}");
+    Ok(())
+}
+
+/// Two candidates the resolver holds at every target each get their lower targets tried jointly
+/// once; with nothing landing jointly and both holds attested, retrying each alone would only
+/// repeat those trials.
+#[tokio::test]
+async fn persistent_pair_skips_individual_retries_after_futile_joint_fallbacks() -> eyre::Result<()>
+{
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(
+        Resolver::PersistentPair {
+            coupled: false,
+            attests: true,
+        },
+        4,
+        true,
+    )?;
+    let outcome = workspace.upgrade(&RunOpts::default()).await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    // Neither candidate moves.
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("parent").map(String::as_str), Some("1.0.0"));
+    assert_eq!(versions.get("sibling").map(String::as_str), Some("1.0.0"));
+    // The initial trial and three joint fallbacks, and no individual fallback.
+    let trials = std::fs::read_to_string(project.root.join("trials"))?;
+    let fallback: Vec<_> = trials
+        .lines()
+        .filter(|line| !line.contains("parent@1.4.0") || !line.contains("sibling@1.4.0"))
+        .collect();
+    assert_eq!(fallback.len(), 3, "{trials}");
+    assert!(
+        fallback
+            .iter()
+            .all(|line| line.contains("parent@") && line.contains("sibling@")),
+        "{trials}"
+    );
+    Ok(())
+}
+
+/// Without the writer's attestation, nothing proves a retry alone would be refused too, so each
+/// candidate still gets its individual retries.
+#[tokio::test]
+async fn unattested_holds_keep_every_individual_retry() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(
+        Resolver::PersistentPair {
+            coupled: false,
+            attests: false,
+        },
+        4,
+        true,
+    )?;
+    let outcome = workspace.upgrade(&RunOpts::default()).await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    let trials = std::fs::read_to_string(project.root.join("trials"))?;
+    // Three joint retries, then three alone for each of the two candidates.
+    let fallback = trials
+        .lines()
+        .filter(|line| !line.contains("parent@1.4.0") || !line.contains("sibling@1.4.0"))
+        .count();
+    assert_eq!(fallback, 9, "{trials}");
+    Ok(())
+}
+
+/// A hold that depends on another planned candidate is not attested, so the candidate's retry
+/// alone still runs and lands, while the attested sibling is not retried alone.
+#[tokio::test]
+async fn a_hold_coupled_to_a_planned_sibling_is_retried_alone() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(
+        Resolver::PersistentPair {
+            coupled: true,
+            attests: true,
+        },
+        4,
+        true,
+    )?;
+    let outcome = workspace.upgrade(&RunOpts::default()).await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("parent").map(String::as_str), Some("1.3.0"));
+    assert_eq!(versions.get("sibling").map(String::as_str), Some("1.0.0"));
+    let trials = std::fs::read_to_string(project.root.join("trials"))?;
+    assert!(
+        trials
+            .lines()
+            .any(|line| line.contains("parent@1.3.0") && !line.contains("sibling@")),
+        "{trials}"
+    );
+    assert!(
+        !trials
+            .lines()
+            .any(|line| line.contains("sibling@1.3.0") && !line.contains("parent@")),
+        "{trials}"
+    );
+    Ok(())
+}
+
+/// A transitive the parent's next major would carry off its line is not planned beside that
+/// parent, and once the parent stays held it gets its own in-line upgrade.
+#[tokio::test]
+async fn a_child_deferred_for_a_held_major_parent_still_upgrades() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(Resolver::MajorParent, 1, false)?;
+    let outcome = workspace
+        .upgrade(&RunOpts {
+            allow_major: true,
+            ..RunOpts::default()
+        })
+        .await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("parent").map(String::as_str), Some("1.0.0"));
+    assert_eq!(versions.get("child").map(String::as_str), Some("1.1.0"));
+    // The parent's trial plans the parent alone, and the child follows in a trial of its own.
+    let trials = std::fs::read_to_string(project.root.join("trials"))?;
+    let lines: Vec<_> = trials.lines().collect();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("parent@2.0.0") && !line.contains("child@")),
+        "{trials}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("child@1.1.0") && !line.contains("parent@")),
+        "{trials}"
+    );
     Ok(())
 }
 

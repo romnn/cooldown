@@ -243,6 +243,83 @@ async fn mutually_blocked_widens_land_in_one_resolve() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A candidate whose target Cargo cannot select at all, such as one that dropped a feature a member
+/// enables, no longer sinks the whole joint probe: the probe retries once without it and lands the
+/// rest together, instead of leaving every candidate to its own per-change attempt.
+#[tokio::test]
+async fn a_joint_probe_retries_without_the_candidate_cargo_refused() -> eyre::Result<()> {
+    let fixture = WidenFixture::new(
+        3,
+        indoc! {r#"
+        if [ "$count" = 1 ]; then
+          echo 'error: failed to select a version for `pkg001`.' >&2
+          echo '    ... required by package `app v0.1.0`' >&2
+          echo 'versions that meet the requirements `^2` (locked to 2.0.0) are: 2.0.0' >&2
+          exit 101
+        fi
+        grep -q 'pkg001 = "1"' Cargo.toml
+        cp dropped.lock Cargo.lock
+    "#},
+    )?;
+    let mut dropped = fixture.changes.clone();
+    dropped.swap(1, 2);
+    std::fs::write(
+        fixture.project.root.join("dropped.lock"),
+        WidenFixture::lock(&dropped, 2),
+    )?;
+    let journal = fixture.journal().await?;
+    let mut stats = WholeGraphStats::default();
+    assert!(fixture.probe(&journal, &mut stats).await?.is_some());
+
+    // One refused resolve, one retry that lands both remaining widens jointly.
+    assert_eq!(fixture.invocations()?.len(), 2);
+    assert_eq!(stats.joint_retries, 1);
+    assert_eq!(stats.joint_full_successes, 1);
+
+    // The refused candidate keeps its original requirement for its own per-change attempt.
+    let manifest = std::fs::read_to_string(&fixture.project.manifest)?;
+    assert!(manifest.contains("pkg000 = \"2"), "{manifest}");
+    assert!(manifest.contains("pkg001 = \"1\""), "{manifest}");
+    assert!(manifest.contains("pkg002 = \"2"), "{manifest}");
+    Ok(())
+}
+
+/// Cargo names the crate it could not select, which can be a dependency of the widened candidate,
+/// such as the `-sys` crate of a `links` clash; the retry then drops the candidate the
+/// explanation's chain cites instead.
+#[tokio::test]
+async fn a_joint_probe_retries_without_the_candidate_its_refusal_chain_cites() -> eyre::Result<()> {
+    let fixture = WidenFixture::new(
+        3,
+        indoc! {r#"
+        if [ "$count" = 1 ]; then
+          echo 'error: failed to select a version for `pkg001-sys`.' >&2
+          echo '    ... required by package `other v1.0.0`' >&2
+          echo 'versions that meet the requirements `^1` (locked to 1.0.0) are: 1.0.0' >&2
+          echo 'previously selected package `pkg001-sys v2.0.0`' >&2
+          echo '    ... which satisfies dependency `pkg001-sys = "^2"` of package `pkg001 v2.0.0`' >&2
+          exit 101
+        fi
+        grep -q 'pkg001 = "1"' Cargo.toml
+        cp dropped.lock Cargo.lock
+    "#},
+    )?;
+    let mut dropped = fixture.changes.clone();
+    dropped.swap(1, 2);
+    std::fs::write(
+        fixture.project.root.join("dropped.lock"),
+        WidenFixture::lock(&dropped, 2),
+    )?;
+    let journal = fixture.journal().await?;
+    let mut stats = WholeGraphStats::default();
+    assert!(fixture.probe(&journal, &mut stats).await?.is_some());
+    assert_eq!(fixture.invocations()?.len(), 2);
+    assert_eq!(stats.joint_retries, 1);
+    let manifest = std::fs::read_to_string(&fixture.project.manifest)?;
+    assert!(manifest.contains("pkg001 = \"1\""), "{manifest}");
+    Ok(())
+}
+
 #[tokio::test]
 async fn partial_replay_keeps_only_the_independently_reached_widen() -> eyre::Result<()> {
     let fixture = WidenFixture::new(2, "cp partial.lock Cargo.lock")?;

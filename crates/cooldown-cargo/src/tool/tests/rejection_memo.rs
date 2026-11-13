@@ -147,6 +147,7 @@ impl MemoFixture {
                             stats,
                         )
                         .await?
+                        .into_landed()
                         .is_none()
                 );
             }
@@ -172,6 +173,11 @@ impl MemoFixture {
                     .await;
                 stats.memo.include(&memo_stats);
                 assert!(matches!(result?, TentativeWiden::Rejected));
+            }
+            MemoOperation::Landing | MemoOperation::LockedRead => {
+                return Err(CoreError::System(
+                    "a landing or locked read is recorded, never attempted".to_string(),
+                ));
             }
         }
         Ok(())
@@ -293,6 +299,7 @@ async fn failed_seed_repeats_without_cargo_or_per_member_diagnostics() -> eyre::
                     &mut stats
                 )
                 .await?
+                .into_landed()
                 .is_none()
         );
     }
@@ -637,6 +644,9 @@ async fn disabled_memo_repeats_every_native_attempt_and_preserves_details() -> e
                         .await?;
                     assert!(matches!(result, TentativeWiden::Rejected));
                     stats.memo.include(&memo_stats);
+                }
+                MemoOperation::Landing | MemoOperation::LockedRead => {
+                    eyre::bail!("a landing or locked read is recorded, never attempted")
                 }
             }
             if attempt == 0 {

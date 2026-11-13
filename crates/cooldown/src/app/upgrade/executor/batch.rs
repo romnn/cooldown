@@ -2,8 +2,8 @@
 
 use super::super::UpgradeAccum;
 use crate::app::UpgradeItem;
-use crate::app::change_key::ChangeTargetKey;
-use cooldown_core::{BaselineViolation, Diagnostic, EdgeRebind};
+use crate::app::change_key::{ChangeProvenanceKey, ChangeTargetKey, change_provenance_key};
+use cooldown_core::{ApplyReport, BaselineViolation, Change, Diagnostic, EdgeRebind};
 use std::collections::HashSet;
 
 /// The report produced by one native resolver batch.
@@ -17,6 +17,43 @@ pub(super) struct BatchReport {
     pub(super) errors: Vec<Diagnostic>,
     pub(super) strict_incomplete: bool,
     pub(super) lock_refreshed: bool,
+    /// What the writer's apply attested about its skipped changes, when an apply ran.
+    ///
+    /// Boxed because most outcomes travel without one through enums sized by their largest
+    /// variant.
+    pub(super) attestation: Option<Box<HoldAttestation>>,
+}
+
+/// The skipped changes a writer attested it would skip again beside exactly the planned changes
+/// its apply applied (see [`ApplyReport::independent_holds`]).
+///
+/// Changes are keyed with their source version, because the attestation is about one exact
+/// change: another change to the same target from another version may be held for another
+/// reason.
+pub(super) struct HoldAttestation {
+    /// The planned changes the apply reported applied, before any verification of the graph.
+    pub(super) applied: HashSet<ChangeProvenanceKey>,
+    pub(super) holds: HashSet<ChangeProvenanceKey>,
+}
+
+impl HoldAttestation {
+    pub(super) fn of(report: &ApplyReport, planned: &[Change]) -> Self {
+        let planned: HashSet<ChangeProvenanceKey> =
+            planned.iter().map(change_provenance_key).collect();
+        HoldAttestation {
+            applied: report
+                .applied
+                .iter()
+                .map(change_provenance_key)
+                .filter(|key| planned.contains(key))
+                .collect(),
+            holds: report
+                .independent_holds
+                .iter()
+                .map(change_provenance_key)
+                .collect(),
+        }
+    }
 }
 
 /// The physical project state left by one resolver batch.

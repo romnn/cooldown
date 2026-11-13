@@ -230,14 +230,14 @@ pub(crate) type LockedSlots = BTreeMap<SlotKey, BTreeSet<String>>;
 /// The `Cargo.lock`'s `[[package]]` array, parsed for the before/after version diff and the
 /// edge-binding policies.
 /// Only the fields those need are read; Cargo owns the canonical format.
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 pub(crate) struct CargoLock {
     #[serde(default)]
     pub(crate) package: Vec<LockPackage>,
 }
 
 /// The lockfile fields needed to identify a package and inspect its resolved edges.
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 pub(crate) struct LockPackage {
     pub(crate) name: String,
     #[serde(default)]
@@ -333,6 +333,14 @@ impl<'lock> EntryIndex<'lock> {
     }
 }
 
+/// One resolved dependency edge of a lock.
+pub(crate) struct LockEdge<'lock> {
+    /// The package whose dependency list carries the entry.
+    pub(crate) requirer: &'lock LockPackage,
+    /// The block the entry binds.
+    pub(crate) endpoint: &'lock LockPackage,
+}
+
 /// One dependency an authored local package declares, as the exact node its lock entry binds.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct DeclaredEndpoint {
@@ -417,6 +425,23 @@ impl CargoLock {
             }
         }
         DeclaredEndpoints(endpoints)
+    }
+
+    /// Every dependency entry of the lock with the block it binds.
+    ///
+    /// Ambiguous and dangling entries are left out.
+    pub(crate) fn edges(&self) -> Vec<LockEdge<'_>> {
+        let index = EntryIndex::new(self);
+        let entries = &index;
+        self.package
+            .iter()
+            .flat_map(|requirer| {
+                requirer.dependencies.iter().filter_map(move |entry| {
+                    let endpoint = self.package.get(entries.resolve(entry)?)?;
+                    Some(LockEdge { requirer, endpoint })
+                })
+            })
+            .collect()
     }
 
     /// Every crates.io version the lock carries of `name`.

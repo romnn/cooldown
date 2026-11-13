@@ -6,7 +6,8 @@ use super::transaction::SpeculativeLockTransaction;
 use super::{
     EdgeRewrite, GuardedRewrites, LockEdgeView, RejectedRewrite, guard_rewrites, rewrite_lock_text,
 };
-use crate::cargocmd::{Cargo, ResolvedGraph};
+use crate::cargocmd::ResolvedGraph;
+use crate::locked_reads::LockedReader;
 use crate::lockfile::CargoLock;
 use camino::Utf8Path;
 use cooldown_core::{ApplyObserver, Project, Result};
@@ -37,7 +38,7 @@ enum CandidateFailure {
 }
 
 pub(super) async fn apply_rewrites(
-    cargo: &Cargo,
+    reader: LockedReader<'_>,
     project: &Project,
     lock_path: &Utf8Path,
     resolver_text: &str,
@@ -60,7 +61,7 @@ pub(super) async fn apply_rewrites(
     };
     let mut transaction = SpeculativeLockTransaction::begin(lock_path, resolver_text, &rewritten)?;
     let result = apply_transaction(
-        cargo,
+        reader,
         project,
         resolver_text,
         guarded,
@@ -76,7 +77,7 @@ pub(super) async fn apply_rewrites(
 }
 
 async fn apply_transaction(
-    cargo: &Cargo,
+    reader: LockedReader<'_>,
     project: &Project,
     resolver_text: &str,
     guarded: &mut GuardedRewrites,
@@ -87,10 +88,7 @@ async fn apply_transaction(
     if let Some(observer) = observer {
         observer.resolver_started(None);
     }
-    match cargo
-        .verify_locked(&project.root, &project.generated_members)
-        .await
-    {
+    match reader.graph(project).await {
         Ok(graph) => {
             transaction.accept()?;
             transaction.commit()?;
@@ -107,7 +105,7 @@ async fn apply_transaction(
         Err(cooldown_core::CoreError::StaleLock(_)) => {
             transaction.reject()?;
             let committed = isolate_rewrites(
-                cargo,
+                reader,
                 project,
                 resolver_text,
                 guarded,
@@ -146,7 +144,7 @@ fn released_failure(error: cooldown_core::CoreError) -> cooldown_core::CoreError
 }
 
 async fn isolate_rewrites(
-    cargo: &Cargo,
+    reader: LockedReader<'_>,
     project: &Project,
     resolver_text: &str,
     guarded: &mut GuardedRewrites,
@@ -162,7 +160,7 @@ async fn isolate_rewrites(
         super::rewrite::rewrite_components(std::mem::take(&mut guarded.accepted)).into();
     while let Some(component) = components.pop_front() {
         match try_isolation_candidate(
-            cargo,
+            reader,
             project,
             transaction,
             &current_text,
@@ -179,7 +177,7 @@ async fn isolate_rewrites(
             }
             IsolationCandidate::Rejected(failure) if component.len() > 1 => {
                 match verified_subset(
-                    cargo,
+                    reader,
                     project,
                     transaction,
                     &current_text,
@@ -259,7 +257,7 @@ enum IsolationCandidate {
 }
 
 async fn verified_subset(
-    cargo: &Cargo,
+    reader: LockedReader<'_>,
     project: &Project,
     transaction: &mut SpeculativeLockTransaction,
     current_text: &str,
@@ -280,7 +278,7 @@ async fn verified_subset(
             continue;
         }
         match try_isolation_candidate(
-            cargo,
+            reader,
             project,
             transaction,
             current_text,
@@ -368,7 +366,7 @@ fn partition_subsets(size: usize) -> Vec<Vec<usize>> {
 }
 
 async fn try_isolation_candidate(
-    cargo: &Cargo,
+    reader: LockedReader<'_>,
     project: &Project,
     transaction: &mut SpeculativeLockTransaction,
     current_text: &str,
@@ -382,7 +380,7 @@ async fn try_isolation_candidate(
     *probes_remaining -= 1;
     Ok(
         match try_candidate(
-            cargo,
+            reader,
             project,
             transaction,
             current_text,
@@ -398,7 +396,7 @@ async fn try_isolation_candidate(
 }
 
 async fn try_candidate(
-    cargo: &Cargo,
+    reader: LockedReader<'_>,
     project: &Project,
     transaction: &mut SpeculativeLockTransaction,
     current_text: &str,
@@ -412,10 +410,7 @@ async fn try_candidate(
     if let Some(observer) = observer {
         observer.resolver_started(None);
     }
-    match cargo
-        .verify_locked(&project.root, &project.generated_members)
-        .await
-    {
+    match reader.graph(project).await {
         Ok(graph) => {
             transaction.accept()?;
             Ok(Ok((candidate_text, graph)))

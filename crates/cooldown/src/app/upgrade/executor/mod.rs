@@ -5,13 +5,14 @@ mod report;
 mod transitive_gate;
 
 use self::batch::{
-    BatchOutcome, CommittedBatch, VerifiedBatchReport, indeterminate_trial, trial_errors,
+    BatchOutcome, CommittedBatch, HoldAttestation, VerifiedBatchReport, indeterminate_trial,
+    trial_errors,
 };
 pub(crate) use self::planning::target_package_for;
 use self::planning::{
-    EffectiveHold, candidate_scope, coordinated_upgrade_nodes, current_line_target,
-    dep_resolve_ctx, effective_hold, fix_change, is_downgrade, lower_adoptable_targets,
-    plan_baseline_violations, sort_planned_changes, upgrade_dependency,
+    EffectiveHold, candidate_scope, coordinated_upgrade_nodes, crosses_line, current_line_target,
+    dep_resolve_ctx, effective_hold, fix_change, is_downgrade, line_leaving_nodes,
+    lower_adoptable_targets, plan_baseline_violations, sort_planned_changes, upgrade_dependency,
 };
 use self::report::{collapse_applied_legs, combine_lock_status, conflict_skip_message, plan_item};
 use self::transitive_gate::{
@@ -38,6 +39,91 @@ use cooldown_core::{
 };
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
+
+/// The individual fallback retries the writer attested it would refuse, per attempt index.
+///
+/// A joint fallback trial that applied exactly the accepted set leaves the writer's attestation
+/// of which skipped alternatives it would skip again beside that set alone.
+/// The attestation holds only while the accepted set is the one it was made against.
+#[derive(Default)]
+struct AttestedHolds {
+    against: Option<HashSet<ChangeProvenanceKey>>,
+    holds: HashMap<usize, HashSet<ChangeProvenanceKey>>,
+}
+
+impl AttestedHolds {
+    /// Records the holds the joint trial of `attempt` attested, when it applied exactly
+    /// `required`, both as the writer reports it and as the trial verified it.
+    fn record(
+        &mut self,
+        attempt: usize,
+        required: &HashSet<ChangeProvenanceKey>,
+        landed: &[Change],
+        outcomes: &[BatchOutcome],
+    ) {
+        let landed: HashSet<ChangeProvenanceKey> =
+            landed.iter().map(change_provenance_key).collect();
+        let Some(attestation) = outcomes
+            .first()
+            .and_then(|outcome| outcome.attestation.as_ref())
+        else {
+            return;
+        };
+        if landed != *required || attestation.applied != *required {
+            return;
+        }
+        if self.against.as_ref() != Some(required) {
+            self.holds.clear();
+            self.against = Some(required.clone());
+        }
+        self.holds.insert(attempt, attestation.holds.clone());
+    }
+
+    /// Whether the writer attested it would refuse `alternative` retried at `attempt` beside
+    /// exactly `required`.
+    fn covers(
+        &self,
+        attempt: usize,
+        required: &HashSet<ChangeProvenanceKey>,
+        alternative: &Change,
+    ) -> bool {
+        self.against.as_ref() == Some(required)
+            && self
+                .holds
+                .get(&attempt)
+                .is_some_and(|holds| holds.contains(&change_provenance_key(alternative)))
+    }
+}
+
+/// The changes an upgrade plans now, and the nodes it plans once their requirers have settled.
+struct PlannedUpgrade {
+    changes: Vec<Change>,
+    /// The undeclared nodes every requirer of which leaves its line in `changes`.
+    deferred: HashSet<(String, String)>,
+}
+
+/// The nodes an upgrade batch moves, as planning sees them before any trial.
+struct MovingNodes {
+    /// Every node with an adoptable target whose ceiling-imposing requirers can move too.
+    moving: HashSet<(String, String)>,
+    /// The moving nodes planned onto another compatibility line, and the undeclared nodes whose
+    /// every requirer is in this set (see [`line_leaving_nodes`]).
+    leaving: HashSet<(String, String)>,
+}
+
+/// `dep` with its graph ceiling released when every requirer imposing it moves too, for a
+/// declared node only.
+///
+/// The release exists so a declared node a moving requirer pins can be planned beside it, since
+/// the acceptance rule never lets a declared crate move outside the plan; an undeclared node needs
+/// no plan of its own and follows its requirers as collateral.
+fn released_dependency(dep: &Dependency, moving: &HashSet<(String, String)>) -> Dependency {
+    if dep.direct {
+        upgrade_dependency(dep, moving)
+    } else {
+        dep.clone()
+    }
+}
 
 /// Whether the executor moves dependencies *forward* (`upgrade`) or *backward* to a compliant
 /// version (`fix`). The trial/rollback/verify machinery is shared; only planning differs.
@@ -831,8 +917,29 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// re-lock produced: downgrade any too-fresh transitive a forward move floated up, so a single
     /// `upgrade` ends gate-clean — no separate `fix` needed.
     async fn run_upgrade(&mut self, deps: Vec<Dependency>, state: &mut TrialState) -> MutationFlow {
-        let planned = self.plan_upgrade_changes(&deps).await;
-        self.apply_upgrade_changes(planned, state).await
+        let PlannedUpgrade { changes, deferred } = self.plan_upgrade_changes(&deps).await;
+        // Each pass's trials are heap-pinned, so the two passes do not share one stack frame.
+        let flow = Box::pin(self.apply_upgrade_changes(changes, state)).await;
+        if flow.is_break() || deferred.is_empty() {
+            return flow;
+        }
+        // The requirers that were carrying these nodes off their line have settled.
+        // A node still at its version was kept by their successors or left behind by a move that
+        // did not land, and plans on its own now.
+        let Some(deps) = self.scoped_deps(GraphRead::Replan).await else {
+            return flow;
+        };
+        let followers: Vec<_> = deps
+            .into_iter()
+            .filter(|dep| {
+                deferred.contains(&(dep.package.name.clone(), dep.current.as_str().to_string()))
+            })
+            .collect();
+        if followers.is_empty() {
+            return flow;
+        }
+        let PlannedUpgrade { changes, .. } = self.plan_upgrade_changes(&followers).await;
+        Box::pin(self.apply_upgrade_changes(changes, state)).await
     }
 
     /// Applies planned changes: manifest-only build-backend floors in their own batch, then the
@@ -1316,6 +1423,40 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .await
     }
 
+    /// The lower-line trial `attempt` of a fallback pass: `required` plus, for every candidate the
+    /// pass covers that `required` has not placed, its `attempt`-th alternative or else its
+    /// original.
+    ///
+    /// The pass covers every candidate, or only the `individual` one.
+    /// Returns `None` when no covered candidate has that alternative, so the trial would add
+    /// nothing.
+    fn fallback_retry(
+        &self,
+        candidates: &[UpgradeFallback],
+        individual: Option<usize>,
+        required: &[Change],
+        attempt: usize,
+    ) -> Option<Vec<Change>> {
+        let mut retry = required.to_vec();
+        let mut has_alternative = false;
+        for (index, candidate) in candidates.iter().enumerate() {
+            if individual.is_some_and(|selected| selected != index)
+                || required
+                    .iter()
+                    .any(|change| same_upgrade_candidate(change, &candidate.original))
+            {
+                continue;
+            }
+            let alternative = candidate.alternatives.get(attempt);
+            if let Some(change) = alternative {
+                self.observe_fallback(change);
+            }
+            has_alternative |= alternative.is_some();
+            retry.push(alternative.unwrap_or(&candidate.original).clone());
+        }
+        has_alternative.then_some(retry)
+    }
+
     fn observe_fallback(&self, change: &Change) {
         cooldown_core::trace::Event::Mutation {
             project: self.ctx.pctx.project.root.as_str(),
@@ -1377,6 +1518,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         // Retry only rejected candidates. Joint substitutions preserve coupled exact families;
         // individual substitutions salvage independent candidates if the joint family cannot land.
         // The budget excludes initial isolation and the final replay: at most 3 + 3 * |R| trials.
+        // An individual retry the writer attested it would refuse is left out.
+        let mut attested = AttestedHolds::default();
         for individual in std::iter::once(None).chain(
             (candidates.len() > 1)
                 .then_some(0..candidates.len())
@@ -1385,28 +1528,23 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .map(Some),
         ) {
             let required = accepted.clone();
+            let required_keys: HashSet<ChangeProvenanceKey> =
+                required.iter().map(change_provenance_key).collect();
             let mut best = accepted.clone();
             for attempt in 0..3 {
-                let mut retry = required.clone();
-                let mut has_alternative = false;
-                for (index, candidate) in candidates.iter().enumerate() {
-                    if individual.is_some_and(|selected| selected != index)
-                        || accepted
-                            .iter()
-                            .any(|change| same_upgrade_candidate(change, &candidate.original))
-                    {
-                        continue;
-                    }
-                    let alternative = candidate.alternatives.get(attempt);
-                    if let Some(change) = alternative {
-                        self.observe_fallback(change);
-                    }
-                    has_alternative |= alternative.is_some();
-                    retry.push(alternative.unwrap_or(&candidate.original).clone());
-                }
-                if !has_alternative {
+                if individual
+                    .and_then(|selected| candidates.get(selected))
+                    .and_then(|candidate| candidate.alternatives.get(attempt))
+                    .is_some_and(|alternative| {
+                        attested.covers(attempt, &required_keys, alternative)
+                    })
+                {
                     continue;
                 }
+                let Some(retry) = self.fallback_retry(&candidates, individual, &required, attempt)
+                else {
+                    continue;
+                };
                 let result = self
                     .try_upgrade_group_once(
                         retry.clone(),
@@ -1419,6 +1557,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     UpgradeTrialResult::Settled(outcomes) => {
                         let landed =
                             landed_upgrade_changes(&retry, &outcomes, &self.last_gate_graph);
+                        if individual.is_none() {
+                            attested.record(attempt, &required_keys, &landed, &outcomes);
+                        }
                         // Score the entire landed batch and never exchange an accepted target
                         // for a lower candidate, even when the resolver reports a safe subset.
                         if required.iter().all(|change| {
@@ -2060,7 +2201,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         deps: &[Dependency],
         fetched: &[FetchedRelease<Vec<Release>>],
         rctx: &ResolveContext<'_>,
-    ) -> HashSet<(String, String)> {
+    ) -> MovingNodes {
         // Old exact-pin edges cease to be authoritative when their requirers move in this batch.
         // Start optimistically, then remove candidates whose pinning parents cannot move under
         // the selected scope, manifest constraints, pins, or cooldown policy.
@@ -2068,12 +2209,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .iter()
             .map(|dep| (dep.package.name.clone(), dep.current.as_str().to_string()))
             .collect();
+        let mut crossing = HashSet::new();
         let moving = fetched
             .iter()
             .filter_map(|fetched| {
                 let dep = &fetched.dependency;
                 let releases = fetched.result.as_ref().ok()?;
-                let effective = upgrade_dependency(dep, &potential);
+                let effective = released_dependency(dep, &potential);
                 let advised = self
                     .advisories
                     .as_ref()
@@ -2087,29 +2229,35 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     &dep_resolve_ctx(rctx, dep),
                     self.ws.now(),
                 );
-                (verdict.status != Status::Held
-                    && verdict
-                        .adoptable_target
-                        .as_ref()
-                        .is_some_and(|target| *target != dep.current))
-                .then(|| (dep.package.name.clone(), dep.current.as_str().to_string()))
+                let target = verdict
+                    .adoptable_target
+                    .as_ref()
+                    .filter(|target| verdict.status != Status::Held && **target != dep.current)?;
+                let node = (dep.package.name.clone(), dep.current.as_str().to_string());
+                if crosses_line(releases, &dep.current, target) {
+                    crossing.insert(node.clone());
+                }
+                Some(node)
             })
             .collect();
-        coordinated_upgrade_nodes(deps, moving)
+        let moving = coordinated_upgrade_nodes(deps, moving);
+        crossing.retain(|node| moving.contains(node));
+        MovingNodes {
+            leaving: line_leaving_nodes(deps, crossing),
+            moving,
+        }
     }
 
-    async fn plan_upgrade_changes(&mut self, deps: &[Dependency]) -> Vec<Change> {
+    async fn fetch_upgrade_releases(
+        &self,
+        deps: &[Dependency],
+    ) -> Vec<FetchedRelease<Vec<Release>>> {
         self.ctx.progress.phase(format!(
             "fetching metadata for {} upgrade candidates",
             deps.len()
         ));
-        let rctx = ResolveContext {
-            honor_declared_bounds: self.ctx.opts.rewrite == RewriteMode::Auto,
-            ..Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts)
-        };
         let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
-        let fetched = self
-            .ws
+        self.ws
             .fetch_candidate_releases(
                 self.ctx.reader,
                 deps.to_vec(),
@@ -2118,10 +2266,19 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.ctx.progress,
                 self.ctx.opts.fanout(),
             )
-            .await;
+            .await
+    }
+
+    async fn plan_upgrade_changes(&mut self, deps: &[Dependency]) -> PlannedUpgrade {
+        let fetched = self.fetch_upgrade_releases(deps).await;
+        let rctx = ResolveContext {
+            honor_declared_bounds: self.ctx.opts.rewrite == RewriteMode::Auto,
+            ..Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts)
+        };
         let advisories = self.advisories.clone();
-        let moving = self.upgrade_moving_nodes(deps, &fetched, &rctx);
+        let MovingNodes { moving, leaving } = self.upgrade_moving_nodes(deps, &fetched, &rctx);
         let mut planned = Vec::new();
+        let mut deferred = HashSet::new();
         for FetchedRelease {
             dependency: dep,
             result,
@@ -2134,11 +2291,17 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     continue;
                 }
             };
+            // Its requirers' successors decide the version of a node they all carry off its line.
+            let node = (dep.package.name.clone(), dep.current.as_str().to_string());
+            if !dep.direct && leaving.contains(&node) {
+                deferred.insert(node);
+                continue;
+            }
             let advised = advisories
                 .as_ref()
                 .and_then(|project| project.classify(self.ctx.reader, &dep, &releases));
             let advisory_ctx = advised.as_ref().map(ClassifiedAdvisories::context);
-            let effective = upgrade_dependency(&dep, &moving);
+            let effective = released_dependency(&dep, &moving);
             let verdict = evaluate_advised(
                 &effective,
                 &releases,
@@ -2203,7 +2366,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             planned.push(change);
         }
         sort_planned_changes(&mut planned);
-        planned
+        PlannedUpgrade {
+            changes: planned,
+            deferred,
+        }
     }
 
     /// Records the matured target hidden by a package-owned ceiling: a declared manifest upper
@@ -2783,16 +2949,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let journal = prepared.journal();
         let expected = mutation.expected;
         let report = mutation.report;
+        outcome.attestation = Some(Box::new(HoldAttestation::of(&report, &changes)));
         // Candidates recovery dropped for a non-resolver failure (verification, stale lock — e.g.
         // a peer contract the resolve broke without a culpable candidate) are per-candidate
         // errors: rendering them as skips would hide a real defect behind "the resolver rejected
         // this change" and a `0 errors` summary.
-        for rejection in mutation.rejected {
-            let diag = self.project_diag(&rejection.error, Some(&rejection.change.package.name));
-            outcome
-                .items
-                .push(self.change_error_item(&rejection.change, diag));
-        }
+        self.add_recovery_errors(&mut outcome, mutation.rejected);
         if let Err(error) = validate_edge_rebinds(&report.edge_rebinds) {
             self.restore_journal_into_outcome(journal, &expected, &mut outcome);
             self.add_change_errors(&mut outcome, &error, &changes);
@@ -3734,6 +3896,19 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         self.change_item(change, true, None)
     }
 
+    fn add_recovery_errors(
+        &self,
+        outcome: &mut BatchOutcome,
+        rejected: Vec<super::super::resilient_apply::RejectedChange>,
+    ) {
+        for rejection in rejected {
+            let diag = self.project_diag(&rejection.error, Some(&rejection.change.package.name));
+            outcome
+                .items
+                .push(self.change_error_item(&rejection.change, diag));
+        }
+    }
+
     fn change_error_item(&self, change: &Change, diag: Diagnostic) -> UpgradeItem {
         let mut item = self.change_item(change, false, None);
         item.error = Some(diag);
@@ -3993,6 +4168,7 @@ fn verify_applied_targets(
         edge_rebinds: report.edge_rebinds,
         warnings: report.warnings,
         followed_manifests: report.followed_manifests,
+        independent_holds: report.independent_holds,
     };
 
     for change in report.applied {

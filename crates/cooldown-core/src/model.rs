@@ -778,7 +778,7 @@ pub struct Change {
 /// constraint untouched and may widen an implicit caret/tilde ceiling for an opted-in major update.
 /// An explicit `<`/`<=` comparator holds in this mode. [`Always`](RewriteMode::Always) rewrites every
 /// adopted target and is the deliberate escape hatch for crossing an explicit upper bound.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RewriteMode {
     /// Preserve an in-range constraint where possible and widen only implicit ceilings when
@@ -1234,6 +1234,12 @@ pub struct ApplyReport {
     /// away (a dry run, `outdated`'s policy preview), so it phrases the regeneration note in the
     /// run's mood.
     pub followed_manifests: Vec<Utf8PathBuf>,
+    /// Skipped changes the adapter attests it would skip again in a plan made of exactly the
+    /// planned changes this apply applied plus that change, applied from the same project state.
+    ///
+    /// A caller retrying a skipped change on its own may leave out such a retry.
+    /// An empty list promises nothing, so an adapter that cannot tell leaves it empty.
+    pub independent_holds: Vec<Change>,
 }
 
 /// The authoritative final edge audit plus non-fatal durability warnings.

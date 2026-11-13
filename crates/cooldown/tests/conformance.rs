@@ -706,6 +706,7 @@ impl ToolWrite for FakeEco {
             skipped,
             edge_rebinds: self.edge_rebinds_on_apply.clone(),
             followed_manifests: Vec::new(),
+            independent_holds: Vec::new(),
             warnings: p
                 .root
                 .join("warn-on-apply")

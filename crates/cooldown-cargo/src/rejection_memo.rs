@@ -10,6 +10,10 @@ pub(crate) enum MemoOperation {
     Widen,
     Precise,
     Seed,
+    /// The start of a whole-graph resolve, which keys the landing it reaches.
+    Landing,
+    /// A `cargo metadata --locked` read, which keys the graph it returned.
+    LockedRead,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -133,6 +137,21 @@ pub(crate) struct RejectionEffect {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MemoRejection {
     pub(crate) effects: Vec<RejectionEffect>,
+    /// Splits of a declared crate the refusal stands on.
+    ///
+    /// Such a refusal depends on the plan, which the key omits: it holds only while the plan
+    /// carries no planned move that heals one of them.
+    pub(crate) heals: Vec<SplitHeal>,
+}
+
+/// The planned moves that would heal a split of a declared crate: the move of the split crate
+/// itself, or of a requirer still binding its old line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SplitHeal {
+    /// The split crate.
+    pub(crate) name: String,
+    /// The requirers still binding the crate's old line.
+    pub(crate) retainers: Vec<crate::lockfile::PackageKey>,
 }
 
 impl MemoRejection {
@@ -1779,7 +1798,11 @@ mod tests {
             },
         ];
         let mut rejections = BTreeMap::new();
-        MemoRejection { effects }.apply(&mut rejections);
+        MemoRejection {
+            effects,
+            heals: Vec::new(),
+        }
+        .apply(&mut rejections);
         assert_eq!(rejections.get(&key).map(String::as_str), Some("last"));
         MemoRejection::default().apply(&mut rejections);
         assert_eq!(rejections.len(), 1);
