@@ -9,6 +9,7 @@ use cooldown_core::{
 use std::collections::{HashMap, HashSet};
 
 use super::GO_ID;
+use super::conflicts::{self, Conflict};
 
 pub(super) async fn apply(
     go: &Go,
@@ -33,29 +34,36 @@ pub(super) async fn apply(
     let before = read_go_mod(go, project).await?;
     let protected = protected_pins(&before, plan);
 
-    // The whole graph is settled in one MVS pass: every planned `module@version` target is handed to
+    // The whole graph is settled in one MVS pass: every active `module@version` target is handed to
     // a single `go get`, so Go runs one joint resolve over the entire graph rather than a sequence of
     // per-module re-resolves that would silently move other modules between candidates. MVS raises
     // each named module's floor to its cooldown-matured target; there is no `<` upper bound, so the
     // result is the unique fixed point and no candidate can ping-pong another down.
-    let targets: Vec<(String, String)> = plan
-        .changes
-        .iter()
-        .map(|change| (change.package.name.clone(), change.to.as_str().to_string()))
-        .collect();
-    match go.get_many(&project.root, &targets).await {
-        Ok(()) => {}
-        Err(err) if err.is_tool_spawn_failure() => return Err(err),
-        // The joint resolve/compile was rejected (an incompatible API surfaced by `go build` inside
-        // `go get`, or an otherwise-unsatisfiable set). Propagate so the caller's `apply_resilient`
-        // can isolate the offending candidate(s) and apply the rest, instead of holding every
-        // candidate. The caller restores the journal, so no partial `go.mod`/`go.sum` is kept.
-        Err(err) => return Err(err),
+    // A conflict `go` names is settled here and the resolve retried (see `Isolation`); any other
+    // failure propagates, so the caller's `apply_resilient` can isolate the offending candidates and
+    // apply the rest instead of holding every candidate. The caller restores the journal, so no
+    // partial `go.mod`/`go.sum` is kept, and a failed `go get` writes neither file.
+    let mut isolation = Isolation::new(plan);
+    loop {
+        let targets: Vec<(String, String)> = isolation
+            .active
+            .iter()
+            .map(|change| (change.package.name.clone(), change.to.as_str().to_string()))
+            .collect();
+        match go.get_many(&project.root, &targets).await {
+            Ok(()) => break,
+            Err(CoreError::Tool { stderr, .. }) if isolation.settle(&stderr) => {}
+            Err(err) => return Err(err),
+        }
     }
+    report.skipped.append(&mut isolation.held);
+    report
+        .skipped
+        .extend(isolation.superseded.iter().map(Supersession::skipped));
 
-    // Cross-major path changes → rewrite `/vN` import paths old→new for the planned set. The single
-    // joint resolve already landed, so this runs once over the whole plan rather than per candidate.
-    for change in &plan.changes {
+    // Cross-major path changes → rewrite `/vN` import paths old→new for the active set. The single
+    // joint resolve already landed, so this runs once over the whole set rather than per candidate.
+    for change in &isolation.active {
         let target_path = &change.package.name;
         if let Some(old_path) = mutation::old_import_path(change)
             && old_path != *target_path
@@ -79,19 +87,21 @@ pub(super) async fn apply(
         return Err(CoreError::UnacceptableResolve(describe_pin_moves(&moves)));
     }
 
-    let planned: HashSet<&str> = plan
-        .changes
+    // Only an active change's own row reports its module; a held or superseded module, and the old
+    // path a cross-major change leaves, are reported by the diff below like any other module.
+    let active: HashSet<&str> = isolation
+        .active
         .iter()
         .map(|change| change.package.name.as_str())
         .collect();
 
-    // Each planned candidate either reached cooldown's target (its newest-within-window) — reported
+    // Each active candidate either reached cooldown's target (its newest-within-window) — reported
     // applied — or fell short because the joint MVS pass could not place it there — reported held.
     // "Reached" respects the move's direction: a forward candidate must land at or above its target,
     // a downgrade at or below it.
-    for change in &plan.changes {
+    for change in &isolation.active {
         if reached(&after.requires, change) {
-            report.applied.push(change.clone());
+            report.applied.push((*change).clone());
         } else {
             report.skipped.push(graph_ceiling_hold(change));
         }
@@ -105,7 +115,7 @@ pub(super) async fn apply(
     let mut collateral: Vec<Change> = before
         .requires
         .iter()
-        .filter(|(name, _)| !planned.contains(name.as_str()))
+        .filter(|(name, _)| !active.contains(name.as_str()))
         .filter_map(|(name, from)| {
             let to = &after.requires.get(name)?.version;
             (semver::compare(&from.version, to) != std::cmp::Ordering::Equal).then(|| {
@@ -143,18 +153,188 @@ fn reached(after: &HashMap<String, Require>, change: &Change) -> bool {
 }
 
 fn graph_ceiling_hold(change: &Change) -> Skipped {
-    // A cross-major candidate is planned under its *target* path (`…/vN` — `go get` needs it), but
-    // a skip means the tree still holds the from-major module, so the row reports the identity
-    // that actually exists; the target path stays visible in the To column's major.
-    let mut reported = change.clone();
-    if let Some(old_path) = mutation::old_import_path(change) {
-        reported.package = PackageId::new(GO_ID, old_path, change.package.registry.clone());
-    }
+    let reported = reported_change(change);
     Skipped {
         offending: Some(reported.package.clone()),
         change: reported,
         reason: SkipReason::GraphCeilingHeld,
         detail: None,
+    }
+}
+
+/// `change` under the identity a hold reports it by.
+///
+/// A cross-major candidate is planned under its *target* path (`…/vN` — `go get` needs it), but a
+/// skip means the tree still holds the from-major module, so the row reports the identity that
+/// actually exists; the target path stays visible in the To column's major.
+fn reported_change(change: &Change) -> Change {
+    let mut reported = change.clone();
+    if let Some(old_path) = mutation::old_import_path(change) {
+        reported.package = PackageId::new(GO_ID, old_path, change.package.registry.clone());
+    }
+    reported
+}
+
+/// The planned changes a joint `go get` still requests, and the ones it settled from the conflicts
+/// `go` named.
+///
+/// A requirement conflict means the requirer, at its target, needs a newer version of a module than
+/// the plan requests for it:
+///
+/// - For a forward change of an `// indirect` module, the plan only advanced it because no
+///   requirer did, so its pin is dropped and the module follows its requirers through MVS.
+///   It is *superseded*, and the age gate judges where it lands, as for any unplanned module.
+/// - Otherwise the plan's target is the newest version it accepts for that module, so the requirer
+///   needs a version the plan does not accept, and the requirer is held.
+///
+/// A version whose `go.mod` declares another module path is held too.
+/// Holds are settled before supersessions, and a superseded module needs a requirer that is still
+/// requested: a later round that holds or supersedes every requirer of an earlier supersession
+/// gives up, and the caller's bisection settles the rest.
+struct Isolation<'a> {
+    active: Vec<&'a Change>,
+    superseded: Vec<Supersession<'a>>,
+    /// The rows of the held changes.
+    held: Vec<Skipped>,
+}
+
+/// A change whose pin was dropped for the requirers that need its module newer.
+struct Supersession<'a> {
+    change: &'a Change,
+    /// The requiring changes, as their `path@version` arguments.
+    requirers: Vec<String>,
+}
+
+impl Supersession<'_> {
+    /// The row reporting the dropped target.
+    /// The module's real movement is reported by the collateral diff, like any unplanned module's.
+    fn skipped(&self) -> Skipped {
+        Skipped {
+            change: self.change.clone(),
+            offending: None,
+            reason: SkipReason::NotEligible,
+            detail: Some(format!(
+                "{} require a newer version, so it follows them",
+                self.requirers.join(", ")
+            )),
+        }
+    }
+}
+
+/// The exact `path@version` argument `go get` receives for `change`.
+fn argument(change: &Change) -> String {
+    format!("{}@{}", change.package.name, change.to)
+}
+
+impl<'a> Isolation<'a> {
+    fn new(plan: &'a Plan) -> Self {
+        Isolation {
+            active: plan.changes.iter().collect(),
+            superseded: Vec::new(),
+            held: Vec::new(),
+        }
+    }
+
+    fn active_change(&self, argument_text: &str) -> Option<&'a Change> {
+        self.active
+            .iter()
+            .copied()
+            .find(|change| argument(change) == argument_text)
+    }
+
+    /// Settles the conflicts `stderr` names, returning whether the resolve can be retried.
+    ///
+    /// It returns `false` when no conflict names an active change it can settle, or when settling
+    /// them leaves an earlier supersession without a requested requirer.
+    fn settle(&mut self, stderr: &str) -> bool {
+        let mut holds: Vec<Skipped> = Vec::new();
+        let mut held: HashSet<String> = HashSet::new();
+        let mut supersessions: Vec<(&'a Change, String)> = Vec::new();
+        for conflict in conflicts::conflicts(stderr) {
+            match conflict {
+                Conflict::ForeignPath { argument, detail } => {
+                    if let Some(change) = self.active_change(argument)
+                        && held.insert(argument.to_string())
+                    {
+                        let reported = reported_change(change);
+                        holds.push(Skipped {
+                            offending: Some(reported.package.clone()),
+                            change: reported,
+                            reason: SkipReason::ResolverConflict,
+                            detail: Some(detail),
+                        });
+                    }
+                }
+                Conflict::Requirement {
+                    requirer,
+                    constrained,
+                    line,
+                } => {
+                    let (Some(requiring), Some(requested)) = (
+                        self.active_change(requirer),
+                        self.active_change(constrained),
+                    ) else {
+                        continue;
+                    };
+                    if requirer == constrained || requiring.downgrade {
+                        continue;
+                    }
+                    if !requested.direct && !requested.downgrade {
+                        supersessions.push((requested, requirer.to_string()));
+                    } else if held.insert(requirer.to_string()) {
+                        holds.push(Skipped {
+                            change: reported_change(requiring),
+                            offending: Some(reported_change(requested).package),
+                            reason: SkipReason::ResolverConflict,
+                            detail: Some(line.to_string()),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Holds first, so a supersession only counts requirers that are still requested.
+        let mut superseded: HashSet<String> = HashSet::new();
+        for (change, requirer) in supersessions {
+            if held.contains(&requirer) || superseded.contains(&requirer) {
+                continue;
+            }
+            let module = argument(change);
+            if held.contains(&module) {
+                continue;
+            }
+            superseded.insert(module);
+            match self
+                .superseded
+                .iter_mut()
+                .find(|entry| std::ptr::eq(entry.change, change))
+            {
+                Some(entry) => entry.requirers.push(requirer),
+                None => self.superseded.push(Supersession {
+                    change,
+                    requirers: vec![requirer],
+                }),
+            }
+        }
+        if holds.is_empty() && superseded.is_empty() {
+            return false;
+        }
+        self.active.retain(|change| {
+            let module = argument(change);
+            !held.contains(&module) && !superseded.contains(&module)
+        });
+        let requested: HashSet<String> =
+            self.active.iter().map(|change| argument(change)).collect();
+        if self.superseded.iter().any(|entry| {
+            !entry
+                .requirers
+                .iter()
+                .any(|requirer| requested.contains(requirer))
+        }) {
+            return false;
+        }
+        self.held.append(&mut holds);
+        true
     }
 }
 
@@ -779,5 +959,460 @@ mod tests {
         };
         // Landed at v0.30.2 but the downgrade target was v0.30.0 (lower) — not reached.
         assert!(!reached(&after, &downgrade_short));
+    }
+
+    /// A project whose scripted `go` fails chosen `go get` runs with a given stderr.
+    #[cfg(unix)]
+    struct ScriptedGets {
+        #[expect(dead_code, reason = "dropping the guard deletes the project directory")]
+        directory: tempfile::TempDir,
+        project: Project,
+        go: Go,
+    }
+
+    /// The scripted `go`: `go mod edit -json` prints `before` until `go mod tidy` switches it to
+    /// `tidied`. The n-th `go get` (counting from 1) fails with `failures[n - 1]` as its stderr while
+    /// one is given, and succeeds after that. Every `go get` logs its arguments, one run per line.
+    #[cfg(unix)]
+    fn scripted_gets(
+        before: &str,
+        tidied: &str,
+        failures: &[&str],
+    ) -> color_eyre::eyre::Result<ScriptedGets> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir()?;
+        let root = camino::Utf8PathBuf::from_path_buf(directory.path().to_path_buf())
+            .map_err(|path| color_eyre::eyre::eyre!("non-UTF-8 path {}", path.display()))?;
+        std::fs::write(root.join("go.mod"), "module example.com/demo\n")?;
+        std::fs::write(root.join("go.mod.json"), before)?;
+        std::fs::write(root.join("go.mod.tidied.json"), tidied)?;
+        for (index, stderr) in failures.iter().enumerate() {
+            std::fs::write(root.join(format!("get.{}.stderr", index + 1)), stderr)?;
+        }
+        let script = root.join("go");
+        std::fs::write(
+            &script,
+            indoc::indoc! {r#"
+                #!/bin/sh
+                case "$1 $2" in
+                  "mod edit") cat go.mod.json ;;
+                  "mod tidy") cp go.mod.tidied.json go.mod.json ;;
+                  get\ *)
+                    run=$(( $(cat gets.count 2>/dev/null || echo 0) + 1 ))
+                    echo "$run" > gets.count
+                    shift
+                    echo "$*" >> gets.log
+                    if [ -f "get.$run.stderr" ]; then cat "get.$run.stderr" >&2; exit 1; fi ;;
+                  *) exit 1 ;;
+                esac
+            "#},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let project = Project {
+            root: root.clone(),
+            kind: GO_ID,
+            manifest: root.join("go.mod"),
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        };
+        Ok(ScriptedGets {
+            directory,
+            project,
+            go: Go::with_program(script.as_str()),
+        })
+    }
+
+    /// The argument lists of every `go get` the scripted project ran.
+    #[cfg(unix)]
+    fn get_runs(scripted: &ScriptedGets) -> color_eyre::eyre::Result<Vec<String>> {
+        let log = std::fs::read_to_string(scripted.project.root.join("gets.log"))?;
+        Ok(log.lines().map(str::to_string).collect())
+    }
+
+    #[cfg(unix)]
+    fn forward(name: &str, from: &str, to: &str, direct: bool) -> Change {
+        Change {
+            package: PackageId::new(GO_ID, name, None),
+            from: Version::new(from),
+            to: Version::new(to),
+            kind: UpdateKind::Minor,
+            downgrade: false,
+            direct,
+            members: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn plan_of(changes: Vec<Change>) -> Plan {
+        Plan {
+            changes,
+            ..Plan::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn moves(changes: &[Change]) -> Vec<String> {
+        changes
+            .iter()
+            .map(|change| format!("{} {} -> {}", change.package.name, change.from, change.to))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn holds(skipped: &[Skipped]) -> Vec<(String, SkipReason, Option<String>)> {
+        skipped
+            .iter()
+            .map(|skip| {
+                (
+                    skip.change.package.name.clone(),
+                    skip.reason,
+                    skip.offending.as_ref().map(|package| package.name.clone()),
+                )
+            })
+            .collect()
+    }
+
+    /// A requirer that needs a direct module newer than the plan's target for it is held, the rest
+    /// of the resolve is retried without it, and its own resolver-forced movement is still reported.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_requirer_needing_a_direct_module_newer_than_planned_is_held()
+    -> color_eyre::eyre::Result<()> {
+        const CONFLICT: &str =
+            "example.com/x@v1.2.0 requires example.com/d@v1.3.0, not example.com/d@v1.1.0";
+        let before = go_mod_json(
+            &[
+                direct("example.com/x", "v1.0.0"),
+                direct("example.com/d", "v1.0.0"),
+            ],
+            &[],
+        );
+        // `d`'s target raised `x` as far as it needed.
+        let tidied = go_mod_json(
+            &[
+                direct("example.com/x", "v1.1.0"),
+                direct("example.com/d", "v1.1.0"),
+            ],
+            &[],
+        );
+        let scripted = scripted_gets(&before, &tidied, &[&format!("go: {CONFLICT}\n")])?;
+        let plan = plan_of(vec![
+            forward("example.com/x", "v1.0.0", "v1.2.0", true),
+            forward("example.com/d", "v1.0.0", "v1.1.0", true),
+        ]);
+        let journal = mutation::mutation_journal(&scripted.project.root, &plan)?;
+
+        let report = apply(&scripted.go, &scripted.project, &plan, &journal).await?;
+
+        // The retry requests everything but the held requirer.
+        assert_eq!(
+            get_runs(&scripted)?,
+            [
+                "example.com/x@v1.2.0 example.com/d@v1.1.0",
+                "example.com/d@v1.1.0"
+            ]
+        );
+        assert_eq!(
+            holds(&report.skipped),
+            [(
+                "example.com/x".to_string(),
+                SkipReason::ResolverConflict,
+                Some("example.com/d".to_string())
+            )]
+        );
+        assert_eq!(
+            report
+                .skipped
+                .first()
+                .and_then(|skip| skip.detail.as_deref()),
+            Some(CONFLICT)
+        );
+        assert_eq!(
+            moves(&report.applied),
+            [
+                "example.com/d v1.0.0 -> v1.1.0",
+                "example.com/x v1.0.0 -> v1.1.0"
+            ]
+        );
+        Ok(())
+    }
+
+    /// An `// indirect` module that a requirer's target needs newer than planned follows that
+    /// requirer instead of holding it: its pin is dropped, and its real movement is reported.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_indirect_module_a_requirer_needs_newer_follows_the_requirer()
+    -> color_eyre::eyre::Result<()> {
+        let before = go_mod_json(
+            &[
+                direct("example.com/x", "v1.0.0"),
+                indirect("example.com/m", "v0.21.0"),
+            ],
+            &[],
+        );
+        let tidied = go_mod_json(
+            &[
+                direct("example.com/x", "v1.2.0"),
+                indirect("example.com/m", "v1.47.0"),
+            ],
+            &[],
+        );
+        let scripted = scripted_gets(
+            &before,
+            &tidied,
+            &[
+                "go: example.com/x@v1.2.0 requires example.com/m@v1.47.0, not example.com/m@v0.22.0\n",
+            ],
+        )?;
+        let plan = plan_of(vec![
+            forward("example.com/x", "v1.0.0", "v1.2.0", true),
+            forward("example.com/m", "v0.21.0", "v0.22.0", false),
+        ]);
+        let journal = mutation::mutation_journal(&scripted.project.root, &plan)?;
+
+        let report = apply(&scripted.go, &scripted.project, &plan, &journal).await?;
+
+        assert_eq!(
+            get_runs(&scripted)?,
+            [
+                "example.com/x@v1.2.0 example.com/m@v0.22.0",
+                "example.com/x@v1.2.0"
+            ]
+        );
+        // The dropped target is a conservative skip naming the requirer, and the module's real
+        // move is reported beside the requirer's upgrade.
+        assert_eq!(
+            holds(&report.skipped),
+            [("example.com/m".to_string(), SkipReason::NotEligible, None)]
+        );
+        assert!(
+            report
+                .skipped
+                .first()
+                .and_then(|skip| skip.detail.as_deref())
+                .is_some_and(|detail| detail.contains("example.com/x@v1.2.0")),
+            "{:?}",
+            report.skipped
+        );
+        assert_eq!(
+            moves(&report.applied),
+            [
+                "example.com/x v1.0.0 -> v1.2.0",
+                "example.com/m v0.21.0 -> v1.47.0"
+            ]
+        );
+        Ok(())
+    }
+
+    /// A version whose `go.mod` declares another module path is held with Go's explanation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_version_declaring_another_path_is_held() -> color_eyre::eyre::Result<()> {
+        let before = go_mod_json(
+            &[
+                direct("example.com/c", "v0.29.2"),
+                direct("example.com/x", "v1.0.0"),
+            ],
+            &[],
+        );
+        let tidied = go_mod_json(
+            &[
+                direct("example.com/c", "v0.29.2"),
+                direct("example.com/x", "v1.2.0"),
+            ],
+            &[],
+        );
+        let foreign = indoc::indoc! {"
+            go: example.com/c@v0.32.0 requires example.com/c@v0.32.0: parsing go.mod:
+            \tmodule declares its path as: example.dev/c
+            \t        but was required as: example.com/c
+        "};
+        let scripted = scripted_gets(&before, &tidied, &[foreign])?;
+        let plan = plan_of(vec![
+            forward("example.com/c", "v0.29.2", "v0.32.0", true),
+            forward("example.com/x", "v1.0.0", "v1.2.0", true),
+        ]);
+        let journal = mutation::mutation_journal(&scripted.project.root, &plan)?;
+
+        let report = apply(&scripted.go, &scripted.project, &plan, &journal).await?;
+
+        assert_eq!(
+            get_runs(&scripted)?,
+            [
+                "example.com/c@v0.32.0 example.com/x@v1.2.0",
+                "example.com/x@v1.2.0"
+            ]
+        );
+        assert_eq!(
+            holds(&report.skipped),
+            [(
+                "example.com/c".to_string(),
+                SkipReason::ResolverConflict,
+                Some("example.com/c".to_string())
+            )]
+        );
+        assert_eq!(moves(&report.applied), ["example.com/x v1.0.0 -> v1.2.0"]);
+        Ok(())
+    }
+
+    /// A failure that names no active change it can settle propagates unchanged, so the caller's
+    /// bisection takes over, and so does one that would leave a supersession without its requirer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unsettled_failure_propagates_after_one_resolve() -> color_eyre::eyre::Result<()> {
+        let before = go_mod_json(
+            &[
+                direct("example.com/y", "v1.0.0"),
+                indirect("example.com/x", "v0.21.0"),
+                indirect("example.com/m", "v0.21.0"),
+            ],
+            &[],
+        );
+        let plan = plan_of(vec![
+            forward("example.com/y", "v1.0.0", "v1.1.0", true),
+            forward("example.com/x", "v0.21.0", "v0.22.0", false),
+            forward("example.com/m", "v0.21.0", "v0.22.0", false),
+        ]);
+        let unknown = "go: example.com/y@v1.1.0: invalid version: unknown revision v1.1.0\n";
+        // `x` first supersedes `m`, then is itself superseded by `y`, which leaves `m`'s pin dropped
+        // for a requirer that is no longer requested.
+        let chain: [&str; 2] = [
+            "go: example.com/x@v0.22.0 requires example.com/m@v1.0.0, not example.com/m@v0.22.0\n",
+            "go: example.com/y@v1.1.0 requires example.com/x@v1.0.0, not example.com/x@v0.22.0\n",
+        ];
+        for (failures, runs) in [(&[unknown][..], 1), (&chain[..], 2)] {
+            let scripted = scripted_gets(&before, &before, failures)?;
+            let journal = mutation::mutation_journal(&scripted.project.root, &plan)?;
+
+            let result = apply(&scripted.go, &scripted.project, &plan, &journal).await;
+
+            assert!(
+                matches!(result, Err(CoreError::Tool { .. })),
+                "{failures:?}: {result:?}"
+            );
+            assert_eq!(get_runs(&scripted)?.len(), runs, "{failures:?}");
+        }
+        Ok(())
+    }
+
+    /// A held cross-major change rewrites no import, and its row names the module that still exists.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_held_cross_major_change_rewrites_no_import() -> color_eyre::eyre::Result<()> {
+        const MAIN: &str = indoc::indoc! {r#"
+            package main
+
+            import _ "example.com/foo"
+        "#};
+        let before = go_mod_json(
+            &[
+                direct("example.com/foo", "v1.3.0"),
+                direct("example.com/d", "v1.0.0"),
+            ],
+            &[],
+        );
+        let tidied = go_mod_json(
+            &[
+                direct("example.com/foo", "v1.3.0"),
+                direct("example.com/d", "v1.1.0"),
+            ],
+            &[],
+        );
+        let scripted = scripted_gets(
+            &before,
+            &tidied,
+            &[
+                "go: example.com/foo/v2@v2.0.0 requires example.com/d@v1.4.0, not example.com/d@v1.1.0\n",
+            ],
+        )?;
+        std::fs::write(scripted.project.root.join("main.go"), MAIN)?;
+        let mut cross_major = forward("example.com/foo/v2", "v1.3.0", "v2.0.0", true);
+        cross_major.kind = UpdateKind::Major;
+        let plan = plan_of(vec![
+            cross_major,
+            forward("example.com/d", "v1.0.0", "v1.1.0", true),
+        ]);
+        let journal = mutation::mutation_journal(&scripted.project.root, &plan)?;
+
+        let report = apply(&scripted.go, &scripted.project, &plan, &journal).await?;
+
+        assert_eq!(
+            std::fs::read_to_string(scripted.project.root.join("main.go"))?,
+            MAIN
+        );
+        assert_eq!(
+            holds(&report.skipped),
+            [(
+                "example.com/foo".to_string(),
+                SkipReason::ResolverConflict,
+                Some("example.com/d".to_string())
+            )]
+        );
+        Ok(())
+    }
+
+    /// A requirer held in a round supersedes nothing in that round: the module it needed newer keeps
+    /// its pin, and a line naming the same argument on both sides settles nothing while the round's
+    /// other conflicts still do.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_a_still_requested_other_change_supersedes_a_pin() -> color_eyre::eyre::Result<()>
+    {
+        let before = go_mod_json(
+            &[
+                direct("example.com/x", "v1.0.0"),
+                direct("example.com/d", "v1.0.0"),
+                indirect("example.com/m", "v0.21.0"),
+            ],
+            &[],
+        );
+        let tidied = go_mod_json(
+            &[
+                direct("example.com/x", "v1.0.0"),
+                direct("example.com/d", "v1.1.0"),
+                indirect("example.com/m", "v0.22.0"),
+            ],
+            &[],
+        );
+        let round = indoc::indoc! {"
+            go: example.com/m@v0.22.0 indirectly requires example.com/m@v0.23.0, not example.com/m@v0.22.0
+            go: example.com/x@v1.2.0 requires example.com/m@v1.0.0, not example.com/m@v0.22.0
+            go: example.com/x@v1.2.0 requires example.com/d@v1.3.0, not example.com/d@v1.1.0
+        "};
+        let scripted = scripted_gets(&before, &tidied, &[round])?;
+        let plan = plan_of(vec![
+            forward("example.com/x", "v1.0.0", "v1.2.0", true),
+            forward("example.com/d", "v1.0.0", "v1.1.0", true),
+            forward("example.com/m", "v0.21.0", "v0.22.0", false),
+        ]);
+        let journal = mutation::mutation_journal(&scripted.project.root, &plan)?;
+
+        let report = apply(&scripted.go, &scripted.project, &plan, &journal).await?;
+
+        assert_eq!(
+            get_runs(&scripted)?,
+            [
+                "example.com/x@v1.2.0 example.com/d@v1.1.0 example.com/m@v0.22.0",
+                "example.com/d@v1.1.0 example.com/m@v0.22.0"
+            ]
+        );
+        assert_eq!(
+            holds(&report.skipped),
+            [(
+                "example.com/x".to_string(),
+                SkipReason::ResolverConflict,
+                Some("example.com/d".to_string())
+            )]
+        );
+        assert_eq!(
+            moves(&report.applied),
+            [
+                "example.com/d v1.0.0 -> v1.1.0",
+                "example.com/m v0.21.0 -> v0.22.0"
+            ]
+        );
+        Ok(())
     }
 }
