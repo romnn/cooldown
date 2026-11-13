@@ -335,6 +335,7 @@ impl OutputCapture {
                 snapshot: None,
                 source,
                 size: None,
+                sha256: None,
             }
             .emit();
             artifact

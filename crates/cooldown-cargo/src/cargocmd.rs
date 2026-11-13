@@ -7,7 +7,7 @@ use cooldown_core::{
     CoreError, GeneratedMembers, LockStatus, LockVerifyReport, MemberRef, ToolTermination,
     VerifyReport, failure_detail,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use tokio::process::Command;
 
 pub(crate) use crate::lockfile::CRATES_IO_SOURCE;
@@ -493,6 +493,63 @@ impl ResolvedGraph {
         members.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
         members.dedup();
         members
+    }
+
+    /// [`reaching_members`](Self::reaching_members) of every node at once; a node no member
+    /// reaches is absent.
+    ///
+    /// One forward walk per root rather than a reverse walk per node: a workspace graph has
+    /// thousands of nodes, and every dependency read attributes all of them.
+    #[must_use]
+    pub fn reaching_members_by_node(&self) -> HashMap<&str, Vec<MemberRef>> {
+        let authored = self.reached_from(self.authored_roots(), true);
+        let generated = self.reached_from(self.generated_roots.iter(), false);
+        let mut reaching: HashMap<&str, Vec<&str>> = generated;
+        reaching.extend(authored);
+        reaching
+            .into_iter()
+            .map(|(node, roots)| {
+                let mut members: Vec<MemberRef> = roots
+                    .into_iter()
+                    .filter_map(|root| self.member_of(root))
+                    .collect();
+                members.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+                members.dedup();
+                (node, members)
+            })
+            .collect()
+    }
+
+    /// For every node, the `roots` with a path to it, other than itself.
+    ///
+    /// With `authored_paths`, a path never leaves a generated root, as
+    /// [`authored_reaching_roots`](Self::authored_reaching_roots) walks.
+    fn reached_from<'a>(
+        &'a self,
+        roots: impl Iterator<Item = &'a String>,
+        authored_paths: bool,
+    ) -> HashMap<&'a str, Vec<&'a str>> {
+        let mut reached: HashMap<&str, Vec<&str>> = HashMap::new();
+        for root in roots {
+            let root = root.as_str();
+            let mut seen: HashSet<&str> = HashSet::new();
+            let mut queue: VecDeque<&str> = VecDeque::from([root]);
+            while let Some(node) = queue.pop_front() {
+                if authored_paths && self.generated_roots.contains(node) {
+                    continue;
+                }
+                for next in self.edges.get(node).into_iter().flatten() {
+                    let next = next.as_str();
+                    if seen.insert(next) {
+                        queue.push_back(next);
+                        if next != root {
+                            reached.entry(next).or_default().push(root);
+                        }
+                    }
+                }
+            }
+        }
+        reached
     }
 }
 
@@ -1420,7 +1477,13 @@ impl Cargo {
         }
     }
 
-    async fn run_locked_metadata(&self, dir: &Utf8Path) -> Result<String, CoreError> {
+    /// Runs `cargo metadata --locked` in `dir` and returns its output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::StaleLock`] when the lock must be updated, or the Cargo tool error
+    /// for any other failure.
+    pub(crate) async fn locked_metadata_output(&self, dir: &Utf8Path) -> Result<String, CoreError> {
         let out = self
             .output(
                 dir,
@@ -1486,7 +1549,7 @@ impl Cargo {
         dir: &Utf8Path,
         generated: &GeneratedMembers,
     ) -> Result<ResolvedGraph, CoreError> {
-        let stdout = self.run_locked_metadata(dir).await?;
+        let stdout = self.locked_metadata_output(dir).await?;
         Self::parse_graph(&stdout, generated)
     }
 
@@ -1500,7 +1563,7 @@ impl Cargo {
         &self,
         dir: &Utf8Path,
     ) -> Result<StagingMetadata, CoreError> {
-        let stdout = self.run_locked_metadata(dir).await?;
+        let stdout = self.locked_metadata_output(dir).await?;
         let raw: RawMeta = serde_json::from_str(&stdout)
             .map_err(|error| CoreError::LockUnreadable(format!("cargo metadata: {error}")))?;
         let workspace_root = camino::Utf8PathBuf::from(raw.workspace_root);
@@ -1652,7 +1715,10 @@ impl Cargo {
         })
     }
 
-    fn parse_graph(stdout: &str, generated: &GeneratedMembers) -> Result<ResolvedGraph, CoreError> {
+    pub(crate) fn parse_graph(
+        stdout: &str,
+        generated: &GeneratedMembers,
+    ) -> Result<ResolvedGraph, CoreError> {
         let raw: RawMeta = serde_json::from_str(stdout)
             .map_err(|error| CoreError::LockUnreadable(format!("cargo metadata: {error}")))?;
         Self::build_graph(raw, generated)
@@ -1681,7 +1747,7 @@ impl Cargo {
         dir: &Utf8Path,
         generated: &GeneratedMembers,
     ) -> Result<ResolvedGraph, CoreError> {
-        let stdout = self.run_locked_metadata(dir).await?;
+        let stdout = self.locked_metadata_output(dir).await?;
         Self::parse_graph(&stdout, generated)
     }
 
@@ -1873,6 +1939,29 @@ pub(crate) struct ConflictParty {
     pub(crate) name: String,
     /// The version the diagnostic attributes to it, if any.
     pub(crate) version: Option<String>,
+}
+
+/// Every package name a resolver diagnostic cites, from its backticked requirements
+/// (`` `serde = "^1"` ``) and package lines (`` `app v0.1.0 (/path)` ``).
+///
+/// This is the whole chain Cargo printed, both sides of the conflict and every requirer up to the
+/// workspace member, not only the parties [`conflict_parties`] can release.
+/// Tokens that are not crate names, such as a bare requirement (`` `=1.2.3` ``), are skipped; a
+/// stray feature name only adds a name the lock does not carry.
+pub(crate) fn diagnostic_packages(stderr: &str) -> BTreeSet<String> {
+    stderr
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter_map(|quoted| quoted.split_whitespace().next())
+        .filter(|name| {
+            name.chars().next().is_some_and(char::is_alphanumeric)
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The packages a `failed to select a version for` diagnostic sets against each other: the one
@@ -3520,6 +3609,19 @@ mod tests {
         members.into_iter().map(|member| member.name).collect()
     }
 
+    /// The attribution of every node at once matches the per-node walk, absent nodes reached by
+    /// no member.
+    fn assert_reaching_agrees(graph: &ResolvedGraph) {
+        let all = graph.reaching_members_by_node();
+        for id in graph.packages.keys() {
+            assert_eq!(
+                all.get(id.as_str()).cloned().unwrap_or_default(),
+                graph.reaching_members(id),
+                "{id}"
+            );
+        }
+    }
+
     /// Without a declaration the hack is an ordinary member (the regression baseline): every
     /// line it mirrors is direct and attributed to it, and its pin holds.
     #[test]
@@ -3532,6 +3634,7 @@ mod tests {
         assert_eq!(member_names(graph.direct_members("it14")), ["hack"]);
         assert!(graph.is_exact_pinned("pinned", "1.0.0"));
         assert_eq!(graph.nodes_reached_only_via_generated(), []);
+        assert_reaching_agrees(&graph);
     }
 
     /// Declared generated, the hack's declarations follow rather than drive: nothing it alone
@@ -3566,6 +3669,7 @@ mod tests {
         // named as the stale projection.
         assert!(!graph.is_direct("orphan"));
         assert_eq!(member_names(graph.reaching_members("orphan")), ["hack"]);
+        assert_reaching_agrees(&graph);
         assert_eq!(
             graph.nodes_reached_only_via_generated(),
             vec![("orphan".to_string(), "2.0.0".to_string())]

@@ -36,7 +36,11 @@ pub fn emit(event: &Event<'_>) {
                 } => Some(*path),
                 _ => None,
             };
-            tracing::trace!(target: TARGET, trace_event = payload.as_str(), trace_artifact = artifact, trace_input_path = input_path, trace_artifact_finished = matches!(event, Event::ArtifactFinished { .. }));
+            let sha256 = match event {
+                Event::ArtifactStarted { sha256, .. } => *sha256,
+                _ => None,
+            };
+            tracing::trace!(target: TARGET, trace_event = payload.as_str(), trace_artifact = artifact, trace_input_path = input_path, trace_artifact_sha256 = sha256, trace_artifact_finished = matches!(event, Event::ArtifactFinished { .. }));
         }
         Err(err) => {
             tracing::error!(target: TARGET, error = %err, "trace event serialization failed");
@@ -348,6 +352,13 @@ pub enum Event<'a> {
         source: ArtifactSource<'a>,
         /// Expected byte length when known.
         size: Option<u64>,
+        /// The lowercase hex SHA-256 of the complete content, when it is known before the first
+        /// chunk.
+        ///
+        /// A recorder that has already written identical content in the same run may record this
+        /// artifact as a reference to that copy instead of repeating its chunks.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sha256: Option<&'a str>,
     },
     /// One bounded artifact chunk, available even if later capture fails.
     ArtifactChunk {
@@ -543,11 +554,13 @@ pub fn artifact(source: ArtifactSource<'_>, bytes: &[u8]) {
         return;
     }
     let artifact = operation_id();
+    let sha256 = hex_sha256(bytes);
     Event::ArtifactStarted {
         artifact,
         snapshot: None,
         source,
         size: Some(bytes.len() as u64),
+        sha256: Some(&sha256),
     }
     .emit();
     let mut offset = 0;
@@ -566,4 +579,13 @@ pub fn artifact(source: ArtifactSource<'_>, bytes: &[u8]) {
         outcome: ArtifactOutcome::Complete,
     }
     .emit();
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .flat_map(|byte| [byte >> 4, byte & 0x0f])
+        .filter_map(|nibble| char::from_digit(u32::from(nibble), 16))
+        .collect()
 }

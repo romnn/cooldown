@@ -29,6 +29,7 @@ use crate::CARGO_ID;
 use crate::cargocmd::{Cargo, ConflictParty, PackageKey, ResolvedGraph, conflict_parties};
 use crate::edges;
 use crate::index::{CRATES_IO, CratesIoIndex};
+use crate::locked_reads::{LockedReader, LockedReads};
 use crate::lockfile::{
     CargoLock, DeclaredEndpoints, PlannedNodeMove, SlotKey, SourcedSlotKey, rewrite_planned_nodes,
 };
@@ -37,6 +38,7 @@ use crate::native::native_policy_layer;
 use crate::publish_age::CargoEnvironment;
 use crate::rejection_memo::{
     MemoKey, MemoMetadataMode, MemoOperation, MemoRejection, RejectionEffect, RejectionMemo,
+    SplitHeal,
 };
 use crate::version;
 use async_trait::async_trait;
@@ -59,6 +61,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod acceptance;
+mod landing;
 
 use acceptance::{ResolveBaseline, Violation};
 
@@ -106,11 +109,36 @@ pub struct CargoTool {
     /// Ordinary pin batches route it to its precise pin to avoid repeated bisection.
     /// Joint widen probes bypass this memory because their manifest context differs.
     refused_alone: std::sync::Mutex<HashSet<(String, String, String)>>,
+    /// The other planned crates each refused change of the current resolve per project root was
+    /// refused over: a conflict party withheld because it is planned, or a planned crate the step
+    /// would have moved off its own plan.
+    ///
+    /// A plan without those crates may land the change, so its hold is not attested.
+    refusal_constraints: std::sync::Mutex<HashMap<RefusalKey, BTreeSet<String>>>,
+    /// The split completions of the current resolve per project root that did not land.
+    ///
+    /// A completion's outcome is a function of the project files it starts from, its coalition
+    /// and the plan, and the plan is fixed for one resolve, so a later step meeting the same
+    /// coalition in the same files skips the resolve.
+    failed_completions: std::sync::Mutex<HashSet<CompletionKey>>,
     rejection_memo: RejectionMemo,
     rejection_memo_enabled: bool,
+    /// Where earlier whole-graph resolves of the run ended, to warm-start later applies from.
+    landings: landing::LandingMemo,
+    /// The run's recent `cargo metadata --locked` reads, reused for identical native inputs.
+    locked_reads: LockedReads,
 }
 
 impl CargoTool {
+    /// Reads locked graphs, reusing an earlier read of the same native inputs in this run.
+    fn locked_reader(&self) -> LockedReader<'_> {
+        LockedReader {
+            cargo: &self.cargo,
+            memo: &self.rejection_memo,
+            reads: &self.locked_reads,
+        }
+    }
+
     async fn metadata_with_observer(
         &self,
         project: &Project,
@@ -135,8 +163,12 @@ impl CargoTool {
             cargo: Cargo::new(),
             generated: tokio::sync::Mutex::new(HashMap::new()),
             refused_alone: std::sync::Mutex::new(HashSet::new()),
+            refusal_constraints: std::sync::Mutex::new(HashMap::new()),
+            failed_completions: std::sync::Mutex::new(HashSet::new()),
             rejection_memo: RejectionMemo::default(),
             rejection_memo_enabled: true,
+            landings: landing::LandingMemo::default(),
+            locked_reads: LockedReads::default(),
         }
     }
 
@@ -177,10 +209,7 @@ impl CargoTool {
         if let Some(observer) = observer {
             observer.resolver_started(None);
         }
-        let graph = self
-            .cargo
-            .metadata_locked(&project.root, &project.generated_members)
-            .await?;
+        let graph = self.locked_reader().graph(project).await?;
         self.remember_generated_facts(project, &graph).await
     }
 
@@ -481,11 +510,9 @@ impl ToolRead for CargoTool {
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         crate::staging::reject_custom_lockfile(&project.root)?;
         edges::enforce::ensure_no_pending(project)?;
-        let graph = self
-            .cargo
-            .metadata_locked(&project.root, &project.generated_members)
-            .await?;
+        let graph = self.locked_reader().graph(project).await?;
         self.remember_generated_facts(project, &graph).await?;
+        let reaching = graph.reaching_members_by_node();
         let mut deps = Vec::new();
         for (id, info) in &graph.packages {
             if graph.roots.contains(id) || !info.is_crates_io() {
@@ -526,7 +553,7 @@ impl ToolRead for CargoTool {
                 members: if direct {
                     graph.direct_members(id)
                 } else {
-                    graph.reaching_members(id)
+                    reaching.get(id.as_str()).cloned().unwrap_or_default()
                 },
                 pinned,
                 hold_edges: graph.node_hold_edges(&info.name, &info.version).to_vec(),
@@ -550,11 +577,7 @@ impl ToolRead for CargoTool {
     async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport> {
         crate::staging::reject_custom_lockfile(&project.root)?;
         edges::enforce::ensure_no_pending(project)?;
-        match self
-            .cargo
-            .verify_locked(&project.root, &project.generated_members)
-            .await
-        {
+        match self.locked_reader().graph(project).await {
             Ok(_) => Ok(LockVerifyReport {
                 status: LockStatus::Current,
                 detail: "Cargo.lock is current".to_string(),
@@ -858,6 +881,8 @@ struct PinBatchStats {
     resolver_rejected: bool,
     memo_disqualified: bool,
     rejection_effects: Vec<RejectionEffect>,
+    /// The splits the batch's refusals stand on (see [`MemoRejection::heals`]).
+    heals: Vec<SplitHeal>,
 }
 
 impl PinBatchStats {
@@ -874,6 +899,7 @@ impl PinBatchStats {
         rejection.apply(rejections);
         self.rejection_effects
             .extend(rejection.effects.iter().cloned());
+        self.heals.extend(rejection.heals.iter().cloned());
     }
 }
 
@@ -886,6 +912,9 @@ struct SeedGroup<'a> {
 
 struct MemoAttempt<'a> {
     project: &'a Project,
+    /// Every change of the plan, which decides whether a refusal guarded by a split still stands
+    /// (see [`MemoRejection::heals`]).
+    plan: &'a [Change],
     operation: MemoOperation,
     metadata_mode: MemoMetadataMode,
     changes: &'a [&'a Change],
@@ -910,16 +939,120 @@ impl MemoAttempt<'_> {
     }
 }
 
+/// The outcome of a whole-graph resolve.
+struct WholeGraphResolve {
+    rejections: PinRejections,
+    /// The state the resolve started and ended in, when it warm-started and landed nothing more.
+    unmoved: Option<UnmovedResolve>,
+}
+
+/// A warm-started resolve that ended where it started: the key of its inputs, its starting lock,
+/// and the files its landing rewrote.
+struct UnmovedResolve {
+    key: MemoKey,
+    lock: CargoLock,
+    files: Vec<(Utf8PathBuf, String)>,
+}
+
+/// What a whole-graph resolve started from: the key of its inputs and the write set's contents.
+struct LandingStart {
+    key: MemoKey,
+    lock: CargoLock,
+    files: Vec<(Utf8PathBuf, Option<Vec<u8>>)>,
+}
+
 struct SeededResolve {
     before: CargoLock,
     after: CargoLock,
     snapshot: Vec<(Utf8PathBuf, Option<String>)>,
 }
 
+/// How one seeded resolve ended; anything but a landing left the lock as the seed found it.
+enum SeedOutcome {
+    Landed(SeededResolve),
+    /// The resolve broke the [acceptance rule](acceptance) and was restored.
+    Violated(Violation),
+    /// Cargo refused the seed, or it was not attempted.
+    Refused,
+}
+
+impl SeedOutcome {
+    fn into_landed(self) -> Option<SeededResolve> {
+        match self {
+            SeedOutcome::Landed(seeded) => Some(seeded),
+            SeedOutcome::Violated(_) | SeedOutcome::Refused => None,
+        }
+    }
+}
+
+impl Violation {
+    /// The planned moves that would heal this violation, when it is a split of a declared crate.
+    fn heal(&self) -> Option<SplitHeal> {
+        match self {
+            Violation::DirectSplit {
+                name, retainers, ..
+            } => Some(SplitHeal {
+                name: name.clone(),
+                retainers: retainers.clone(),
+            }),
+            Violation::DeclaredMoved { .. }
+            | Violation::PlannedDrifted { .. }
+            | Violation::TargetDisplaced { .. } => None,
+        }
+    }
+
+    /// The names of the planned crates a violation points at, whose own moves broke the rule.
+    ///
+    /// A displaced target names no culprit: some other move of the step pushed it off.
+    fn culprits(&self) -> BTreeSet<&str> {
+        match self {
+            Violation::DeclaredMoved { name, .. } | Violation::PlannedDrifted { name, .. } => {
+                BTreeSet::from([name.as_str()])
+            }
+            Violation::DirectSplit { name, movers, .. } => movers
+                .iter()
+                .map(String::as_str)
+                .chain(std::iter::once(name.as_str()))
+                .collect(),
+            Violation::TargetDisplaced { .. } => BTreeSet::new(),
+        }
+    }
+
+    /// The other planned crate whose own plan the violation enforced against `change`'s step.
+    fn planned_constraint(&self, change: &Change) -> Option<&str> {
+        match self {
+            Violation::PlannedDrifted { name, .. } | Violation::TargetDisplaced { name, .. }
+                if *name != change.package.name =>
+            {
+                Some(name)
+            }
+            _ => None,
+        }
+    }
+
+    /// The `changes` the violation names and the rest, when both are non-empty.
+    fn split_culprits<'a>(&self, changes: &[&'a Change]) -> Option<CulpritSplit<'a>> {
+        let culprits = self.culprits();
+        let (named, rest): (Vec<&Change>, Vec<&Change>) = changes
+            .iter()
+            .copied()
+            .partition(|change| culprits.contains(change.package.name.as_str()));
+        (!named.is_empty() && !rest.is_empty()).then_some(CulpritSplit { named, rest })
+    }
+}
+
+/// The changes of a group a violation names, and the rest of the group.
+struct CulpritSplit<'a> {
+    named: Vec<&'a Change>,
+    rest: Vec<&'a Change>,
+}
+
 #[derive(Default)]
 struct WholeGraphStats {
     rounds: usize,
     joint_probes: usize,
+    /// Joint probes repeated without the candidates Cargo named in the previous probe's refusal.
+    joint_retries: usize,
     joint_full_successes: usize,
     partial_replays_kept: usize,
     partial_replays_discarded: usize,
@@ -947,6 +1080,7 @@ impl ApplyObserver for ResolveCounter<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
 struct WidenProbe<'a> {
     project: &'a Project,
     /// Every change of the plan, which each widen's [acceptance rule](acceptance) is judged
@@ -993,6 +1127,32 @@ impl<'a> WidenProbe<'a> {
 struct WidenEvidence {
     versions: BTreeMap<SlotKey, String>,
     graph: Option<ResolvedGraph>,
+}
+
+/// The outcome of resolving one widened group.
+enum GroupResolve {
+    /// The group resolved within the acceptance rule.
+    Resolved(Box<WidenEvidence>),
+    /// Cargo refused the group, naming the packages it could not select and every package its
+    /// explanation cites (both empty for a refusal it does not explain).
+    Refused {
+        parties: Vec<ConflictParty>,
+        chain: BTreeSet<String>,
+    },
+    /// The resolve broke the acceptance rule.
+    Violated(Violation),
+    /// The resolve moved a seeded package to a version the plan does not name, or the seed could
+    /// not be written.
+    Discarded,
+}
+
+impl GroupResolve {
+    fn into_evidence(self) -> Option<WidenEvidence> {
+        match self {
+            Self::Resolved(evidence) => Some(*evidence),
+            Self::Refused { .. } | Self::Violated(_) | Self::Discarded => None,
+        }
+    }
 }
 
 impl WidenEvidence {
@@ -1075,6 +1235,8 @@ enum PrecisePinOutcome {
         resolver_rejection: bool,
         /// The packages Cargo's conflict set against the pin, when it reported one.
         parties: Vec<ConflictParty>,
+        /// The split of a declared crate the pin's landing caused, when that refused it.
+        split: Option<SplitHeal>,
     },
 }
 
@@ -1106,6 +1268,49 @@ struct RefusedPin<'a> {
     detail: Option<String>,
     resolver_rejection: bool,
     parties: Vec<ConflictParty>,
+    split: Option<SplitHeal>,
+}
+
+/// A refused precise pin's identity: the project root and the change's `(name, from, to)`.
+type RefusalKey = (Utf8PathBuf, (String, String, String));
+
+/// What releasing a refused pin's blockers achieved.
+enum Unlocking {
+    Landed,
+    /// Every attempt was refused, the last one for the split it would cause when that is why.
+    Refused(Option<UnlockedSplit>),
+    /// The refusal named no blocker the batch may release, so no unlocking was attempted.
+    NothingToRelease,
+}
+
+/// A split of a declared crate an unlocking pin caused while releasing `released`.
+struct UnlockedSplit {
+    heal: SplitHeal,
+    released: Vec<PackageKey>,
+}
+
+/// What [`CargoTool::complete_split`] achieved.
+enum SplitCompletion {
+    /// The step landed together with the planned moves that heal its split.
+    Landed(Box<WidenEvidence>),
+    /// No planned move heals the split, so no resolve was tried.
+    Unhealable,
+    /// The healing moves were tried together and did not land.
+    Refused,
+}
+
+/// A split completion's identity within one resolve: the project root, a digest of the project
+/// files it starts from, the coalition and the changes it must not displace, the rewrite mode its
+/// widens use, and the locked nodes it releases.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CompletionKey {
+    root: Utf8PathBuf,
+    state: [u8; 32],
+    coalition: BTreeSet<(String, String, String)>,
+    protected: BTreeSet<(String, String, String)>,
+    rewrite: RewriteMode,
+    /// The locked nodes the completion releases, which change the commands it runs.
+    released: BTreeSet<(String, String)>,
 }
 
 /// How many rounds of newly named blockers one refused pin may release before it stays held.
@@ -1123,6 +1328,33 @@ fn widen_fingerprint(
     if !tracing::enabled!(tracing::Level::DEBUG) {
         return Ok(None);
     }
+    let JournaledDigests { manifests, lock } = journaled_digests(project, journal)?;
+    Ok(Some(WidenFingerprint {
+        manifests: format!("{:02x?}", manifests.finalize().as_slice()),
+        lock: format!("{:02x?}", lock.finalize().as_slice()),
+    }))
+}
+
+/// A digest of every journaled project file as it is on disk now.
+fn journaled_state(project: &Project, journal: &ProjectMutationJournal) -> Result<[u8; 32]> {
+    let JournaledDigests { manifests, lock } = journaled_digests(project, journal)?;
+    let mut state = Sha256::new();
+    state.update(manifests.finalize());
+    state.update(lock.finalize());
+    Ok(state.finalize().into())
+}
+
+struct JournaledDigests {
+    manifests: Sha256,
+    lock: Sha256,
+}
+
+/// The digests of the journaled manifests and of the lock, each over every file's path, presence
+/// and contents in path order.
+fn journaled_digests(
+    project: &Project,
+    journal: &ProjectMutationJournal,
+) -> Result<JournaledDigests> {
     let mut manifests = Sha256::new();
     let mut lock = Sha256::new();
     let mut files: Vec<_> = journal.files().iter().collect();
@@ -1147,10 +1379,7 @@ fn widen_fingerprint(
             hash.update(contents);
         }
     }
-    Ok(Some(WidenFingerprint {
-        manifests: format!("{:02x?}", manifests.finalize().as_slice()),
-        lock: format!("{:02x?}", lock.finalize().as_slice()),
-    }))
+    Ok(JournaledDigests { manifests, lock })
 }
 
 /// Rejects seeded slots that resolve to neither their original nor requested version.
@@ -1171,6 +1400,81 @@ fn seed_has_drive_by(before: &CargoLock, after: &CargoLock, moves: &[PlannedNode
             || (!after.has_crates_io_package(&planned.name, &planned.from)
                 && !after.has_crates_io_package(&planned.name, &planned.to))
     })
+}
+
+/// The planned, unreached changes of `plan` that would heal `split`: the move of the split crate
+/// itself, and the moves of the requirers still binding its old line, other than `coalition`'s.
+fn split_partners<'a>(
+    plan: &'a [Change],
+    lock: &CargoLock,
+    split: &SplitHeal,
+    coalition: &[&Change],
+) -> Vec<&'a Change> {
+    plan.iter()
+        .filter(|planned| {
+            !coalition.contains(planned)
+                && current_selector(lock, planned).is_some()
+                && (planned.package.name == split.name
+                    || split.retainers.iter().any(|retainer| {
+                        retainer.name == planned.package.name
+                            && retainer.version == planned.from.as_str()
+                    }))
+        })
+        .collect()
+}
+
+/// The candidates of a refused joint group the refusal names: those Cargo could not select, or
+/// failing any, those its explanation cites.
+fn refused_candidates<'a>(
+    candidates: &[&'a Change],
+    parties: &[ConflictParty],
+    chain: &BTreeSet<String>,
+) -> Vec<&'a Change> {
+    let party = |change: &&Change| {
+        parties
+            .iter()
+            .any(|party| party.name == change.package.name)
+    };
+    if candidates.iter().any(party) {
+        candidates.iter().copied().filter(party).collect()
+    } else {
+        candidates
+            .iter()
+            .copied()
+            .filter(|change| chain.contains(&change.package.name))
+            .collect()
+    }
+}
+
+/// The lock moves a seed of `changes` writes: every change whose target `lock` does not carry yet.
+fn seed_moves(lock: &CargoLock, changes: &[&Change]) -> Vec<PlannedNodeMove> {
+    changes
+        .iter()
+        .filter(|change| !lock.has_crates_io_package(&change.package.name, change.to.as_str()))
+        .map(|change| PlannedNodeMove {
+            name: change.package.name.clone(),
+            from: change.from.to_string(),
+            to: change.to.to_string(),
+        })
+        .collect()
+}
+
+/// Logs one per-change pin attempt with the inputs it was judged against.
+fn log_pin_attempt(
+    change: &Change,
+    fingerprint: Option<&WidenFingerprint>,
+    memo_hit: bool,
+    outcome: &str,
+) {
+    tracing::debug!(
+        change = ?rejection_key(change),
+        members = ?change.members,
+        manifest_hash = fingerprint.map(|hash| hash.manifests.as_str()),
+        lock_hash = fingerprint.map(|hash| hash.lock.as_str()),
+        memo_hit,
+        outcome,
+        "cargo per-change pin attempt"
+    );
 }
 
 fn seed_resolver_rejection(err: &CoreError) -> bool {
@@ -1372,6 +1676,16 @@ fn blocking_requirer(
     blocker.filter(|name| name != held)
 }
 
+/// Every package a resolver refusal's explanation cites, or none for any other failure.
+fn rejection_chain(error: &CoreError) -> BTreeSet<String> {
+    match error {
+        CoreError::Tool { stderr, .. } if memoizable_resolver_rejection(error) => {
+            crate::cargocmd::diagnostic_packages(stderr)
+        }
+        _ => BTreeSet::new(),
+    }
+}
+
 /// The parties of a resolver conflict `error` reports, or none for any other refusal.
 fn rejection_parties(error: &CoreError) -> Vec<ConflictParty> {
     match error {
@@ -1421,6 +1735,26 @@ fn conflicting_nodes(
 /// A planned crate reaches its own target through its own pin.
 /// A directly declared node is never moved outside the plan (see [`acceptance`]), so releasing
 /// one would only buy a landing the rule then refuses.
+/// The planned crates other than `change` among the conflict parties [`pin_blockers`] withholds
+/// because `batch` plans them.
+fn withheld_planned(
+    lock: &CargoLock,
+    change: &Change,
+    batch: &[&Change],
+    parties: &[ConflictParty],
+) -> BTreeSet<String> {
+    conflicting_nodes(lock, change, parties)
+        .into_iter()
+        .filter(|node| {
+            node.name != change.package.name
+                && batch
+                    .iter()
+                    .any(|planned| planned.package.name == node.name)
+        })
+        .map(|node| node.name)
+        .collect()
+}
+
 fn pin_blockers(
     lock: &CargoLock,
     baseline: &ResolveBaseline,
@@ -1467,7 +1801,19 @@ impl CargoTool {
         let Some(key) = key else {
             return Ok(None);
         };
-        let rejection = self.rejection_memo.get(key);
+        let mut rejection = self.rejection_memo.get(key);
+        if let Some(recalled) = &rejection
+            && !recalled.heals.is_empty()
+        {
+            let lock = read_lock(attempt.project)?;
+            if recalled
+                .heals
+                .iter()
+                .any(|heal| !split_partners(attempt.plan, &lock, heal, attempt.changes).is_empty())
+            {
+                rejection = None;
+            }
+        }
         if rejection.is_some() {
             stats.hits += 1;
         } else {
@@ -1482,14 +1828,20 @@ impl CargoTool {
         before: Option<MemoKey>,
         rejection: MemoRejection,
     ) -> Result<()> {
-        attempt.validate()?;
-        let Some(before) = before else {
-            return Ok(());
-        };
-        if self.rejection_memo_key(attempt)?.as_ref() == Some(&before) {
+        if let Some(before) = before
+            && self.inputs_restored(attempt, &before)?
+        {
             self.rejection_memo.insert(before, rejection);
         }
         Ok(())
+    }
+
+    /// Whether `attempt` left every native input as it found it, which is what makes its refusal
+    /// reusable: an input it changed and did not restore belongs to a state no later attempt starts
+    /// from.
+    fn inputs_restored(&self, attempt: &MemoAttempt<'_>, before: &MemoKey) -> Result<bool> {
+        attempt.validate()?;
+        Ok(self.rejection_memo_key(attempt)?.as_ref() == Some(before))
     }
 
     /// Revalidates `mutation` through whichever execution mode this platform selected.
@@ -1516,6 +1868,7 @@ impl CargoTool {
     /// jointly and replays partial landings with only their own edits.
     /// Targets still short get a tentative individual widen, kept when the re-pin lands and
     /// restored when it does not.
+    #[cfg(all(test, unix))]
     async fn whole_graph_resolve(
         &self,
         project: &Project,
@@ -1523,6 +1876,19 @@ impl CargoTool {
         journal: &ProjectMutationJournal,
         observer: Option<&dyn ApplyObserver>,
     ) -> Result<PinRejections> {
+        self.resolve_whole_graph(project, plan, journal, observer)
+            .await
+            .map(|resolved| resolved.rejections)
+    }
+
+    /// [`Self::whole_graph_resolve`], with what the resolve settled for attesting its holds.
+    async fn resolve_whole_graph(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        journal: &ProjectMutationJournal,
+        observer: Option<&dyn ApplyObserver>,
+    ) -> Result<WholeGraphResolve> {
         let counter = ResolveCounter {
             observer,
             invocations: AtomicUsize::new(0),
@@ -1534,6 +1900,7 @@ impl CargoTool {
         tracing::debug!(
             rounds = stats.rounds,
             joint_probes = stats.joint_probes,
+            joint_retries = stats.joint_retries,
             joint_full_successes = stats.joint_full_successes,
             partial_replays_kept = stats.partial_replays_kept,
             partial_replays_discarded = stats.partial_replays_discarded,
@@ -1554,8 +1921,14 @@ impl CargoTool {
         journal: &ProjectMutationJournal,
         observer: Option<&dyn ApplyObserver>,
         stats: &mut WholeGraphStats,
-    ) -> Result<PinRejections> {
+    ) -> Result<WholeGraphResolve> {
         let followers = self.pin_followers(project).await?;
+        self.forget_resolve_state(&project.root);
+        let start = self.landing_start(project, journal, &followers)?;
+        let warm = match &start {
+            Some(start) => self.warm_start(project, plan, journal, start)?,
+            None => None,
+        };
         // Widen the owning manifest constraints for all candidates up front under `Always`; under
         // `Auto`, widen only those whose own declared requirement would otherwise cap them below the
         // target (a cross-major bump). The pin itself follows.
@@ -1586,7 +1959,126 @@ impl CargoTool {
         )
         .await?;
         self.reconcile_projections(scope).await?;
-        Ok(rejections)
+        let mut unmoved = None;
+        if let Some(start) = start {
+            let files = self.remember_landing(project, plan, &start)?;
+            // A resolve that ended on its warm start's files landed nothing beyond it, so every
+            // refusal it met was met in that one state.
+            if files.is_some() && files == warm {
+                unmoved = Some(UnmovedResolve {
+                    key: start.key,
+                    lock: start.lock,
+                    files: files.unwrap_or_default(),
+                });
+            }
+        }
+        Ok(WholeGraphResolve {
+            rejections,
+            unmoved,
+        })
+    }
+
+    /// The key and files a whole-graph resolve starts from, when the run may reuse its landing.
+    fn landing_start(
+        &self,
+        project: &Project,
+        journal: &ProjectMutationJournal,
+        followers: &[MemberRef],
+    ) -> Result<Option<LandingStart>> {
+        // The landing key never recalls a rejection, so no plan guards it.
+        let attempt = MemoAttempt {
+            project,
+            plan: &[],
+            operation: MemoOperation::Landing,
+            metadata_mode: MemoMetadataMode::Skip,
+            changes: &[],
+            followers,
+            journal,
+        };
+        let Some(key) = self.rejection_memo_key(&attempt)? else {
+            return Ok(None);
+        };
+        let mut files = Vec::new();
+        for file in journal.files() {
+            let contents = match std::fs::read(project.root.join(file.path())) {
+                Ok(contents) => Some(contents),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(CoreError::from(error)),
+            };
+            files.push((file.path().to_path_buf(), contents));
+        }
+        Ok(Some(LandingStart {
+            key,
+            lock: read_lock(project)?,
+            files,
+        }))
+    }
+
+    /// Writes the landing of an earlier resolve that `plan` may start from, if one is recorded,
+    /// and returns its files.
+    fn warm_start(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        journal: &ProjectMutationJournal,
+        start: &LandingStart,
+    ) -> Result<Option<Vec<(Utf8PathBuf, String)>>> {
+        let Some(warm) = self.landings.recall(
+            &start.key,
+            &start.lock,
+            plan.rewrite,
+            &plan.changes,
+            journal,
+            &project.generated_members,
+        ) else {
+            return Ok(None);
+        };
+        for (path, contents) in &warm.files {
+            journal.validate_project(&project.root)?;
+            std::fs::write(project.root.join(path), contents)?;
+        }
+        tracing::debug!(
+            touched = warm.touched,
+            files = warm.files.len(),
+            "cargo whole graph resolve warm-started from an earlier landing"
+        );
+        Ok(Some(warm.files))
+    }
+
+    /// Records where the resolve that began at `start` ended, for later applies of the run, and
+    /// returns the files it changed, unless one is no longer text.
+    fn remember_landing(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        start: &LandingStart,
+    ) -> Result<Option<Vec<(Utf8PathBuf, String)>>> {
+        let mut files = Vec::new();
+        for (path, before) in &start.files {
+            let after = match std::fs::read(project.root.join(path)) {
+                Ok(contents) => Some(contents),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(CoreError::from(error)),
+            };
+            if after == *before {
+                continue;
+            }
+            // Only rewritten text files are replayed; a landing that removed or garbled one is
+            // not reused.
+            let Some(text) = after.and_then(|bytes| String::from_utf8(bytes).ok()) else {
+                return Ok(None);
+            };
+            files.push((path.clone(), text));
+        }
+        self.landings.remember(landing::Finished {
+            start: start.key.clone(),
+            rewrite: plan.rewrite,
+            plan: &plan.changes,
+            start_lock: &start.lock,
+            lock: read_lock(project)?,
+            files: files.clone(),
+        });
+        Ok(Some(files))
     }
 
     async fn widen_in_rounds(
@@ -1623,6 +2115,16 @@ impl CargoTool {
                 observer,
             )
             .await?;
+        let scope = WidenProbe {
+            project,
+            plan: &plan.changes,
+            rewrite: plan.rewrite,
+            candidates: &[],
+            protected: &[],
+            followers: &followers,
+            journal,
+            observer,
+        };
         // Carry post-command evidence between rounds; another unlocked preflight could displace it.
         let mut round = WidenRound::new(project, &plan.changes, graph)?;
         for _ in 0..plan.changes.len() {
@@ -1635,21 +2137,21 @@ impl CargoTool {
                 break;
             }
             stats.rounds += 1;
-            let retained = self
-                .joint_widen_probe(
+            // A lone candidate gains nothing from a joint probe: its own tentative widen below
+            // widens, pins and resolves it alone.
+            let retained = if candidates.len() > 1 {
+                self.joint_widen_probe(
                     WidenProbe {
-                        project,
-                        plan: &plan.changes,
-                        rewrite: plan.rewrite,
                         candidates: &candidates,
                         protected: &round.protected,
-                        followers: &followers,
-                        journal,
-                        observer,
+                        ..scope
                     },
                     stats,
                 )
-                .await?;
+                .await?
+            } else {
+                None
+            };
             let mut progressed = retained.is_some();
             if let Some(retained) = retained {
                 round.accept(retained, &plan.changes);
@@ -1663,14 +2165,9 @@ impl CargoTool {
                 let attempt = self
                     .tentative_widen_logged(
                         WidenProbe {
-                            project,
-                            plan: &plan.changes,
-                            rewrite: plan.rewrite,
                             candidates: &candidates,
                             protected: &round.protected,
-                            followers: &followers,
-                            journal,
-                            observer,
+                            ..scope
                         },
                         change,
                         rejections,
@@ -1692,14 +2189,9 @@ impl CargoTool {
                 && let Some(evidence) = self
                     .pin_unwidened_protected(
                         WidenProbe {
-                            project,
-                            plan: &plan.changes,
-                            rewrite: plan.rewrite,
                             candidates: &candidates,
                             protected: &round.protected,
-                            followers: &followers,
-                            journal,
-                            observer,
+                            ..scope
                         },
                         &unwidened_short,
                         rejections,
@@ -1747,7 +2239,45 @@ impl CargoTool {
         let owners: Vec<_> = candidates.iter().chain(probe.protected).copied().collect();
         let checkpoint = widen_checkpoint(probe.project, &owners, probe.followers)?;
         stats.joint_probes += 1;
-        let resolved = self.resolve_widened_group(&probe, &candidates).await?;
+        // One candidate Cargo cannot select (a target that dropped a feature a member enables)
+        // refuses the whole group, so retry without the candidates the refusal names before
+        // leaving every candidate to its own per-change attempt.
+        // Cargo names the package it could not select, which may be a dependency of the widened
+        // candidate (a `links` clash of its new `-sys` crate); the candidate then appears only
+        // further up the explanation's chain.
+        // A candidate dropped wrongly only falls back to its own attempt.
+        // Each retry drops at least one candidate, which bounds the loop by the group size.
+        let resolved = loop {
+            match self.resolve_widened_group(&probe, &candidates, &[]).await? {
+                GroupResolve::Resolved(evidence) => break Some(*evidence),
+                GroupResolve::Discarded => break None,
+                outcome @ (GroupResolve::Refused { .. } | GroupResolve::Violated(_)) => {
+                    let dropped = match outcome {
+                        GroupResolve::Refused { parties, chain } => {
+                            refused_candidates(&candidates, &parties, &chain)
+                        }
+                        // A violation that names the planned crates whose own moves broke the
+                        // rule retries without them like a refusal naming them.
+                        GroupResolve::Violated(violation) => violation
+                            .split_culprits(&candidates)
+                            .map(|split| split.named)
+                            .unwrap_or_default(),
+                        GroupResolve::Resolved(_) | GroupResolve::Discarded => Vec::new(),
+                    };
+                    if dropped.is_empty() || dropped.len() == candidates.len() {
+                        break None;
+                    }
+                    restore_widen_checkpoint(probe.project, probe.journal, &checkpoint)?;
+                    candidates.retain(|change| !dropped.contains(change));
+                    stats.joint_retries += 1;
+                    tracing::debug!(
+                        dropped = ?dropped.iter().map(|change| change.package.name.as_str()).collect::<Vec<_>>(),
+                        remaining = candidates.len(),
+                        "retrying cargo joint widen without the refused candidates"
+                    );
+                }
+            }
+        };
         let reached: Vec<_> = resolved
             .as_ref()
             .map(|resolved| {
@@ -1758,12 +2288,27 @@ impl CargoTool {
                     .collect()
             })
             .unwrap_or_default();
+        let displaced: Vec<_> = resolved
+            .as_ref()
+            .map(|resolved| {
+                probe
+                    .protected
+                    .iter()
+                    .filter(|change| !resolved.reached(change))
+                    .map(|change| change.package.name.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        tracing::debug!(
+            resolved = resolved.is_some(),
+            candidates = candidates.len(),
+            reached = reached.len(),
+            ?displaced,
+            "cargo joint widen probe finished"
+        );
         if let Some(resolved) = resolved
             && reached.len() == candidates.len()
-            && probe
-                .protected
-                .iter()
-                .all(|change| resolved.reached(change))
+            && displaced.is_empty()
         {
             stats.joint_full_successes += 1;
             return Ok(Some(resolved));
@@ -1774,7 +2319,10 @@ impl CargoTool {
         }
         // Evidence from the full probe cannot authorize A without the failed B's edits.
         // Rebuild the subset from the checkpoint and resolve exactly those edits again.
-        let replayed = self.resolve_widened_group(&probe, &reached).await?;
+        let replayed = self
+            .resolve_widened_group(&probe, &reached, &[])
+            .await?
+            .into_evidence();
         if let Some(replayed) = replayed
             && reached.iter().all(|change| replayed.reached(change))
             && probe
@@ -1790,11 +2338,14 @@ impl CargoTool {
         Ok(None)
     }
 
+    /// Widens and seeds `candidates` together and resolves them in one step, also releasing the
+    /// locked nodes `released` names so they may move wherever the candidates need them.
     async fn resolve_widened_group(
         &self,
         probe: &WidenProbe<'_>,
         candidates: &[&Change],
-    ) -> Result<Option<WidenEvidence>> {
+        released: &[PackageKey],
+    ) -> Result<GroupResolve> {
         let baseline =
             ResolveBaseline::capture(&read_lock(probe.project)?, &probe.project.generated_members);
         let mut edited = 0;
@@ -1833,7 +2384,7 @@ impl CargoTool {
             .collect();
         if !moves.is_empty() {
             let Some(seeded) = rewrite_planned_nodes(&lock_text, &moves) else {
-                return Ok(None);
+                return Ok(GroupResolve::Discarded);
             };
             probe.journal.validate_project(&probe.project.root)?;
             std::fs::write(&lock_path, seeded)?;
@@ -1841,6 +2392,25 @@ impl CargoTool {
         probe.journal.validate_project(&probe.project.root)?;
         if let Some(observer) = probe.observer {
             observer.resolver_started(candidates.first().copied());
+        }
+        // A metadata resolve keeps every locked version its requirements admit, so a blocker the
+        // candidates conflict with is released by name first.
+        if !released.is_empty() {
+            let unlocked = self
+                .cargo
+                .update_unlocking(&probe.project.root, released)
+                .await;
+            probe.journal.validate_project(&probe.project.root)?;
+            match unlocked {
+                Ok(()) => {}
+                Err(err) if seed_resolver_rejection(&err) => {
+                    return Ok(GroupResolve::Refused {
+                        parties: rejection_parties(&err),
+                        chain: rejection_chain(&err),
+                    });
+                }
+                Err(err) => return Err(err),
+            }
         }
         let resolved = self
             .cargo
@@ -1850,22 +2420,133 @@ impl CargoTool {
         probe.journal.validate_project(&probe.project.root)?;
         let graph = match resolved {
             Ok(graph) => graph,
-            Err(err) if seed_resolver_rejection(&err) => return Ok(None),
+            Err(err) if seed_resolver_rejection(&err) => {
+                return Ok(GroupResolve::Refused {
+                    parties: rejection_parties(&err),
+                    chain: rejection_chain(&err),
+                });
+            }
             Err(err) => return Err(err),
         };
         // No follower edit follows this call: the graph and lock describe the retained manifests.
         let lock = read_lock(probe.project)?;
         if seed_has_drive_by(&before, &lock, &moves) {
-            return Ok(None);
+            tracing::debug!("cargo joint widen moved a seeded package to an unplanned version");
+            return Ok(GroupResolve::Discarded);
         }
         if let Some(violation) = probe.violation(&baseline, &lock) {
             tracing::debug!(%violation, "cargo joint widen broke the acceptance rule");
-            return Ok(None);
+            return Ok(GroupResolve::Violated(violation));
         }
-        Ok(Some(WidenEvidence {
+        Ok(GroupResolve::Resolved(Box::new(WidenEvidence {
             versions: lock.crates_io_locked_versions(),
             graph: Some(graph),
-        }))
+        })))
+    }
+
+    /// Lands `change`, whose own step split a declared crate, together with the planned moves
+    /// that heal the split, as one atomic step.
+    ///
+    /// The partners are the planned, unreached moves of the split crate itself and of the
+    /// requirers still binding its old line; a step that splits again names further partners.
+    /// Each round adds at least one planned change to the coalition, so the plan's size bounds
+    /// the rounds.
+    /// The step releases `released` too, the blockers `change`'s own step had to release.
+    /// It is kept only when every partner reaches its exact target and the step keeps the
+    /// [acceptance rule](acceptance); otherwise the files are restored byte for byte.
+    async fn complete_split(
+        &self,
+        probe: &WidenProbe<'_>,
+        change: &Change,
+        heal: SplitHeal,
+        released: &[PackageKey],
+    ) -> Result<SplitCompletion> {
+        let start = journaled_state(probe.project, probe.journal)?;
+        let completion_key = |coalition: &[&Change]| CompletionKey {
+            root: probe.project.root.clone(),
+            state: start,
+            coalition: coalition
+                .iter()
+                .map(|change| rejection_key(change))
+                .collect(),
+            protected: probe
+                .protected
+                .iter()
+                .map(|change| rejection_key(change))
+                .collect(),
+            rewrite: probe.rewrite,
+            released: released
+                .iter()
+                .map(|node| (node.name.clone(), node.version.clone()))
+                .collect(),
+        };
+        let mut coalition = vec![change];
+        let mut split = heal;
+        let mut tried = Vec::new();
+        for _ in 0..probe.plan.len() {
+            let partners =
+                split_partners(probe.plan, &read_lock(probe.project)?, &split, &coalition);
+            if partners.is_empty() {
+                break;
+            }
+            coalition.extend(partners);
+            let key = completion_key(&coalition);
+            if self.completion_failed(&key) {
+                break;
+            }
+            tried.push(key);
+            let owners: Vec<&Change> = coalition.iter().chain(probe.protected).copied().collect();
+            let checkpoint = widen_checkpoint(probe.project, &owners, probe.followers)?;
+            let outcome = self
+                .resolve_widened_group(probe, &coalition, released)
+                .await?;
+            tracing::debug!(
+                change = ?rejection_key(change),
+                coalition = ?coalition.iter().map(|change| rejection_key(change)).collect::<Vec<_>>(),
+                landed = matches!(outcome, GroupResolve::Resolved(_)),
+                "cargo split completion attempt"
+            );
+            match outcome {
+                GroupResolve::Resolved(evidence)
+                    if coalition
+                        .iter()
+                        .chain(probe.protected)
+                        .all(|change| evidence.reached(change)) =>
+                {
+                    return Ok(SplitCompletion::Landed(evidence));
+                }
+                GroupResolve::Violated(violation) => {
+                    restore_widen_checkpoint(probe.project, probe.journal, &checkpoint)?;
+                    let Some(next) = violation.heal() else {
+                        break;
+                    };
+                    split = next;
+                }
+                GroupResolve::Resolved(_)
+                | GroupResolve::Refused { .. }
+                | GroupResolve::Discarded => {
+                    restore_widen_checkpoint(probe.project, probe.journal, &checkpoint)?;
+                    break;
+                }
+            }
+        }
+        if coalition.len() == 1 {
+            return Ok(SplitCompletion::Unhealable);
+        }
+        self.failed_completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(tried);
+        Ok(SplitCompletion::Refused)
+    }
+
+    /// Whether a completion of the same coalition from the same files already failed in this
+    /// resolve.
+    fn completion_failed(&self, key: &CompletionKey) -> bool {
+        self.failed_completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(key)
     }
 
     async fn tentative_widen_logged(
@@ -1878,6 +2559,7 @@ impl CargoTool {
         let changes = [change];
         let memo_attempt = MemoAttempt {
             project: probe.project,
+            plan: probe.plan,
             operation: MemoOperation::Widen,
             metadata_mode: probe.metadata_mode(),
             changes: &changes,
@@ -1907,6 +2589,7 @@ impl CargoTool {
                     key,
                     MemoRejection {
                         effects: pins.rejection_effects,
+                        heals: pins.heals,
                     },
                 )?;
             }
@@ -1927,6 +2610,57 @@ impl CargoTool {
             "cargo per-change widen attempt"
         );
         attempt
+    }
+
+    /// Refuses `change`'s widen, whose step broke the [acceptance rule](acceptance) with
+    /// `violation`, unless the step lands together with the planned moves that heal its split.
+    async fn settle_widen_violation(
+        &self,
+        probe: &WidenProbe<'_>,
+        change: &Change,
+        violation: &Violation,
+        checkpoint: &ProjectMutationJournal,
+        rejections: &mut PinRejections,
+        stats: &mut PinBatchStats,
+    ) -> Result<TentativeWiden> {
+        self.note_refusal_constraints(
+            &probe.project.root,
+            change,
+            violation.planned_constraint(change).map(str::to_owned),
+        );
+        let effect = RejectionEffect {
+            key: rejection_key(change),
+            detail: violation.to_string(),
+            overwrite: false,
+        };
+        MemoRejection {
+            effects: vec![effect.clone()],
+            heals: Vec::new(),
+        }
+        .apply(rejections);
+        stats.rejection_effects.push(effect);
+        restore_widen_checkpoint(probe.project, probe.journal, checkpoint)?;
+        let heal = violation.heal();
+        let completion = match heal.clone() {
+            Some(heal) => self.complete_split(probe, change, heal, &[]).await?,
+            None => SplitCompletion::Refused,
+        };
+        match (completion, heal) {
+            (SplitCompletion::Landed(evidence), _) => {
+                return Ok(TentativeWiden::Landed(evidence));
+            }
+            // A split refuses the step under every plan, and only a planned move can heal
+            // it, so the refusal stands wherever the plan carries none.
+            (SplitCompletion::Unhealable, Some(heal)) => {
+                stats.record_rejection(true);
+                stats.heals.push(heal);
+            }
+            // Any other verdict depends on the plan, which the memo key omits.
+            (SplitCompletion::Unhealable | SplitCompletion::Refused, _) => {
+                stats.memo_disqualified = true;
+            }
+        }
+        Ok(TentativeWiden::Rejected)
     }
 
     async fn tentative_widen(
@@ -1982,6 +2716,7 @@ impl CargoTool {
                         };
                         MemoRejection {
                             effects: vec![effect.clone()],
+                            heals: Vec::new(),
                         }
                         .apply(rejections);
                         stats.rejection_effects.push(effect);
@@ -1997,20 +2732,9 @@ impl CargoTool {
         };
         let lock = read_lock(probe.project)?;
         if let Some(violation) = probe.violation(&baseline, &lock) {
-            // The verdict depends on the plan, which the memo key omits.
-            stats.memo_disqualified = true;
-            let effect = RejectionEffect {
-                key: rejection_key(change),
-                detail: violation.to_string(),
-                overwrite: false,
-            };
-            MemoRejection {
-                effects: vec![effect.clone()],
-            }
-            .apply(rejections);
-            stats.rejection_effects.push(effect);
-            restore_widen_checkpoint(probe.project, probe.journal, checkpoint)?;
-            return Ok(TentativeWiden::Rejected);
+            return self
+                .settle_widen_violation(&probe, change, &violation, checkpoint, rejections, stats)
+                .await;
         }
         let evidence = WidenEvidence {
             versions: lock.crates_io_locked_versions(),
@@ -2244,7 +2968,7 @@ impl CargoTool {
             )
             .await;
         memo_stats.include(&stats.memo);
-        let Some(seeded) = seeded? else {
+        let Some(seeded) = seeded?.into_landed() else {
             return Ok(());
         };
         // All-or-nothing: the seed removed every `from` node, so a member the reconcile did NOT
@@ -2278,14 +3002,14 @@ impl CargoTool {
         journal: &ProjectMutationJournal,
         notification: Option<(&dyn ApplyObserver, &Change)>,
         stats: &mut PinBatchStats,
-    ) -> Result<Option<SeededResolve>> {
+    ) -> Result<SeedOutcome> {
         let moves = group.moves;
         let lock_path = project.root.join("Cargo.lock");
         let lock_text = std::fs::read_to_string(&lock_path)?;
         let before = CargoLock::parse(&lock_text)?;
         let baseline = ResolveBaseline::capture(&before, &project.generated_members);
         let Some(seeded) = rewrite_planned_nodes(&lock_text, moves) else {
-            return Ok(None);
+            return Ok(SeedOutcome::Refused);
         };
         // The generated projections follow the seeded moves as they follow a pin: a projection
         // still demanding a seeded node's old version would reject the joint resolve for the
@@ -2294,6 +3018,7 @@ impl CargoTool {
         let followers = self.pin_followers(project).await?;
         let memo_attempt = MemoAttempt {
             project,
+            plan: group.plan,
             operation: MemoOperation::Seed,
             metadata_mode: MemoMetadataMode::Resolve,
             changes: group.changes,
@@ -2306,7 +3031,7 @@ impl CargoTool {
             .is_some()
         {
             stats.resolver_rejected = true;
-            return Ok(None);
+            return Ok(SeedOutcome::Refused);
         }
         let snapshot = widen_snapshot(&project.root, &[], &followers)?;
         journal.validate_project(&project.root)?;
@@ -2347,10 +3072,10 @@ impl CargoTool {
                     // The verdict depends on the plan, which the memo key omits.
                     stats.memo_disqualified = true;
                     restore_widen_snapshot(&project.root, &snapshot, journal)?;
-                    return Ok(None);
+                    return Ok(SeedOutcome::Violated(violation));
                 }
                 replay_seeded_follows(&project.root, &snapshot, &followers, moves, &after)?;
-                Ok(Some(SeededResolve {
+                Ok(SeedOutcome::Landed(SeededResolve {
                     before,
                     after,
                     snapshot,
@@ -2364,7 +3089,7 @@ impl CargoTool {
                         self.remember_rejection(&memo_attempt, key, MemoRejection::default())?;
                     }
                     // A group rejection cannot explain any one candidate's refusal.
-                    Ok(None)
+                    Ok(SeedOutcome::Refused)
                 } else {
                     Err(err)
                 }
@@ -2523,17 +3248,7 @@ impl CargoTool {
                 continue;
             }
             let lock = read_lock(project)?;
-            let moves: Vec<PlannedNodeMove> = unlanded
-                .iter()
-                .filter(|change| {
-                    !lock.has_crates_io_package(&change.package.name, change.to.as_str())
-                })
-                .map(|change| PlannedNodeMove {
-                    name: change.package.name.clone(),
-                    from: change.from.to_string(),
-                    to: change.to.to_string(),
-                })
-                .collect();
+            let moves = seed_moves(&lock, &unlanded);
             // Seeding an already present target would create duplicate lock blocks, and a precise
             // pin can still converge the original source copy into that target.
             // A lone change gains nothing from a seed either: the precise pin is one resolve too,
@@ -2548,7 +3263,7 @@ impl CargoTool {
                 continue;
             }
             let notification = observer.zip(unlanded.first().copied());
-            if let Some(seeded) = self
+            let seeded = match self
                 .seed_resolve(
                     project,
                     SeedGroup {
@@ -2562,6 +3277,22 @@ impl CargoTool {
                 )
                 .await?
             {
+                SeedOutcome::Landed(seeded) => Some(seeded),
+                // The changes the violation names go on alone, and the rest seed again together,
+                // instead of halving a large group until the culprit is alone.
+                SeedOutcome::Violated(violation) => {
+                    if let Some(CulpritSplit { named, rest }) = violation.split_culprits(&unlanded)
+                    {
+                        stats.bisected += 1;
+                        groups.push(rest);
+                        groups.extend(named.into_iter().map(|change| vec![change]));
+                        continue;
+                    }
+                    None
+                }
+                SeedOutcome::Refused => None,
+            };
+            if let Some(seeded) = seeded {
                 if seed_has_drive_by(&seeded.before, &seeded.after, &moves) {
                     tracing::debug!(group = moves.len(), "restoring cargo seed after a drive-by");
                     restore_widen_snapshot(&project.root, &seeded.snapshot, journal)?;
@@ -2653,6 +3384,7 @@ impl CargoTool {
                 let changes = [*change];
                 let memo_attempt = MemoAttempt {
                     project,
+                    plan: pass.scope.plan,
                     operation: MemoOperation::Precise,
                     metadata_mode: MemoMetadataMode::Skip,
                     changes: &changes,
@@ -2661,20 +3393,12 @@ impl CargoTool {
                 };
                 let key = self.rejection_memo_key(&memo_attempt)?;
                 let fingerprint = widen_fingerprint(project, journal)?;
-                if let Some(recalled) =
+                if let Some(rejection) =
                     self.recall_rejection(&memo_attempt, key.as_ref(), &mut stats.memo)?
                 {
-                    stats.record_effects(&recalled, rejections);
+                    stats.record_effects(&rejection, rejections);
                     stats.resolver_rejected = true;
-                    tracing::debug!(
-                        change = ?rejection_key(change),
-                        members = ?change.members,
-                        manifest_hash = fingerprint.as_ref().map(|hash| hash.manifests.as_str()),
-                        lock_hash = fingerprint.as_ref().map(|hash| hash.lock.as_str()),
-                        memo_hit = true,
-                        outcome = "rejected",
-                        "cargo per-change pin attempt"
-                    );
+                    log_pin_attempt(change, fingerprint.as_ref(), true, "rejected");
                     continue;
                 }
                 if let Some(observer) = observer {
@@ -2685,28 +3409,19 @@ impl CargoTool {
                 let updated = self.update_precise(pass.scope, change, &current).await;
                 let validated = journal.validate_project(&project.root);
                 stats.memo_disqualified |= updated.is_err() || validated.is_err();
-                tracing::debug!(
-                    change = ?rejection_key(change),
-                    members = ?change.members,
-                    manifest_hash = fingerprint.as_ref().map(|hash| hash.manifests.as_str()),
-                    lock_hash = fingerprint.as_ref().map(|hash| hash.lock.as_str()),
-                    memo_hit = false,
-                    outcome = if validated.is_err() {
-                        "topology-error"
-                    } else {
-                        match &updated {
-                            Ok(PrecisePinOutcome::Rejected { .. }) => "rejected",
-                            Ok(PrecisePinOutcome::Completed) => "completed",
-                            Err(_) => "error",
-                        }
-                    },
-                    "cargo per-change pin attempt"
-                );
+                let outcome = match (&validated, &updated) {
+                    (Err(_), _) => "topology-error",
+                    (Ok(()), Ok(PrecisePinOutcome::Rejected { .. })) => "rejected",
+                    (Ok(()), Ok(PrecisePinOutcome::Completed)) => "completed",
+                    (Ok(()), Err(_)) => "error",
+                };
+                log_pin_attempt(change, fingerprint.as_ref(), false, outcome);
                 validated?;
                 if let PrecisePinOutcome::Rejected {
                     detail,
                     resolver_rejection,
                     parties,
+                    split,
                 } = updated?
                 {
                     let refused = RefusedPin {
@@ -2715,6 +3430,7 @@ impl CargoTool {
                         detail,
                         resolver_rejection,
                         parties,
+                        split,
                     };
                     self.settle_refused_pin(pass, refused, &memo_attempt, key, rejections, stats)
                         .await?;
@@ -2739,8 +3455,46 @@ impl CargoTool {
         rejections: &mut PinRejections,
         stats: &mut PinBatchStats,
     ) -> Result<()> {
-        if self.pin_unlocking_blockers(pass, &refused, stats).await? {
-            return Ok(());
+        let unlocking = self.pin_unlocking_blockers(pass, &refused, stats).await?;
+        let split = match unlocking {
+            Unlocking::Landed => return Ok(()),
+            Unlocking::Refused(Some(split)) => Some(split),
+            Unlocking::Refused(None) | Unlocking::NothingToRelease => {
+                refused.split.clone().map(|heal| UnlockedSplit {
+                    heal,
+                    released: Vec::new(),
+                })
+            }
+        };
+        let mut unhealable = None;
+        if let Some(UnlockedSplit { heal, released }) = split {
+            let PinScope {
+                project,
+                plan,
+                journal,
+                observer,
+            } = pass.scope;
+            let followers = self.pin_followers(project).await?;
+            // Requirements a split can heal through are widened already under `Always`, and are
+            // widened here only where they do not admit the target.
+            let probe = WidenProbe {
+                project,
+                plan,
+                rewrite: RewriteMode::Auto,
+                candidates: &[],
+                protected: &[],
+                followers: &followers,
+                journal,
+                observer,
+            };
+            match self
+                .complete_split(&probe, refused.change, heal.clone(), &released)
+                .await?
+            {
+                SplitCompletion::Landed(_) => return Ok(()),
+                SplitCompletion::Unhealable if released.is_empty() => unhealable = Some(heal),
+                SplitCompletion::Unhealable | SplitCompletion::Refused => {}
+            }
         }
         let RefusedPin {
             change,
@@ -2756,15 +3510,53 @@ impl CargoTool {
                 overwrite: true,
             })
             .collect();
-        let rejection = MemoRejection { effects };
+        // A split the pin's own landing caused refuses it under every plan, and only a planned
+        // move can heal it, so the refusal stands wherever the plan carries none.
+        let memoizable = resolver_rejection || unhealable.is_some();
+        let rejection = MemoRejection {
+            effects,
+            heals: unhealable.into_iter().collect(),
+        };
         // Last rejection wins; a candidate a later pass still lands never reads its
         // stale entry (details are consulted only for unreached candidates).
         stats.record_effects(&rejection, rejections);
-        stats.record_rejection(resolver_rejection);
-        if stats.memoizable_rejection() && resolver_rejection {
+        stats.record_rejection(memoizable);
+        if stats.memoizable_rejection() && memoizable {
             self.remember_rejection(memo_attempt, key, rejection)?;
         }
         Ok(())
+    }
+
+    /// Starts a resolve of `root` with no refusal constraints or failed split completions
+    /// recorded, since both depend on the plan.
+    fn forget_resolve_state(&self, root: &Utf8Path) {
+        self.refusal_constraints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(constrained, _), _| constrained != root);
+        self.failed_completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|completion| completion.root != root);
+    }
+
+    /// Records the other planned crates `change`'s refusal in `root` depended on.
+    fn note_refusal_constraints(
+        &self,
+        root: &Utf8Path,
+        change: &Change,
+        names: impl IntoIterator<Item = String>,
+    ) {
+        let mut names = names.into_iter().peekable();
+        if names.peek().is_none() {
+            return;
+        }
+        self.refusal_constraints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry((root.to_path_buf(), rejection_key(change)))
+            .or_default()
+            .extend(names);
     }
 
     /// Retries a refused precise pin with the locked nodes Cargo blamed released beside it, so a
@@ -2778,36 +3570,39 @@ impl CargoTool {
     /// [acceptance rule](acceptance); otherwise the lock is restored byte for byte.
     /// The released nodes may move anywhere their requirements admit: the apply reports them as
     /// collateral rows, and the executor's transitive gate matures any that floated too fresh.
-    /// Returns whether the pin landed.
+    /// Returns whether the pin landed, or that the refusal named nothing to release.
     async fn pin_unlocking_blockers(
         &self,
         pass: PinPass<'_>,
         refused: &RefusedPin<'_>,
         stats: &mut PinBatchStats,
-    ) -> Result<bool> {
+    ) -> Result<Unlocking> {
         let PinPass { scope, batch } = pass;
         let PinScope {
             project,
-            plan,
             journal,
             observer,
+            ..
         } = scope;
         let RefusedPin {
             change, current, ..
         } = *refused;
-        let lock_path = project.root.join("Cargo.lock");
-        let before_text = std::fs::read_to_string(&lock_path)?;
+        let before_text = std::fs::read_to_string(project.root.join("Cargo.lock"))?;
         let before = CargoLock::parse(&before_text)?;
         // Which conflict parties may be released depends on the batch, which the memo key omits,
         // so a refusal naming any is not remembered even when this batch releases none of them.
         if !conflicting_nodes(&before, change, &refused.parties).is_empty() {
             stats.memo_disqualified = true;
         }
-        let generated = &project.generated_members;
-        let baseline = ResolveBaseline::capture(&before, generated);
+        let baseline = ResolveBaseline::capture(&before, &project.generated_members);
+        self.note_refusal_constraints(
+            &project.root,
+            change,
+            withheld_planned(&before, change, batch, &refused.parties),
+        );
         let mut blockers = pin_blockers(&before, &baseline, change, batch, &refused.parties);
         if blockers.is_empty() {
-            return Ok(false);
+            return Ok(Unlocking::NothingToRelease);
         }
         let mut released: Vec<PackageKey> = Vec::new();
         for _ in 0..PIN_BLOCKER_ROUNDS {
@@ -2835,27 +3630,23 @@ impl CargoTool {
             journal.validate_project(&project.root)?;
             match updated {
                 Ok(()) => {
-                    let after = read_lock(project)?;
-                    let violation = baseline.violation(&after, generated, plan);
-                    let kept =
-                        reached(&after.crates_io_locked_versions(), change) && violation.is_none();
-                    tracing::debug!(
-                        change = ?rejection_key(change),
-                        released = ?released,
-                        kept,
-                        violation = violation.as_ref().map(ToString::to_string),
-                        "cargo unlocking pin attempt"
-                    );
-                    if !kept {
-                        journal.validate_project(&project.root)?;
-                        std::fs::write(&lock_path, &before_text)?;
-                    }
-                    return Ok(kept);
+                    let unlocked = UnlockedPin {
+                        change,
+                        baseline: &baseline,
+                        before_text: &before_text,
+                        released: &released,
+                    };
+                    return self.judge_unlocked_pin(scope, &unlocked);
                 }
                 Err(err) if err.is_local_environment_failure() => return Err(err),
                 Err(err) => {
-                    blockers =
-                        pin_blockers(&before, &baseline, change, batch, &rejection_parties(&err));
+                    let parties = rejection_parties(&err);
+                    self.note_refusal_constraints(
+                        &project.root,
+                        change,
+                        withheld_planned(&before, change, batch, &parties),
+                    );
+                    blockers = pin_blockers(&before, &baseline, change, batch, &parties);
                 }
             }
         }
@@ -2864,7 +3655,60 @@ impl CargoTool {
             released = ?released,
             "cargo unlocking pin refused"
         );
-        Ok(false)
+        Ok(Unlocking::Refused(None))
+    }
+
+    /// Keeps an unlocking pin that reached its target within the [acceptance rule](acceptance),
+    /// and otherwise restores the lock it started from.
+    fn judge_unlocked_pin(
+        &self,
+        scope: PinScope<'_>,
+        unlocked: &UnlockedPin<'_>,
+    ) -> Result<Unlocking> {
+        let PinScope {
+            project,
+            plan,
+            journal,
+            ..
+        } = scope;
+        let UnlockedPin {
+            change,
+            baseline,
+            before_text,
+            released,
+        } = *unlocked;
+        let after = read_lock(project)?;
+        let violation = baseline.violation(&after, &project.generated_members, plan);
+        let kept = reached(&after.crates_io_locked_versions(), change) && violation.is_none();
+        tracing::debug!(
+            change = ?rejection_key(change),
+            released = ?released,
+            kept,
+            violation = violation.as_ref().map(ToString::to_string),
+            "cargo unlocking pin attempt"
+        );
+        if kept {
+            return Ok(Unlocking::Landed);
+        }
+        self.note_refusal_constraints(
+            &project.root,
+            change,
+            violation
+                .as_ref()
+                .and_then(|violation| violation.planned_constraint(change))
+                .map(str::to_owned),
+        );
+        journal.validate_project(&project.root)?;
+        std::fs::write(project.root.join("Cargo.lock"), before_text)?;
+        Ok(Unlocking::Refused(
+            violation
+                .as_ref()
+                .and_then(Violation::heal)
+                .map(|heal| UnlockedSplit {
+                    heal,
+                    released: released.to_vec(),
+                }),
+        ))
     }
 
     /// Issues one tolerant precise pin, separating resolver rejection from local breakage.
@@ -2930,11 +3774,19 @@ impl CargoTool {
                     %violation,
                     "restoring a cargo pin that broke the acceptance rule"
                 );
+                self.note_refusal_constraints(
+                    &project.root,
+                    change,
+                    violation.planned_constraint(change).map(str::to_owned),
+                );
                 restore()?;
                 Ok(PrecisePinOutcome::Rejected {
                     detail: Some(violation.to_string()),
+                    // The verdict depends on the plan, which the memo key omits: a split may land
+                    // beside the planned moves that heal it.
                     resolver_rejection: false,
                     parties: Vec::new(),
+                    split: violation.heal(),
                 })
             }
             Err(err) if err.is_local_environment_failure() => Err(err),
@@ -2945,6 +3797,7 @@ impl CargoTool {
                     resolver_rejection: memoizable_resolver_rejection(&err),
                     detail: summarize_pin_rejection(&err),
                     parties: rejection_parties(&err),
+                    split: None,
                 })
             }
         }
@@ -3003,23 +3856,20 @@ impl CargoTool {
         // A missing or unparsable snapshot leaves `before` empty.
         // Planned target reporting still uses the resolved result, but collateral comparison then
         // has no baseline.
-        let before_lock = journal
-            .files()
-            .iter()
-            .find(|file| file.path() == Utf8Path::new("Cargo.lock"))
-            .and_then(ProjectMutationFile::contents)
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .and_then(|content| CargoLock::parse(content).ok());
+        let before_lock = journaled_lock(journal);
 
         // The whole graph is re-resolved as one logical batch, trying seeded targets before the
         // precise-pin fixed point for failed leaves and unlanded targets.
         // The diff below surfaces every paired version-slot move.
         let pin_phase = std::time::Instant::now();
-        let pin_rejections = match self
-            .whole_graph_resolve(project, plan, journal, observer)
+        let WholeGraphResolve {
+            rejections: pin_rejections,
+            unmoved,
+        } = match self
+            .resolve_whole_graph(project, plan, journal, observer)
             .await
         {
-            Ok(rejections) => rejections,
+            Ok(resolved) => resolved,
             Err(err) if err.is_tool_spawn_failure() => return Err(err),
             // The joint resolve is unsatisfiable as a whole (a `=`-pin conflict or an unfetchable
             // version). Propagate so the caller's `apply_resilient` can isolate the offending
@@ -3071,7 +3921,7 @@ impl CargoTool {
         let edge_phase = std::time::Instant::now();
         let generated = self.generated_facts(project, observer).await?;
         let enforced = edges::enforce::enforce(
-            &self.cargo,
+            self.locked_reader(),
             project,
             plan.edge_policy,
             before_lock.as_ref(),
@@ -3107,6 +3957,8 @@ impl CargoTool {
             &pin_rejections,
             &mut report,
         );
+        report.independent_holds =
+            self.independent_holds(project, plan, journal, unmoved.as_ref(), &report);
 
         add_collateral_changes(
             before_lock.as_ref(),
@@ -3118,6 +3970,76 @@ impl CargoTool {
         let followers = self.generated_facts(project, observer).await?;
         report.followed_manifests = followed_manifests(project, &followers.members, journal)?;
         Ok(report)
+    }
+
+    /// The skipped changes of `report` its apply would skip again in a plan of exactly its applied
+    /// planned changes plus that change (see [`ApplyReport::independent_holds`]).
+    ///
+    /// The resolve landed nothing beyond its warm start, so every refusal it met was met in that
+    /// state, and the narrower plan starts from the same state when the landing memo returns it
+    /// for that plan.
+    /// Each lone step of a held change there meets the same refusal unless that refusal hinged on
+    /// another planned crate the narrower plan no longer carries.
+    /// A resolve without `unmoved` evidence attests nothing.
+    fn independent_holds(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        journal: &ProjectMutationJournal,
+        unmoved: Option<&UnmovedResolve>,
+        report: &ApplyReport,
+    ) -> Vec<Change> {
+        let Some(unmoved) = unmoved else {
+            return Vec::new();
+        };
+        let applied: Vec<Change> = report
+            .applied
+            .iter()
+            .filter(|change| plan.changes.contains(change))
+            .cloned()
+            .collect();
+        let unapplied: BTreeSet<&str> = plan
+            .changes
+            .iter()
+            .filter(|change| !applied.contains(change))
+            .map(|change| change.package.name.as_str())
+            .collect();
+        let held: Vec<&Change> = {
+            let constraints = self
+                .refusal_constraints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            report
+                .skipped
+                .iter()
+                .map(|skipped| &skipped.change)
+                .filter(|held| plan.changes.contains(held))
+                .filter(|held| {
+                    constraints
+                        .get(&(project.root.clone(), rejection_key(held)))
+                        .is_none_or(|names| {
+                            names.iter().all(|name| !unapplied.contains(name.as_str()))
+                        })
+                })
+                .collect()
+        };
+        held.into_iter()
+            .filter(|held| {
+                let mut narrowed = applied.clone();
+                narrowed.push((*held).clone());
+                self.landings
+                    .recall(
+                        &unmoved.key,
+                        &unmoved.lock,
+                        plan.rewrite,
+                        &narrowed,
+                        journal,
+                        &project.generated_members,
+                    )
+                    .is_some_and(|warm| warm.files == unmoved.files)
+            })
+            .cloned()
+            .collect()
     }
 
     /// Reads the resolved graph after the pin phase left `resolver_lock`.
@@ -3168,17 +4090,21 @@ impl CargoTool {
         let before = initial.as_ref().or(before);
         // Authored direct intent comes from Cargo's resolved edges, including renamed and
         // workspace-inherited declarations, after generated projections and edge policy settle.
-        if graph.is_none() && !new_direct_lines(before, after).is_empty() {
+        if graph.is_none()
+            && !new_direct_lines(before, after, &project.generated_members).is_empty()
+        {
             if let Some(observer) = observer {
                 observer.resolver_started(None);
             }
-            graph = Some(
-                self.cargo
-                    .metadata_locked(&project.root, &project.generated_members)
-                    .await?,
-            );
+            graph = Some(self.locked_reader().graph(project).await?);
         }
-        guard_resolved_copies(before, after, graph.as_ref(), &plan.single_copy)?;
+        guard_resolved_copies(
+            before,
+            after,
+            graph.as_ref(),
+            &plan.single_copy,
+            &project.generated_members,
+        )?;
         Ok(graph)
     }
 }
@@ -3350,6 +4276,26 @@ fn widen_and_follow_checked(
     Ok(rewrite)
 }
 
+/// An unlocking pin cargo carried out, with the state it started from.
+struct UnlockedPin<'a> {
+    change: &'a Change,
+    baseline: &'a ResolveBaseline,
+    /// The lock text before the pin, which a refused pin restores byte for byte.
+    before_text: &'a str,
+    released: &'a [PackageKey],
+}
+
+/// The `Cargo.lock` the journal captured, or `None` when it is missing or does not parse.
+fn journaled_lock(journal: &ProjectMutationJournal) -> Option<CargoLock> {
+    journal
+        .files()
+        .iter()
+        .find(|file| file.path() == Utf8Path::new("Cargo.lock"))
+        .and_then(ProjectMutationFile::contents)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(|content| CargoLock::parse(content).ok())
+}
+
 /// The generated manifests whose journaled preimage differs from what is on disk after the
 /// apply: every projection a landed move was followed into, which its generator now has to
 /// rewrite.
@@ -3419,6 +4365,7 @@ fn resolved_copies(lock: &CargoLock) -> BTreeMap<(Option<String>, String), BTree
 fn new_direct_lines(
     before: Option<&CargoLock>,
     after: &CargoLock,
+    generated: &GeneratedMembers,
 ) -> BTreeSet<(Option<String>, String)> {
     let compatibility_lines = |lock: &CargoLock| {
         let mut lines: BTreeMap<(Option<String>, String), BTreeSet<String>> = BTreeMap::new();
@@ -3430,17 +4377,140 @@ fn new_direct_lines(
         }
         lines
     };
-    let before = before.map(compatibility_lines).unwrap_or_default();
+    let before_lines = before.map(compatibility_lines).unwrap_or_default();
     compatibility_lines(after)
         .into_iter()
         .filter(|(name, lines)| {
             lines.len() > 1
-                && lines
-                    .iter()
-                    .any(|line| !before.get(name).is_some_and(|before| before.contains(line)))
+                && lines.iter().any(|line| {
+                    !before_lines
+                        .get(name)
+                        .is_some_and(|before| before.contains(line))
+                })
+                && before.is_none_or(|before| splits_requirers(before, after, name, generated))
         })
         .map(|(name, _)| name)
         .collect()
+}
+
+/// Whether `after` gives the crate `identity` a split that `before` did not already have.
+///
+/// A requirer is one package of the lock, and binds the compatibility lines of the crate's blocks
+/// its dependency entries resolve to.
+/// A requirer of `after` continues the same package of `before`, or the one version of its name
+/// and source that it replaced when each lock binds the crate from exactly one version of it.
+/// The resolve splits the crate when an authored member and another requirer that shared a line
+/// no longer share any, or when a requirer that continues none binds a line `before` did not
+/// carry while a member declares the crate.
+/// A line no requirer binds gives no evidence either way and counts as a split.
+/// Generated members only mirror the authored ones, so they neither split nor retain.
+/// A member moving off a line no other requirer kept leaves a standing split as it was, so a
+/// direct dependency already apart from its dependents' lines may move to a newer one.
+fn splits_requirers(
+    before: &CargoLock,
+    after: &CargoLock,
+    identity: &(Option<String>, String),
+    generated: &GeneratedMembers,
+) -> bool {
+    let before_bound = requirer_lines(before, identity, generated);
+    let after_bound = requirer_lines(after, identity, generated);
+    let carried = |lock: &CargoLock| -> BTreeSet<String> {
+        resolved_copies(lock)
+            .remove(identity)
+            .unwrap_or_default()
+            .iter()
+            .map(|version| compatibility_line(version))
+            .collect()
+    };
+    let new_lines: BTreeSet<String> = carried(after)
+        .difference(&carried(before))
+        .cloned()
+        .collect();
+    let after_lines: BTreeSet<&String> = after_bound.values().flatten().collect();
+    if new_lines.iter().any(|line| !after_lines.contains(line)) {
+        return true;
+    }
+    let versions_of = |bound: &BTreeMap<Requirer, BTreeSet<String>>, requirer: &Requirer| {
+        bound
+            .keys()
+            .filter(|other| other.name == requirer.name && other.source == requirer.source)
+            .count()
+    };
+    let predecessor = |requirer: &Requirer| -> Option<&BTreeSet<String>> {
+        before_bound.get(requirer).or_else(|| {
+            let mut replaced = before_bound.iter().filter(|(other, _)| {
+                other.name == requirer.name && other.source == requirer.source
+            });
+            match (replaced.next(), replaced.next()) {
+                (Some((_, lines)), None) if versions_of(&after_bound, requirer) == 1 => Some(lines),
+                _ => None,
+            }
+        })
+    };
+    if after_bound.keys().any(Requirer::is_authored)
+        && after_bound.iter().any(|(requirer, lines)| {
+            predecessor(requirer).is_none() && !lines.is_disjoint(&new_lines)
+        })
+    {
+        return true;
+    }
+    after_bound
+        .iter()
+        .filter(|(member, _)| member.is_authored())
+        .filter_map(|(member, after)| Some((member, predecessor(member)?, after)))
+        .any(|(member, member_before, member_after)| {
+            after_bound.iter().any(|(requirer, after)| {
+                requirer != member
+                    && predecessor(requirer).is_some_and(|before| {
+                        !member_before.is_disjoint(before) && member_after.is_disjoint(after)
+                    })
+            })
+        })
+}
+
+/// One package of a lock that binds a crate.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Requirer {
+    name: String,
+    version: Option<String>,
+    source: Option<String>,
+}
+
+impl Requirer {
+    /// A path package, which is a workspace member or a path dependency of one.
+    fn is_authored(&self) -> bool {
+        self.source.is_none()
+    }
+}
+
+/// The compatibility lines of `identity` each requirer other than a generated member binds.
+fn requirer_lines(
+    lock: &CargoLock,
+    identity: &(Option<String>, String),
+    generated: &GeneratedMembers,
+) -> BTreeMap<Requirer, BTreeSet<String>> {
+    let (source, name) = identity;
+    let mut bound: BTreeMap<Requirer, BTreeSet<String>> = BTreeMap::new();
+    for edge in lock.edges() {
+        if edge.endpoint.name != *name
+            || edge.endpoint.source != *source
+            || (edge.requirer.source.is_none() && generated.contains(&edge.requirer.name))
+        {
+            continue;
+        }
+        let Some(version) = &edge.endpoint.version else {
+            continue;
+        };
+        bound
+            .entry(Requirer {
+                name: edge.requirer.name.clone(),
+                version: edge.requirer.version.clone(),
+                source: edge.requirer.source.clone(),
+            })
+            .or_default()
+            .insert(compatibility_line(version));
+    }
+    bound
 }
 
 fn compatibility_line(version: &str) -> String {
@@ -3457,6 +4527,7 @@ fn guard_resolved_copies(
     after: &CargoLock,
     graph: Option<&ResolvedGraph>,
     single_copy: &cooldown_core::SingleCopyPolicy,
+    generated: &GeneratedMembers,
 ) -> Result<()> {
     let after_copies = resolved_copies(after);
     let before_copies = before.map(resolved_copies).unwrap_or_default();
@@ -3477,7 +4548,7 @@ fn guard_resolved_copies(
     let Some(graph) = graph else {
         return Ok(());
     };
-    for identity in new_direct_lines(before, after) {
+    for identity in new_direct_lines(before, after, generated) {
         let (source, name) = &identity;
         if graph
             .packages
@@ -3836,7 +4907,7 @@ impl ToolWrite for CargoTool {
         };
         let generated = self.generated_facts(project, None).await?;
         let mut result = edges::enforce::enforce(
-            &self.cargo,
+            self.locked_reader(),
             project,
             policy,
             before_lock.as_ref(),
@@ -3873,6 +4944,9 @@ mod tests {
     #[cfg(unix)]
     mod acceptance_steps;
 
+    #[cfg(unix)]
+    mod split_completion;
+
     fn duplicate_guard_lock(versions: &[(&str, &str)]) -> eyre::Result<CargoLock> {
         let mut content = String::new();
         for (name, version) in versions {
@@ -3904,6 +4978,7 @@ mod tests {
             &after,
             Some(&graph),
             &cooldown_core::SingleCopyPolicy::default(),
+            &GeneratedMembers::undeclared(),
         )
         .expect_err("authored dep cannot gain an incompatible line");
         assert!(matches!(error, CoreError::UnacceptableResolve(ref detail)
@@ -3918,7 +4993,8 @@ mod tests {
                 Some(&standing),
                 &after,
                 Some(&graph),
-                &cooldown_core::SingleCopyPolicy::default()
+                &cooldown_core::SingleCopyPolicy::default(),
+                &GeneratedMembers::undeclared()
             ),
             Err(CoreError::UnacceptableResolve(_))
         ));
@@ -3934,6 +5010,7 @@ mod tests {
             &after,
             Some(&graph),
             &cooldown_core::SingleCopyPolicy::default(),
+            &GeneratedMembers::undeclared(),
         )?;
         Ok(())
     }
@@ -3991,6 +5068,7 @@ mod tests {
             &after,
             Some(&graph),
             &cooldown_core::SingleCopyPolicy::default(),
+            &GeneratedMembers::undeclared(),
         )
         .expect_err("the direct upgrade must not add an incompatible copy");
         let CoreError::UnacceptableResolve(detail) = error else {
@@ -4018,12 +5096,189 @@ mod tests {
             every_name: true,
             ..Default::default()
         };
-        assert!(new_direct_lines(Some(&before), &after).is_empty());
-        guard_resolved_copies(Some(&before), &after, None, &policy)?;
+        assert!(
+            new_direct_lines(Some(&before), &after, &GeneratedMembers::undeclared()).is_empty()
+        );
+        guard_resolved_copies(
+            Some(&before),
+            &after,
+            None,
+            &policy,
+            &GeneratedMembers::undeclared(),
+        )?;
         let before = duplicate_guard_lock(&[("dep", "1.0.0")])?;
         let after = duplicate_guard_lock(&[("dep", "2.0.0")])?;
-        assert!(new_direct_lines(Some(&before), &after).is_empty());
-        guard_resolved_copies(Some(&before), &after, None, &policy)?;
+        assert!(
+            new_direct_lines(Some(&before), &after, &GeneratedMembers::undeclared()).is_empty()
+        );
+        guard_resolved_copies(
+            Some(&before),
+            &after,
+            None,
+            &policy,
+            &GeneratedMembers::undeclared(),
+        )?;
+        Ok(())
+    }
+
+    /// A lock of `app` and registry crates, each `(name, version, dependency entries)`.
+    fn requirer_lock(packages: &[(&str, &str, &[&str])]) -> eyre::Result<CargoLock> {
+        let mut content = String::new();
+        for (name, version, dependencies) in packages {
+            let source = if *name == "app" {
+                String::new()
+            } else {
+                "source = \"registry+https://github.com/rust-lang/crates.io-index\"\n".to_string()
+            };
+            let dependencies = serde_json::to_string(dependencies)?;
+            content.push_str(&formatdoc! {r#"
+                [[package]]
+                name = "{name}"
+                version = "{version}"
+                {source}dependencies = {dependencies}
+            "#});
+        }
+        Ok(CargoLock::parse(&content)?)
+    }
+
+    /// A direct dependency already on its own line beside its dependents' older lines may move to
+    /// a newer line: no requirer that shared a line with it is left behind.
+    #[test]
+    fn duplicate_guard_lets_a_direct_dependency_leave_a_standing_split() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(tmp.path()).ok_or_else(|| eyre::eyre!("utf8 root"))?;
+        let graph = hakari_workspace(root);
+        let before = requirer_lock(&[
+            ("app", "0.1.0", &["dep 0.45.0", "extract", "print"]),
+            ("extract", "0.12.1", &["dep 0.42.0"]),
+            ("print", "0.12.8", &["dep 0.44.0"]),
+            ("dep", "0.42.0", &[]),
+            ("dep", "0.44.0", &[]),
+            ("dep", "0.45.0", &[]),
+        ])?;
+        let after = requirer_lock(&[
+            ("app", "0.1.0", &["dep 0.46.0", "extract", "print"]),
+            ("extract", "0.12.1", &["dep 0.42.0"]),
+            ("print", "0.12.8", &["dep 0.44.0"]),
+            ("dep", "0.42.0", &[]),
+            ("dep", "0.44.0", &[]),
+            ("dep", "0.46.0", &[]),
+        ])?;
+        assert!(
+            new_direct_lines(Some(&before), &after, &GeneratedMembers::undeclared()).is_empty()
+        );
+        guard_resolved_copies(
+            Some(&before),
+            &after,
+            Some(&graph),
+            &cooldown_core::SingleCopyPolicy::default(),
+            &GeneratedMembers::undeclared(),
+        )?;
+        Ok(())
+    }
+
+    /// Moving a direct dependency off a line another requirer keeps is a new split even when the
+    /// number of lines stays the same.
+    #[test]
+    fn duplicate_guard_refuses_leaving_a_shared_line_behind() -> eyre::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(tmp.path()).ok_or_else(|| eyre::eyre!("utf8 root"))?;
+        let graph = hakari_workspace(root);
+        let before = requirer_lock(&[
+            ("app", "0.1.0", &["dep 2.0.0", "lower", "sharer"]),
+            ("lower", "1.0.0", &["dep 1.0.0"]),
+            ("sharer", "1.0.0", &["dep 2.0.0"]),
+            ("dep", "1.0.0", &[]),
+            ("dep", "2.0.0", &[]),
+        ])?;
+        // `lower` moves onto the new line with `app`, so 1.x disappears while `sharer` keeps 2.x.
+        let after = requirer_lock(&[
+            ("app", "0.1.0", &["dep 3.0.0", "lower", "sharer"]),
+            ("lower", "2.0.0", &["dep 3.0.0"]),
+            ("sharer", "1.0.0", &["dep 2.0.0"]),
+            ("dep", "2.0.0", &[]),
+            ("dep", "3.0.0", &[]),
+        ])?;
+        let result = guard_resolved_copies(
+            Some(&before),
+            &after,
+            Some(&graph),
+            &cooldown_core::SingleCopyPolicy::default(),
+            &GeneratedMembers::undeclared(),
+        );
+        assert!(
+            matches!(&result, Err(CoreError::UnacceptableResolve(detail)) if detail.contains("another incompatible line")),
+            "{result:?}"
+        );
+        // A requirer that did not depend on the crate before and lands on the new line splits it
+        // as well.
+        let before = requirer_lock(&[
+            ("app", "0.1.0", &["dep 2.0.0", "lower"]),
+            ("lower", "1.0.0", &["dep 1.0.0"]),
+            ("dep", "1.0.0", &[]),
+            ("dep", "2.0.0", &[]),
+        ])?;
+        let after = requirer_lock(&[
+            ("app", "0.1.0", &["dep 2.0.0", "lower", "newcomer"]),
+            ("lower", "1.0.0", &["dep 1.0.0"]),
+            ("newcomer", "1.0.0", &["dep 3.0.0"]),
+            ("dep", "1.0.0", &[]),
+            ("dep", "2.0.0", &[]),
+            ("dep", "3.0.0", &[]),
+        ])?;
+        assert!(
+            !new_direct_lines(Some(&before), &after, &GeneratedMembers::undeclared()).is_empty()
+        );
+        Ok(())
+    }
+
+    /// Each version of a requirer keeps its own lines: an unchanged version left on the old
+    /// line splits from the member even when another version of its name moved along.
+    #[test]
+    fn duplicate_guard_tells_coexisting_requirer_versions_apart() -> eyre::Result<()> {
+        let before = requirer_lock(&[
+            ("app", "0.1.0", &["dep 1.0.0", "wrapper 1.0.0"]),
+            ("wrapper", "1.0.0", &["dep 1.0.0"]),
+            ("other", "1.0.0", &["wrapper 2.0.0"]),
+            ("wrapper", "2.0.0", &["dep 2.0.0"]),
+            ("dep", "1.0.0", &[]),
+            ("dep", "2.0.0", &[]),
+        ])?;
+        let after = requirer_lock(&[
+            ("app", "0.1.0", &["dep 3.0.0", "wrapper 1.0.0"]),
+            ("wrapper", "1.0.0", &["dep 1.0.0"]),
+            ("other", "1.0.0", &["wrapper 3.0.0"]),
+            ("wrapper", "3.0.0", &["dep 3.0.0"]),
+            ("dep", "1.0.0", &[]),
+            ("dep", "3.0.0", &[]),
+        ])?;
+        assert!(
+            !new_direct_lines(Some(&before), &after, &GeneratedMembers::undeclared()).is_empty()
+        );
+        Ok(())
+    }
+
+    /// A dependency moving onto the new line together with the member is the same requirer in
+    /// its new version, so the pair stays together and no split is reported.
+    #[test]
+    fn duplicate_guard_lets_a_requirer_move_along_with_the_member() -> eyre::Result<()> {
+        let before = requirer_lock(&[
+            ("app", "0.1.0", &["dep 1.0.0", "follower", "holder"]),
+            ("follower", "0.3.0", &["dep 1.0.0"]),
+            ("holder", "1.0.0", &["dep 0.9.0"]),
+            ("dep", "0.9.0", &[]),
+            ("dep", "1.0.0", &[]),
+        ])?;
+        let after = requirer_lock(&[
+            ("app", "0.1.0", &["dep 2.0.0", "follower", "holder"]),
+            ("follower", "0.4.0", &["dep 2.0.0"]),
+            ("holder", "1.0.0", &["dep 0.9.0"]),
+            ("dep", "0.9.0", &[]),
+            ("dep", "2.0.0", &[]),
+        ])?;
+        assert!(
+            new_direct_lines(Some(&before), &after, &GeneratedMembers::undeclared()).is_empty()
+        );
         Ok(())
     }
 
@@ -4044,6 +5299,7 @@ mod tests {
                 &after,
                 Some(&graph),
                 &cooldown_core::SingleCopyPolicy::default(),
+                &GeneratedMembers::undeclared(),
             );
             assert_eq!(result.is_err(), incompatible, "{baseline} and {target}");
         }
@@ -4055,19 +5311,22 @@ mod tests {
     {
         let before = duplicate_guard_lock(&[("dep", "1.0.0")])?;
         let after = duplicate_guard_lock(&[("dep", "1.0.0"), ("dep", "1.1.0")])?;
-        assert!(new_direct_lines(Some(&before), &after).is_empty());
+        assert!(
+            new_direct_lines(Some(&before), &after, &GeneratedMembers::undeclared()).is_empty()
+        );
         guard_resolved_copies(
             Some(&before),
             &after,
             None,
             &cooldown_core::SingleCopyPolicy::default(),
+            &GeneratedMembers::undeclared(),
         )?;
         let policy = cooldown_core::SingleCopyPolicy {
             every_name: true,
             ..Default::default()
         };
         assert!(
-            matches!(guard_resolved_copies(Some(&before), &after, None, &policy),
+            matches!(guard_resolved_copies(Some(&before), &after, None, &policy, &GeneratedMembers::undeclared()),
             Err(CoreError::UnacceptableResolve(detail)) if detail.contains("--fail-on-new-duplicate"))
         );
         Ok(())
@@ -4099,7 +5358,8 @@ mod tests {
                     Some(&before),
                     &after,
                     Some(&graph),
-                    &cooldown_core::SingleCopyPolicy::default()
+                    &cooldown_core::SingleCopyPolicy::default(),
+                    &GeneratedMembers::undeclared()
                 ),
                 Err(CoreError::UnacceptableResolve(_))
             ));
@@ -4148,7 +5408,8 @@ mod tests {
                 Some(&before),
                 &after,
                 Some(&graph),
-                &cooldown_core::SingleCopyPolicy::default()
+                &cooldown_core::SingleCopyPolicy::default(),
+                &GeneratedMembers::undeclared()
             ),
             Err(CoreError::UnacceptableResolve(_))
         ));
@@ -4168,6 +5429,7 @@ mod tests {
             &private_move,
             Some(&graph),
             &cooldown_core::SingleCopyPolicy::default(),
+            &GeneratedMembers::undeclared(),
         )?;
         // A newly split private line has no authored direct intent in the crates.io graph.
         for lock in [&mut before, &mut private_move] {
@@ -4177,12 +5439,20 @@ mod tests {
             }
             lock.package.extend(extra.package);
         }
-        assert!(!new_direct_lines(Some(&before), &private_move).is_empty());
+        assert!(
+            !new_direct_lines(
+                Some(&before),
+                &private_move,
+                &GeneratedMembers::undeclared()
+            )
+            .is_empty()
+        );
         guard_resolved_copies(
             Some(&before),
             &private_move,
             Some(&graph),
             &cooldown_core::SingleCopyPolicy::default(),
+            &GeneratedMembers::undeclared(),
         )?;
         Ok(())
     }
@@ -4213,7 +5483,13 @@ mod tests {
             ..cooldown_core::SingleCopyPolicy::default()
         };
         assert!(matches!(
-            guard_resolved_copies(Some(&before), &after, Some(&graph), &policy),
+            guard_resolved_copies(
+                Some(&before),
+                &after,
+                Some(&graph),
+                &policy,
+                &GeneratedMembers::undeclared()
+            ),
             Err(CoreError::UnacceptableResolve(_))
         ));
         let plan = Plan {
@@ -5484,12 +6760,18 @@ mod tests {
         [[package]]
         name = "app"
         version = "0.1.0"
-        dependencies = ["dep"]
+        dependencies = ["dep", "holder"]
 
         [[package]]
         name = "dep"
         version = "1.0.0"
         source = "registry+https://github.com/rust-lang/crates.io-index"
+
+        [[package]]
+        name = "holder"
+        version = "1.0.0"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+        dependencies = ["dep"]
     "#};
 
     /// A tentative-Auto fixture project driven by a scripted `cargo` stand-in. The script rejects
@@ -5515,7 +6797,7 @@ mod tests {
                     [[package]]
                     name = "app"
                     version = "0.1.0"
-                    dependencies = ["dep 2.0.0"]
+                    dependencies = ["dep 2.0.0", "holder"]
 
                     [[package]]
                     name = "dep"
@@ -5526,6 +6808,12 @@ mod tests {
                     name = "dep"
                     version = "2.0.0"
                     source = "registry+https://github.com/rust-lang/crates.io-index"
+
+                    [[package]]
+                    name = "holder"
+                    version = "1.0.0"
+                    source = "registry+https://github.com/rust-lang/crates.io-index"
+                    dependencies = ["dep 1.0.0"]
                 "#},
             )?;
             indoc! {r#"
@@ -5899,10 +7187,12 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn tentative_auto_widen_is_kept_when_the_pin_lands_as_a_fork() -> eyre::Result<()> {
-        // The success arm of the same state machine: once the widen lifts the declared cap, the
-        // re-pin forks the new major beside the third-party-held old line. The widened manifest
-        // must be kept — restoring it would demand the old major back and undo the landing.
+    async fn tentative_auto_widen_is_restored_when_the_pin_splits_the_declared_line()
+    -> eyre::Result<()> {
+        // Once the widen lifts the declared cap, the re-pin forks the new major beside the
+        // third-party-held old line.
+        // The fork splits a crate the workspace declares, which the final guard refuses for the
+        // whole apply, so the step itself is refused and only this candidate is held.
         let dir = tempfile::tempdir()?;
         let root = Utf8Path::from_path(dir.path()).ok_or_else(|| eyre::eyre!("non-UTF-8 root"))?;
         let (project, tool) = widen_fixture(root, true)?;
@@ -5913,24 +7203,26 @@ mod tests {
         };
         let journal = tool.mutation_journal(&project, &plan).await?;
 
-        tool.whole_graph_resolve(&project, &plan, &journal, None)
+        let rejections = tool
+            .whole_graph_resolve(&project, &plan, &journal, None)
             .await?;
 
-        let manifest = std::fs::read_to_string(root.join("Cargo.toml"))?;
+        // The widen and the forked lock are restored byte for byte.
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.toml"))?,
+            WIDEN_MANIFEST
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.lock"))?,
+            WIDEN_LOCK
+        );
+        // The held candidate names the split it would have caused.
+        let detail = rejections
+            .get(&("dep".to_string(), "1.0.0".to_string(), "2.0.0".to_string()))
+            .ok_or_else(|| eyre::eyre!("the held candidate keeps its rejection"))?;
         assert!(
-            !manifest.contains(r#"dep = "1""#),
-            "the landed widen keeps the manifest on the new requirement: {manifest}"
-        );
-        let landed = read_lock(&project)?.crates_io_locked_versions();
-        assert_eq!(
-            landed.get(&("dep".into(), "2".into())).map(String::as_str),
-            Some("2.0.0"),
-            "the pin landed in the target major slot"
-        );
-        assert_eq!(
-            landed.get(&("dep".into(), "1".into())).map(String::as_str),
-            Some("1.0.0"),
-            "the third-party-held old major coexists as its own line"
+            detail.contains("would resolve direct dependency dep at another incompatible line"),
+            "{detail}"
         );
         Ok(())
     }

@@ -39,9 +39,28 @@ const SCRIPT: &str = indoc! {r#"
       mv rewritten.lock Cargo.lock
     }
 
+    refused_moved() {
+      for file in refuse-*; do
+        [ -f "$file" ] || continue
+        if awk -v name="${file#refuse-}" '
+          /^\[\[package\]\]/ { selected = 0 }
+          $0 == "name = \"" name "\"" { selected = 1 }
+          selected && /^version = / && $0 != "version = \"1.0.0\"" { found = 1 }
+          END { exit !found }
+        ' Cargo.lock; then
+          return 0
+        fi
+      done
+      return 1
+    }
+
     case "$1" in
       metadata)
         if [ -f interrupt ]; then kill -TERM "$$"; fi
+        if refused_moved; then
+          echo 'error: joint seed cannot resolve' >&2
+          exit 101
+        fi
         if [ -f permission-failure ]; then
           echo 'error: Permission denied reading the registry cache' >&2
           exit 101
@@ -56,6 +75,17 @@ const SCRIPT: &str = indoc! {r#"
           ' Cargo.lock; then
             echo 'error: joint seed cannot resolve' >&2
             exit 101
+          fi
+        fi
+        if [ -f drift-name ]; then
+          drift=$(cat drift-name)
+          if awk -v drift="$drift" '
+            /^\[\[package\]\]/ { selected = 0 }
+            $0 == "name = \"" drift "\"" { selected = 1 }
+            selected && $0 == "version = \"1.1.0\"" { found = 1 }
+            END { exit !found }
+          ' Cargo.lock; then
+            rewrite "$drift" "$crates_io" '1.0.5'
           fi
         fi
         if [ -f leave-name ]; then rewrite "$(cat leave-name)" "$crates_io" '1.0.0'; fi
@@ -88,6 +118,28 @@ const SCRIPT: &str = indoc! {r#"
         done
         name="${spec##*#}"
         name="${name%@*}"
+        if [ -f "refuse-$name" ]; then
+          party=$(cat "refuse-$name")
+          if [ -n "$party" ]; then
+            printf 'error: failed to select a version for `%s`.\n' "$party" >&2
+            echo '    ... required by package `holder v1.0.0`' >&2
+            echo 'versions that meet the requirements `^1.0.0` (locked to 1.0.0) are: 1.0.0' >&2
+            echo 'all possible versions conflict with previously selected packages' >&2
+            printf '  previously selected package `%s v0.9.0`\n' "$party" >&2
+            printf '    ... which satisfies dependency `%s = "=0.9.0"` of package `%s v%s`\n' \
+              "$party" "$name" "$target" >&2
+            printf 'failed to select a version for `%s` which could resolve this conflict\n' \
+              "$party" >&2
+          else
+            printf 'error: failed to select a version for the requirement `%s = "^1.0"`\n' \
+              "$name" >&2
+          fi
+          exit 101
+        fi
+        if [ -f drift-name ] && [ "$(cat drift-name)" = "$name" ]; then
+          printf 'error: failed to select a version for the requirement `%s = "^1.0"`\n' "$name" >&2
+          exit 101
+        fi
         if [ -f bad-name ] && [ "$(cat bad-name)" = "$name" ]; then
           printf 'error: failed to select a version for the requirement `%s = "=1.0.0"`\n' "$name" >&2
           echo 'required by package `holder v1.0.0`' >&2
@@ -320,6 +372,62 @@ async fn one_incompatible_target_bisects_without_linear_precise_pins() -> eyre::
     Ok(())
 }
 
+/// A seed in which one target drifts within its line names that target, so it is pinned alone and
+/// the rest seed again at once, instead of halving the group until the target is alone.
+#[tokio::test]
+async fn a_drifting_seed_target_is_split_out_without_bisection() -> eyre::Result<()> {
+    let fixture = SeedFixture::new(200)?;
+    std::fs::write(fixture.project.root.join("drift-name"), "pkg137")?;
+    let journal = fixture.journal().await?;
+    let mut rejections = PinRejections::new();
+    fixture
+        .tool
+        .pin_batch(
+            &fixture.project,
+            &fixture.changes,
+            &journal,
+            None,
+            &mut rejections,
+        )
+        .await?;
+    let invocations = fixture.invocations()?;
+    // The drifted seed, the drifting target's own refused pin, and the seed of the other 199.
+    let resolves = invocations
+        .iter()
+        .filter(|arguments| {
+            arguments
+                .first()
+                .is_some_and(|command| command == "metadata")
+        })
+        .count();
+    assert_eq!(resolves, 2, "{invocations:?}");
+    let precise: Vec<_> = invocations
+        .iter()
+        .filter(|arguments| arguments.first().is_some_and(|command| command == "update"))
+        .collect();
+    assert!(
+        !precise.is_empty()
+            && precise.iter().all(|arguments| {
+                arguments
+                    .iter()
+                    .any(|argument| argument.contains("pkg137@"))
+            }),
+        "{precise:?}"
+    );
+    // Every other target lands, and the drifting one keeps its original version.
+    let report = fixture.report(&rejections)?;
+    assert_eq!(report.applied.len(), 199);
+    assert_eq!(report.skipped.len(), 1);
+    let versions = read_lock(&fixture.project)?.crates_io_locked_versions();
+    assert_eq!(
+        versions
+            .get(&("pkg137".to_string(), "1".to_string()))
+            .map(String::as_str),
+        Some("1.0.0")
+    );
+    Ok(())
+}
+
 /// A target refused on its own stays out of the seeds of every later batch in the run, so a
 /// planner that hands the same candidates over again does not bisect down to it a second time.
 #[tokio::test]
@@ -358,15 +466,15 @@ async fn a_target_refused_alone_skips_later_seeds() -> eyre::Result<()> {
         )
         .await?;
 
-    // One seed carries the other 199 without bisecting; the remembered target only gets its
-    // precise pins, the second from the fixed-point pass that retries it after the seed landed.
+    // One seed carries the other 199 without bisecting; the remembered target gets at most its
+    // precise pins, and none while the conflict that refused it in the first batch still stands.
     let invocations = fixture.invocations()?;
     let (precise, seeds): (Vec<_>, Vec<_>) = invocations
         .iter()
         .partition(|arguments| arguments.first().is_some_and(|command| command == "update"));
     assert_eq!(seeds.len(), 1, "{invocations:?}");
     assert!(
-        (1..=2).contains(&precise.len())
+        precise.len() <= 2
             && precise.iter().all(|arguments| arguments
                 .iter()
                 .any(|argument| argument.contains("pkg137@"))),
@@ -1047,5 +1155,203 @@ async fn previously_refused_candidates_land_in_one_joint_widen_seed() -> eyre::R
     for planned in &fixture.changes {
         assert!(lock.has_crates_io_package(&planned.package.name, "1.1.0"));
     }
+    Ok(())
+}
+
+/// The plan of a lower-target fallback: every change of `changes` except `refused`, which moves
+/// to `alternative` instead.
+fn fallback_plan(changes: &[Change], refused: &str, alternative: &str) -> Plan {
+    Plan {
+        changes: changes
+            .iter()
+            .map(|change| {
+                if change.package.name == refused {
+                    change_with_target(change, alternative)
+                } else {
+                    change.clone()
+                }
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+fn change_with_target(change: &Change, target: &str) -> Change {
+    Change {
+        to: Version::new(target),
+        ..change.clone()
+    }
+}
+
+/// A later apply from the same inputs whose plan keeps every change an earlier apply landed starts
+/// from that landing, so only the change the earlier apply could not land is resolved again.
+#[tokio::test]
+async fn a_fallback_apply_warm_starts_from_the_earlier_landing() -> eyre::Result<()> {
+    let fixture = SeedFixture::new(20)?;
+    std::fs::write(fixture.project.root.join("bad-name"), "pkg013")?;
+    let journal = fixture.journal().await?;
+    let plan = Plan {
+        changes: fixture.changes.clone(),
+        ..Default::default()
+    };
+    let rejections = fixture
+        .tool
+        .whole_graph_resolve(&fixture.project, &plan, &journal, None)
+        .await?;
+    assert_eq!(rejections.len(), 1);
+
+    // The executor restores the baseline and retries the refused crate at a lower target.
+    journal.restore()?;
+    std::fs::remove_file(fixture.project.root.join("bad-name"))?;
+    std::fs::remove_file(fixture.project.root.join("invocations"))?;
+    let rejections = fixture
+        .tool
+        .whole_graph_resolve(
+            &fixture.project,
+            &fallback_plan(&fixture.changes, "pkg013", "1.0.5"),
+            &journal,
+            None,
+        )
+        .await?;
+    assert!(rejections.is_empty(), "{rejections:?}");
+    // Only the alternative is pinned; the nineteen earlier landings are not resolved again.
+    let invocations = fixture.invocations()?;
+    assert_eq!(invocations.len(), 1, "{invocations:?}");
+    assert!(
+        invocations
+            .iter()
+            .flatten()
+            .any(|argument| argument.contains("pkg013@1.0.0")),
+        "{invocations:?}"
+    );
+    let versions = read_lock(&fixture.project)?.crates_io_locked_versions();
+    for planned in &fixture.changes {
+        let expected = if planned.package.name == "pkg013" {
+            "1.0.5"
+        } else {
+            "1.1.0"
+        };
+        assert_eq!(
+            versions
+                .get(&(planned.package.name.clone(), "1".to_string()))
+                .map(String::as_str),
+            Some(expected),
+            "{}",
+            planned.package.name
+        );
+    }
+    Ok(())
+}
+
+/// A plan that no longer carries a change the earlier apply landed starts cold, so the dropped
+/// change never reaches the lock through the earlier landing.
+#[tokio::test]
+async fn a_plan_dropping_a_landed_change_does_not_warm_start() -> eyre::Result<()> {
+    let fixture = SeedFixture::new(20)?;
+    let journal = fixture.journal().await?;
+    let plan = Plan {
+        changes: fixture.changes.clone(),
+        ..Default::default()
+    };
+    fixture
+        .tool
+        .whole_graph_resolve(&fixture.project, &plan, &journal, None)
+        .await?;
+
+    journal.restore()?;
+    let without_pkg007 = Plan {
+        changes: fixture
+            .changes
+            .iter()
+            .filter(|change| change.package.name != "pkg007")
+            .cloned()
+            .collect(),
+        ..Default::default()
+    };
+    fixture
+        .tool
+        .whole_graph_resolve(&fixture.project, &without_pkg007, &journal, None)
+        .await?;
+    let versions = read_lock(&fixture.project)?.crates_io_locked_versions();
+    assert_eq!(
+        versions
+            .get(&("pkg007".to_string(), "1".to_string()))
+            .map(String::as_str),
+        Some("1.0.0")
+    );
+    assert_eq!(
+        versions
+            .get(&("pkg008".to_string(), "1".to_string()))
+            .map(String::as_str),
+        Some("1.1.0")
+    );
+    Ok(())
+}
+
+/// A fallback apply that lands nothing beyond its warm start attests the holds it would meet again
+/// beside exactly what it applied, but not one whose refusal named another planned candidate.
+#[tokio::test]
+async fn an_unmoved_fallback_apply_attests_its_independent_holds() -> eyre::Result<()> {
+    let fixture = SeedFixture::new(20)?;
+    let root = &fixture.project.root;
+    // `pkg013`'s pin is refused over the planned `pkg014`, and `pkg014`'s over its own requirement.
+    std::fs::write(root.join("refuse-pkg013"), "pkg014")?;
+    std::fs::write(root.join("refuse-pkg014"), "")?;
+    let journal = fixture.journal().await?;
+    let plan = Plan {
+        changes: fixture.changes.clone(),
+        ..Plan::default()
+    };
+    let cold = fixture
+        .tool
+        .apply_plan(&fixture.project, &plan, &journal, None)
+        .await?;
+    // A cold apply's refusals were met in states a narrower plan does not start from.
+    assert_eq!(cold.independent_holds, []);
+    assert_eq!(cold.skipped.len(), 2);
+
+    journal.restore()?;
+    let fallback = Plan {
+        changes: fallback_plan(
+            &fallback_plan(&fixture.changes, "pkg013", "1.0.5").changes,
+            "pkg014",
+            "1.0.5",
+        )
+        .changes,
+        ..Plan::default()
+    };
+    let warm = fixture
+        .tool
+        .apply_plan(&fixture.project, &fallback, &journal, None)
+        .await?;
+    let attested: Vec<_> = warm
+        .independent_holds
+        .iter()
+        .map(|change| (change.package.name.as_str(), change.to.as_str()))
+        .collect();
+    assert_eq!(attested, [("pkg014", "1.0.5")]);
+
+    // The attested hold is met again in exactly the narrower plan it was attested for.
+    journal.restore()?;
+    let narrowed = Plan {
+        changes: warm
+            .applied
+            .iter()
+            .filter(|change| fallback.changes.contains(change))
+            .chain(&warm.independent_holds)
+            .cloned()
+            .collect(),
+        ..Plan::default()
+    };
+    let alone = fixture
+        .tool
+        .apply_plan(&fixture.project, &narrowed, &journal, None)
+        .await?;
+    assert!(
+        alone
+            .skipped
+            .iter()
+            .any(|skipped| skipped.change.package.name == "pkg014")
+    );
     Ok(())
 }

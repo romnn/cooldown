@@ -7,6 +7,7 @@
 pub mod cargocmd;
 mod edges;
 pub mod index;
+mod locked_reads;
 mod lockfile;
 mod manifest;
 mod native;

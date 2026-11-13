@@ -63,6 +63,62 @@ pub(super) fn current_line_target<'a>(
         })
 }
 
+/// Whether moving from `from` to `to` leaves the current compatibility line, as the releases'
+/// major keys state it.
+///
+/// A version missing from `releases` never counts as crossing, so an unproven line keeps the
+/// node plannable.
+pub(super) fn crosses_line(releases: &[Release], from: &Version, to: &Version) -> bool {
+    let major_of = |version: &Version| {
+        releases
+            .iter()
+            .find(|release| release.version == *version)
+            .map(|release| &release.major)
+    };
+    matches!((major_of(from), major_of(to)), (Some(from), Some(to)) if from != to)
+}
+
+/// Closes `leaving`, the nodes planned onto another compatibility line, over the undeclared nodes
+/// every attributed requirer of which is itself leaving its line.
+///
+/// Such a node is not planned beside its requirers: their successors decide its version, which
+/// the planner cannot see, so an in-line target planned for it could contradict them and hold
+/// them back.
+/// The upgrade plans it once its requirers have settled instead (see `run_upgrade`).
+/// A declared node, or one without attributed requirers, is never added, which keeps adapters
+/// without attribution planning as before.
+pub(super) fn line_leaving_nodes(
+    deps: &[Dependency],
+    mut leaving: HashSet<(String, String)>,
+) -> HashSet<(String, String)> {
+    loop {
+        let followers: Vec<_> = deps
+            .iter()
+            .filter(|dep| !dep.direct && !dep.hold_edges.is_empty())
+            .map(|dep| {
+                (
+                    dep,
+                    (dep.package.name.clone(), dep.current.as_str().to_string()),
+                )
+            })
+            .filter(|(dep, node)| {
+                !leaving.contains(node)
+                    && dep.hold_edges.iter().all(|edge| {
+                        leaving.contains(&(
+                            edge.requirer.clone(),
+                            edge.requirer_version.as_str().to_string(),
+                        ))
+                    })
+            })
+            .map(|(_, node)| node)
+            .collect();
+        if followers.is_empty() {
+            return leaving;
+        }
+        leaving.extend(followers);
+    }
+}
+
 /// Selects the dependency scope that supplies upgrade or downgrade candidates.
 ///
 /// Both directions walk the resolved graph by default. Resolvers only promote the minimum a

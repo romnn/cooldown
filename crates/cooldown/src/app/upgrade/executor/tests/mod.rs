@@ -1,13 +1,15 @@
+use super::batch::HoldAttestation;
 use super::planning::{
-    current_line_target, effective_hold, lower_adoptable_targets, plan_baseline_violations,
-    target_package, upgrade_dependency,
+    crosses_line, current_line_target, effective_hold, line_leaving_nodes, lower_adoptable_targets,
+    plan_baseline_violations, target_package, upgrade_dependency,
 };
 use super::{
-    BatchOutcome, CommittedBatch, PlanMode, TrialRollback, candidate_scope, collapse_applied_legs,
-    collateral_rows, combine_lock_status, conflict_skip_message, conservative_hold,
-    followed_manifest_warning, indeterminate_trial, insert_graph_violation, is_downgrade,
-    landed_upgrade_changes, newly_introduced_violations, package_label, planned_changes_landed,
-    preserve_rollback_entries, sort_planned_changes, verify_applied_targets, violation_identity,
+    AttestedHolds, BatchOutcome, CommittedBatch, PlanMode, TrialRollback, candidate_scope,
+    collapse_applied_legs, collateral_rows, combine_lock_status, conflict_skip_message,
+    conservative_hold, followed_manifest_warning, indeterminate_trial, insert_graph_violation,
+    is_downgrade, landed_upgrade_changes, newly_introduced_violations, package_label,
+    planned_changes_landed, preserve_rollback_entries, sort_planned_changes,
+    verify_applied_targets, violation_identity,
 };
 use crate::app::{TransitiveGate, UpgradeItem};
 use color_eyre::eyre;
@@ -587,6 +589,97 @@ fn upgrade_ceiling_requires_all_attributed_requirers_to_move() {
     assert_eq!(
         upgrade_dependency(&child, &together).graph_ceiling,
         child.graph_ceiling
+    );
+}
+
+/// A release on the major line `line`, which [`rel`] leaves unclassified.
+fn rel_on(version: &str, order: u8, line: &str) -> Release {
+    Release {
+        major: MajorKey(line.to_string()),
+        ..rel(version, order)
+    }
+}
+
+#[test]
+fn crossing_a_line_needs_both_versions_classified() {
+    let releases = [
+        rel_on("48.0.7", 1, "48"),
+        rel_on("48.0.8", 2, "48"),
+        rel_on("50.0.1", 3, "50"),
+    ];
+    assert!(crosses_line(
+        &releases,
+        &Version::new("48.0.7"),
+        &Version::new("50.0.1")
+    ));
+    assert!(!crosses_line(
+        &releases,
+        &Version::new("48.0.7"),
+        &Version::new("48.0.8")
+    ));
+    // An unknown version cannot prove a line change.
+    assert!(!crosses_line(
+        &releases,
+        &Version::new("48.0.7"),
+        &Version::new("51.0.0")
+    ));
+}
+
+/// The internals a crossing requirer pins, and the crates only those internals require, follow the
+/// requirer off its line; a node one staying requirer still holds, a declared node, and a node
+/// without attribution keep being planned on their own.
+#[test]
+fn nodes_whose_every_requirer_leaves_its_line_follow_it() {
+    let held = |name: &str, version: &str, requirers: &[(&str, &str)], kind: GraphHoldKind| {
+        let mut dependency = dep(name, version);
+        dependency.direct = false;
+        dependency.hold_edges = requirers
+            .iter()
+            .map(|(requirer, at)| hold_edge(requirer, at, version, kind))
+            .collect();
+        dependency
+    };
+    let pinned = |name: &str, version: &str, requirers: &[(&str, &str)]| {
+        held(name, version, requirers, GraphHoldKind::Ceiling)
+    };
+    let mut declared = pinned("declared-internal", "48.0.7", &[("wasmtime", "48.0.7")]);
+    declared.direct = true;
+    let deps = [
+        dep("wasmtime", "48.0.7"),
+        pinned("wasmtime-environ", "48.0.7", &[("wasmtime", "48.0.7")]),
+        // Only pinned by a node that follows, so it follows too.
+        pinned(
+            "cranelift-bforest",
+            "0.135.7",
+            &[("wasmtime-environ", "48.0.7")],
+        ),
+        // A requirer staying on its line still holds it.
+        pinned(
+            "shared",
+            "1.2.0",
+            &[("wasmtime", "48.0.7"), ("unrelated", "3.0.0")],
+        ),
+        // A ranged requirement follows too: the successor's own requirement is unknown here.
+        held(
+            "ranged",
+            "1.0.0",
+            &[("wasmtime", "48.0.7")],
+            GraphHoldKind::Floor,
+        ),
+        declared,
+        pinned("unattributed", "1.0.0", &[]),
+    ];
+
+    let leaving = line_leaving_nodes(&deps, violation_set(&[("wasmtime", "48.0.7")]));
+
+    assert_eq!(
+        leaving,
+        violation_set(&[
+            ("wasmtime", "48.0.7"),
+            ("wasmtime-environ", "48.0.7"),
+            ("cranelift-bforest", "0.135.7"),
+            ("ranged", "1.0.0"),
+        ])
     );
 }
 
@@ -1520,4 +1613,26 @@ fn restored_applied_rows_are_not_landed_evidence() {
         ),
         []
     );
+}
+
+/// An attested hold covers only the exact change it was made for.
+///
+/// Another change to the same target from another source version, such as a member's second
+/// declaration of the crate, can be held for another reason, so its retry is not left out.
+#[test]
+fn an_attested_hold_does_not_cover_a_change_from_another_version() {
+    let held = change("foo", "1.0.0", "3.0.0");
+    let sibling = change("foo", "2.0.0", "3.0.0");
+    let mut outcome = BatchOutcome::default();
+    outcome.attestation = Some(Box::new(HoldAttestation {
+        applied: HashSet::new(),
+        holds: HashSet::from([crate::app::change_key::change_provenance_key(&held)]),
+    }));
+    let required = HashSet::new();
+    let mut attested = AttestedHolds::default();
+
+    attested.record(0, &required, &[], &[outcome]);
+
+    assert!(attested.covers(0, &required, &held));
+    assert!(!attested.covers(0, &required, &sibling));
 }

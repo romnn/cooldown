@@ -11,25 +11,28 @@
 //!    change to its target.
 //! 2. Every planned target already reached stays reached.
 //! 3. Every planned crate not yet reached stays at its original version or reaches its target.
+//! 4. No crate an authored package declares gains a split it did not have, where requirers that
+//!    shared a compatibility line no longer share one.
 //!
 //! A declared crate moved outside the plan is never gated as a planned direct change is, and a
 //! planned crate drifting past its target can land a version younger than the cooldown permits.
 //! A local package the step dropped from the lock, such as a path-patched crate the upgraded
 //! graph no longer reaches, takes its declarations with it; workspace members always stay.
 
-use super::reached;
+use super::{compatibility_line, new_direct_lines, reached};
 use crate::index::CRATES_IO;
 use crate::lockfile::{
     CRATES_IO_SOURCE, CargoLock, DeclaredEndpoint, DeclaredEndpoints, LockPackage, LockPackageId,
-    LockedSlots, SlotKey,
+    LockedSlots, PackageKey, SlotKey,
 };
 use crate::version;
 use cooldown_core::{Change, GeneratedMembers};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 
 /// The lock one resolve step starts from, captured before the step edits any lock or manifest.
 pub(super) struct ResolveBaseline {
+    lock: CargoLock,
     declared: DeclaredEndpoints,
     slots: LockedSlots,
     versions: BTreeMap<SlotKey, String>,
@@ -40,6 +43,7 @@ impl ResolveBaseline {
     pub(super) fn capture(lock: &CargoLock, generated: &GeneratedMembers) -> Self {
         let slots = lock.crates_io_locked_slots();
         ResolveBaseline {
+            lock: lock.clone(),
             declared: lock.declared_endpoints(generated),
             versions: lock.crates_io_locked_versions(),
             slots,
@@ -61,6 +65,80 @@ impl ResolveBaseline {
     ) -> Option<Violation> {
         self.declared_violation(after, generated, plan)
             .or_else(|| self.planned_violation(after, plan))
+            .or_else(|| self.split_violation(after, generated))
+    }
+
+    /// The first crate an authored package declares that the step split, judged as the final
+    /// guard judges the whole apply.
+    ///
+    /// Refusing the step holds only the candidate that split the crate, where the final guard
+    /// could only refuse the apply as a whole.
+    fn split_violation(
+        &self,
+        after: &CargoLock,
+        generated: &GeneratedMembers,
+    ) -> Option<Violation> {
+        let declared = after.declared_endpoints(generated);
+        new_direct_lines(Some(&self.lock), after, generated)
+            .into_iter()
+            .find(|(source, name)| {
+                declared.iter().any(|declared| {
+                    declared.endpoint.name == *name
+                        && declared.endpoint.source() == source.as_deref()
+                })
+            })
+            .map(|identity| self.split(after, generated, &identity))
+    }
+
+    fn split(
+        &self,
+        after: &CargoLock,
+        generated: &GeneratedMembers,
+        identity: &(Option<String>, String),
+    ) -> Violation {
+        let (source, name) = identity;
+        let of_identity = |package: &LockPackage| {
+            package.name == *name && package.source.as_deref() == source.as_deref()
+        };
+        let old_lines: BTreeSet<String> = self
+            .lock
+            .package
+            .iter()
+            .filter(|package| of_identity(package))
+            .filter_map(|package| package.version.as_deref().map(compatibility_line))
+            .collect();
+        let mut versions: Vec<String> = after
+            .package
+            .iter()
+            .filter(|package| of_identity(package))
+            .filter_map(|package| package.version.clone())
+            .collect();
+        versions.sort_by(|left, right| version::compare(left, right));
+        let mut retainers = BTreeSet::new();
+        let mut movers = BTreeSet::new();
+        for edge in after.edges() {
+            let (Some(version), Some(requirer_version)) =
+                (&edge.endpoint.version, &edge.requirer.version)
+            else {
+                continue;
+            };
+            if !of_identity(edge.endpoint)
+                || (edge.requirer.source.is_none() && generated.contains(&edge.requirer.name))
+            {
+                continue;
+            }
+            if old_lines.contains(&compatibility_line(version)) {
+                retainers.insert(PackageKey::new(&edge.requirer.name, requirer_version));
+            } else {
+                movers.insert(edge.requirer.name.clone());
+            }
+        }
+        Violation::DirectSplit {
+            name: name.clone(),
+            versions,
+            retainers: retainers.into_iter().collect(),
+            movers: movers.into_iter().collect(),
+        }
     }
 
     fn declared_violation(
@@ -187,6 +265,17 @@ pub(super) enum Violation {
         /// The version it drifted to, when one remains in its lines.
         landed: Option<String>,
     },
+    /// A crate an authored package declares gained a split: requirers that shared a
+    /// compatibility line no longer share one.
+    DirectSplit {
+        name: String,
+        /// Every version of the crate afterwards, oldest first.
+        versions: Vec<String>,
+        /// The requirers still binding a line the crate had before.
+        retainers: Vec<PackageKey>,
+        /// The requirers binding a line the step added.
+        movers: Vec<String>,
+    },
 }
 
 impl fmt::Display for Violation {
@@ -217,6 +306,35 @@ impl fmt::Display for Violation {
                 }
                 write!(formatter, " instead of its target {target}")
             }
+            Violation::DirectSplit {
+                name,
+                versions,
+                retainers,
+                movers: _,
+            } => {
+                write!(
+                    formatter,
+                    "would resolve direct dependency {name} at another incompatible line ({}); ",
+                    versions.join(" and ")
+                )?;
+                if retainers.is_empty() {
+                    write!(formatter, "a dependency retains the old line")?;
+                } else {
+                    let retainers: Vec<String> = retainers
+                        .iter()
+                        .map(|retainer| format!("{} {}", retainer.name, retainer.version))
+                        .collect();
+                    write!(
+                        formatter,
+                        "the old line is retained by {}",
+                        retainers.join(", ")
+                    )?;
+                }
+                write!(
+                    formatter,
+                    "; align the retaining dependents' requirements and compatible releases, or keep this candidate held"
+                )
+            }
         }
     }
 }
@@ -225,7 +343,7 @@ impl fmt::Display for Violation {
 mod tests {
     use super::{ResolveBaseline, Violation};
     use crate::index::CRATES_IO;
-    use crate::lockfile::CargoLock;
+    use crate::lockfile::{CargoLock, PackageKey};
     use cooldown_core::{Change, GeneratedMembers, PackageId, UpdateKind, Version};
     use indoc::formatdoc;
 
@@ -272,6 +390,63 @@ mod tests {
     fn violation(before: &CargoLock, after: &CargoLock, plan: &[Change]) -> Option<Violation> {
         let generated = GeneratedMembers::undeclared();
         ResolveBaseline::capture(before, &generated).violation(after, &generated, plan)
+    }
+
+    /// A lock of the authored `app` and the crates.io `holder`, which binds `dep` at
+    /// `holder_binds`, with `dep` at each of `versions`.
+    fn shared_lock(app_binds: &str, holder_binds: &str, versions: &[&str]) -> CargoLock {
+        let mut content = formatdoc! {r#"
+            version = 4
+
+            [[package]]
+            name = "app"
+            version = "0.1.0"
+            dependencies = ["{app_binds}", "holder"]
+
+            [[package]]
+            name = "holder"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            dependencies = ["{holder_binds}"]
+        "#};
+        for version in versions {
+            content.push_str(&formatdoc! {r#"
+
+                [[package]]
+                name = "dep"
+                version = "{version}"
+                source = "registry+https://github.com/rust-lang/crates.io-index"
+            "#});
+        }
+        CargoLock::parse(&content).expect("lock parses")
+    }
+
+    /// A planned move of a declared crate that leaves a dependency on the shared old line splits
+    /// the crate, and the step is refused with the dependency named.
+    #[test]
+    fn a_step_splitting_a_declared_crate_is_refused() {
+        let plan = [planned("dep", "1.0.0", "2.0.0")];
+        let before = shared_lock("dep", "dep", &["1.0.0"]);
+        let split = shared_lock("dep 2.0.0", "dep 1.0.0", &["1.0.0", "2.0.0"]);
+        let refused = violation(&before, &split, &plan);
+        assert_eq!(
+            refused,
+            Some(Violation::DirectSplit {
+                name: "dep".to_owned(),
+                versions: vec!["1.0.0".to_owned(), "2.0.0".to_owned()],
+                retainers: vec![PackageKey::new("holder", "1.0.0")],
+                movers: vec!["app".to_owned()],
+            })
+        );
+        assert!(
+            refused
+                .map(|refused| refused.to_string())
+                .is_some_and(|detail| detail.contains("the old line is retained by holder 1.0.0"))
+        );
+
+        // Moving together keeps the line shared, so the step is kept.
+        let together = shared_lock("dep", "dep", &["2.0.0"]);
+        assert_eq!(violation(&before, &together, &plan), None);
     }
 
     /// The issue #55 shape: landing the planned pest family must not drag the `psm` the

@@ -133,6 +133,13 @@ async fn apply_checked(
             report: Err(err), ..
         } => {
             let reason = err.to_string();
+            // Recovery re-runs the whole native apply on subsets of the plan, so the reason it was
+            // needed belongs in the diagnostic log too, not only in the run trace.
+            tracing::debug!(
+                candidates = mutation.plan().changes.len(),
+                %reason,
+                "resolver trial rejected"
+            );
             cooldown_core::trace::Event::Mutation {
                 project: environment.as_str(),
                 transition: cooldown_core::trace::Mutation::Rejected { reason: &reason },

@@ -67,6 +67,12 @@ Chunks use UTF-8 text where lossless and byte arrays otherwise. Concatenate deco
 artifact ID and offset to recover the original bytes. Only a `complete` file artifact establishes
 available graph evidence; `missing`, `failed`, and `changed` outcomes never do.
 
+An artifact whose complete content is known up front carries its `sha256`. When a run captures the
+same content again, such as an unchanged manifest at every mutation checkpoint, its
+`artifact_started` record names the earlier artifact in `duplicate_of` and its chunks are omitted:
+recover its bytes from that artifact. Schema version 2 introduced these references; version 1 traces
+repeat every chunk.
+
 Native lock documents retain distinct copies, sources, workspace packages, and dependency bindings.
 Formats containing only pins explicitly declare inventory coverage. Missing locks, unreadable
 inputs, and additional inputs that an adapter cannot establish are recorded as limitations. Cooldown

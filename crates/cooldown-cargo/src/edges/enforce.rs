@@ -5,8 +5,9 @@ use super::{
     BindingChange, EdgeRewrite, LockEdgeView, RequirementIndex, binding_changes, guard_rewrites,
 };
 use crate::CARGO_ID;
-use crate::cargocmd::{CRATES_IO_SOURCE, Cargo, ResolvedGraph};
+use crate::cargocmd::{CRATES_IO_SOURCE, ResolvedGraph};
 use crate::index::CRATES_IO;
+use crate::locked_reads::LockedReader;
 use crate::lockfile::CargoLock;
 use cooldown_core::{
     ApplyObserver, EdgeBindingAction, EdgePolicy, EdgeRebind, PackageId, Project, Result, Version,
@@ -46,7 +47,7 @@ enum BindingOutcome {
 
 /// Enforces `policy` over the resolver-produced lock and reports every committed or limited move.
 pub(crate) async fn enforce(
-    cargo: &Cargo,
+    reader: LockedReader<'_>,
     project: &Project,
     policy: EdgePolicy,
     before: Option<&CargoLock>,
@@ -79,7 +80,7 @@ pub(crate) async fn enforce(
     };
     let mut guarded = guard_rewrites(&resolver_view, proposed);
     let application = apply_rewrites(
-        cargo,
+        reader,
         project,
         &lock_path,
         &resolver_text,
@@ -441,6 +442,7 @@ fn observed_row(
 mod tests {
     use super::super::tests::{path_key, view};
     use super::*;
+    use crate::cargocmd::Cargo;
     use indoc::indoc;
 
     fn generated_row(

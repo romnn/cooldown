@@ -11,6 +11,31 @@
   honors it too. cooldown's own cargo commands run without that age, so a stricter native age no
   longer makes Cargo refuse a version cooldown is pinning.
 
+- **Cargo `upgrade` finishes on large workspaces.** On a workspace with a few hundred candidates,
+  `upgrade --major` could run for more than twelve hours, because every lower-line fallback trial
+  redid the whole cargo apply. A fallback trial now starts from the lock an earlier trial reached
+  for the same changes, a joint widen that one candidate breaks is retried without it, a held
+  candidate the cargo adapter shows would be refused again is not retried on its own, and repeated
+  `cargo metadata --locked` reads of unchanged files are reused within a run. Attributing every
+  transitive dependency to the members that reach it also no longer walks the whole graph once
+  per dependency.
+
+- **A cargo candidate that would split a declared crate is held on its own.** A step that left a
+  crate the workspace declares on two incompatible lines failed the whole apply, which then
+  bisected every candidate. Each step is now checked, so only that candidate is held, with the
+  dependents that keep the old line named, and a step that the plan's other moves heal lands
+  together with them.
+
+- **Cargo upgrades plan an exact-pinned family after its requirer.** A family such as `wasmtime`'s
+  internals, pinned `=` by a requirer that moves to another major, was planned to the newest
+  release of its current line, which no lock could combine with the requirer's new major, so the
+  whole family was held. A dependency whose every requirer leaves its line is now planned once
+  those requirers have settled.
+
+- **Run traces store repeated content once.** A trace captured every command's output and every
+  resolver input file at each step, about 3 MB per cargo command on a large workspace. Identical
+  content is now written once per run and referenced afterwards, in trace schema version 2.
+
 ## v0.0.29
 
 - **uv candidates whose wheel tags changed get their upload times instead of `unknown_age`.**

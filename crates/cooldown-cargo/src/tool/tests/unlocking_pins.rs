@@ -314,8 +314,25 @@ async fn a_transitive_namesake_of_a_declared_line_is_released() -> eyre::Result<
             source = "registry+https://github.com/rust-lang/crates.io-index"
         "#}
     };
-    let declared = with_declared_line(lock("1.0.0", "1.0.0", "1.0.0"));
-    let landed = with_declared_line(lock("1.2.0", "1.0.0", "0.9.0"));
+    // `pkg` binds the transitive blocker line, so moving it to 0.9.0 splits no line `app` binds.
+    let binding = |lock: String, pkg: &str, blocker: &str| {
+        lock.replace(
+            &formatdoc! {r#"
+                name = "pkg"
+                version = "{pkg}"
+                source = "registry+https://github.com/rust-lang/crates.io-index"
+            "#},
+            &formatdoc! {r#"
+                name = "pkg"
+                version = "{pkg}"
+                source = "registry+https://github.com/rust-lang/crates.io-index"
+                dependencies = ["blocker {blocker}"]
+            "#},
+        )
+    };
+    let declared = with_declared_line(binding(lock("1.0.0", "1.0.0", "1.0.0"), "1.0.0", "1.0.0"));
+    let landed = with_declared_line(binding(lock("1.2.0", "1.0.0", "0.9.0"), "1.2.0", "0.9.0"));
+    assert!(declared.contains(r#"dependencies = ["blocker 1.0.0"]"#));
     std::fs::write(fixture.project.root.join("Cargo.lock"), &declared)?;
     std::fs::write(fixture.project.root.join("landed.lock"), &landed)?;
 
