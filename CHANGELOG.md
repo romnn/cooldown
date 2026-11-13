@@ -11,6 +11,10 @@
   honors it too. cooldown's own cargo commands run without that age, so a stricter native age no
   longer makes Cargo refuse a version cooldown is pinning.
 
+- **Run traces store repeated content once.** A trace captured every command's output and every
+  resolver input file at each step, about 3 MB per cargo command on a large workspace. Identical
+  content is now written once per run and referenced afterwards, in trace schema version 2.
+
 ## v0.0.29
 
 - **uv candidates whose wheel tags changed get their upload times instead of `unknown_age`.**

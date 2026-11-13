@@ -72,6 +72,7 @@ fn capture_file(snapshot: u64, path: &Utf8Path, role: cooldown_core::trace::Inpu
             role,
         },
         size: declared.as_ref().ok().map(std::fs::Metadata::len),
+        sha256: None,
     }
     .emit();
     let mut bytes = 0;

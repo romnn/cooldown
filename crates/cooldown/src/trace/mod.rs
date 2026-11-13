@@ -15,7 +15,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
-const SCHEMA_VERSION: u32 = 1;
+/// Version 2 records repeated identical artifact content as a `duplicate_of` reference.
+const SCHEMA_VERSION: u32 = 2;
+/// The oldest schema whose files this producer still recognizes as its own, so pruning keeps
+/// removing traces written before the current version.
+const OLDEST_OWNED_SCHEMA_VERSION: u32 = 1;
 const PRODUCER: &str = "cooldown";
 
 #[derive(Clone, Copy)]
@@ -88,7 +92,7 @@ impl Header {
 
     fn owned(&self) -> bool {
         self.producer == PRODUCER
-            && self.schema_version == SCHEMA_VERSION
+            && (OLDEST_OWNED_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&self.schema_version)
             && self.sequence == 0
             && self.event.kind == "run_started"
             && !self.run_id.is_empty()
@@ -361,6 +365,83 @@ mod tests {
             chunks
                 .iter()
                 .any(|record| record["event"]["content"]["data"] == "actual resolver input")
+        );
+        Ok(())
+    }
+
+    /// A run that captures the same bytes again, as every mutation checkpoint does for unchanged
+    /// manifests, writes them once and records later captures as references to that copy.
+    #[test]
+    fn identical_artifact_content_is_written_once_per_run() -> eyre::Result<()> {
+        use cooldown_core::trace::{ArtifactSource, InputRole};
+        use tracing_subscriber::prelude::*;
+        let directory = tempfile::tempdir()?;
+        let recorder = Recorder::in_directory(
+            directory.path(),
+            Path::new("project"),
+            TraceCommand::Upgrade,
+        )?;
+        let header = serde_json::value::to_raw_value(&serde_json::json!({"kind": "run_started"}))?;
+        recorder.record(&header, &[]);
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(
+            TraceLayer::new(Arc::clone(&recorder)).with_filter(
+                tracing_subscriber::filter::filter_fn(|metadata| {
+                    metadata.target().starts_with("cooldown")
+                }),
+            ),
+        ));
+        let manifest = |path| ArtifactSource::File {
+            path,
+            role: InputRole::ResolverInput,
+        };
+        tracing::dispatcher::with_default(&dispatch, || {
+            cooldown_core::trace::artifact(manifest("/a/Cargo.toml"), b"[package]");
+            cooldown_core::trace::artifact(manifest("/b/Cargo.toml"), b"[package]");
+            cooldown_core::trace::artifact(manifest("/c/Cargo.toml"), b"[workspace]");
+        });
+        let records: Vec<Value> = std::fs::read_to_string(&recorder.path)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        let events = |kind: &str| -> Vec<Value> {
+            records
+                .iter()
+                .filter(|record| record["event"]["kind"] == kind)
+                .map(|record| record["event"].clone())
+                .collect()
+        };
+        let started = events("artifact_started");
+        let [first, repeat, other] = started.as_slice() else {
+            eyre::bail!("expected three artifacts, got {started:?}");
+        };
+
+        // Every capture states its content hash; only the repeat refers back to the first copy.
+        assert_eq!(first["sha256"], repeat["sha256"]);
+        assert_ne!(first["sha256"], other["sha256"]);
+        assert_eq!(repeat["duplicate_of"], first["artifact"]);
+        assert!(first.get("duplicate_of").is_none() && other.get("duplicate_of").is_none());
+
+        // The repeat's bytes are written once, under the first artifact, and every capture still
+        // records its complete outcome and original length.
+        let chunk_owners: Vec<Value> = events("artifact_chunk")
+            .iter()
+            .map(|chunk| chunk["artifact"].clone())
+            .collect();
+        assert_eq!(
+            chunk_owners,
+            [first["artifact"].clone(), other["artifact"].clone()]
+        );
+        let finished = events("artifact_finished");
+        assert_eq!(finished.len(), 3);
+        assert!(
+            finished
+                .iter()
+                .all(|record| record["outcome"]["kind"] == "complete")
+        );
+        assert!(
+            finished
+                .iter()
+                .any(|record| record["artifact"] == repeat["artifact"] && record["bytes"] == 9)
         );
         Ok(())
     }
