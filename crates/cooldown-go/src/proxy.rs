@@ -165,7 +165,7 @@ impl GoProxy {
     ///
     /// The response is immutable and cached long.
     /// Returns `None` when no proxy serves the file, or when its `module` directive is not a single
-    /// plain path (see [`gomod::declared_module_path`](crate::gomod::declared_module_path)).
+    /// plain path.
     ///
     /// # Errors
     ///
