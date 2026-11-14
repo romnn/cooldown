@@ -25,9 +25,9 @@ use super::{
     diag_from_error,
 };
 use cooldown_core::{
-    AcceptedPublication, Change, Diagnostic, DiagnosticKind, EdgeBindingAction, IsolatedMutation,
-    IsolatedMutationStrategy, LockStatus, MemberRef, MutationExecution, PackageId, ToolRead,
-    ToolWrite,
+    AcceptedPublication, BaselineViolation, Change, Diagnostic, DiagnosticKind, EdgeBindingAction,
+    IsolatedMutation, IsolatedMutationStrategy, LockStatus, MemberRef, MutationExecution,
+    PackageId, ToolRead, ToolWrite,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -68,6 +68,9 @@ pub(super) struct UpgradeAccum {
     /// `None` until lock currency is probed; tracks the strongest non-current outcome across
     /// projects.
     pub(super) lock_status: Option<LockStatus>,
+    /// The versions outside a configured `max-major` this project's passes authorized, which a
+    /// later refresh of its lock may keep (see [`run_staled`]).
+    pub(super) allowed_crossings: HashSet<BaselineViolation>,
 }
 
 /// The evidence a preview's targets were selected from, carried into the trial's policy run so
@@ -251,6 +254,12 @@ impl Workspace {
             {
                 TurnLock::Unchanged => {}
                 TurnLock::Refreshed => {
+                    if !self
+                        .refresh_kept_ceilings(pctx, opts, current_at_start, &mut acc)
+                        .await
+                    {
+                        return acc;
+                    }
                     if let Some(gate) = refresh_gate(mode) {
                         // Only the requested pass builds, so the project is built once, from the
                         // state the run leaves it in.
@@ -730,6 +739,7 @@ fn merge_upgrade_accum(target: &mut UpgradeAccum, mut source: UpgradeAccum) {
     target.build_requested |= source.build_requested;
     target.build_ok = combine_build_ok(target.build_ok, source.build_ok);
     target.lock_status = combine_lock_status(target.lock_status, source.lock_status);
+    target.allowed_crossings.extend(source.allowed_crossings);
 }
 
 /// One failed build fails the run; a build that ran and passed is reported only when none
