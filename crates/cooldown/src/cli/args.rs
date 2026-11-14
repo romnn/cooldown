@@ -258,6 +258,20 @@ pub(in crate::cli) enum Command {
         /// Config: `[tool.cargo] edge-policy`.
         #[arg(long = "cargo-edge-policy", value_enum, value_name = "POLICY")]
         edge_policy: Option<EdgePolicyArg>,
+        /// Trade optimality for speed: skip the slow searches that can only find further
+        /// upgrades.
+        /// Cargo skips the older-version fallback trials for a held target and drops every
+        /// candidate a joint resolve names as a culprit at once.
+        /// Every landed version still passes the same policy gates and lock verification, but
+        /// fewer upgrades may land, and the run names the held candidates a full run may still
+        /// land.
+        /// Other tools are unaffected.
+        /// Config: `[global]`/`[upgrade] fast`.
+        #[arg(long)]
+        fast: bool,
+        /// Run the full search even when config sets `fast = true` (the inverse of `--fast`).
+        #[arg(long = "no-fast", conflicts_with = "fast")]
+        no_fast: bool,
         #[command(flatten)]
         mutation: MutationArgs,
     },
@@ -643,6 +657,8 @@ pub struct CliOverrides {
     /// package.
     pub(crate) fail_on_new_duplicate: Option<bool>,
     pub(crate) build: Option<bool>,
+    /// `upgrade --fast` / `--no-fast` — trade optimality for speed, if set on the CLI.
+    pub(crate) fast: Option<bool>,
     /// `outdated --transitive` — list indirect deps in the report (a bool; outdated-only).
     pub(crate) transitive: Option<bool>,
     pub(crate) downgrade_pinned: Option<bool>,
@@ -712,6 +728,15 @@ impl CliOverrides {
             fail_on_advisory_source: set_on_subcommand(matches, "check", "fail_on_advisory_source")
                 .then_some(true),
             build: set_on_subcommand(matches, "upgrade", "build").then_some(true),
+            // `--fast` forces the shortened search on; `--no-fast` forces it off over a config
+            // `fast = true`.
+            fast: if set_on_subcommand(matches, "upgrade", "fast") {
+                Some(true)
+            } else if set_on_subcommand(matches, "upgrade", "no_fast") {
+                Some(false)
+            } else {
+                None
+            },
             hide_pinned: set_on_subcommand(matches, "outdated", "hide_pinned").then_some(true),
             why: set_on_subcommand(matches, "outdated", "why").then_some(true),
             // `--countdown <latest|soonest>` carries an enum value under `outdated`; absent, the
@@ -835,6 +860,7 @@ mod tests {
             strict,
             fail_on_new_duplicate,
             build,
+            fast,
             transitive,
             downgrade_pinned,
             transitive_mode,
@@ -864,6 +890,7 @@ mod tests {
             strict,
             fail_on_new_duplicate,
             build,
+            fast,
             transitive,
             downgrade_pinned,
             transitive_mode,
@@ -1085,6 +1112,15 @@ mod tests {
             overrides(&["cooldown", "upgrade", "--build"]).build,
             Some(true)
         );
+        assert_eq!(
+            overrides(&["cooldown", "upgrade", "--fast"]).fast,
+            Some(true)
+        );
+        assert_eq!(
+            overrides(&["cooldown", "upgrade", "--no-fast"]).fast,
+            Some(false)
+        );
+        assert_eq!(overrides(&["cooldown", "upgrade"]).fast, None);
 
         assert_eq!(
             overrides(&["cooldown", "outdated", "--transitive"]).transitive,
@@ -1155,6 +1191,13 @@ mod tests {
         // `--lock` belongs to read-only commands that can refresh before reading, not mutating
         // commands that already lock as part of their operation.
         let parsed = Cli::command().try_get_matches_from(["cooldown", "upgrade", "--lock"]);
+        assert!(parsed.is_err());
+        // `--fast` shortens only `upgrade`'s search; `fix` has no such search to shorten.
+        let parsed = Cli::command().try_get_matches_from(["cooldown", "fix", "--fast"]);
+        assert!(parsed.is_err());
+        // `--fast` and `--no-fast` contradict each other.
+        let parsed =
+            Cli::command().try_get_matches_from(["cooldown", "upgrade", "--fast", "--no-fast"]);
         assert!(parsed.is_err());
     }
 

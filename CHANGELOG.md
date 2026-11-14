@@ -13,6 +13,21 @@
   workspace mode, cooldown's own reads included, adds checksums to it, so a rolled-back trial may
   leave verified checksums there.
 
+- **Cargo upgrades run fewer `cargo metadata` reads and stop reparsing the same lock.** After a
+  whole-graph resolve that leaves `Cargo.lock` as it was, the locked reads of the same files that
+  follow, such as edge-policy enforcement and the final checks, now reuse its output instead of
+  running Cargo again. A recently parsed lock text is reused instead of parsed again. Results are
+  unchanged.
+
+- **`upgrade --fast` trades optimality for speed.** A Cargo `upgrade --major` on a large workspace
+  spent most of its time retrying held candidates at older versions that rarely landed, and
+  dropping one culprit per full resolve when a joint widen broke the acceptance rule. `--fast`
+  (config `fast = true` under `[global]` or `[upgrade]`) skips those older-version retries and
+  drops every culprit of a resolve at once. Every landed version still passes the same gates, so
+  fewer upgrades may land but never an unchecked one, and a `config` warning names the candidates
+  that stayed held and the older versions not tried. `--no-fast` overrides the config. A run
+  without the flag searches exactly as before.
+
 - **pnpm advances each copy of a transitive package resolved at several versions.** A name with
   more than one copy in the graph was held as `multi_version_held` outright, so ordinary in-range
   updates such as `ansi-regex` 6.2.2 → 6.5.0 beside an unaffected 5.0.1 copy, or Babel helpers

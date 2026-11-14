@@ -204,6 +204,15 @@ impl LockedReads {
             .filter(ReadOutcome::current)
     }
 
+    /// Forgets every read.
+    #[cfg(all(test, unix))]
+    pub(crate) fn clear(&self) {
+        self.reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
     fn insert(&self, read: LockedRead) {
         let mut reads = self
             .reads
@@ -268,6 +277,28 @@ impl LockedReader<'_> {
             }
         }
         Cargo::parse_graph(&read?, &project.generated_members)
+    }
+
+    /// Keeps `stdout` as the locked read of `project`'s current `inputs`, whose key is captured for
+    /// a [`MemoOperation::LockedRead`].
+    ///
+    /// The caller vouches that a locked read of these inputs would succeed with this output now.
+    pub(crate) fn keep_settled(&self, project: &Project, inputs: MemoKey, stdout: &str) {
+        if !inputs.is_cacheable() {
+            return;
+        }
+        let Some(packages) = path_packages(stdout) else {
+            return;
+        };
+        self.reads.insert(LockedRead {
+            root: project.root.clone(),
+            inputs,
+            outcome: ReadOutcome::Graph {
+                stdout: Arc::from(stdout),
+                discovery: discovery_digest(&packages),
+                packages: Arc::from(packages),
+            },
+        });
     }
 
     /// The key of `project`'s native inputs, or `None` when they cannot all be captured.

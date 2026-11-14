@@ -286,6 +286,13 @@ pub struct RunOpts {
     pub strict: bool,
     /// `--build` (upgrade): compile/sync after re-locking.
     pub build: bool,
+    /// `--fast` (upgrade, config `fast`): skip the searches that can only find further upgrades.
+    ///
+    /// Cargo's older-version fallback trials are skipped, and its joint widen probe drops every
+    /// culprit a resolve names at once.
+    /// Every gate that keeps a landed version within policy still runs, so the run lands fewer
+    /// upgrades at most, and it names the held candidates a full run may still land.
+    pub fast: bool,
     /// `--dry-run`: resolve and print the plan; never mutate.
     pub dry_run: bool,
     /// `--offline`: cache-only mode. Registry fetches are already constrained by the HTTP client;

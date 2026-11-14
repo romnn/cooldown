@@ -169,6 +169,9 @@ pub(super) fn resolve_invocation(
             fail_on_new_duplicate: merged.fail_on_new_duplicate.unwrap_or(false),
             strict: merged.strict.unwrap_or(false),
             build: merged.build.unwrap_or(false),
+            // Only `upgrade` has a search to shorten; a `[global] fast = true` must not reach
+            // `outdated`'s policy preview.
+            fast: command.shortens_search() && merged.fast.unwrap_or(false),
             dry_run: merged.dry_run.unwrap_or(false),
             offline: merged.offline.unwrap_or(false),
             outdated_exit_code: merged.exit_code,
@@ -231,6 +234,7 @@ fn builtin_command_config(default_major: bool) -> CommandConfig {
         fail_on_new_duplicate: Some(false),
         strict: Some(false),
         build: Some(false),
+        fast: Some(false),
         transitive: Some(false),
         downgrade_pinned: Some(false),
         dry_run: Some(false),
@@ -266,6 +270,7 @@ fn explicit_command_config(global: &GlobalArgs, overrides: &CliOverrides) -> Com
         fail_on_new_duplicate: overrides.fail_on_new_duplicate,
         strict: overrides.strict,
         build: overrides.build,
+        fast: overrides.fast,
         transitive: overrides.transitive,
         downgrade_pinned: overrides.downgrade_pinned,
         dry_run: overrides.dry_run,
@@ -397,11 +402,77 @@ fn env_window_fields() -> Result<WindowFields, CoreError> {
 mod tests {
     use super::{
         advisory_failure_mode, builtin_command_config, reject_offline_dry_run, reject_offline_lock,
+        resolve_invocation,
     };
     use crate::app::AdvisoryFailureMode;
     use crate::cli::setup::SetupCommand;
+    use crate::cli::{Cli, CliOverrides};
+    use clap::FromArgMatches as _;
+    use color_eyre::eyre;
     use cooldown_core::CoreError;
     use cooldown_core::config::CommandConfig;
+
+    /// The `fast` run option `args` resolve to over the config layer `cfg`.
+    fn resolved_fast(
+        args: &[&str],
+        cfg: &CommandConfig,
+        command: SetupCommand,
+    ) -> eyre::Result<bool> {
+        let matches = Cli::command().try_get_matches_from(args)?;
+        let cli = Cli::from_arg_matches(&matches)?;
+        let overrides = CliOverrides::from_matches(&matches);
+        let invocation = resolve_invocation(&cli.global, &overrides, cfg, command)?;
+        Ok(invocation.into_run_opts().fast)
+    }
+
+    /// `fast` is off by default, follows the config, and yields to an explicit `--fast` or
+    /// `--no-fast`; only `upgrade` honors it, so a `[global] fast = true` leaves `outdated`'s
+    /// policy preview exhaustive.
+    #[test]
+    fn fast_is_an_upgrade_option_the_cli_overrides() -> eyre::Result<()> {
+        let unset = CommandConfig::default();
+        let configured = CommandConfig {
+            fast: Some(true),
+            ..CommandConfig::default()
+        };
+
+        // Off unless asked for
+        assert!(!resolved_fast(
+            &["cooldown", "upgrade"],
+            &unset,
+            SetupCommand::Upgrade
+        )?);
+
+        // Config and CLI precedence
+        assert!(resolved_fast(
+            &["cooldown", "upgrade"],
+            &configured,
+            SetupCommand::Upgrade
+        )?);
+        assert!(resolved_fast(
+            &["cooldown", "upgrade", "--fast"],
+            &unset,
+            SetupCommand::Upgrade
+        )?);
+        assert!(!resolved_fast(
+            &["cooldown", "upgrade", "--no-fast"],
+            &configured,
+            SetupCommand::Upgrade
+        )?);
+
+        // Scoped to upgrade
+        assert!(!resolved_fast(
+            &["cooldown", "outdated"],
+            &configured,
+            SetupCommand::Outdated
+        )?);
+        assert!(!resolved_fast(
+            &["cooldown", "fix"],
+            &configured,
+            SetupCommand::Fix
+        )?);
+        Ok(())
+    }
 
     #[test]
     fn builtin_defaults_seed_the_config_shape() {

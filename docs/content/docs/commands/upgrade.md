@@ -201,6 +201,41 @@ which of two things happened, because the way forward differs:
 Both fail a `--strict` run. `outdated` reports the same rows as `blocked`, with the same sentence
 in `blockedReason` and under `--why`.
 
+## Fast mode
+
+By default `upgrade` searches until it has landed every upgrade it can, however long that takes.
+`--fast` trades that optimality for speed. It never trades correctness: every version it lands
+passes the same cooldown, `max-major`, pin, and transitive gates and the same lock verification
+as a full run. It may land fewer upgrades, but each one it lands is a planned target in a
+resolve those gates checked.
+
+It shortens two Cargo searches; every other tool runs exactly as without it:
+
+- **Older-version fallback.** When the resolve cannot land a candidate's target, a full run
+  retries up to three older matured versions on the same line, first for all held candidates
+  together and then for each alone. `--fast` skips those retries and commits what the planned
+  targets landed.
+- **Joint widen culprits.** When a joint resolve of several widened requirements breaks the
+  acceptance rule, a full run drops the candidates the first violation names and resolves again,
+  one round per culprit. `--fast` drops every culprit the resolve names at once. Each dropped
+  candidate still gets its own attempt, but one that would only land together with another
+  culprit may stay held.
+
+A held candidate keeps the reason its planned target got, so `--strict` judges it as it would a
+held candidate of a full run. The run adds one `config` warning per project naming every candidate
+that stayed held, and the older matured versions it did not try, since a run without `--fast` may
+still land some of them:
+
+```text
+warning [config] --fast shortened the upgrade search, so a run without it (`--no-fast`) may still
+land some of these held candidates or an older matured version of them: web-sys 0.3.103 → 0.3.107
+(older matured versions not tried: 0.3.106, 0.3.105, 0.3.104)
+```
+
+`fast = true` under `[global]` or `[upgrade]` makes it the default; `--no-fast` runs the full search
+over such a config. Only `upgrade` reads it, so `outdated`'s blocked reasons always come from the
+full search.
+
 ## Lock edge bindings (cargo)
 
 A `Cargo.lock` records not only which versions exist but which coexisting version each dependent's
@@ -360,6 +395,7 @@ mutates only a throwaway copy, so it never stales, probes, or refreshes a lock.
 | `--major` | Allow cross-major bumps; explicit manifest bounds, config `max-major` ceilings, and the npm `latest` dist-tag still hold. |
 | `--no-respect-dist-tags` | Adopt npm-family releases above the `latest` dist-tag too. |
 | `--strict` | Exit `1` if the mutation cannot complete cleanly. |
+| `--fast` | Trade optimality for speed: Cargo skips the older-version fallback trials and drops every joint-resolve culprit at once. Every landed version still passes the same gates; fewer upgrades may land, and a `config` warning names the candidates that stayed held (see [Fast mode](#fast-mode)). `--no-fast` overrides a config `fast = true`. Config: `[global]`/`[upgrade] fast`. |
 | `--fail-on-new-duplicate` | Cargo and pnpm: refuse a resolve that gives *any* package a second resolved copy — the candidate whose landing added it is held with the copy and its requirer named and the lock restored — instead of committing it with a `duplicate_copy` warning. Config: `[global]`/`[upgrade] fail-on-new-duplicate`; `[tool.pnpm] single-copy` gates named packages on every run. On a tool without Cargo or pnpm's settlement guard the flag has no effect and the run says so. |
 | `--dry-run` | Resolve and print the plan; never mutate. |
 
