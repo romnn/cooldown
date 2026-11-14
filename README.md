@@ -66,9 +66,10 @@ to choose their directory or `--no-trace` to disable recording. `cooldown prune`
 traces and disposable cache files older than 30 days (`--older-than` / `--dry-run` customize it).
 See [run traces](docs/content/docs/traces.md) for storage locations and the event format.
 
-Cargo reuses identical resolver rejections within a run by default. Use the global
-`--no-memo` flag or `COOLDOWN_NO_MEMO=true` to retry every Cargo attempt while keeping
-HTTP caching. `--fresh` (alias `--no-cache`) disables both HTTP caching and the rejection memo.
+Cargo reuses identical resolver rejections within a run by default, and replays a Cargo command
+whose inputs are byte-identical to an earlier one's. Use the global `--no-memo` flag or
+`COOLDOWN_NO_MEMO=true` to retry every Cargo attempt while keeping HTTP caching. `--fresh` (alias
+`--no-cache`) disables both HTTP caching and the Cargo memos.
 
 #### Fixing violations
 
