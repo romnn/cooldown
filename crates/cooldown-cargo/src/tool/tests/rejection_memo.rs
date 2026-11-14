@@ -174,9 +174,9 @@ impl MemoFixture {
                 stats.memo.include(&memo_stats);
                 assert!(matches!(result?, TentativeWiden::Rejected));
             }
-            MemoOperation::Landing | MemoOperation::LockedRead => {
+            MemoOperation::Landing | MemoOperation::LockedRead | MemoOperation::Command => {
                 return Err(CoreError::System(
-                    "a landing or locked read is recorded, never attempted".to_string(),
+                    "a landing, locked read or command is recorded, never attempted".to_string(),
                 ));
             }
         }
@@ -645,8 +645,8 @@ async fn disabled_memo_repeats_every_native_attempt_and_preserves_details() -> e
                     assert!(matches!(result, TentativeWiden::Rejected));
                     stats.memo.include(&memo_stats);
                 }
-                MemoOperation::Landing | MemoOperation::LockedRead => {
-                    eyre::bail!("a landing or locked read is recorded, never attempted")
+                MemoOperation::Landing | MemoOperation::LockedRead | MemoOperation::Command => {
+                    eyre::bail!("a landing, locked read or command is recorded, never attempted")
                 }
             }
             if attempt == 0 {
