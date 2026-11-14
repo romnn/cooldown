@@ -1,6 +1,7 @@
-//! Why a candidate the whole-graph resolve left below its target is held: the requirement that
-//! caps it and the package declaring it, attributed from the lock first and from PyPI's
-//! per-release metadata second.
+//! Why a candidate the whole-graph resolve left below its target is held: the project's own uv
+//! constraint or override that excludes the target, or else the requirement that caps it and the
+//! package declaring it, attributed from the lock first and from PyPI's per-release metadata
+//! second.
 //!
 //! uv settles every conflict itself and says nothing about a candidate it kept back, and a
 //! modern `uv.lock` records declared requirements (`requires-dist`) only for workspace sources,
@@ -8,13 +9,16 @@
 //! requirer's own release metadata.
 //! Attribution is best-effort and read-only: it never changes what the resolve adopted, only
 //! what the held row says.
+//! A hold nothing attributes stays unattributed: a package whose resolved edge merely reaches the
+//! candidate has not been shown to cap it, so it is never named.
 
+use crate::constraints::{LocalConstraint, LocalConstraints, LocalField};
 use crate::lock::{Package, UvLock};
 use crate::requirement;
 use crate::version;
 use async_trait::async_trait;
 use cooldown_adapter_util::pep503_normalize;
-use cooldown_core::{RawRelease, Result};
+use cooldown_core::{RawRelease, Result, SkipReason};
 use jiff::Timestamp;
 use pep440_rs::{Version, VersionSpecifiers};
 use std::collections::BTreeSet;
@@ -52,10 +56,12 @@ impl DeclaredRequirements for crate::pypi::PyPi {
     }
 }
 
-/// The package whose requirement holds a candidate below its target, and which requirement.
+/// What holds a candidate below its target: a package's requirement, or the project's own
+/// constraint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Ceiling {
-    /// The package the held candidate conflicts with, named on the row as its blocker.
+    /// The package named on the row as the blocker: the package the held candidate conflicts
+    /// with, or the held candidate itself when its own project constraint holds it.
     pub blocker: String,
     /// The blocker's locked version, when the lock records one.
     pub blocker_version: Option<String>,
@@ -74,8 +80,24 @@ pub(crate) enum Cause {
         requirer_version: String,
         declared: Declared,
     },
-    /// Only a resolved edge attributes the blocker; no specifier is known.
-    Edge,
+    /// The project's own `[tool.uv]` constraint or override on the held package excludes the
+    /// target.
+    Local(LocalCap),
+}
+
+/// A project declaration in `[tool.uv]` that excludes a held candidate's target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalCap {
+    /// The list that declares it.
+    pub field: LocalField,
+    /// The declaration as the author wrote it (`onnxruntime==1.31.0`).
+    pub requirement: String,
+    /// Whether it is a lone exact pin.
+    pub exact: bool,
+    /// The manifest that declares it (`pyproject.toml`).
+    pub file: String,
+    /// The target it excludes.
+    pub target: String,
 }
 
 /// A declared requirement as its author wrote it, split from its marker.
@@ -98,44 +120,62 @@ pub(crate) struct Lift {
 ///
 /// Attribution is tried in order of how much it can say, so the row carries the most it can:
 ///
+/// 0. The project's own constraint or override on `held` excludes `target` while admitting every
+///    locked version of `held`.
 /// 1. A requirer's `requires-dist` in the lock (a workspace source) caps `held` below `target`.
 /// 2. A registry requirer's release metadata caps `held` below `target`.
 /// 3. The target release's own metadata requires a sibling under a specifier the sibling's
 ///    locked version violates.
-/// 4. A single package's resolved edge reaches `held`, which names it without a specifier.
 ///
 /// A cap is a requirement the locked version satisfies and the target does not; a requirement
 /// the lock already violates is inactive (a marker uv resolved away) and blames nothing.
+/// An override replaces every requirement on its package, so a requirer's requirement on an
+/// overridden package caps nothing, at step 1 and 2 for `held` and at step 3 for a sibling.
 /// Registry reads are best-effort: a failed or unknown read falls through to the next step.
 pub(crate) async fn attribute(
     lock: &UvLock,
     held: &str,
     target: &str,
+    local: &LocalConstraints,
     registry: &dyn DeclaredRequirements,
 ) -> Option<Ceiling> {
     let target_version = version::parse(target)?;
-    let current = lock
+    let locked: Vec<Version> = lock
         .packages
         .iter()
-        .find(|package| package.name == held)
-        .and_then(|package| package.version.as_deref())
-        .and_then(version::parse);
-    if let Some(ceiling) = requirer_capping_in_lock(lock, held, current.as_ref(), &target_version) {
-        return Some(ceiling);
+        .filter(|package| package.name == held)
+        .filter_map(|package| package.version.as_deref().and_then(version::parse))
+        .collect();
+    if let Some(declared) = local.capping(held, &locked, &target_version) {
+        return Some(local_ceiling(held, target, declared, &local.file));
     }
-    if let Some(ceiling) =
-        requirer_capping_in_metadata(lock, held, current.as_ref(), &target_version, registry).await
-    {
-        return Some(ceiling);
+    if !local.overrides(held) {
+        let current = locked.first();
+        if let Some(ceiling) = requirer_capping_in_lock(lock, held, current, &target_version) {
+            return Some(ceiling);
+        }
+        if let Some(ceiling) =
+            requirer_capping_in_metadata(lock, held, current, &target_version, registry).await
+        {
+            return Some(ceiling);
+        }
     }
-    if let Some(ceiling) = sibling_violated_by_target(lock, held, target, registry).await {
-        return Some(ceiling);
+    sibling_violated_by_target(lock, held, target, local, registry).await
+}
+
+/// The ceiling of the project's own declaration `declared` on `held`, excluding `target`.
+fn local_ceiling(held: &str, target: &str, declared: &LocalConstraint, file: &str) -> Ceiling {
+    Ceiling {
+        blocker: held.to_string(),
+        blocker_version: None,
+        cause: Cause::Local(LocalCap {
+            field: declared.field,
+            requirement: declared.requirement.clone(),
+            exact: declared.is_exact(),
+            file: file.to_string(),
+            target: target.to_string(),
+        }),
     }
-    unique_edge_requirer(lock, held).map(|requirer| Ceiling {
-        blocker_version: locked_version(lock, &requirer),
-        blocker: requirer,
-        cause: Cause::Edge,
-    })
 }
 
 /// The release of the blocker of `ceiling` that lifts its cap on `held`, when the cap is the
@@ -188,10 +228,25 @@ pub(crate) async fn lift(
 }
 
 impl Ceiling {
+    /// The skip reason of the held row.
+    ///
+    /// The project's own exact pin holds like any exact manifest pin.
+    /// Its own range holds a forward move as an explicit upper bound and a downgrade as a floor
+    /// the graph requires.
+    /// A requirement of another package is a graph ceiling.
+    pub(crate) fn skip_reason(&self, downgrade: bool) -> SkipReason {
+        match &self.cause {
+            Cause::Local(cap) if cap.exact => SkipReason::PinHeld,
+            Cause::Local(_) if downgrade => SkipReason::GraphHeld,
+            Cause::Local(_) => SkipReason::DeclaredBoundHeld,
+            Cause::Requires(_) | Cause::RequiredBy { .. } => SkipReason::GraphCeilingHeld,
+        }
+    }
+
     /// The held row's detail: the blocker with its version, the requirement that caps the
     /// candidate with its marker, and the release that lifts the cap when known.
-    /// `None` for an edge-only attribution, whose row keeps the application's own "conflicts
-    /// with" sentence.
+    /// For the project's own declaration it names the declaration, its `[tool.uv]` list, and
+    /// the manifest.
     ///
     /// `cutoff` is the project's resolution window as uv was given it, so a lifting release the
     /// window excluded is dated with when it matures; `now` anchors that estimate.
@@ -201,7 +256,7 @@ impl Ceiling {
         lift: Option<&Lift>,
         cutoff: Option<&str>,
         now: Timestamp,
-    ) -> Option<String> {
+    ) -> String {
         let blocker = match &self.blocker_version {
             Some(version) => format!("{} {version}", self.blocker),
             None => self.blocker.clone(),
@@ -220,7 +275,15 @@ impl Ceiling {
                 "held: conflicts with {blocker}: {held} {requirer_version} requires {}",
                 declared.describe()
             ),
-            Cause::Edge => return None,
+            Cause::Local(cap) => {
+                return format!(
+                    "held: {} [tool.uv] {} declares {}, which excludes {}",
+                    cap.file,
+                    cap.field.key(),
+                    cap.requirement,
+                    cap.target
+                );
+            }
         };
         if let Some(lift) = lift {
             use std::fmt::Write as _;
@@ -233,7 +296,7 @@ impl Ceiling {
                 let _ = write!(detail, " ({note})");
             }
         }
-        Some(detail)
+        detail
     }
 }
 
@@ -351,12 +414,14 @@ async fn requirer_capping_in_metadata(
 /// Step 3: the target release of `held` requires a sibling under a specifier the sibling's
 /// locked version violates, so the sibling, which the same resolve declined to move, is what
 /// holds the candidate.
-/// Requirements under an extra count only when the lock activates that extra of `held`.
+/// Requirements under an extra count only when the lock activates that extra of `held`, and a
+/// requirement on a sibling the project overrides counts not at all, since uv replaces it.
 /// Order-stable across siblings.
 async fn sibling_violated_by_target(
     lock: &UvLock,
     held: &str,
     target: &str,
+    local: &LocalConstraints,
     registry: &dyn DeclaredRequirements,
 ) -> Option<Ceiling> {
     let held_package = lock.packages.iter().find(|package| package.name == held)?;
@@ -373,7 +438,10 @@ async fn sibling_violated_by_target(
         .iter()
         .filter_map(|line| {
             let parsed = requirement::parse(line)?;
-            if !parsed.has_version_specifier() || !extras_permit(parsed.marker, &active_extras) {
+            if !parsed.has_version_specifier()
+                || !extras_permit(parsed.marker, &active_extras)
+                || local.overrides(parsed.name)
+            {
                 return None;
             }
             let sibling = lock
@@ -401,25 +469,6 @@ async fn sibling_violated_by_target(
             declared,
         },
     })
-}
-
-/// Step 4, the last resort: the single package whose resolved edge reaches `held`.
-/// A transitive held below its newest is structurally held by the package that pulls it, but
-/// only a unique requirer is named, since several make the blame ambiguous.
-/// Skips `held` itself.
-fn unique_edge_requirer(lock: &UvLock, held: &str) -> Option<String> {
-    let mut requirers: Vec<&str> = lock
-        .packages
-        .iter()
-        .filter(|package| package.name != held && reaches(package, held))
-        .map(|package| package.name.as_str())
-        .collect();
-    requirers.sort_unstable();
-    requirers.dedup();
-    match requirers.as_slice() {
-        [only] => Some((*only).to_string()),
-        _ => None,
-    }
 }
 
 /// The first line of `lines` that names `held` under an active marker and caps it: its
@@ -531,13 +580,6 @@ fn from_pypi(package: &Package) -> bool {
         .is_some_and(crate::pypi::is_pypi_index)
 }
 
-fn locked_version(lock: &UvLock, name: &str) -> Option<String> {
-    lock.packages
-        .iter()
-        .find(|package| package.name == name)
-        .and_then(|package| package.version.clone())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -603,6 +645,20 @@ mod tests {
         UvLock::parse(content).expect("lock parses")
     }
 
+    /// A project that declares no uv constraints.
+    fn no_local() -> LocalConstraints {
+        LocalConstraints::default()
+    }
+
+    /// The uv constraints of a `pyproject.toml` holding `contents`.
+    fn local(contents: &str) -> LocalConstraints {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let manifest = camino::Utf8PathBuf::from_path_buf(directory.path().join("pyproject.toml"))
+            .expect("utf8 path");
+        std::fs::write(&manifest, contents).expect("write manifest");
+        LocalConstraints::read(&manifest).expect("a valid manifest")
+    }
+
     /// The luup4 shape: `transformers` is pulled by two docling packages, neither of which the
     /// lock carries `requires-dist` for, and one of them caps it on darwin.
     fn docling_lock() -> UvLock {
@@ -663,9 +719,15 @@ mod tests {
                 "3.14.0",
                 &[r#"transformers!=5.0.*,<5.9.0,>=4.42.0; sys_platform == "darwin""#],
             );
-        let ceiling = attribute(&docling_lock(), "transformers", "5.15.1", &registry)
-            .await
-            .expect("the metadata attributes the cap");
+        let ceiling = attribute(
+            &docling_lock(),
+            "transformers",
+            "5.15.1",
+            &no_local(),
+            &registry,
+        )
+        .await
+        .expect("the metadata attributes the cap");
         assert_eq!(ceiling.blocker, "docling-core");
         assert_eq!(ceiling.blocker_version.as_deref(), Some("2.92.0"));
         assert_eq!(
@@ -677,10 +739,7 @@ mod tests {
         );
         assert_eq!(
             ceiling.detail("transformers", None, Some("14 days"), now()),
-            Some(
-                r#"held: conflicts with docling-core 2.92.0, which requires transformers<5.9.0,>=4.34.0 on sys_platform == "darwin" and extra == "chunking""#
-                    .to_string()
-            )
+            r#"held: conflicts with docling-core 2.92.0, which requires transformers<5.9.0,>=4.34.0 on sys_platform == "darwin" and extra == "chunking""#
         );
     }
 
@@ -688,7 +747,7 @@ mod tests {
     async fn an_inactive_extra_or_a_satisfied_specifier_caps_nothing() {
         // docling-core's cap lives under an extra the lock does not activate for it, and
         // docling-ibm-models admits the target: nothing in the metadata caps transformers, so
-        // attribution falls through to the edges, where two requirers leave the blame ambiguous.
+        // the hold stays unattributed.
         let registry = Fake::default()
             .requires(
                 "docling-core",
@@ -697,7 +756,14 @@ mod tests {
             )
             .requires("docling-ibm-models", "3.14.0", &["transformers>=4.42.0"]);
         assert_eq!(
-            attribute(&docling_lock(), "transformers", "5.15.1", &registry).await,
+            attribute(
+                &docling_lock(),
+                "transformers",
+                "5.15.1",
+                &no_local(),
+                &registry
+            )
+            .await,
             None
         );
         // A requirement the lock already violates is not in force: uv resolved that marker away,
@@ -707,21 +773,34 @@ mod tests {
             "3.14.0",
             &["transformers>=6.0; python_full_version >= '3.14'"],
         );
-        let ceiling = attribute(&docling_lock(), "transformers", "5.15.1", &registry).await;
+        let ceiling = attribute(
+            &docling_lock(),
+            "transformers",
+            "5.15.1",
+            &no_local(),
+            &registry,
+        )
+        .await;
         assert_eq!(ceiling, None);
     }
 
     #[tokio::test]
     async fn a_registry_failure_leaves_attribution_to_the_lock() {
         // Offline or a registry outage must not turn a held row into an error: the read fails and
-        // the edges are the fallback, which here name nothing because two packages pull the
-        // candidate.
+        // the hold stays unattributed.
         let registry = Fake {
             failing: true,
             ..Fake::default()
         };
         assert_eq!(
-            attribute(&docling_lock(), "transformers", "5.15.1", &registry).await,
+            attribute(
+                &docling_lock(),
+                "transformers",
+                "5.15.1",
+                &no_local(),
+                &registry
+            )
+            .await,
             None
         );
     }
@@ -771,7 +850,7 @@ mod tests {
             version = "5.8.1"
             source = { registry = "https://pypi.org/simple" }
         "#});
-        let ceiling = attribute(&lock, "transformers", "5.15.1", &registry)
+        let ceiling = attribute(&lock, "transformers", "5.15.1", &no_local(), &registry)
             .await
             .expect("the metadata attributes the cap");
         let lift = lift(&lock, &ceiling, "transformers", "5.15.1", &registry)
@@ -784,10 +863,8 @@ mod tests {
         // a window only the publish date is stated.
         let detail = ceiling.detail("transformers", Some(&lift), Some("14 days"), now());
         assert_eq!(
-            detail.as_deref(),
-            Some(
-                r#"held: conflicts with docling-ibm-models 3.14.0, which requires transformers<5.9.0,>=4.42.0 on sys_platform == "darwin"; the cap lifts in docling-ibm-models 4.0.0 (published 2026-08-25, in cooldown until about 2026-09-08)"#
-            )
+            detail,
+            r#"held: conflicts with docling-ibm-models 3.14.0, which requires transformers<5.9.0,>=4.42.0 on sys_platform == "darwin"; the cap lifts in docling-ibm-models 4.0.0 (published 2026-08-25, in cooldown until about 2026-09-08)"#
         );
         let frozen = ceiling.detail(
             "transformers",
@@ -796,27 +873,18 @@ mod tests {
             now(),
         );
         assert!(
-            frozen
-                .as_deref()
-                .is_some_and(|detail| detail.ends_with("(published 2026-08-25, after the freeze)")),
+            frozen.ends_with("(published 2026-08-25, after the freeze)"),
             "{frozen:?}"
         );
         let unwindowed = ceiling.detail("transformers", Some(&lift), None, now());
         assert!(
-            unwindowed
-                .as_deref()
-                .is_some_and(|detail| detail.ends_with("(published 2026-08-25)")),
+            unwindowed.ends_with("(published 2026-08-25)"),
             "{unwindowed:?}"
         );
         // A release older than the window is simply dated: it was admissible, so something else
         // kept the resolve from taking it, and the row must not claim it is cooling.
         let matured = ceiling.detail("transformers", Some(&lift), Some("3 days"), now());
-        assert!(
-            matured
-                .as_deref()
-                .is_some_and(|detail| detail.ends_with("(published 2026-08-25)")),
-            "{matured:?}"
-        );
+        assert!(matured.ends_with("(published 2026-08-25)"), "{matured:?}");
     }
 
     #[tokio::test]
@@ -859,17 +927,13 @@ mod tests {
                 r#"fastapi>=0.100; extra == "proxy""#,
             ],
         );
-        let ceiling = attribute(&lock, "litellm", "1.91.5", &registry)
+        let ceiling = attribute(&lock, "litellm", "1.91.5", &no_local(), &registry)
             .await
             .expect("the target's metadata attributes the sibling");
         assert_eq!(ceiling.blocker, "openai");
         assert_eq!(
-            ceiling
-                .detail("litellm", None, Some("14 days"), now())
-                .as_deref(),
-            Some(
-                "held: conflicts with openai 3.1.2: litellm 1.91.5 requires openai>=2.20.0,<3.0.0"
-            )
+            ceiling.detail("litellm", None, Some("14 days"), now()),
+            "held: conflicts with openai 3.1.2: litellm 1.91.5 requires openai>=2.20.0,<3.0.0"
         );
         // The sibling's cap is not the sibling's to lift, so no lift is looked for.
         assert_eq!(
@@ -905,15 +969,13 @@ mod tests {
             failing: true,
             ..Fake::default()
         };
-        let ceiling = attribute(&lock, "typer", "0.26.7", &registry)
+        let ceiling = attribute(&lock, "typer", "0.26.7", &no_local(), &registry)
             .await
             .expect("the lock attributes the cap");
         assert_eq!(ceiling.blocker, "huggingface-hub");
         assert_eq!(
-            ceiling.detail("typer", None, None, now()).as_deref(),
-            Some(
-                "held: conflicts with huggingface-hub 1.18.0, which requires typer>=0.20.0,<0.26.0 on sys_platform == 'linux'"
-            )
+            ceiling.detail("typer", None, None, now()),
+            "held: conflicts with huggingface-hub 1.18.0, which requires typer>=0.20.0,<0.26.0 on sys_platform == 'linux'"
         );
         // A target within the bound is not capped by that requirement.
         assert_eq!(
@@ -927,32 +989,208 @@ mod tests {
         );
     }
 
+    /// The single-requirer lock the issue #97 rows were blamed on: `pymupdf` alone reaches
+    /// `onnxruntime`, and nothing it declares caps it.
+    fn sole_requirer_lock() -> UvLock {
+        parse_lock(indoc! {r#"
+            version = 1
+            revision = 3
+
+            [[package]]
+            name = "pymupdf"
+            version = "1.26.0"
+            source = { registry = "https://pypi.org/simple" }
+            dependencies = [{ name = "onnxruntime" }]
+
+            [[package]]
+            name = "onnxruntime"
+            version = "1.31.0"
+            source = { registry = "https://pypi.org/simple" }
+        "#})
+    }
+
     #[tokio::test]
-    async fn a_unique_resolved_edge_is_the_last_resort_and_carries_no_detail() {
-        // A real `uv.lock` often records only resolved edges and the registry knows nothing, so
-        // the unique package whose edge reaches the held transitive is named without a
-        // specifier; the row then keeps the application's own "conflicts with" sentence.
+    async fn a_resolved_edge_alone_blames_nothing() {
+        // A real `uv.lock` often records only resolved edges and the registry knows nothing.
+        // The sole package whose edge reaches the held candidate has not been shown to cap it, so
+        // naming it would send the user to change a package that cannot release the hold.
+        let registry = Fake::default().requires("pymupdf", "1.26.0", &["onnxruntime"]);
+        assert_eq!(
+            attribute(
+                &sole_requirer_lock(),
+                "onnxruntime",
+                "1.32.0",
+                &no_local(),
+                &registry
+            )
+            .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_projects_own_constraint_is_named_with_its_file() {
+        // The issue #97 shape: the project pins onnxruntime through `constraint-dependencies`.
+        // The constraint is the cause, so the row names it and its manifest, and the reason is
+        // the exact pin's.
+        let local = local(indoc! {r#"
+            [tool.uv]
+            constraint-dependencies = ["onnxruntime==1.31.0"]
+        "#});
+        let ceiling = attribute(
+            &sole_requirer_lock(),
+            "onnxruntime",
+            "1.32.0",
+            &local,
+            &Fake::default(),
+        )
+        .await
+        .expect("the constraint attributes the hold");
+        assert_eq!(ceiling.blocker, "onnxruntime");
+        assert_eq!(
+            ceiling.detail("onnxruntime", None, None, now()),
+            "held: pyproject.toml [tool.uv] constraint-dependencies declares onnxruntime==1.31.0, which excludes 1.32.0"
+        );
+        assert_eq!(ceiling.skip_reason(false), SkipReason::PinHeld);
+        assert_eq!(ceiling.skip_reason(true), SkipReason::PinHeld);
+        // The project's own pin is not the blocker's to lift.
+        assert_eq!(
+            lift(
+                &sole_requirer_lock(),
+                &ceiling,
+                "onnxruntime",
+                "1.32.0",
+                &Fake::default()
+            )
+            .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_projects_own_range_holds_as_a_bound_or_a_floor() {
+        // A range the project declares holds a forward move as an explicit upper bound and a
+        // downgrade as a floor, and the row names the override list it comes from.
+        let local = local(indoc! {r#"
+            [tool.uv]
+            override-dependencies = ["onnxruntime>=1.30,<1.32"]
+        "#});
+        let forward = attribute(
+            &sole_requirer_lock(),
+            "onnxruntime",
+            "1.32.0",
+            &local,
+            &Fake::default(),
+        )
+        .await
+        .expect("the override attributes the forward hold");
+        assert_eq!(forward.skip_reason(false), SkipReason::DeclaredBoundHeld);
+        assert_eq!(
+            forward.detail("onnxruntime", None, None, now()),
+            "held: pyproject.toml [tool.uv] override-dependencies declares onnxruntime>=1.30,<1.32, which excludes 1.32.0"
+        );
+        let downgrade = attribute(
+            &sole_requirer_lock(),
+            "onnxruntime",
+            "1.29.0",
+            &local,
+            &Fake::default(),
+        )
+        .await
+        .expect("the override attributes the downgrade hold");
+        assert_eq!(downgrade.skip_reason(true), SkipReason::GraphHeld);
+    }
+
+    #[tokio::test]
+    async fn a_constraint_the_lock_violates_or_admitting_the_target_blames_nothing() {
+        // The constraint admits the target, so something else holds it.
+        let admits = local(indoc! {r#"
+            [tool.uv]
+            constraint-dependencies = ["onnxruntime<2"]
+        "#});
+        // The constraint excludes the locked version too, so it is not what the graph resolved
+        // under (a stale lock), and blaming it would be a guess.
+        let violated = local(indoc! {r#"
+            [tool.uv]
+            constraint-dependencies = ["onnxruntime==1.30.0"]
+        "#});
+        for local in [admits, violated] {
+            assert_eq!(
+                attribute(
+                    &sole_requirer_lock(),
+                    "onnxruntime",
+                    "1.32.0",
+                    &local,
+                    &Fake::default()
+                )
+                .await,
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_override_replaces_the_requirements_that_would_otherwise_be_blamed() {
+        // docling-ibm-models caps transformers below 5.9.0, but the project overrides
+        // transformers with a range that admits the target, so uv never saw that cap.
+        let registry = Fake::default().requires(
+            "docling-ibm-models",
+            "3.14.0",
+            &["transformers<5.9.0,>=4.42.0"],
+        );
+        let overridden = local(indoc! {r#"
+            [tool.uv]
+            override-dependencies = ["transformers>=4.42.0"]
+        "#});
+        assert_eq!(
+            attribute(
+                &docling_lock(),
+                "transformers",
+                "5.15.1",
+                &overridden,
+                &registry
+            )
+            .await,
+            None
+        );
+        // Without the override the same metadata attributes the cap.
+        assert!(
+            attribute(
+                &docling_lock(),
+                "transformers",
+                "5.15.1",
+                &no_local(),
+                &registry
+            )
+            .await
+            .is_some()
+        );
+
+        // The target's own requirement on an overridden sibling is replaced as well.
         let lock = parse_lock(indoc! {r#"
             version = 1
             revision = 3
 
             [[package]]
-            name = "huggingface-hub"
-            version = "1.18.0"
+            name = "litellm"
+            version = "1.83.0"
             source = { registry = "https://pypi.org/simple" }
-            dependencies = [{ name = "typer" }]
+            dependencies = [{ name = "openai" }]
 
             [[package]]
-            name = "typer"
-            version = "0.25.1"
+            name = "openai"
+            version = "3.1.2"
             source = { registry = "https://pypi.org/simple" }
         "#});
-        let ceiling = attribute(&lock, "typer", "0.26.7", &Fake::default())
-            .await
-            .expect("the edge attributes the requirer");
-        assert_eq!(ceiling.blocker, "huggingface-hub");
-        assert_eq!(ceiling.cause, Cause::Edge);
-        assert_eq!(ceiling.detail("typer", None, None, now()), None);
+        let registry = Fake::default().requires("litellm", "1.91.5", &["openai>=2.20.0,<3.0.0"]);
+        let overridden = local(indoc! {r#"
+            [tool.uv]
+            override-dependencies = ["openai>=3"]
+        "#});
+        assert_eq!(
+            attribute(&lock, "litellm", "1.91.5", &overridden, &registry).await,
+            None
+        );
     }
 
     #[test]

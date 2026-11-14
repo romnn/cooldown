@@ -231,6 +231,141 @@ fn upgrade_advances_a_matured_transitive_no_direct_pin_drags() {
     );
 }
 
+/// The transitive-advance project with `certifi` held at its seeded version by the project's own
+/// `[tool.uv] constraint-dependencies`: `requests` is the only package that reaches `certifi`,
+/// and it admits every newer release, so it has nothing to do with the hold.
+const CONSTRAINT_PIN_PYPROJECT: &str = indoc! {r#"
+    [project]
+    name = "cooldown-uv-constraint-pin"
+    version = "0.1.0"
+    requires-python = ">=3.10"
+    dependencies = [
+        "requests==2.32.3",
+    ]
+
+    [tool.uv]
+    constraint-dependencies = ["certifi==2024.8.30"]
+"#};
+
+/// The constraint that holds `certifi` in [`CONSTRAINT_PIN_PYPROJECT`], as its held row names it.
+const CONSTRAINT_PIN_DETAIL: &str = "held: pyproject.toml [tool.uv] constraint-dependencies declares certifi==2024.8.30, which excludes 2024.12.14";
+
+/// A hold caused by the project's own exact constraint names that constraint and its manifest,
+/// in `upgrade` and in `outdated`, and never blames the package that merely pulls the candidate
+/// in (issue #97).
+#[test]
+fn a_constraint_pin_is_named_as_the_hold_not_its_requirer() {
+    skip_if_missing!("uv");
+    let fixture = Fixture::new();
+    fixture.write("pyproject.toml", CONSTRAINT_PIN_PYPROJECT);
+    fixture.write(".python-version", PYTHON_VERSION);
+    seed_lock(&fixture, TRANSITIVE_ADVANCE_SEED);
+    assert_eq!(
+        toml_lock_pins(&fixture.read_bytes("uv.lock"))
+            .get("certifi")
+            .map(String::as_str),
+        Some("2024.8.30"),
+        "seed sanity: the constraint locks certifi at its pin"
+    );
+
+    // certifi 2024.12.14 matured under the freeze, so it is planned; the resolve keeps the
+    // constraint's version, and the row says which declaration holds it.
+    let report = fixture.cooldown_json(&["upgrade", "--freeze", TRANSITIVE_ADVANCE_FREEZE]);
+    assert!(report.ok(), "upgrade should succeed");
+    assert_eq!(
+        report.skipped_reasons_for("certifi"),
+        ["pin_held".to_owned()].into_iter().collect()
+    );
+    assert_eq!(
+        report.skip_detail_for("certifi").as_deref(),
+        Some(CONSTRAINT_PIN_DETAIL)
+    );
+    assert_ne!(
+        report.skipped_offending_for("certifi").as_deref(),
+        Some("requests"),
+        "the hold is the candidate's own, not requests'"
+    );
+    assert_eq!(
+        toml_lock_pins(&fixture.read_bytes("uv.lock"))
+            .get("certifi")
+            .map(String::as_str),
+        Some("2024.8.30"),
+        "the constraint keeps certifi in place"
+    );
+
+    // `outdated` verifies the same target and blocks it with the same reason.
+    let outdated = fixture.cooldown_json(&[
+        "outdated",
+        "--transitive",
+        "--freeze",
+        TRANSITIVE_ADVANCE_FREEZE,
+    ]);
+    assert_eq!(
+        outdated
+            .item_field_str("certifi", "blockedReason")
+            .as_deref(),
+        Some(CONSTRAINT_PIN_DETAIL)
+    );
+}
+
+/// A direct dependency whose own requirement admits newer releases while the project's
+/// `[tool.uv] constraint-dependencies` caps it below them.
+const CONSTRAINT_BOUND_PYPROJECT: &str = indoc! {r#"
+    [project]
+    name = "cooldown-uv-constraint-bound"
+    version = "0.1.0"
+    requires-python = ">=3.10"
+    dependencies = [
+        "requests==2.32.3",
+        "certifi>=2024.2.2",
+    ]
+
+    [tool.uv]
+    constraint-dependencies = ["certifi<2024.12"]
+"#};
+
+/// A project constraint that bounds a direct dependency holds it as a declared bound, and the
+/// upgrade leaves the dependency's own requirement alone: raising its floor past the constraint
+/// would only make the resolve unsatisfiable.
+#[test]
+fn a_constraint_bound_holds_a_direct_dependency_without_rewriting_it() {
+    skip_if_missing!("uv");
+    let fixture = Fixture::new();
+    fixture.write("pyproject.toml", CONSTRAINT_BOUND_PYPROJECT);
+    fixture.write(".python-version", PYTHON_VERSION);
+    seed_lock(&fixture, TRANSITIVE_ADVANCE_SEED);
+    let manifest_before = fixture.read_bytes("pyproject.toml");
+
+    let report = fixture.cooldown_json(&["upgrade", "--freeze", TRANSITIVE_ADVANCE_FREEZE]);
+    assert!(report.ok(), "upgrade should succeed");
+    assert_eq!(
+        report.summary_errors(),
+        0,
+        "the resolve must stay satisfiable"
+    );
+    assert_eq!(
+        report.skipped_reasons_for("certifi"),
+        ["declared_bound_held".to_owned()].into_iter().collect()
+    );
+    assert_eq!(
+        report.skip_detail_for("certifi").as_deref(),
+        Some(
+            "held: pyproject.toml [tool.uv] constraint-dependencies declares certifi<2024.12, which excludes 2024.12.14"
+        )
+    );
+    assert_eq!(
+        manifest_before,
+        fixture.read_bytes("pyproject.toml"),
+        "the project's own certifi requirement is not widened against its constraint"
+    );
+    assert_eq!(
+        toml_lock_pins(&fixture.read_bytes("uv.lock"))
+            .get("certifi")
+            .map(String::as_str),
+        Some("2024.8.30")
+    );
+}
+
 #[test]
 fn outdated_agrees_with_upgrade() {
     skip_if_missing!("uv");
