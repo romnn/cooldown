@@ -737,6 +737,28 @@ fn collateral_rows_keep_a_held_candidates_real_movement() {
     );
 }
 
+/// Two copies of one transitive converging on one target share its target key, but only the
+/// planned copy's row is the plan's own: the other copy's move is collateral and must surface.
+#[test]
+fn collateral_rows_keep_a_sibling_copy_move_to_a_planned_target() {
+    let planned = vec![change("seroval", "1.6.11", "1.7.5")];
+    let applied = vec![
+        change("seroval", "1.6.11", "1.7.5"),
+        change("seroval", "1.7.4", "1.7.5"),
+    ];
+
+    let collateral = collateral_rows(&applied, &planned);
+
+    assert_eq!(
+        collateral
+            .iter()
+            .map(|change| (change.from.as_str(), change.to.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("1.7.4", "1.7.5")],
+        "a source-blind filter would drop the other copy's move"
+    );
+}
+
 /// The regeneration note for a followed generated manifest speaks in the run's mood — a preview
 /// or dry run has rewritten nothing the user keeps — and names the manifest as its path so a
 /// consumer can key on it.
