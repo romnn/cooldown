@@ -8,6 +8,31 @@
   running Cargo again. A recently parsed lock text is reused instead of parsed again. Results are
   unchanged.
 
+- **pnpm advances each copy of a transitive package resolved at several versions.** A name with
+  more than one copy in the graph was held as `multi_version_held` outright, so ordinary in-range
+  updates such as `ansi-regex` 6.2.2 → 6.5.0 beside an unaffected 5.0.1 copy, or Babel helpers
+  moving on both their 7 and 8 lines, never landed. Each copy now advances through override
+  selectors that name the dependents binding it, so another copy of the name stays where it is,
+  and a dependent moving in the same run takes the copy with it. A copy is still held when no
+  selector reaches it alone, such as one required through an npm alias, and the row says why.
+
+- **A resolver can no longer carry a package across its configured `max-major`.** Only planned
+  targets were checked against the ceiling, so a version the resolver chose on its own could
+  cross it as an ordinary collateral row. Examples are Go raising an indirect module from v0 to
+  v1 and Cargo or npm adding a copy on a higher major. `upgrade` and `fix` now roll such a change
+  back and hold the candidate that caused it as `max_major_held`, naming the capped package. A
+  lock refresh that another project in the run forces, and that would cross the ceiling, fails
+  its project instead. A version that was already above the ceiling before the run does not fail
+  it.
+
+- **Run traces are compressed and compact by default.** A large `upgrade --major` run could write a
+  trace of more than 12 GB. Traces are now zstd-compressed on a background thread (`.jsonl.zst`,
+  readable with `zstd -dc`), and by default each distinct release list is recorded once and
+  referred to, rejected releases are summarized in their evaluation, and identical native command
+  output is recorded once. On this repository, an `upgrade --major` trace shrinks from 280 MB to
+  under 2 MB. `--full-trace` (or `COOLDOWN_FULL_TRACE`) records everything as it happens, still
+  compressed. `cooldown prune` also removes the uncompressed traces of earlier versions.
+
 - **The pnpm report credits a transitive upgrade only when its own copy moved.** A name can
   resolve to several copies, and the report judged each planned move by the name's newest copy.
   `inline-style-parser` 0.2.7 → 0.2.9 was reported applied while `style-to-object` 1.0.14 still

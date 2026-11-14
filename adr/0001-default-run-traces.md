@@ -1,6 +1,6 @@
 # 1. Default run traces preserve the evidence behind dependency decisions
 
-**Status:** accepted · **Date:** 2026-11-12
+**Status:** accepted · **Date:** 2026-11-12 · amended by [0002](0002-compressed-compact-traces.md)
 
 ## Context
 

@@ -500,6 +500,10 @@ pub(in crate::cli) struct GlobalArgs {
     /// Disable the diagnostic run trace recorded for upgrade, fix, and outdated.
     #[arg(long = "no-trace", global = true, env = "COOLDOWN_NO_TRACE")]
     pub(in crate::cli) no_trace: bool,
+    /// Record the run trace in full: every release list and filtered release where it occurs, and
+    /// native output as it arrives. The default compacts repeated evidence.
+    #[arg(long = "full-trace", global = true, env = "COOLDOWN_FULL_TRACE")]
+    pub(in crate::cli) full_trace: bool,
     /// Store traces in this directory instead of the user configuration directory.
     #[arg(long = "trace-dir", global = true, env = "COOLDOWN_TRACE_DIR")]
     pub(in crate::cli) trace_dir: Option<Utf8PathBuf>,

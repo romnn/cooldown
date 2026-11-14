@@ -4,19 +4,24 @@ mod layer;
 mod lock;
 mod paths;
 pub(crate) mod prune;
+mod read;
+mod writer;
 
 pub(crate) use layer::TraceLayer;
+pub use read::{Records, records};
 
 use cooldown_core::CoreError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
-use std::io::{BufRead as _, BufReader, BufWriter, Read as _, Write as _};
+use std::io::{BufRead as _, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 /// Version 2 records repeated identical artifact content as a `duplicate_of` reference.
-const SCHEMA_VERSION: u32 = 2;
+/// Version 3 compresses the file and, unless the trace is full, records release lists as
+/// `release_set`s, rejected releases in their evaluation, and native output once complete.
+const SCHEMA_VERSION: u32 = 3;
 /// The oldest schema whose files this producer still recognizes as its own, so pruning keeps
 /// removing traces written before the current version.
 const OLDEST_OWNED_SCHEMA_VERSION: u32 = 1;
@@ -39,18 +44,25 @@ impl TraceCommand {
     }
 }
 
+/// The file name suffix of every trace this producer writes.
+const EXTENSION: &str = ".jsonl.zst";
+/// The file name suffix of traces written before they were compressed, which pruning still owns.
+const UNCOMPRESSED_EXTENSION: &str = ".jsonl";
+
 pub(crate) struct Recorder {
     path: PathBuf,
     run_id: String,
     started: Instant,
+    /// The trace file's identity, since only the writer thread holds the file itself.
+    identity: same_file::Handle,
     state: Mutex<State>,
 }
 
 struct State {
-    file: BufWriter<std::fs::File>,
+    /// The writer of a recording that has not finished.
+    writer: Option<writer::Writer>,
     sequence: u64,
     error: Option<String>,
-    finished: bool,
 }
 
 #[derive(Serialize)]
@@ -84,7 +96,7 @@ struct HeaderEvent {
 impl Header {
     fn read(file: &std::fs::File) -> std::io::Result<Option<Self>> {
         let mut header = String::new();
-        BufReader::new(file)
+        read::decoded(file)?
             .take(1024 * 1024)
             .read_line(&mut header)?;
         Ok(serde_json::from_str(&header).ok())
@@ -104,11 +116,13 @@ impl Recorder {
         directory: &Path,
         command: TraceCommand,
         override_directory: Option<&Path>,
+        detail: cooldown_core::trace::Detail,
     ) -> Result<Arc<Self>, CoreError> {
         Self::in_directory(
             &override_directory.map_or_else(paths::directory, |path| Ok(path.to_owned()))?,
             directory,
             command,
+            detail,
         )
     }
 
@@ -116,6 +130,7 @@ impl Recorder {
         storage: &Path,
         directory: &Path,
         command: TraceCommand,
+        detail: cooldown_core::trace::Detail,
     ) -> Result<Arc<Self>, CoreError> {
         std::fs::create_dir_all(storage)?;
         let repository = directory
@@ -137,26 +152,28 @@ impl Recorder {
         let prefix = format!("{}-{timestamp}-{repository}-", command.as_str());
         let temporary = tempfile::Builder::new()
             .prefix(&prefix)
-            .suffix(".jsonl")
+            .suffix(EXTENSION)
             .tempfile_in(storage)?;
         lock::try_lock(temporary.as_file()).map_err(|err| {
             CoreError::System(format!("lock trace {}: {err}", temporary.path().display()))
         })?;
         let (file, path) = temporary.keep().map_err(|err| CoreError::from(err.error))?;
         let run_id = path
-            .file_stem()
+            .file_name()
             .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(EXTENSION))
             .unwrap_or("run")
             .to_string();
+        let identity = same_file::Handle::from_file(file.try_clone()?)?;
         Ok(Arc::new(Self {
             path,
             run_id,
             started: Instant::now(),
+            identity,
             state: Mutex::new(State {
-                file: BufWriter::new(file),
+                writer: Some(writer::Writer::spawn(file, detail)?),
                 sequence: 0,
                 error: None,
-                finished: false,
             }),
         }))
     }
@@ -168,29 +185,25 @@ impl Recorder {
         let Ok(file) = std::fs::File::open(path) else {
             return false;
         };
-        let candidate = file.try_clone().and_then(same_file::Handle::from_file);
-        if let Ok(candidate) = candidate {
-            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            if state
-                .file
-                .get_ref()
-                .try_clone()
-                .and_then(same_file::Handle::from_file)
-                .is_ok_and(|owned| owned == candidate)
-            {
-                return true;
-            }
+        if file
+            .try_clone()
+            .and_then(same_file::Handle::from_file)
+            .is_ok_and(|candidate| candidate == self.identity)
+        {
+            return true;
         }
-        path.extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+        has_trace_extension(path)
             && Header::read(&file).is_ok_and(|header| header.is_some_and(|header| header.owned()))
     }
 
     pub(crate) fn record(&self, event: &RawValue, spans: &[Value]) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.error.is_some() || state.finished {
+        if state.error.is_some() {
             return;
         }
+        let Some(writer) = &state.writer else {
+            return;
+        };
         let record = Record {
             producer: PRODUCER,
             schema_version: SCHEMA_VERSION,
@@ -201,18 +214,36 @@ impl Recorder {
             event,
             spans,
         };
-        let written = serde_json::to_writer(&mut state.file, &record)
+        let written = serde_json::to_vec(&record)
             .map_err(|err| err.to_string())
+            .and_then(|mut line| {
+                line.push(b'\n');
+                writer.send(line).map_err(str::to_string)
+            })
+            // The header is in the file before the run goes on, so pruning and other runs that
+            // capture this file as an input recognize it as an active trace.
             .and_then(|()| {
-                state
-                    .file
-                    .write_all(b"\n")
-                    .and_then(|()| state.file.flush())
-                    .map_err(|err| err.to_string())
+                if state.sequence == 0 {
+                    writer.flush().map_err(str::to_string)
+                } else {
+                    Ok(())
+                }
             });
         match written {
             Ok(()) => state.sequence += 1,
             Err(err) => state.error = Some(err),
+        }
+    }
+
+    /// Returns once every record so far is in the file.
+    #[cfg(test)]
+    fn flush(&self) {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(writer) = &state.writer
+            && let Err(err) = writer.flush()
+        {
+            drop(state);
+            self.fail(err.to_string());
         }
     }
 
@@ -225,13 +256,21 @@ impl Recorder {
 
     pub(crate) fn finish(&self) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.finished = true;
-        if let Err(err) = state
-            .file
-            .flush()
-            .and_then(|()| state.file.get_ref().sync_data())
+        let Some(writer) = state.writer.take() else {
+            return;
+        };
+        // Records that raced with the end of the run see no writer and are dropped, so the
+        // terminal record stays last.
+        drop(state);
+        let finished = writer.finish();
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Err(err) = finished
+            && state
+                .error
+                .as_deref()
+                .is_none_or(|error| error == writer::STOPPED)
         {
-            state.error.get_or_insert_with(|| err.to_string());
+            state.error = Some(err);
         }
         if let Some(error) = &state.error {
             eprintln!(
@@ -244,33 +283,71 @@ impl Recorder {
     }
 }
 
+impl Drop for Recorder {
+    /// Ends a recording that was never finished, so its frame is complete and its file unlocked
+    /// once the recorder is gone.
+    fn drop(&mut self) {
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        if let Some(writer) = state.writer.take()
+            && let Err(err) = writer.finish()
+        {
+            eprintln!(
+                "cooldown: warning: trace is incomplete at {}: {err}",
+                self.path.display()
+            );
+        }
+    }
+}
+
+/// Whether `path` is named like a trace, compressed or not.
+fn has_trace_extension(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            let name = name.to_ascii_lowercase();
+            name.ends_with(EXTENSION) || name.ends_with(UNCOMPRESSED_EXTENSION)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use color_eyre::eyre;
 
+    /// Every record of a trace that ended cleanly.
+    fn read(path: &Path) -> eyre::Result<Vec<Value>> {
+        let mut records = records(path)?;
+        let read = records.by_ref().collect::<Result<Vec<_>, _>>()?;
+        eyre::ensure!(
+            !records.truncated(),
+            "trace {} is truncated",
+            path.display()
+        );
+        Ok(read)
+    }
+
     #[test]
-    fn concurrent_recorders_use_unique_files_and_flush_each_event() -> eyre::Result<()> {
+    fn concurrent_recorders_use_unique_files() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
         let first = Recorder::in_directory(
             directory.path(),
             Path::new("repository"),
             TraceCommand::Upgrade,
+            cooldown_core::trace::Detail::Compact,
         )?;
         let second = Recorder::in_directory(
             directory.path(),
             Path::new("repository"),
             TraceCommand::Upgrade,
+            cooldown_core::trace::Detail::Compact,
         )?;
         assert_ne!(first.path, second.path);
         let event = serde_json::value::to_raw_value(&serde_json::json!({"kind":"test"}))?;
         first.record(&event, &[]);
         first.record(&event, &[]);
-        let lines = std::fs::read_to_string(&first.path)?;
-        let records: Vec<Value> = lines
-            .lines()
-            .map(serde_json::from_str)
-            .collect::<Result<_, _>>()?;
+        first.finish();
+        second.finish();
+        let records = read(&first.path)?;
         assert_eq!(records.len(), 2);
         let [start, end] = records.as_slice() else {
             eyre::bail!("two events expected");
@@ -291,9 +368,14 @@ mod tests {
             directory.path(),
             Path::new("project"),
             TraceCommand::Outdated,
+            cooldown_core::trace::Detail::Compact,
         )?;
-        let peer =
-            Recorder::in_directory(directory.path(), Path::new("peer"), TraceCommand::Upgrade)?;
+        let peer = Recorder::in_directory(
+            directory.path(),
+            Path::new("peer"),
+            TraceCommand::Upgrade,
+            cooldown_core::trace::Detail::Compact,
+        )?;
         let header = serde_json::value::to_raw_value(&serde_json::json!({"kind": "run_started"}))?;
         recorder.record(&header, &[]);
         peer.record(&header, &[]);
@@ -338,10 +420,9 @@ mod tests {
                 b"actual resolver input",
             );
         });
-        let records: Vec<Value> = std::fs::read_to_string(&recorder.path)?
-            .lines()
-            .map(serde_json::from_str)
-            .collect::<Result<_, _>>()?;
+        recorder.finish();
+        peer.finish();
+        let records = read(&recorder.path)?;
         let excluded = records
             .iter()
             .filter(|record| {
@@ -355,11 +436,11 @@ mod tests {
             .filter(|record| record["event"]["kind"] == "artifact_chunk")
             .collect();
         assert_eq!(chunks.len(), 2);
+        let trace_bytes = serde_json::to_value(cooldown_core::trace::Content::from_bytes(&bytes))?;
         assert!(
             chunks
                 .iter()
-                .any(|record| record["event"]["content"]["data"]
-                    == String::from_utf8_lossy(&bytes).as_ref())
+                .any(|record| record["event"]["content"] == trace_bytes)
         );
         assert!(
             chunks
@@ -380,6 +461,7 @@ mod tests {
             directory.path(),
             Path::new("project"),
             TraceCommand::Upgrade,
+            cooldown_core::trace::Detail::Compact,
         )?;
         let header = serde_json::value::to_raw_value(&serde_json::json!({"kind": "run_started"}))?;
         recorder.record(&header, &[]);
@@ -399,10 +481,8 @@ mod tests {
             cooldown_core::trace::artifact(manifest("/b/Cargo.toml"), b"[package]");
             cooldown_core::trace::artifact(manifest("/c/Cargo.toml"), b"[workspace]");
         });
-        let records: Vec<Value> = std::fs::read_to_string(&recorder.path)?
-            .lines()
-            .map(serde_json::from_str)
-            .collect::<Result<_, _>>()?;
+        recorder.finish();
+        let records = read(&recorder.path)?;
         let events = |kind: &str| -> Vec<Value> {
             records
                 .iter()

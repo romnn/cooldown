@@ -2,6 +2,9 @@
 //!
 //! The application subscribes to [`TARGET`] and owns persistence and run timestamps.
 //! Without a subscriber these observations do no serialization or filesystem work.
+//!
+//! A subscriber that enables [`TARGET`] at [`tracing::Level::DEBUG`] records a compact trace,
+//! and one that enables it at [`tracing::Level::TRACE`] a full one; see [`Detail`].
 
 use crate::{Dependency, FixVerdict, PinVerdict, Release, ResolveContext, Verdict};
 use serde::Serialize;
@@ -13,7 +16,36 @@ pub const TARGET: &str = "cooldown_run_trace";
 /// Whether a recorder is listening in the current execution context.
 #[must_use]
 pub fn enabled() -> bool {
-    tracing::enabled!(target: TARGET, tracing::Level::TRACE)
+    tracing::enabled!(target: TARGET, tracing::Level::DEBUG)
+}
+
+/// How much a recorder keeps of what a run observes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Detail {
+    /// Every observation in the shape it was made, for reproducing a run in full.
+    Full,
+    /// The default: the same decisions and evidence with repetition removed.
+    ///
+    /// A release list is recorded once as a [`Event::ReleaseSet`] and evaluations refer to it,
+    /// rejected releases are summarized in their evaluation instead of one
+    /// [`Event::ReleaseFiltered`] each, and a native output stream is recorded once complete, so
+    /// identical output refers to an earlier copy.
+    Compact,
+}
+
+impl Detail {
+    /// The detail the recorder in the current execution context keeps, or `None` without one.
+    #[must_use]
+    pub fn current() -> Option<Self> {
+        if tracing::enabled!(target: TARGET, tracing::Level::TRACE) {
+            Some(Self::Full)
+        } else if enabled() {
+            Some(Self::Compact)
+        } else {
+            None
+        }
+    }
 }
 
 /// Emits one typed observation when a recorder is present.
@@ -40,7 +72,18 @@ pub fn emit(event: &Event<'_>) {
                 Event::ArtifactStarted { sha256, .. } => *sha256,
                 _ => None,
             };
-            tracing::trace!(target: TARGET, trace_event = payload.as_str(), trace_artifact = artifact, trace_input_path = input_path, trace_artifact_sha256 = sha256, trace_artifact_finished = matches!(event, Event::ArtifactFinished { .. }));
+            let complete = matches!(
+                event,
+                Event::ArtifactFinished {
+                    outcome: ArtifactOutcome::Complete,
+                    ..
+                }
+            );
+            let release_set = match event {
+                Event::ReleaseSet { sha256, .. } => Some(*sha256),
+                _ => None,
+            };
+            tracing::debug!(target: TARGET, trace_event = payload.as_str(), trace_artifact = artifact, trace_input_path = input_path, trace_artifact_sha256 = sha256, trace_artifact_finished = matches!(event, Event::ArtifactFinished { .. }), trace_artifact_complete = complete, trace_release_set = release_set);
         }
         Err(err) => {
             tracing::error!(target: TARGET, error = %err, "trace event serialization failed");
@@ -271,6 +314,15 @@ pub enum ReleaseFilter {
     Unclassified,
 }
 
+/// A release a candidate filter rejected, as an evaluation summarizes it.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct FilteredRelease<'a> {
+    /// The rejected release's version.
+    pub version: &'a crate::Version,
+    /// The filter that rejected it.
+    pub reason: ReleaseFilter,
+}
+
 /// An observation at the boundary where a decision or external effect occurs.
 #[derive(Serialize)]
 #[serde(
@@ -291,6 +343,8 @@ pub enum Event<'a> {
         arch: &'a str,
         /// The process's original working directory.
         directory: &'a str,
+        /// How much of the run the trace keeps.
+        detail: Detail,
     },
     /// Invocation details follow the compact run header so metadata remains cheap to inspect.
     Invocation {
@@ -424,14 +478,28 @@ pub enum Event<'a> {
         /// A spawn/wait/interruption failure, when present.
         error: Option<&'a str>,
     },
+    /// A release list an evaluation judged, recorded once per run in a compact trace.
+    ReleaseSet {
+        /// The lowercase hex SHA-256 of `releases`' JSON, which evaluations refer to.
+        sha256: &'a str,
+        /// The classified releases.
+        releases: &'a serde_json::value::RawValue,
+    },
     /// An actual core policy evaluation and its full decision inputs/output.
     Evaluation {
         /// The project identity used by policy selectors.
         project: &'a str,
         /// The dependency being judged, including graph and declared constraints.
         dependency: &'a Dependency,
-        /// All available classified release evidence.
-        releases: &'a [Release],
+        /// All available classified release evidence, in a full trace.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        releases: Option<&'a [Release]>,
+        /// The [`Event::ReleaseSet`] holding the release evidence, in a compact trace.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        release_set: Option<&'a str>,
+        /// Every release a candidate filter rejected, in the order the filters judged them;
+        /// empty for pin and fix evaluations, which filter none.
+        filtered: &'a [FilteredRelease<'a>],
         /// The actual major/bound/tag context used to evaluate the release set.
         context: &'a ResolveContext<'a>,
         /// The fixed evaluation clock used by policy.
@@ -450,7 +518,7 @@ pub enum Event<'a> {
         /// The selected window and every contributing or discarded rule.
         resolution: &'a crate::Resolution,
     },
-    /// A release was rejected by an actual candidate filter.
+    /// A release was rejected by an actual candidate filter, recorded in a full trace.
     ReleaseFiltered {
         /// The project identity used by the decision.
         project: &'a str,
@@ -491,6 +559,56 @@ impl Event<'_> {
     }
 }
 
+/// The inputs and outcome of one policy evaluation, for [`evaluation`].
+pub(crate) struct EvaluationRecord<'a> {
+    pub(crate) project: &'a str,
+    pub(crate) dependency: &'a Dependency,
+    pub(crate) releases: &'a [Release],
+    pub(crate) filtered: &'a [FilteredRelease<'a>],
+    pub(crate) context: &'a ResolveContext<'a>,
+    pub(crate) evaluation_at: jiff::Timestamp,
+    pub(crate) decision: Decision<'a>,
+    pub(crate) filters: Option<CandidateFilters>,
+}
+
+/// Emits an [`Event::Evaluation`] in the current recorder's [`Detail`].
+///
+/// A compact trace records the release list as an [`Event::ReleaseSet`] first, which the
+/// recorder writes once per run however many evaluations refer to it.
+pub(crate) fn evaluation(record: &EvaluationRecord<'_>) {
+    let Some(detail) = Detail::current() else {
+        return;
+    };
+    let releases = match detail {
+        Detail::Full => None,
+        Detail::Compact => match serde_json::value::to_raw_value(record.releases) {
+            Ok(releases) => Some(releases),
+            Err(err) => {
+                tracing::error!(target: TARGET, error = %err, "trace event serialization failed");
+                return;
+            }
+        },
+    };
+    let sha256 = releases
+        .as_ref()
+        .map(|releases| hex_sha256(releases.get().as_bytes()));
+    if let (Some(sha256), Some(releases)) = (&sha256, &releases) {
+        Event::ReleaseSet { sha256, releases }.emit();
+    }
+    Event::Evaluation {
+        project: record.project,
+        dependency: record.dependency,
+        releases: releases.is_none().then_some(record.releases),
+        release_set: sha256.as_deref(),
+        filtered: record.filtered,
+        context: record.context,
+        evaluation_at: record.evaluation_at,
+        decision: record.decision,
+        filters: record.filters,
+    }
+    .emit();
+}
+
 /// Converts an operation duration to a portable JSON integer without truncating it.
 #[must_use]
 pub fn duration_us(duration: std::time::Duration) -> u64 {
@@ -498,7 +616,7 @@ pub fn duration_us(duration: std::time::Duration) -> u64 {
 }
 
 /// The actual result of one kind of policy evaluation.
-#[derive(Serialize)]
+#[derive(Clone, Copy, Serialize)]
 #[serde(tag = "kind", content = "verdict", rename_all = "snake_case")]
 pub enum Decision<'a> {
     /// A forward candidate-set evaluation.
@@ -550,6 +668,14 @@ pub enum Mutation<'a> {
 
 /// Emits already-owned bytes as bounded artifact records without cloning the stream.
 pub fn artifact(source: ArtifactSource<'_>, bytes: &[u8]) {
+    captured_artifact(source, bytes, ArtifactOutcome::Complete);
+}
+
+/// Emits bytes captured before `outcome` as bounded artifact records.
+///
+/// The records state the content's hash up front, so a recorder can refer identical content to
+/// an earlier copy.
+pub fn captured_artifact(source: ArtifactSource<'_>, bytes: &[u8], outcome: ArtifactOutcome<'_>) {
     if !enabled() {
         return;
     }
@@ -576,7 +702,7 @@ pub fn artifact(source: ArtifactSource<'_>, bytes: &[u8]) {
     Event::ArtifactFinished {
         artifact,
         bytes: offset,
-        outcome: ArtifactOutcome::Complete,
+        outcome,
     }
     .emit();
 }

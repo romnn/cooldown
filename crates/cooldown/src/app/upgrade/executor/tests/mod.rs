@@ -4,13 +4,14 @@ use super::planning::{
     plan_baseline_violations, target_package, upgrade_dependency,
 };
 use super::{
-    AttestedHolds, BatchOutcome, CommittedBatch, PlanMode, TrialRollback, candidate_scope,
-    collapse_applied_legs, collateral_rows, combine_lock_status, conflict_skip_message,
-    conservative_hold, followed_manifest_warning, indeterminate_trial, insert_graph_violation,
-    is_downgrade, landed_upgrade_changes, newly_introduced_violations, package_label,
-    planned_changes_landed, preserve_rollback_entries, sort_planned_changes,
-    verify_applied_targets, violation_identity,
+    AttestedHolds, BatchOutcome, CommittedBatch, PlanMode, TrialRollback, admitted_crossings,
+    candidate_scope, collapse_applied_legs, collateral_rows, combine_lock_status,
+    conflict_skip_message, conservative_hold, followed_manifest_warning, indeterminate_trial,
+    insert_graph_violation, is_downgrade, landed_upgrade_changes, newly_introduced_violations,
+    package_label, planned_changes_landed, preserve_rollback_entries, sort_planned_changes,
+    unauthorized_crossings, verify_applied_targets, violation_identity,
 };
+use crate::app::change_key::change_provenance_key;
 use crate::app::{TransitiveGate, UpgradeItem};
 use color_eyre::eyre;
 use cooldown_core::{
@@ -235,6 +236,26 @@ fn conflict_skip_message_keeps_generic_message_when_offender_is_self() {
     assert_eq!(
         conflict_skip_message(SkipReason::ResolverConflict, None, "foo"),
         SkipReason::ResolverConflict.message()
+    );
+}
+
+/// A collateral ceiling hold names the package it would lift, since that package's
+/// `max-major` is the one to raise; a planned target above its own ceiling keeps the
+/// reason's own message.
+#[test]
+fn conflict_skip_message_names_the_package_a_ceiling_hold_would_lift() {
+    let message = conflict_skip_message(SkipReason::MaxMajorHeld, Some("child"), "parent");
+    assert!(
+        message.contains("child") && message.contains("max-major"),
+        "{message}"
+    );
+    assert_eq!(
+        conflict_skip_message(SkipReason::MaxMajorHeld, Some("parent"), "parent"),
+        SkipReason::MaxMajorHeld.message()
+    );
+    assert_eq!(
+        conflict_skip_message(SkipReason::MaxMajorHeld, None, "parent"),
+        SkipReason::MaxMajorHeld.message()
     );
 }
 
@@ -1032,6 +1053,8 @@ fn restore_conflict_does_not_claim_rows_from_an_earlier_committed_batch() {
         .push(edge_item("consumer", "1.0.0", "1.1.0"));
     committed.mark_committed(CommittedBatch {
         violations_after: HashSet::new(),
+        crossings_after: HashSet::new(),
+        admitted_crossings: HashSet::new(),
         reconcile_needed: false,
     });
     let mut failed = BatchOutcome::default();
@@ -1143,6 +1166,72 @@ fn residual_gate_flags_replacement_by_a_source_distinct_package() {
     assert_eq!(
         newly_introduced_violations(&before, &after),
         vec![replacement]
+    );
+}
+
+fn crossing(name: &str, version: &str) -> BaselineViolation {
+    violation_for(ToolId("mock"), name, version, None)
+}
+
+/// Versions the starting graph already held outside the ceiling stay authorized; any other
+/// version outside it is a crossing, including one that rises beside an authorized copy.
+#[test]
+fn only_authorized_versions_may_stay_outside_a_ceiling() {
+    let allowed = HashSet::from([crossing("foo", "2.0.0")]);
+
+    // Unchanged
+    assert_eq!(unauthorized_crossings(&allowed, &allowed), []);
+    // A second copy beside the authorized one, and a version that replaced it
+    let after = HashSet::from([crossing("foo", "2.0.0"), crossing("foo", "3.0.0")]);
+    assert_eq!(
+        unauthorized_crossings(&after, &allowed),
+        vec![crossing("foo", "3.0.0")]
+    );
+    let after = HashSet::from([crossing("foo", "2.1.0")]);
+    assert_eq!(
+        unauthorized_crossings(&after, &allowed),
+        vec![crossing("foo", "2.1.0")]
+    );
+    // The same version from another source is another package.
+    let twin = violation_for(ToolId("mock"), "foo", "2.0.0", Some("mirror"));
+    assert_eq!(
+        unauthorized_crossings(&HashSet::from([twin.clone()]), &allowed),
+        vec![twin]
+    );
+}
+
+/// Only a planned move of an authorized version that landed authorizes its target.
+#[test]
+fn a_planned_move_authorizes_only_a_continuation_of_an_authorized_version() {
+    let allowed = HashSet::from([crossing("foo", "2.0.0")]);
+    let admitted = |planned: Change, applied: &[Change]| {
+        let applied = applied.iter().map(change_provenance_key).collect();
+        admitted_crossings(&[planned], &applied, &allowed)
+    };
+
+    // Continuing the authorized copy
+    let continued = change("foo", "2.0.0", "2.1.0");
+    assert_eq!(
+        admitted(continued.clone(), std::slice::from_ref(&continued)),
+        HashSet::from([crossing("foo", "2.1.0")])
+    );
+    // The same move held, while another copy lands on its target as collateral
+    assert_eq!(
+        admitted(continued, &[change("foo", "1.9.0", "2.1.0")]),
+        HashSet::new()
+    );
+    // Maturing down a version only the trial put above the ceiling
+    let matured = change("foo", "2.2.0", "2.1.0");
+    assert_eq!(
+        admitted(matured.clone(), std::slice::from_ref(&matured)),
+        HashSet::new()
+    );
+    // A move retargeted onto another package identity, such as a Go path major
+    let mut retargeted = change("foo/v3", "2.0.0", "3.0.0");
+    retargeted.package = PackageId::new(ToolId("mock"), "foo/v3", None);
+    assert_eq!(
+        admitted(retargeted.clone(), std::slice::from_ref(&retargeted)),
+        HashSet::new()
     );
 }
 
@@ -1603,6 +1692,8 @@ fn landed_targets_require_committed_evidence_for_each_original_copy() {
     outcome.items.push(other_copy);
     outcome.mark_committed(CommittedBatch {
         violations_after: HashSet::new(),
+        crossings_after: HashSet::new(),
+        admitted_crossings: HashSet::new(),
         reconcile_needed: false,
     });
     let landed = landed_upgrade_changes(&[held, accepted], &[outcome], &graph);
@@ -1625,6 +1716,8 @@ fn restored_applied_rows_are_not_landed_evidence() {
     let mut committed = BatchOutcome::default();
     committed.mark_committed(CommittedBatch {
         violations_after: HashSet::new(),
+        crossings_after: HashSet::new(),
+        admitted_crossings: HashSet::new(),
         reconcile_needed: false,
     });
     assert_eq!(
