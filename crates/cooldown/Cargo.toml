@@ -59,6 +59,7 @@ tracing-subscriber.workspace = true
 tempfile.workspace = true
 same-file.workspace = true
 libc.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 cooldown-core.workspace = true
