@@ -504,3 +504,84 @@ fn an_undeclared_copy_on_another_line_does_not_hold_the_declared_upgrade() {
     assert_eq!(second.summary_applied(), 0, "second run must be a no-op");
     assert_eq!(after, fixture.read_bytes("pnpm-lock.yaml"));
 }
+
+/// `solid-js` 1.9.17 requires `seroval ~1.6.8` and `@tanstack/router-core` 1.171.36 requires
+/// `seroval ^1.6.7`, both pinned exactly so neither moves.
+/// Seeded on 2026-10-15 both bind one undeclared `seroval` 1.6.9 copy (1.6.10 is 2026-10-18), whose
+/// advance under the freeze targets 1.7.2 (2026-10-24), a release only the caret range admits.
+const SHARED_COPY_PACKAGE_JSON: &str = indoc::indoc! {r#"
+    {
+      "name": "cooldown-pnpm-shared-copy",
+      "version": "0.1.0",
+      "private": true,
+      "dependencies": {
+        "@tanstack/router-core": "1.171.36",
+        "solid-js": "1.9.17"
+      }
+    }
+"#};
+
+const SHARED_COPY_SEED: &str = "2026-10-15T00:00:00Z";
+
+const SHARED_COPY_FREEZE: &str = "2026-10-25T00:00:00Z";
+
+/// Every version a `name@<version>:` package key in `lock` names.
+fn copies_of(lock: &[u8], name: &str) -> std::collections::BTreeSet<String> {
+    let prefix = format!("{name}@");
+    String::from_utf8_lossy(lock)
+        .lines()
+        .filter(|line| line.starts_with("  ") && !line.starts_with("   "))
+        .filter_map(|line| line.trim().strip_prefix(&prefix)?.strip_suffix(':'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A transitive advance the settlement keeps for one dependent and reverts for another advances
+/// the shared copy only partly: `@tanstack/router-core` keeps `seroval` 1.7.2, while `solid-js`'s
+/// tilde range settles on 1.6.12.
+/// The advance is held, naming who moved and who stayed, rather than credited from the copy at
+/// the target, and with nothing landed the run leaves the lock as it was.
+#[test]
+fn a_partly_advanced_shared_copy_is_held_not_credited() {
+    skip_if_missing!("pnpm");
+    let fixture = Fixture::pnpm().tag_independent();
+    fixture.write("package.json", SHARED_COPY_PACKAGE_JSON);
+    fixture.write(".npmrc", NPMRC);
+    seed_lock(&fixture, SHARED_COPY_SEED);
+    let seeded = fixture.read_bytes("pnpm-lock.yaml");
+    assert_eq!(
+        copies_of(&seeded, "seroval"),
+        ["1.6.9".to_string()].into(),
+        "seed sanity: both dependents share one copy"
+    );
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", SHARED_COPY_FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--freeze", SHARED_COPY_FREEZE])
+            .stderr_str()
+    );
+
+    // The advance is held with the copy's real outcome, never credited.
+    assert!(
+        !upgrade.applied_names().contains("seroval"),
+        "the partly advanced copy must not be credited, report: {:?}",
+        upgrade.items()
+    );
+    assert_eq!(
+        upgrade.skipped_reasons_for("seroval"),
+        ["graph_ceiling_held".to_string()].into(),
+        "report: {:?}",
+        upgrade.items()
+    );
+    let detail = upgrade.skip_detail_for("seroval").unwrap_or_default();
+    assert!(
+        detail.contains("moved to 1.7.2 only for @tanstack/router-core@1.171.36")
+            && detail.contains("solid-js@1.9.17 still resolves seroval 1.6.12"),
+        "{detail}"
+    );
+    // Nothing landed, so the batch's lock was restored.
+    assert_eq!(fixture.read_bytes("pnpm-lock.yaml"), seeded);
+}

@@ -458,6 +458,15 @@ diagnostic_kinds! {
     /// is refused instead.
     /// Nothing was held, so this is not a [`Held`](DiagnosticKind::Held) diagnostic either.
     ExcludedMoved = "excluded_moved",
+    /// A resolve moved a dependent's requirement of a package in lock records it rewrote, such as
+    /// the dependent's own copy or its peer context, and the records leave more than one way to
+    /// pair the old versions with the new ones.
+    ///
+    /// Several of the dependent's records bind different versions on either side, so no single
+    /// incoming edge proves which version replaced which.
+    /// The move is committed but reported only by this diagnostic, never as an applied row, and a
+    /// planned move of one of those copies is held rather than credited.
+    UnpairedMove = "unpaired_move",
     /// The advisory feed could not be reached or its response could not be parsed.
     ///
     /// Fail-open on the window: the ordinary, stricter window stands; only the
