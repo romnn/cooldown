@@ -52,6 +52,12 @@ use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::marker::PhantomData;
 
+mod copies;
+mod edges;
+
+use copies::{CopyLanding, CopyLedger, CopyMove, UnpairedRequirement};
+use edges::CopyEdges;
+
 struct WholeGraphInputs {
     exact_pins: Vec<(String, String)>,
     importer_filters: Vec<String>,
@@ -954,30 +960,16 @@ impl<L: NodeLock> ReleaseFetcher for NpmTool<L> {
     }
 }
 
-/// Whether the lock's version for `name` actually moved across a whole-graph resolve.
+/// Whether a whole-graph resolve moved the binding of any of `change`'s declaring members.
 ///
-/// A name can resolve to several copies in a pnpm graph; the `before`/`after` maps track its
-/// *newest* copy, so a candidate planned off a stale duplicate whose newest copy already sits at
-/// the target shows no net move. Reporting only genuine moves keeps the report set equal to the
-/// lock-diff set: a converged re-run, where nothing moved, reports zero applied (no oscillation).
-/// The newest copy alone is blind in the other direction, though: an importer copy that genuinely
-/// moved beneath a newer transitive duplicate shows no net newest-copy change, and its applied row
-/// would vanish. The importer-resolved version sets restore that visibility (empty on both sides
-/// for npm's index, which records no per-importer versions and keeps its newest-copy judgment); a
-/// converged re-run still moves neither.
-fn candidate_moved(
-    name: &str,
-    before: &HashMap<String, String>,
-    after: &HashMap<String, String>,
-    before_members: &crate::lock::MemberIndex,
-    after_members: &crate::lock::MemberIndex,
-) -> bool {
-    before_members.resolved_versions_of(name) != after_members.resolved_versions_of(name)
-        || match (before.get(name), after.get(name)) {
-            (Some(from), Some(to)) => version::compare(from, to).is_ne(),
-            (None, Some(_)) | (Some(_), None) => true,
-            (None, None) => false,
-        }
+/// Judged per member, not per name: another copy of the name moving says nothing about the
+/// members' own copy, and a converged re-run, where no member's binding moved, reports zero
+/// applied (no oscillation).
+fn members_moved(change: &Change, before: &MemberIndex, after: &MemberIndex) -> bool {
+    let name = change.package.name.as_str();
+    change.members.iter().any(|member| {
+        before.resolved_version(&member.path, name) != after.resolved_version(&member.path, name)
+    })
 }
 
 /// Whether the re-locked graph resolves `change` at exactly its target, judged per declaring
@@ -2372,8 +2364,15 @@ impl<L: NodeLock> NpmTool<L> {
         // A recovery subset shares its operation's baseline, so every trial judges the same pins.
         let protected_pins = ProtectedPins::from_baseline::<L>(mutation.baseline())?;
         let mut report = if L::supports_whole_graph_resolve() {
-            self.apply_whole_graph(project, &plan, journal, &evidence, &protected_pins)
-                .await?
+            self.apply_whole_graph(
+                project,
+                &plan,
+                journal,
+                &evidence,
+                &protected_pins,
+                transitive_held,
+            )
+            .await?
         } else {
             self.apply_per_package(
                 project,
@@ -2385,7 +2384,7 @@ impl<L: NodeLock> NpmTool<L> {
             .await?
         };
         report.skipped.extend(peer_held);
-        settle_transitive_holds::<L>(project, lock, transitive_held, &mut report)?;
+        hold_wins(&mut report);
         Ok(report)
     }
 
@@ -2553,6 +2552,11 @@ impl<L: NodeLock> NpmTool<L> {
     /// The report is the diff of the journal's pre-apply lock against the result, so every planned
     /// candidate is reported reached or held (naming the conflicting peer where attributable) and
     /// every collateral move of an unplanned package surfaces as its own row.
+    /// The diff is read per copy and incoming edge ([`CopyLedger`]), so a change without declaring
+    /// members lands only when its own copy moved to the target, and a move of a copy that is not
+    /// the name's newest surfaces too.
+    /// `held` are the transitive candidates the advance pass held before the resolve
+    /// ([`transitive_partition`]), judged against the settled lock like the plan's own.
     /// A resolver failure after the repair retry marks the conflicting candidates held.
     /// The accepted result is
     /// post-verified against the pre-apply peer contracts *between workspace-declared packages in
@@ -2567,9 +2571,12 @@ impl<L: NodeLock> NpmTool<L> {
         journal: &ProjectMutationJournal,
         evidence: &PeerEvidence,
         protected_pins: &ProtectedPins,
+        held: Vec<Skipped>,
     ) -> Result<ApplyReport> {
         let mut report = ApplyReport::default();
         if plan.changes.is_empty() {
+            // Nothing resolves, so the lock stays as it was and every hold stands.
+            report.skipped.extend(held);
             return Ok(report);
         }
         let workspace = &evidence.workspace;
@@ -2593,7 +2600,9 @@ impl<L: NodeLock> NpmTool<L> {
         let (plan, catalog_holds) = catalog_partition::<L>(plan, before_content, &excluded);
         report.skipped.extend(catalog_holds);
         if plan.changes.is_empty() {
-            // Nothing left to resolve; the catalog holds are the whole report.
+            // Nothing left to resolve; the catalog holds and the advance holds are the whole
+            // report.
+            report.skipped.extend(held);
             return Ok(report);
         }
         let plan = &plan;
@@ -2655,6 +2664,10 @@ impl<L: NodeLock> NpmTool<L> {
             },
         )?;
         let before_members = before_members.unwrap_or_default();
+        let members = MemberLocks {
+            before: &before_members,
+            after: &after_members,
+        };
         // The hold detail names the declarations that still disagree with the target — only the
         // in-scope ones, since an excluded importer's line never counted.
         let after_in_scope = L::member_sources_excluding(&after_content, &excluded);
@@ -2666,59 +2679,40 @@ impl<L: NodeLock> NpmTool<L> {
         // target (a split converging under `--rewrite`), and rejecting one must not hide the row of
         // the sibling that landed.
         let rejected = |change: &Change| rejections.iter().any(|skip| skip.change == *change);
+        let ledger = CopyLedger::read::<L>(before_content, &after_content)?;
+        let mut advance_held = held;
         for change in &plan.changes {
             let name = change.package.name.as_str();
             if rejected(change) {
                 continue;
             }
-            // A transitive candidate the advance pass held (importer-owned name, duplicated graph
-            // copies, no override scope) was never handed to the resolver, so its truthful hold
-            // row is its verdict.
-            // It is decided before the landing checks, which judge the name's newest copy: another
-            // copy's move would otherwise credit it as applied, or a duplicate copy already at the
-            // target would make it a silent no-op.
-            // `apply_with_runner` splits these off before the resolve; this keeps a direct caller
-            // truthful too.
-            if let Some(hold) = advance
-                .get(&advance_key(change))
-                .and_then(|verdict| verdict.hold_skip(change))
-            {
-                report.skipped.push(hold);
-                continue;
-            }
-            let moved = candidate_moved(name, &before, &after, &before_members, &after_members);
-            if reached(&after, &after_members, change) {
-                if moved {
-                    report.applied.push(change.clone());
+            match settled_verdict::<L>(change, &advance, &ledger, &after, &members) {
+                Settled::Applied => report.applied.push(change.clone()),
+                Settled::Held(row) => report.skipped.push(*row),
+                // Judged with the holds `apply_with_runner` split off before the resolve.
+                Settled::AdvanceHeld(row) => advance_held.push(*row),
+                Settled::Unmoved => {}
+                Settled::Short(_) if multi_version.contains(name) => {
+                    report.skipped.push(multi_version_hold(
+                        change,
+                        &after_in_scope,
+                        plan,
+                        &evidence.split_holds,
+                    ));
                 }
-                // Otherwise: reached its target without a net lock move because a duplicate copy
-                // of the same name is at the target — a no-op, neither applied nor held.
-            } else if multi_version.contains(name) {
-                report.skipped.push(multi_version_hold(
-                    change,
-                    &after_in_scope,
-                    plan,
-                    &evidence.split_holds,
-                ));
-            } else {
-                let advanced = matches!(
-                    advance.get(&advance_key(change)),
-                    Some(TransitiveAdvance::Pin(_))
-                );
-                report
-                    .skipped
-                    .push(graph_ceiling_hold::<L>(change, &after_content, advanced)?);
+                Settled::Short(shortfall) => {
+                    report.skipped.push(graph_ceiling_hold::<L>(
+                        change,
+                        &after_content,
+                        &shortfall,
+                    )?);
+                }
             }
         }
 
         report.skipped.extend(rejections);
 
-        // The hard requirement is that no net version change to any package may be omitted.
-        // Every moved package the applied rows above do not already report is surfaced as its own collateral
-        // applied row — including a *held* candidate the resolve still floated off its baseline
-        // (whose skip row alone would hide that real move).
-        let collateral = collateral_changes::<L>(&before, &after, &report.applied);
-        report.applied.extend(collateral);
+        settle_copies::<L>(&mut report, &ledger, advance_held, &before, &after);
         Ok(report)
     }
 
@@ -3338,16 +3332,22 @@ impl<L: NodeLock> NpmTool<L> {
 /// must not masquerade as a resolver conflict — or vanish behind the report's newest-copy
 /// projection, whose per-name reduction cannot attribute a multi-copy collapse.
 pub(crate) enum TransitiveAdvance {
-    /// Advance through this qualified override key (`name@^major-line`).
-    Pin(String),
+    /// Advance through these temporary override keys, each pinned to the candidate's target: the
+    /// major-line key (`name@^major-line`) for a name with one copy, or the parent selectors that
+    /// reach only this copy for a name with several ([`CopyEdges::selectors`]).
+    Pin(Vec<String>),
     /// An importer declares the name (at another line — the same line would be one direct dep):
     /// the targeted update and its peer unification own the name, and a graph-wide override would
     /// drag the declared copy along with this one.
     DeclaredElsewhere,
-    /// The name resolves to several graph copies; one qualified override could collapse them, a
-    /// move the newest-copy report projection cannot attribute. Each copy is held on its own line,
-    /// mirroring the importer-side multi-version hold.
-    MultiLine(Vec<String>),
+    /// The name resolves to several graph copies and no override reaches this one alone, so it is
+    /// held on its own line rather than moving another copy with it.
+    MultiLine {
+        /// Every registry version the name resolves to.
+        lines: Vec<String>,
+        /// Why no override reaches this copy alone.
+        blocker: String,
+    },
     /// No safe override scope can be derived from the current version, so there is nothing to
     /// qualify the pin with.
     Unscopable,
@@ -3366,11 +3366,13 @@ impl TransitiveAdvance {
                     change.package.name
                 ),
             ),
-            TransitiveAdvance::MultiLine(lines) => (
+            TransitiveAdvance::MultiLine { lines, blocker } => (
                 SkipReason::MultiVersionHeld,
                 format!(
-                    "resolved at multiple versions across the graph ({}); each copy is kept on its own line",
-                    lines.join(", ")
+                    "resolved at multiple versions across the graph ({}) and {blocker}, so no \
+                     override moves the {} copy alone; each copy is kept on its own line",
+                    lines.join(", "),
+                    change.from
                 ),
             ),
             TransitiveAdvance::Unscopable => (
@@ -3413,8 +3415,8 @@ fn advance_key(change: &Change) -> AdvanceKey {
 }
 
 /// Per-candidate transitive-advance verdicts against the pre-apply lock: which candidates ride the
-/// qualified-override leg, and why each of the rest must be held (importer-owned name, duplicated
-/// graph copies, no safe override scope).
+/// temporary-override leg, and why each of the rest must be held (importer-owned name, a copy no
+/// override reaches alone, no safe override scope).
 ///
 /// An absent pre-apply lock has no version lines; a present but unparsable one is an error.
 fn transitive_advance_verdicts<L: NodeLock>(
@@ -3422,37 +3424,85 @@ fn transitive_advance_verdicts<L: NodeLock>(
     before_content: Option<&str>,
     excluded: &HashSet<String>,
 ) -> Result<HashMap<AdvanceKey, TransitiveAdvance>> {
-    let importer_declared = managed_importer_declarations::<L>(before_content, excluded);
     let version_lines = before_content
         .map(resolved_version_lines::<L>)
         .transpose()?
         .unwrap_or_default();
+    let edges = before_content
+        .map(L::copy_bindings)
+        .transpose()?
+        .map(CopyEdges::new)
+        .unwrap_or_default();
     Ok(classify_transitive_advance(
         plan,
-        &importer_declared,
-        &version_lines,
+        &AdvanceEvidence {
+            managed_declared: managed_importer_declarations::<L>(before_content, excluded),
+            declared: before_content
+                .map(|content| L::member_sources(content).declared_names())
+                .unwrap_or_default(),
+            version_lines,
+            edges,
+        },
     ))
 }
 
+/// What the pre-apply lock says about the transitive candidates' copies.
+#[derive(Default)]
+struct AdvanceEvidence {
+    /// The names the importers the run manages declare ([`managed_importer_declarations`]).
+    managed_declared: HashSet<String>,
+    /// The names any importer declares, excluded ones included.
+    declared: HashSet<String>,
+    /// Every registry version each name resolves to ([`resolved_version_lines`]).
+    version_lines: HashMap<String, BTreeSet<String>>,
+    /// The edges into each copy.
+    edges: CopyEdges,
+}
+
 /// Classifies every transitive (non-direct) candidate against the pre-apply lock: which are
-/// advanced through a qualified override, and why each of the rest is held. Computed once from the
-/// full plan — peer-rejection rounds shrink the plan, and a verdict depends only on the pre-apply
-/// lock, never on the surviving candidate set.
+/// advanced through a temporary override, and why each of the rest is held.
+/// Computed once before the resolve: peer-rejection rounds shrink the plan, and a verdict depends
+/// only on the pre-apply lock and the plan's own targets, never on the surviving candidate set.
+/// A dependent rejected in a round still matches its selector at its current version.
+///
+/// A name with one copy advances through its major-line key, which can only reach that copy.
+/// A name with several copies advances through the parent selectors of its own copy's dependents
+/// ([`CopyEdges::selectors`]): a major-line key matches every request whose range intersects it,
+/// so a request spanning lines (`^7.0.0 || ^8.0.0`) would pull another copy's edge onto the
+/// target.
+/// A workspace manifest declaring the name could match a parent selector by its own name and
+/// version, which the lock does not record, so an importer the run excludes declaring the name
+/// holds every copy too.
 fn classify_transitive_advance(
     plan: &Plan,
-    importer_declared: &HashSet<String>,
-    version_lines: &HashMap<String, BTreeSet<String>>,
+    evidence: &AdvanceEvidence,
 ) -> HashMap<AdvanceKey, TransitiveAdvance> {
+    let planned = edges::planned_targets(&plan.changes);
     let mut verdicts = HashMap::new();
     for change in plan.changes.iter().filter(|change| !change.direct) {
         let name = &change.package.name;
-        let verdict = if importer_declared.contains(name) {
+        let lines = evidence
+            .version_lines
+            .get(name)
+            .filter(|lines| lines.len() > 1);
+        let verdict = if evidence.managed_declared.contains(name) {
             TransitiveAdvance::DeclaredElsewhere
-        } else if let Some(lines) = version_lines.get(name).filter(|lines| lines.len() > 1) {
-            TransitiveAdvance::MultiLine(lines.iter().cloned().collect())
+        } else if let Some(lines) = lines {
+            let selectors = if evidence.declared.contains(name) {
+                Err("an importer the run excludes declares it".to_string())
+            } else {
+                evidence.edges.selectors(change, &planned)
+            };
+            match selectors {
+                Ok(selectors) => TransitiveAdvance::Pin(selectors),
+                Err(blocker) => TransitiveAdvance::MultiLine {
+                    lines: lines.iter().cloned().collect(),
+                    blocker,
+                },
+            }
         } else {
             match major_line_qualifier(change.from.as_str()) {
-                Some(qualifier) => TransitiveAdvance::Pin(format!("{name}@{qualifier}")),
+                Some(qualifier) => TransitiveAdvance::Pin(vec![format!("{name}@{qualifier}")]),
                 None => TransitiveAdvance::Unscopable,
             }
         };
@@ -3461,10 +3511,11 @@ fn classify_transitive_advance(
     verdicts
 }
 
-/// The temporary override entries for the plan's advanceable transitive candidates: each
-/// [`TransitiveAdvance::Pin`] verdict becomes a major-line-qualified override (`name@^3.0.0`,
-/// `name@^0.11.0`) pinned to its exact matured target, so only the candidate's own version line is
-/// addressed and a same-name copy on another major stays untouched.
+/// The temporary override entries for the plan's advanceable transitive candidates: each key of a
+/// [`TransitiveAdvance::Pin`] verdict pinned to the candidate's exact matured target.
+/// A major-line key (`name@^3.0.0`, `name@^0.11.0`) addresses only the candidate's own version
+/// line, and a parent selector only its own copy's dependents, so a same-name copy elsewhere
+/// stays untouched.
 fn transitive_override_pins(
     plan: &Plan,
     advance: &HashMap<AdvanceKey, TransitiveAdvance>,
@@ -3473,12 +3524,17 @@ fn transitive_override_pins(
         .changes
         .iter()
         .filter(|change| !change.direct)
-        .filter_map(|change| {
-            let TransitiveAdvance::Pin(key) = advance.get(&advance_key(change))? else {
-                return None;
-            };
-            Some((key.clone(), change.to.as_str().to_string()))
+        .filter_map(|change| match advance.get(&advance_key(change))? {
+            TransitiveAdvance::Pin(keys) => Some(
+                keys.iter()
+                    .map(|key| (key.clone(), change.to.as_str().to_string()))
+                    .collect::<Vec<_>>(),
+            ),
+            TransitiveAdvance::DeclaredElsewhere
+            | TransitiveAdvance::MultiLine { .. }
+            | TransitiveAdvance::Unscopable => None,
         })
+        .flatten()
         .collect();
     pins.sort();
     pins.dedup();
@@ -3495,8 +3551,9 @@ struct TransitivePartition {
 
 /// Splits off the transitive candidates whose advance verdict holds them
 /// ([`TransitiveAdvance::hold_skip`]), judged against the pre-apply `lock`.
-/// A verdict depends only on that lock and the change itself, so splitting before any other
-/// partition matches what the joint resolve would decide for the change.
+/// Whether a verdict holds depends only on that lock and the change itself (the plan's other
+/// targets only widen a pinned candidate's selectors), so splitting before any other partition
+/// matches what the joint resolve would decide for the change.
 fn transitive_partition<L: NodeLock>(
     plan: &Plan,
     lock: Option<&str>,
@@ -3522,79 +3579,251 @@ fn transitive_partition<L: NodeLock>(
     })
 }
 
-/// Reports each split-off transitive hold ([`transitive_partition`]) against the lock the apply
-/// settled on.
-///
-/// Holding a candidate keeps it out of the resolve, but it does not freeze its copy: pnpm updating
-/// the declared copy of the same name re-resolves an undeclared copy within its own range too.
-/// A hold that provably landed ([`line_landed`]) becomes an applied row, replacing the anonymous
-/// collateral row the name-level diff may have recorded for the same move.
-/// Every other hold keeps its row.
-fn settle_transitive_holds<L: NodeLock>(
-    project: &Project,
-    before: Option<&str>,
-    held: Vec<Skipped>,
-    report: &mut ApplyReport,
-) -> Result<()> {
-    if held.is_empty() {
-        return Ok(());
-    }
-    let before = before
-        .map(resolved_version_lines::<L>)
-        .transpose()?
-        .unwrap_or_default();
-    let path = project.root.join(L::LOCKFILE);
-    let after = match std::fs::read_to_string(&path) {
-        Ok(content) => resolved_version_lines::<L>(&content)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-        Err(error) => return Err(CoreError::Filesystem(format!("{path}: {error}"))),
-    };
-    for hold in held {
-        if !line_landed(&before, &after, &hold.change) {
-            report.skipped.push(hold);
-            continue;
-        }
-        let change = hold.change;
-        report.applied.retain(|row| {
-            !(row.package == change.package
-                && row.from == change.from
-                && row.to == change.to
-                && !row.direct
-                && row.members.is_empty())
-        });
-        report.applied.push(change);
-    }
-    Ok(())
+/// The per-importer resolved versions of the locks before and after a resolve.
+struct MemberLocks<'a> {
+    before: &'a MemberIndex,
+    after: &'a MemberIndex,
 }
 
-/// Whether the resolved versions `before` and `after` the resolve prove that `change`'s own copy
-/// moved to its target.
+/// What the settled lock proves about one planned change ([`settled_verdict`]).
+enum Settled {
+    /// The change landed.
+    Applied,
+    /// Every declaring member already bound the target, a no-op, neither applied nor held.
+    Unmoved,
+    /// The change is held for the reason the row gives.
+    Held(Box<Skipped>),
+    /// A transitive candidate the advance pass held, which the resolver was never handed; the row
+    /// is its hold, still to be judged against the settled lock ([`settle_copies`]).
+    AdvanceHeld(Box<Skipped>),
+    /// The change fell short of its target, for the ordinary hold to explain.
+    Short(Shortfall),
+}
+
+/// A change that fell short of its target, as its hold row explains it ([`graph_ceiling_hold`]).
+#[derive(Debug, Default)]
+struct Shortfall {
+    /// Whether the change rode a transitive advance ([`TransitiveAdvance::Pin`]).
+    advanced: bool,
+    /// The version the change's own copy settled at, when its edges agree on one
+    /// ([`CopyLanding::settled`]).
+    settled: Option<String>,
+    /// The first dependent package its copy's edges left behind ([`CopyLanding::holder`]).
+    holder: Option<String>,
+}
+
+/// Judges one planned change against the settled lock.
 ///
-/// The lock names versions, not which parent's copy each is, so only an unambiguous line counts:
-/// `from`'s major line held exactly one copy, at `from`, and holds exactly one copy after, at or
-/// beyond the target.
-/// With several copies on one line, another copy reaching the target, or the old copy vanishing
-/// beside a copy already at it, proves nothing about this one, which keeps its hold row.
-fn line_landed(
-    before: &HashMap<String, BTreeSet<String>>,
-    after: &HashMap<String, BTreeSet<String>>,
+/// A transitive candidate the advance pass held (importer-owned name, a copy no override reaches
+/// alone, no override scope) keeps its hold row.
+/// A change with declaring members is judged at each member's own binding ([`reached`],
+/// [`members_moved`]).
+/// Without members, only the copy's own edges prove a landing ([`CopyLedger::landing`]): the
+/// name's newest copy or version set would credit another copy's move, or a copy added for other
+/// dependents.
+fn settled_verdict<L: NodeLock>(
     change: &Change,
-) -> bool {
-    let name = change.package.name.as_str();
-    let line = version::major_key(change.from.as_str()).0;
-    let on_line = |lines: &HashMap<String, BTreeSet<String>>| -> Vec<String> {
-        lines
-            .get(name)
-            .into_iter()
-            .flatten()
-            .filter(|version| version::major_key(version).0 == line)
-            .cloned()
-            .collect()
+    advance: &HashMap<AdvanceKey, TransitiveAdvance>,
+    ledger: &CopyLedger,
+    after_newest: &HashMap<String, String>,
+    members: &MemberLocks<'_>,
+) -> Settled {
+    let verdict = advance.get(&advance_key(change));
+    if let Some(hold) = verdict.and_then(|verdict| verdict.hold_skip(change)) {
+        return Settled::AdvanceHeld(Box::new(hold));
+    }
+    let advanced = matches!(verdict, Some(TransitiveAdvance::Pin(_)));
+    if change.members.is_empty() {
+        let landing = ledger.landing(change);
+        if landing.replaced() {
+            Settled::Applied
+        } else if landing.explains_hold() {
+            Settled::Held(Box::new(copy_hold::<L>(change, &landing)))
+        } else {
+            Settled::Short(Shortfall {
+                advanced,
+                settled: landing.settled().map(str::to_string),
+                holder: landing.holder().map(str::to_string),
+            })
+        }
+    } else if !reached(after_newest, members.after, change) {
+        Settled::Short(Shortfall {
+            advanced,
+            ..Shortfall::default()
+        })
+    } else if members_moved(change, members.before, members.after) {
+        Settled::Applied
+    } else {
+        Settled::Unmoved
+    }
+}
+
+/// Completes a whole-graph report from the resolve's edges ([`CopyLedger`]): settles the advance
+/// holds, adds the collateral rows and the unpaired-move warnings, and keeps each hold's target its
+/// own ([`hold_wins`]).
+///
+/// `before` and `after` are the locks' newest copies per name ([`locked_versions`]), the evidence
+/// for a name no edge records.
+fn settle_copies<L: NodeLock>(
+    report: &mut ApplyReport,
+    ledger: &CopyLedger,
+    advance_held: Vec<Skipped>,
+    before: &HashMap<String, String>,
+    after: &HashMap<String, String>,
+) {
+    // Holding a transitive candidate keeps it out of the resolve but does not freeze its copy:
+    // pnpm updating the declared copy of the same name re-resolves an undeclared copy within its
+    // own range too.
+    // A hold whose copy the edges prove replaced is applied; every other hold keeps its row.
+    for hold in advance_held {
+        if hold.change.members.is_empty() && ledger.landing(&hold.change).replaced() {
+            report.applied.push(hold.change);
+        } else {
+            report.skipped.push(hold);
+        }
+    }
+
+    // The hard requirement is that no net version change to any package may be omitted.
+    // Every edge move the applied rows above do not already state is surfaced as its own
+    // collateral applied row — including a *held* candidate's copy the resolve still moved (whose
+    // skip row alone would hide that real move), and a copy that is not the name's newest.
+    let collateral = copy_collateral::<L>(ledger, before, after, &report.applied);
+    report.applied.extend(collateral);
+    report
+        .warnings
+        .extend(ledger.unpaired().iter().map(unpaired_move_warning));
+    hold_wins(report);
+}
+
+/// The hold row of a change without declaring members whose copy the resolve did not replace,
+/// when its edges say why ([`CopyLanding::explains_hold`]): the copy advanced for only some
+/// dependents, the lock does not pair one of its edges, or a copy at the target was added for other
+/// dependents.
+/// The row blames the first dependent package left behind, whose range kept the copy.
+fn copy_hold<L: NodeLock>(change: &Change, landing: &CopyLanding) -> Skipped {
+    let holder = landing
+        .holder()
+        .unwrap_or(change.package.name.as_str())
+        .to_string();
+    Skipped {
+        change: change.clone(),
+        reason: SkipReason::GraphCeilingHeld,
+        offending: Some(PackageId::new(L::ID, holder, Some(NPM.to_string()))),
+        detail: Some(landing.hold_detail(change)),
+    }
+}
+
+/// The net edge moves of a whole-graph resolve that `applied` does not already state, as sorted
+/// collateral rows.
+///
+/// Each row is one edge move of one copy ([`CopyLedger::moves`]), so a copy that is not the name's
+/// newest is reported too, and a copy added for other dependents is no move of an old one.
+/// An applied row covers only the exact move it states: a planned candidate the resolve held can
+/// still have had its copy moved, and an applied row claiming a different landing (an overshoot the
+/// executor re-verifies into a skip) leaves the real movement to its own row.
+/// A name no edge of either lock binds has no copy evidence, so it keeps the newest-copy diff
+/// ([`collateral_changes`]) and is never less visible than its name.
+fn copy_collateral<L: NodeLock>(
+    ledger: &CopyLedger,
+    before: &HashMap<String, String>,
+    after: &HashMap<String, String>,
+    applied: &[Change],
+) -> Vec<Change> {
+    let stated = |name: &str, from: &str, to: &str| {
+        applied.iter().any(|change| {
+            change.package.name == name
+                && version::compare(change.from.as_str(), from).is_eq()
+                && version::compare(change.to.as_str(), to).is_eq()
+        })
     };
-    let before_copies = on_line(before);
-    let after_copies = on_line(after);
-    matches!(before_copies.as_slice(), [only] if only == change.from.as_str())
-        && matches!(after_copies.as_slice(), [landed] if satisfies_target(change, landed))
+    let mut rows: Vec<Change> = ledger
+        .moves()
+        .into_iter()
+        .filter(|CopyMove { name, from, to }| !stated(name, from, to))
+        .map(|CopyMove { name, from, to }| collateral_change::<L>(&name, &from, &to))
+        .collect();
+    let unrecorded: HashMap<String, String> = before
+        .iter()
+        .filter(|(name, _)| !ledger.records(name))
+        .map(|(name, version)| (name.clone(), version.clone()))
+        .collect();
+    rows.extend(collateral_changes::<L>(&unrecorded, after, applied));
+    rows.sort_by(|a, b| {
+        a.package
+            .name
+            .cmp(&b.package.name)
+            .then_with(|| version::compare(a.from.as_str(), b.from.as_str()))
+            .then_with(|| version::compare(a.to.as_str(), b.to.as_str()))
+    });
+    rows
+}
+
+/// The warning for a dependent's requirement the resolve moved across lock records it rewrote,
+/// with no single pairing of old and new versions ([`UnpairedRequirement`]).
+fn unpaired_move_warning(requirement: &UnpairedRequirement) -> Diagnostic {
+    let UnpairedRequirement {
+        dependent,
+        name,
+        before,
+        after,
+    } = requirement;
+    let join =
+        |versions: &BTreeSet<String>| versions.iter().cloned().collect::<Vec<_>>().join(", ");
+    Diagnostic::new(
+        DiagnosticKind::UnpairedMove,
+        format!(
+            "{dependent} moved its {name} requirement from {} to {} in lock records the resolve rewrote, so no edge pairs an old version with a new one and no row reports this move",
+            join(before),
+            join(after)
+        ),
+    )
+    .with_package(name.clone())
+}
+
+/// Whether `change`'s executor key leaves out its members, so it names only the package and target:
+/// a transitive change, or a direct one no member declares.
+fn memberless_key(change: &Change) -> bool {
+    !change.direct || change.members.is_empty()
+}
+
+/// Keeps each held change's target its own in the finished report.
+///
+/// The executor matches applied rows to planned changes by package and target, and leaves out the
+/// source version and, for a change without members in its key ([`memberless_key`]), the members.
+/// An applied row with such a held change's target, whether a collateral move or another planned
+/// copy converging on it, would therefore count the held change as landed.
+/// The hold wins: each such row leaves the applied list and its move is named in the hold's
+/// detail instead.
+fn hold_wins(report: &mut ApplyReport) {
+    let ApplyReport {
+        applied, skipped, ..
+    } = report;
+    for hold in skipped
+        .iter_mut()
+        .filter(|hold| memberless_key(&hold.change))
+    {
+        let mut moves = Vec::new();
+        applied.retain(|row| {
+            let shares_target = memberless_key(row)
+                && row.package == hold.change.package
+                && row.to == hold.change.to;
+            if shares_target {
+                moves.push(format!("{} {} → {}", row.package.name, row.from, row.to));
+            }
+            !shares_target
+        });
+        if moves.is_empty() {
+            continue;
+        }
+        let note = format!(
+            "the resolve still moved {}, which shares this candidate's target and is reported here",
+            moves.join(", ")
+        );
+        hold.detail = Some(match hold.detail.take() {
+            Some(detail) => format!("{detail}; {note}"),
+            None => note,
+        });
+    }
 }
 
 /// [`partition_catalog_managed`] against the pre-apply lock, with the run's excluded importers left
@@ -3784,32 +4013,46 @@ fn multi_version_hold(
 /// mutually-exclusive peer won, so the row names the sibling whose peer choice excluded it (the
 /// candidate itself absent a unique blocker).
 /// The resolve succeeded, so this is a graph ceiling, never a rejection.
-/// For an attempted transitive advance (`advanced`) the unattributed message hides the real
-/// cause — whether the qualified override never matched (an exact or sub-line dependent range)
-/// or the override-free settlement reverted the pin, the target sits outside some dependent's
-/// declared range — so the detail says that instead.
+/// For an attempted transitive advance ([`Shortfall::advanced`]) the unattributed message hides
+/// the real cause — whether the qualified override never matched (an exact or sub-line dependent
+/// range, or a dependent that moved past its parent selector) or the override-free settlement
+/// reverted the pin, the target sits outside some dependent's declared range — so the detail says
+/// that instead.
+/// A copy's own edges name where it settled and who kept it there; the name-level reading is the
+/// fallback for a change no edge records.
 fn graph_ceiling_hold<L: NodeLock>(
     change: &Change,
     after_content: &str,
-    advanced: bool,
+    shortfall: &Shortfall,
 ) -> Result<Skipped> {
     let name = change.package.name.as_str();
-    let offender = peer_conflict_blocker(after_content, name).unwrap_or_else(|| name.to_string());
-    let detail = if advanced {
+    // The dependent the copy's own edges left behind is the blocker when they name one; another
+    // copy of the name can have other dependents.
+    let offender = shortfall
+        .holder
+        .clone()
+        .or_else(|| peer_conflict_blocker(after_content, name))
+        .unwrap_or_else(|| name.to_string());
+    let detail = if shortfall.advanced {
         // The settlement may have re-resolved the copy to a different in-range version than
         // the pre-apply one; the row names where the graph actually settled, since a stale
         // `from` would contradict the collateral row that shows the real landing.
+        // The copy's own edges say where it settled; the name's versions on the copy's major line
+        // are the fallback, which another copy on that line could answer instead.
         // An unparsable settlement lock fails the verdict instead of silently naming the
         // pre-apply version; only a name genuinely absent from a parsable lock falls back.
-        let settled = resolved_version_lines::<L>(after_content)?
-            .remove(name)
-            .and_then(|versions| {
-                let line = version::major_key(change.from.as_str()).0;
-                versions
-                    .into_iter()
-                    .find(|version| version::major_key(version).0 == line)
-            })
-            .unwrap_or_else(|| change.from.as_str().to_string());
+        let settled = match &shortfall.settled {
+            Some(settled) => settled.clone(),
+            None => resolved_version_lines::<L>(after_content)?
+                .remove(name)
+                .and_then(|versions| {
+                    let line = version::major_key(change.from.as_str()).0;
+                    versions
+                        .into_iter()
+                        .find(|version| version::major_key(version).0 == line)
+                })
+                .unwrap_or_else(|| change.from.as_str().to_string()),
+        };
         Some(format!(
             "the transitive advance did not land: a dependent's declared range holds it at {settled}"
         ))
@@ -3915,40 +4158,35 @@ fn propagate_repeated_minimum_age_rejection(error: CoreError) -> CoreError {
 /// A package whose first-match rule exempts every version keeps that exemption, since pnpm cannot
 /// express every version but one ([`crate::exclusions::set_exact_permission`]).
 fn minimum_age_repair_exclusions(plan: &Plan, configured_exclusions: Vec<String>) -> Vec<String> {
-    let targeted = plan
-        .changes
-        .iter()
-        .map(|change| change.package.name.as_str())
-        .collect::<HashSet<_>>();
     let mut exclusions = configured_exclusions;
     for (name, granted) in minimum_age_repair_versions(plan) {
-        let withheld: BTreeSet<String> = if targeted.contains(name.as_str()) {
-            plan.baseline_violations
-                .iter()
-                .filter(|violation| violation.package.name == name)
-                .filter_map(|violation| {
-                    crate::exclusions::version_identity(violation.version.as_str())
-                })
-                .collect()
-        } else {
-            BTreeSet::new()
-        };
+        let withheld: BTreeSet<String> = plan
+            .baseline_violations
+            .iter()
+            .filter(|violation| {
+                violation.package.name == name && moves_violating_copy(plan, violation)
+            })
+            .filter_map(|violation| crate::exclusions::version_identity(violation.version.as_str()))
+            .collect();
         crate::exclusions::set_exact_permission(&mut exclusions, &name, &withheld, &granted);
     }
     exclusions
 }
 
+/// Whether a planned change moves the copy at `violation`'s version.
+/// Another copy of the same name stays where it is, so it keeps its permission.
+fn moves_violating_copy(plan: &Plan, violation: &cooldown_core::BaselineViolation) -> bool {
+    plan.changes.iter().any(|change| {
+        change.package.name == violation.package.name && change.from == violation.version
+    })
+}
+
 fn minimum_age_repair_versions(plan: &Plan) -> BTreeMap<String, BTreeSet<String>> {
-    let targeted = plan
-        .changes
-        .iter()
-        .map(|change| change.package.name.as_str())
-        .collect::<HashSet<_>>();
     let mut exact_versions = BTreeMap::<String, BTreeSet<String>>::new();
     for violation in plan
         .baseline_violations
         .iter()
-        .filter(|violation| !targeted.contains(violation.package.name.as_str()))
+        .filter(|violation| !moves_violating_copy(plan, violation))
     {
         exact_versions
             .entry(violation.package.name.clone())
@@ -4416,6 +4654,9 @@ mod berry_attribution_tests;
 
 #[cfg(test)]
 mod npm_attribution_tests;
+
+#[cfg(test)]
+mod pnpm_advance_tests;
 
 #[cfg(all(test, unix))]
 mod pnpm_verify_tests;
@@ -6763,6 +7004,14 @@ packages:
         assert!(detail.contains("pnpm-workspace.yaml"), "{detail}");
     }
 
+    /// The shortfall of an attempted transitive advance whose copy's edges name no settled version.
+    fn advanced() -> Shortfall {
+        Shortfall {
+            advanced: true,
+            ..Shortfall::default()
+        }
+    }
+
     /// The advanced-hold detail names where the settlement actually left the copy — it may have
     /// re-resolved to a different in-range version than the pre-apply one, and a stale `from`
     /// would contradict the collateral row that shows the real landing.
@@ -6785,7 +7034,7 @@ packages:
                 resolution: {integrity: sha512-a}
         "};
 
-        let hold = graph_ceiling_hold::<Pnpm>(&advance, after, true)
+        let hold = graph_ceiling_hold::<Pnpm>(&advance, after, &advanced())
             .expect("a parsable settlement lock yields the hold");
         let detail = hold.detail.expect("advanced holds carry a detail");
         assert!(
@@ -6795,8 +7044,8 @@ packages:
 
         // An empty document is a legitimately empty lock, not a parse failure: the name is simply
         // absent, so the pre-apply version is the honest fallback.
-        let unresolvable =
-            graph_ceiling_hold::<Pnpm>(&advance, "", true).expect("an empty lock is parsable");
+        let unresolvable = graph_ceiling_hold::<Pnpm>(&advance, "", &advanced())
+            .expect("an empty lock is parsable");
         let detail = unresolvable.detail.expect("advanced holds carry a detail");
         assert!(
             detail.contains("holds it at 3.4.8"),
@@ -6817,7 +7066,7 @@ packages:
               debug@3.4.9: [unclosed
         "};
 
-        let error = graph_ceiling_hold::<Pnpm>(&advance, malformed, true)
+        let error = graph_ceiling_hold::<Pnpm>(&advance, malformed, &advanced())
             .expect_err("an unparsable lock is an error, not a stale-from fallback");
         assert!(
             matches!(error, CoreError::LockUnreadable(_)),
@@ -6836,8 +7085,8 @@ packages:
         // copy — held, with a row saying so.
         let mut declared_elsewhere = change("react", "18.2.0", "18.3.1");
         declared_elsewhere.direct = false;
-        // Two resolved copies of one undeclared name: a single qualified override could collapse
-        // them, which the newest-copy report projection cannot attribute — held on its own lines.
+        // Two resolved copies of one undeclared name, and no edge into this one to address it
+        // by: held on its own line rather than moved through a key that reaches the other copy.
         let mut duplicated = change("entities", "4.5.0", "4.5.3");
         duplicated.direct = false;
         // No parsable major line: nothing safe to scope an override to.
@@ -6855,13 +7104,17 @@ packages:
             ],
             ..Plan::default()
         };
-        let importer_declared: HashSet<String> = HashSet::from(["react".to_string()]);
-        let version_lines: HashMap<String, BTreeSet<String>> = HashMap::from([(
-            "entities".to_string(),
-            BTreeSet::from(["4.5.0".to_string(), "5.0.2".to_string()]),
-        )]);
+        let evidence = AdvanceEvidence {
+            managed_declared: HashSet::from(["react".to_string()]),
+            declared: HashSet::from(["react".to_string()]),
+            version_lines: HashMap::from([(
+                "entities".to_string(),
+                BTreeSet::from(["4.5.0".to_string(), "5.0.2".to_string()]),
+            )]),
+            edges: CopyEdges::default(),
+        };
 
-        let advance = classify_transitive_advance(&plan, &importer_declared, &version_lines);
+        let advance = classify_transitive_advance(&plan, &evidence);
         let pins = transitive_override_pins(&plan, &advance);
 
         assert_eq!(
@@ -6894,7 +7147,8 @@ packages:
             duplicated_hold
                 .detail
                 .as_deref()
-                .is_some_and(|detail| detail.contains("4.5.0, 5.0.2")),
+                .is_some_and(|detail| detail.contains("4.5.0, 5.0.2")
+                    && detail.contains("no dependent in the lock binds the 4.5.0 copy")),
         );
         let unscopable_hold = hold(&unscopable);
         assert_eq!(unscopable_hold.reason, SkipReason::NotEligible);
@@ -6953,8 +7207,8 @@ packages:
     }
 
     /// An importer copy that genuinely moved beneath a newer transitive duplicate shows no net
-    /// newest-copy change; the importer-resolved version sets keep its applied row visible, while
-    /// a converged re-run (nothing moved anywhere) still reports no movement.
+    /// newest-copy change; the member's own binding keeps its applied row visible, while a
+    /// converged re-run (nothing moved anywhere) still reports no movement.
     #[test]
     fn a_move_under_a_newer_duplicate_copy_is_still_a_move() {
         let before_lock = indoc::indoc! {"
@@ -6975,21 +7229,27 @@ packages:
         "};
         let after_lock = before_lock.replace("4.1.1", "4.1.2");
         let before = locked_versions::<Pnpm>(before_lock).expect("a well-formed lock parses");
-        let after = locked_versions::<Pnpm>(&after_lock).expect("a well-formed lock parses");
         assert_eq!(
             before.get("chalk").map(String::as_str),
             Some("5.6.0"),
             "the newest-copy projection is blind to the importer copy"
         );
 
+        let planned = Change {
+            members: vec![MemberRef {
+                name: "app".to_string(),
+                path: ".".to_string(),
+            }],
+            ..change("chalk", "4.1.1", "4.1.2")
+        };
         let before_members = Pnpm::member_sources(before_lock);
         let after_members = Pnpm::member_sources(&after_lock);
         assert!(
-            candidate_moved("chalk", &before, &after, &before_members, &after_members),
+            members_moved(&planned, &before_members, &after_members),
             "the importer copy moved 4.1.1 -> 4.1.2 beneath the 5.6.0 duplicate"
         );
         assert!(
-            !candidate_moved("chalk", &before, &before, &before_members, &before_members),
+            !members_moved(&planned, &before_members, &before_members),
             "a converged re-run reports no movement"
         );
     }
@@ -7423,6 +7683,7 @@ packages:
                 &journal,
                 &evidence,
                 &ProtectedPins::default(),
+                Vec::new(),
             )
             .await?;
 
@@ -7532,7 +7793,14 @@ packages:
         let evidence =
             PeerEvidence::gather::<Pnpm>(Some(&root), journaled_lock::<Pnpm>(&journal), &plan);
         let protected_pins = ProtectedPins::default();
-        let apply = tool.apply_whole_graph(&project, &plan, &journal, &evidence, &protected_pins);
+        let apply = tool.apply_whole_graph(
+            &project,
+            &plan,
+            &journal,
+            &evidence,
+            &protected_pins,
+            Vec::new(),
+        );
         tokio::pin!(apply);
 
         // Interrupt only once the temporary overrides are on disk and the resolver is running.
@@ -7668,6 +7936,7 @@ packages:
                 &journal,
                 &evidence,
                 &ProtectedPins::default(),
+                Vec::new(),
             )
             .await
             .expect_err("an unparsable post-resolve lock must fail the batch, not read as held");
@@ -9390,50 +9659,6 @@ mod whole_graph_tests {
         Ok(())
     }
 
-    /// Only an unambiguous line proves a held copy landed: with several copies on one major line,
-    /// another copy's move, or the old copy vanishing beside one already at the target, credits
-    /// nothing.
-    #[test]
-    fn only_an_unambiguous_line_proves_a_held_copy_landed() {
-        let lines = |versions: &[&str]| {
-            HashMap::from([(
-                "host".to_string(),
-                versions
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<BTreeSet<_>>(),
-            )])
-        };
-        let held = |from: &str, to: &str| Change {
-            direct: false,
-            ..change("host", from, to, &[])
-        };
-
-        // One copy on the line before and after, at the target.
-        assert!(line_landed(
-            &lines(&["2.0.0", "1.0.0"]),
-            &lines(&["2.1.0", "1.2.0"]),
-            &held("1.0.0", "1.2.0"),
-        ));
-        // Two copies on the line: one reaching the target says nothing about the other.
-        let before = lines(&["2.0.0", "1.0.0", "1.1.0"]);
-        let after = lines(&["2.1.0", "1.0.1", "1.2.0"]);
-        assert!(!line_landed(&before, &after, &held("1.0.0", "1.2.0")));
-        assert!(!line_landed(&before, &after, &held("1.1.0", "1.2.0")));
-        // The old copy vanishing beside a copy already at the target.
-        assert!(!line_landed(
-            &lines(&["1.0.0", "1.2.0"]),
-            &lines(&["1.2.0"]),
-            &held("1.0.0", "1.2.0"),
-        ));
-        // A single copy that moved short of the target.
-        assert!(!line_landed(
-            &lines(&["1.0.0"]),
-            &lines(&["1.1.0"]),
-            &held("1.0.0", "1.2.0"),
-        ));
-    }
-
     /// The joint resolve's report judges a held transitive candidate by its hold before any landing
     /// check, so a caller that hands it in is never told another copy's move landed it.
     #[tokio::test]
@@ -9456,10 +9681,331 @@ mod whole_graph_tests {
                 &journal,
                 &evidence,
                 &ProtectedPins::default(),
+                Vec::new(),
             )
             .await?;
 
         assert_undeclared_copy_held(&fixture, &report);
+        Ok(())
+    }
+
+    /// A root project declaring `dependencies`, locked as `before`, with a scripted pnpm whose
+    /// every resolve settles on `after`.
+    fn settling_project(
+        dependencies: &serde_json::Value,
+        before: &str,
+        after: &str,
+    ) -> eyre::Result<(tempfile::TempDir, Utf8PathBuf, NpmTool<Pnpm>)> {
+        let (directory, root) = tempdir_root()?;
+        std::fs::write(
+            root.join("package.json"),
+            serde_json::json!({ "name": "app", "dependencies": dependencies }).to_string(),
+        )?;
+        std::fs::write(root.join("pnpm-lock.yaml"), before)?;
+        std::fs::write(root.join("settled.yaml"), after)?;
+        let script = fake_pnpm(
+            &root,
+            indoc! {r#"
+                  *"--frozen-lockfile"*) exit 0 ;;
+                  *" update "*|*"install"*)
+                    cp settled.yaml pnpm-lock.yaml; exit 0 ;;
+            "#},
+        )?;
+        let tool = tool_with(&script)?;
+        Ok((directory, root, tool))
+    }
+
+    fn transitive(name: &str, from: &str, to: &str) -> Change {
+        Change {
+            direct: false,
+            ..change(name, from, to, &[])
+        }
+    }
+
+    /// The issue's `seroval` run: the root's declared copy moves 1.7.4 → 1.7.5 while the undeclared
+    /// 1.6.11 copy `solid-js` binds only moves to 1.6.12.
+    /// The 1.6.11 copy's planned 1.7.5 is never credited, and its real move, which the name's
+    /// newest copy hides, is its own row.
+    #[tokio::test]
+    async fn the_old_copy_move_is_reported_beside_the_declared_upgrade() -> eyre::Result<()> {
+        use super::copies::tests::{SEROVAL_AFTER, SEROVAL_BEFORE};
+        let (_directory, root, tool) = settling_project(
+            &serde_json::json!({
+                "seroval": "^1.5.6",
+                "seroval-plugins": "^1.5.6",
+                "solid-js": "^1.9.14",
+            }),
+            SEROVAL_BEFORE,
+            SEROVAL_AFTER,
+        )?;
+        let app = [("app", ".")];
+        let declared = vec![
+            change("seroval", "1.7.4", "1.7.5", &app),
+            change("seroval-plugins", "1.7.4", "1.7.6", &app),
+            change("solid-js", "1.9.17", "1.9.18", &app),
+        ];
+        let undeclared = transitive("seroval", "1.6.11", "1.7.5");
+        let plan = Plan {
+            changes: [declared.clone(), vec![undeclared.clone()]].concat(),
+            ..Plan::default()
+        };
+
+        let report = apply(&tool, &project(&root), plan).await?;
+
+        // The declared moves land, and the old copy's move is reported as it happened.
+        let rows: Vec<(&str, &str, &str, bool)> = report
+            .applied
+            .iter()
+            .map(|row| {
+                (
+                    row.package.name.as_str(),
+                    row.from.as_str(),
+                    row.to.as_str(),
+                    row.direct,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("seroval", "1.7.4", "1.7.5", true),
+                ("seroval-plugins", "1.7.4", "1.7.6", true),
+                ("solid-js", "1.9.17", "1.9.18", true),
+                ("seroval", "1.6.11", "1.6.12", false),
+            ],
+            "{report:?}"
+        );
+        // The undeclared copy keeps its own hold, and every edge pairs.
+        let [hold] = report.skipped.as_slice() else {
+            panic!("only the undeclared copy is held: {report:?}");
+        };
+        assert_eq!(hold.change, undeclared);
+        assert_eq!(hold.reason, SkipReason::MultiVersionHeld);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        Ok(())
+    }
+
+    /// The issue's `inline-style-parser` run: the advance's copy stays at 0.2.7 for
+    /// `style-to-object` 1.0.14, and only a new `style-to-object` 2.0.2 binds a new 0.2.9 copy.
+    /// A copy added elsewhere is no landing of the planned one, so it is held, naming both.
+    #[tokio::test]
+    async fn a_target_copy_added_elsewhere_holds_the_transitive_advance() -> eyre::Result<()> {
+        let before = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  md:
+                    specifier: ^1.0.0
+                    version: 1.0.0
+                  style-to-js:
+                    specifier: ^1.1.21
+                    version: 1.1.21
+
+            packages:
+
+              inline-style-parser@0.2.7:
+                resolution: {integrity: sha512-a}
+
+              md@1.0.0:
+                resolution: {integrity: sha512-b}
+
+              style-to-js@1.1.21:
+                resolution: {integrity: sha512-c}
+
+              style-to-object@1.0.14:
+                resolution: {integrity: sha512-d}
+
+            snapshots:
+
+              inline-style-parser@0.2.7: {}
+
+              md@1.0.0: {}
+
+              style-to-js@1.1.21:
+                dependencies:
+                  style-to-object: 1.0.14
+
+              style-to-object@1.0.14:
+                dependencies:
+                  inline-style-parser: 0.2.7
+        "};
+        let after = indoc! {"
+            lockfileVersion: '9.0'
+
+            importers:
+
+              .:
+                dependencies:
+                  md:
+                    specifier: ^1.0.0
+                    version: 1.1.0
+                  style-to-js:
+                    specifier: ^1.1.21
+                    version: 1.1.21
+
+            packages:
+
+              inline-style-parser@0.2.7:
+                resolution: {integrity: sha512-a}
+
+              inline-style-parser@0.2.9:
+                resolution: {integrity: sha512-e}
+
+              md@1.1.0:
+                resolution: {integrity: sha512-f}
+
+              style-to-js@1.1.21:
+                resolution: {integrity: sha512-c}
+
+              style-to-object@1.0.14:
+                resolution: {integrity: sha512-d}
+
+              style-to-object@2.0.2:
+                resolution: {integrity: sha512-g}
+
+            snapshots:
+
+              inline-style-parser@0.2.7: {}
+
+              inline-style-parser@0.2.9: {}
+
+              md@1.1.0:
+                dependencies:
+                  style-to-object: 2.0.2
+
+              style-to-js@1.1.21:
+                dependencies:
+                  style-to-object: 1.0.14
+
+              style-to-object@1.0.14:
+                dependencies:
+                  inline-style-parser: 0.2.7
+
+              style-to-object@2.0.2:
+                dependencies:
+                  inline-style-parser: 0.2.9
+        "};
+        let (_directory, root, tool) = settling_project(
+            &serde_json::json!({ "md": "^1.0.0", "style-to-js": "^1.1.21" }),
+            before,
+            after,
+        )?;
+        let planned = transitive("inline-style-parser", "0.2.7", "0.2.9");
+        let plan = Plan {
+            changes: vec![planned.clone()],
+            ..Plan::default()
+        };
+
+        let report = apply(&tool, &project(&root), plan).await?;
+
+        // Only the importer's own move is a row; the new copy moved nothing.
+        assert_eq!(applied_names(&report), vec!["md"], "{report:?}");
+        let [hold] = report.skipped.as_slice() else {
+            panic!("the advance is held: {report:?}");
+        };
+        assert_eq!(hold.change, planned);
+        assert_eq!(hold.reason, SkipReason::GraphCeilingHeld);
+        assert_eq!(
+            hold.offending.as_ref().map(|package| package.name.as_str()),
+            Some("style-to-object")
+        );
+        assert_eq!(
+            hold.detail.as_deref(),
+            Some(
+                "style-to-object@1.0.14 still resolves inline-style-parser 0.2.7; \
+                 inline-style-parser 0.2.9 is a new copy, bound by style-to-object@2.0.2"
+            )
+        );
+        Ok(())
+    }
+
+    /// A transitive advance the settlement kept for one dependent and reverted for another is
+    /// held, and its partial move cannot borrow the advance's target: the executor would count a
+    /// row with that target as the advance landing, so the move is named in the hold instead.
+    /// The other dependent's real move is its own row.
+    #[tokio::test]
+    async fn a_partly_advanced_copy_is_held_and_names_its_moves() -> eyre::Result<()> {
+        use super::copies::tests::shared_copy;
+        let (_directory, root, tool) = settling_project(
+            &serde_json::json!({ "p": "^1.0.0", "q": "^1.0.0" }),
+            &shared_copy("1.0.0", "1.0.0"),
+            &shared_copy("1.2.0", "1.0.1"),
+        )?;
+        let planned = transitive("leaf", "1.0.0", "1.2.0");
+        let plan = Plan {
+            changes: vec![planned.clone()],
+            ..Plan::default()
+        };
+
+        let report = apply(&tool, &project(&root), plan).await?;
+
+        let rows: Vec<(&str, &str)> = report
+            .applied
+            .iter()
+            .map(|row| (row.from.as_str(), row.to.as_str()))
+            .collect();
+        assert_eq!(rows, vec![("1.0.0", "1.0.1")], "{report:?}");
+        let [hold] = report.skipped.as_slice() else {
+            panic!("the advance is held: {report:?}");
+        };
+        assert_eq!(hold.change, planned);
+        assert_eq!(hold.reason, SkipReason::GraphCeilingHeld);
+        assert_eq!(
+            hold.detail.as_deref(),
+            Some(
+                "the leaf 1.0.0 copy moved to 1.2.0 only for p@1.0.0; \
+                 q@1.0.0 still resolves leaf 1.0.1; \
+                 the resolve still moved leaf 1.0.0 → 1.2.0, which shares this candidate's \
+                 target and is reported here"
+            )
+        );
+        Ok(())
+    }
+
+    /// A dependent whose rewritten records leave no single pairing of old and new versions credits
+    /// no planned move of its copies and reports none as a row; one warning describes it.
+    #[tokio::test]
+    async fn an_unpaired_requirement_is_a_warning_not_a_move() -> eyre::Result<()> {
+        use super::copies::tests::{UNPAIRED_AFTER, UNPAIRED_BEFORE};
+        let (_directory, root, tool) = settling_project(
+            &serde_json::json!({ "a": "^1.0.0" }),
+            UNPAIRED_BEFORE,
+            UNPAIRED_AFTER,
+        )?;
+        let planned = transitive("leaf", "1.0.0", "1.0.1");
+        let plan = Plan {
+            changes: vec![planned.clone()],
+            ..Plan::default()
+        };
+
+        let report = apply(&tool, &project(&root), plan).await?;
+
+        // The importer's own move is the only row.
+        assert_eq!(applied_names(&report), vec!["a"], "{report:?}");
+        let [hold] = report.skipped.as_slice() else {
+            panic!("the advance is held: {report:?}");
+        };
+        assert_eq!(hold.change, planned);
+        assert!(
+            hold.detail.as_deref().is_some_and(|detail| detail
+                .contains("the lock does not pair the leaf 1.0.0 requirement of p@1.0.0")),
+            "{hold:?}"
+        );
+        let [warning] = report.warnings.as_slice() else {
+            panic!("the unpaired requirement is reported once: {report:?}");
+        };
+        assert_eq!(warning.kind, DiagnosticKind::UnpairedMove);
+        assert_eq!(warning.package.as_deref(), Some("leaf"));
+        assert!(
+            warning
+                .message
+                .starts_with("p moved its leaf requirement from 1.0.0, 1.1.0 to 1.0.1, 1.1.1"),
+            "{}",
+            warning.message
+        );
         Ok(())
     }
 
@@ -10527,8 +11073,17 @@ mod whole_graph_tests {
             "{settle}"
         );
 
-        // The upgrade lands with the excluded copy moved alongside it.
-        assert_eq!(applied_names(&report), vec!["mongoose"]);
+        // The upgrade lands, and the excluded importer's own copy surfaces as its own move.
+        assert_eq!(
+            report
+                .applied
+                .iter()
+                .map(|row| (row.from.as_str(), row.to.as_str(), row.direct))
+                .collect::<Vec<_>>(),
+            vec![("9.9.1", "9.9.3", true), ("9.8.0", "9.9.3", false)],
+            "{:?}",
+            report.applied
+        );
         assert!(report.skipped.is_empty(), "{:?}", report.skipped);
         assert_eq!(read(&root, "pnpm-lock.yaml")?, both);
         let [warning] = report.warnings.as_slice() else {
@@ -10620,8 +11175,18 @@ mod whole_graph_tests {
 
         let report = apply(&tool, &project(&root), plan).await?;
 
-        // The acceptance policy is unchanged: an unprovable range is no proof of drift.
-        assert_eq!(applied_names(&report), vec!["mongoose"]);
+        // The acceptance policy is unchanged: an unprovable range is no proof of drift, and the
+        // excluded importer's own copy surfaces as its own move.
+        assert_eq!(
+            report
+                .applied
+                .iter()
+                .map(|row| (row.from.as_str(), row.to.as_str(), row.direct))
+                .collect::<Vec<_>>(),
+            vec![("9.9.1", "9.9.3", true), ("9.8.0", "9.9.3", false)],
+            "{:?}",
+            report.applied
+        );
         assert!(report.skipped.is_empty(), "{:?}", report.skipped);
         assert_eq!(read(&root, "pnpm-lock.yaml")?, settled);
         let [warning] = report.warnings.as_slice() else {

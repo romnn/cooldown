@@ -11,6 +11,7 @@ fn run(root: &Path, config: &Path, args: &[&str]) -> eyre::Result<Output> {
         .current_dir(root)
         .env_remove("COOLDOWN_NO_TRACE")
         .env_remove("COOLDOWN_TRACE_DIR")
+        .env_remove("COOLDOWN_FULL_TRACE")
         .env("XDG_CONFIG_HOME", config)
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("COOLDOWN_NPM", root.join("missing-npm"))
@@ -28,11 +29,16 @@ fn traces(config: &Path) -> eyre::Result<Vec<PathBuf>> {
         .collect::<Result<_, _>>()?)
 }
 
+/// Every record of a finished trace, which must not be cut short.
 fn records(path: &Path) -> eyre::Result<Vec<Value>> {
-    std::fs::read_to_string(path)?
-        .lines()
-        .map(|line| Ok(serde_json::from_str(line)?))
-        .collect()
+    let mut records = cooldown::trace::records(path)?;
+    let read = records.by_ref().collect::<Result<Vec<_>, _>>()?;
+    eyre::ensure!(
+        !records.truncated(),
+        "trace {} is truncated",
+        path.display()
+    );
+    Ok(read)
 }
 
 #[test]
@@ -54,10 +60,22 @@ fn default_trace_keeps_json_stdout_and_captures_setup_failure() -> eyre::Result<
     assert!(String::from_utf8_lossy(&output.stderr).contains("trace recorded at"));
     let files = traces(&config)?;
     assert_eq!(files.len(), 1);
-    let events = records(files.first().ok_or_else(|| eyre::eyre!("missing trace"))?)?;
+    let file = files.first().ok_or_else(|| eyre::eyre!("missing trace"))?;
+    // The trace is a zstd stream, compact unless a full trace is requested.
+    assert!(
+        file.to_string_lossy().ends_with(".jsonl.zst"),
+        "{}",
+        file.display()
+    );
+    assert!(std::fs::read(file)?.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]));
+    let events = records(file)?;
     assert_eq!(
         events.first().map(|event| &event["event"]["kind"]),
         Some(&Value::from("run_started"))
+    );
+    assert_eq!(
+        events.first().map(|event| &event["event"]["detail"]),
+        Some(&Value::from("compact"))
     );
     assert_eq!(
         events.last().map(|event| &event["event"]["kind"]),
@@ -175,8 +193,9 @@ fn baseline_binds_the_exact_native_graph_and_preserves_input_bytes() -> eyre::Re
     Ok(())
 }
 
-#[test]
-fn offline_evaluation_keeps_metadata_filter_reasons_and_the_printed_report() -> eyre::Result<()> {
+/// One offline `outdated` evaluation of a single npm dependency with three releases, recorded at
+/// the given trace detail.
+fn offline_evaluation(detail_args: &[&str]) -> eyre::Result<OfflineEvaluation> {
     let root = tempfile::tempdir()?;
     std::fs::create_dir(root.path().join(".git"))?;
     std::fs::write(
@@ -211,53 +230,116 @@ fn offline_evaluation_keeps_metadata_filter_reasons_and_the_printed_report() -> 
         },
     )?;
     let config = root.path().join("config");
-    let output = run(
-        root.path(),
-        &config,
-        &[
-            "outdated",
-            "--offline",
-            "--no-advisories",
-            "--json",
-            "--no-progress",
-        ],
-    )?;
-    assert!(output.status.success(), "{output:?}");
+    let mut args = vec![
+        "outdated",
+        "--offline",
+        "--no-advisories",
+        "--json",
+        "--no-progress",
+    ];
+    args.extend_from_slice(detail_args);
+    let output = run(root.path(), &config, &args)?;
+    eyre::ensure!(output.status.success(), "{output:?}");
     let report: Value = serde_json::from_slice(&output.stdout)?;
     let files = traces(&config)?;
     let events = records(files.first().ok_or_else(|| eyre::eyre!("missing trace"))?)?;
-    assert!(
-        events
+    Ok(OfflineEvaluation { report, events })
+}
+
+struct OfflineEvaluation {
+    report: Value,
+    events: Vec<Value>,
+}
+
+impl OfflineEvaluation {
+    fn events(&self, kind: &str) -> Vec<&Value> {
+        self.events
             .iter()
-            .any(|record| record["event"]["kind"] == "evaluation"
-                && record["event"]["decision"]["kind"] == "upgrade")
-    );
-    assert!(
-        events
-            .iter()
-            .any(|record| record["event"]["kind"] == "release_filtered"
-                && record["event"]["reason"] == "current_or_older")
-    );
-    assert!(
-        events
-            .iter()
-            .any(|record| record["event"]["kind"] == "artifact_started"
-                && record["event"]["source"]["kind"] == "http"
-                && record["event"]["source"]["fromCache"] == true)
-    );
-    assert!(
-        events.iter().any(
-            |record| record["event"]["kind"] == "report" && record["event"]["report"] == report
-        )
-    );
-    for (sequence, record) in events.iter().enumerate() {
-        assert_eq!(record["sequence"].as_u64(), Some(u64::try_from(sequence)?));
-        assert!(
-            record["timestamp"]
-                .as_str()
-                .is_some_and(|value| value.parse::<jiff::Timestamp>().is_ok())
-        );
+            .filter_map(|record| record.get("event"))
+            .filter(|event| event.get("kind").is_some_and(|value| value == kind))
+            .collect()
     }
+
+    /// The upgrade evaluation of `dep`, whose release list includes the locked 1.0.0.
+    fn evaluation(&self) -> eyre::Result<&Value> {
+        self.events("evaluation")
+            .into_iter()
+            .find(|event| {
+                event
+                    .pointer("/decision/kind")
+                    .is_some_and(|value| value == "upgrade")
+            })
+            .ok_or_else(|| eyre::eyre!("missing upgrade evaluation"))
+    }
+}
+
+#[test]
+fn offline_evaluation_keeps_metadata_filter_reasons_and_the_printed_report() -> eyre::Result<()> {
+    let compact = offline_evaluation(&[])?;
+    let full = offline_evaluation(&["--full-trace"])?;
+    for trace in [&compact, &full] {
+        assert!(
+            trace
+                .events
+                .iter()
+                .any(|record| record["event"]["kind"] == "artifact_started"
+                    && record["event"]["source"]["kind"] == "http"
+                    && record["event"]["source"]["fromCache"] == true)
+        );
+        assert!(
+            trace
+                .events("report")
+                .iter()
+                .any(|event| event["report"] == trace.report)
+        );
+        for (sequence, record) in trace.events.iter().enumerate() {
+            assert_eq!(record["sequence"].as_u64(), Some(u64::try_from(sequence)?));
+            assert!(
+                record["timestamp"]
+                    .as_str()
+                    .is_some_and(|value| value.parse::<jiff::Timestamp>().is_ok())
+            );
+        }
+    }
+    let compact_evaluation = compact.evaluation()?;
+    let full_evaluation = full.evaluation()?;
+
+    // Both details state why each release was rejected, in the evaluation itself.
+    assert!(
+        compact_evaluation["filtered"]
+            .as_array()
+            .is_some_and(|filtered| filtered
+                .iter()
+                .any(|release| release["version"] == "1.0.0"
+                    && release["reason"] == "current_or_older"))
+    );
+    assert_eq!(compact_evaluation["filtered"], full_evaluation["filtered"]);
+
+    // A compact trace records the release list once, before the evaluation that refers to it by
+    // hash, and no per-release rejection records.
+    let sets = compact.events("release_set");
+    let [set] = sets.as_slice() else {
+        eyre::bail!("one release set expected, got {sets:?}");
+    };
+    assert_eq!(compact_evaluation["releaseSet"], set["sha256"]);
+    assert!(compact_evaluation.get("releases").is_none());
+    assert_eq!(compact.events("release_filtered"), Vec::<&Value>::new());
+
+    // A full trace inlines the same release list and adds one record per rejected release.
+    assert_eq!(full_evaluation["releases"], set["releases"]);
+    assert!(full_evaluation.get("releaseSet").is_none());
+    assert_eq!(full.events("release_set"), Vec::<&Value>::new());
+    assert!(
+        full.events("release_filtered")
+            .iter()
+            .any(|event| event["reason"] == "current_or_older")
+    );
+    assert_eq!(
+        full.events("run_started")
+            .first()
+            .map(|event| &event["detail"]),
+        Some(&Value::from("full"))
+    );
     Ok(())
 }
 

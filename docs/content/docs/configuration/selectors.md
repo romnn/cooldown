@@ -220,6 +220,15 @@ max-major = 24
 Raising or removing the value in `cooldown.toml` is the only way to cross a configured
 `max-major`. There is no CLI or environment override.
 
+The ceiling also covers versions cooldown does not plan. A resolve can lift a package across it
+on its own: Go's minimal version selection raises an indirect module, uv moves a package to follow
+a requirer, or Cargo and npm add a copy on a higher major beside the old one. `upgrade` and `fix`
+roll such a change back and report the candidate that caused it as `max_major_held`, naming the
+capped package. A version already above the ceiling before the run is left alone, and cooldown can
+still move that copy within its own plan. When a project's lock goes stale because another project
+in the same run changed a manifest it resolves against, and the refresh would cross the ceiling,
+that project fails with an error.
+
 A package rule that applies to uv also reaches uv's own per-package cutoff: `cooldown sync` writes
 it into `exclude-newer-package`, and cooldown passes it to every uv command it runs (see
 [`sync`]({{< relref "../commands/other.md" >}}#uv)).

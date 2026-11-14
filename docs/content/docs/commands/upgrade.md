@@ -152,9 +152,18 @@ gates every package for one run without naming any. A gated name is refused even
 copy is the one an exclusion asked for (an excluded importer left on the old version): the lock
 the workspace installs would still hold two copies.
 
+The report reads each move per copy, from the lock's edges into it. A transitive copy's planned
+move lands only when every dependent that bound the old copy now binds the target. A copy that
+advanced for only some dependents, or whose target copy was added for other dependents, is held,
+and the row names who moved and who stayed. Every copy's own move is a row, even when the copy is
+not the package's newest, such as an old copy a dependent's range kept on a newer patch. When a
+dependent's records change so that several versions sit on either side, no edge proves which
+version replaced which: the move is reported as an `unpaired_move` warning rather than a row, and a
+planned move of those copies is held.
+
 ## Transitive dependencies
 
-By default `upgrade` moves the **whole graph**: it advances each dependency — transitive ones included — to its newest matured version, and reconciles any too-fresh transitive a re-lock drags in back down, so the new lock is **gate-clean by construction** — a subsequent `check` won't reject it. Advancing a transitive requires an engine that can pin a package no manifest declares: cargo, pnpm, go, and uv have one; **every other adapter (npm, yarn, bun, deno, pip, …) plans direct dependencies only** (their per-package apply needs a declared requirement). A transitive whose parents exclude its matured release (an exact-pinning parent, a name resolved at several graph copies) is reported held rather than forced. `--transitive` relaxes the default:
+By default `upgrade` moves the **whole graph**: it advances each dependency — transitive ones included — to its newest matured version, and reconciles any too-fresh transitive a re-lock drags in back down, so the new lock is **gate-clean by construction** — a subsequent `check` won't reject it. Advancing a transitive requires an engine that can pin a package no manifest declares: cargo, pnpm, go, and uv have one; **every other adapter (npm, yarn, bun, deno, pip, …) plans direct dependencies only** (their per-package apply needs a declared requirement). A transitive whose parents exclude its matured release (an exact-pinning parent) is reported held rather than forced. On pnpm, each copy of a transitive resolved at several versions advances on its own, through overrides that name the dependents binding that copy; a copy no such override reaches alone (one required through an npm alias, say) is reported `multi_version_held`. `--transitive` relaxes the default:
 
 - **`--transitive hide`** — plan direct dependencies only. A re-lock can still move transitives; such moves stay visible as collateral rows.
 - **`--transitive allow`** — still advance the graph, but leave a floated-up too-fresh transitive in place (reported, not rolled back).
@@ -289,7 +298,8 @@ When `upgrade` holds a cross-major update back, it explains the required action:
 - `declared_bound_held` means pass `--rewrite` to cross and rewrite the manifest's explicit
   `<`/`<=` bound.
 - `max_major_held` means raise the package's `max-major` in `cooldown.toml`; no CLI flag overrides
-  this ceiling.
+  this ceiling. When the row names another package, adopting the candidate would lift that package
+  above its own ceiling.
 - `dist_tag_held` (npm family) means the target sits above the registry's current `latest`
   dist-tag, so it is not what a default `npm install` would resolve to today. Version-adopting
   commands (`upgrade`, `fix`) revalidate the package document against the registry so the mutable

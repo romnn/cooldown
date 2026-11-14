@@ -61,10 +61,7 @@ fn prune_traces(
             continue;
         }
         let path = entry.path();
-        if !path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
-        {
+        if !super::has_trace_extension(&path) {
             continue;
         }
         let file = std::fs::OpenOptions::new()
@@ -114,6 +111,7 @@ mod tests {
             directory.path(),
             Path::new("project"),
             crate::trace::TraceCommand::Upgrade,
+            cooldown_core::trace::Detail::Compact,
         )?;
         let header = serde_json::value::to_raw_value(&serde_json::json!({"kind": "run_started"}))?;
         recorder.record(&header, &[]);
@@ -126,19 +124,26 @@ mod tests {
         assert_eq!(result.active_traces, 1);
         assert_eq!(result.traces, 0);
         drop(recorder);
+        // A trace written before traces were compressed is still this producer's to prune.
+        let uncompressed = directory.path().join("upgrade-before-compression.jsonl");
+        let header = serde_json::json!({
+            "producer": "cooldown", "schemaVersion": 2, "runId": "old", "sequence": 0,
+            "event": {"kind": "run_started"},
+        });
+        std::fs::write(&uncompressed, format!("{header}\n"))?;
         let renamed = directory.path().join("a-different-filename-format.jsonl");
         std::fs::rename(&path, &renamed)?;
         let path = renamed;
         let mut result = Pruned::default();
         prune_traces(directory.path(), cutoff, true, &mut result)?;
-        assert_eq!(result.traces, 1);
-        assert!(path.exists());
+        assert_eq!(result.traces, 2);
+        assert!(path.exists() && uncompressed.exists());
         let mut result = Pruned::default();
         prune_traces(directory.path(), SystemTime::UNIX_EPOCH, false, &mut result)?;
         assert_eq!(result.traces, 0);
         prune_traces(directory.path(), cutoff, false, &mut result)?;
-        assert_eq!(result.traces, 1);
-        assert!(!path.exists());
+        assert_eq!(result.traces, 2);
+        assert!(!path.exists() && !uncompressed.exists());
         assert!(unrelated.exists());
         Ok(())
     }
