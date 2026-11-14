@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **A uv upgrade held by the project's own constraint names that constraint.** A package held
+  by `[tool.uv] constraint-dependencies` or `override-dependencies`, such as `onnxruntime==1.31.0`,
+  was reported as conflicting with whichever package happened to pull it in, even when that
+  package admits the newer release. The held row and `outdated`'s blocked reason now name the
+  constraint and `pyproject.toml`, as a pin or declared-bound hold. A hold nothing explains is no
+  longer blamed on a package merely because it is the only one that depends on the candidate. An
+  upgrade no longer raises a dependency's own requirement past such a constraint, which made the
+  resolve fail, and an override now releases the pins and bounds it replaces, as it does in uv.
+
 - **Go reports and plans only modules that `go.mod` requires.** A module that sits in the module
   graph without a requirement in a `go 1.17`+ `go.mod` builds no code, and `go mod tidy` drops any
   requirement an upgrade adds for it. Such modules were still listed by `outdated` and `check` and

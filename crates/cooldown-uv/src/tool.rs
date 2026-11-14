@@ -4,6 +4,7 @@
 //! The core owns the verdict; uv only resolves/applies a window.
 
 use crate::artifact::candidate_published_at;
+use crate::constraints::LocalConstraints;
 use crate::cutoff::{Cutoffs, package_cutoffs};
 use crate::lock::UvLock;
 use crate::manifest;
@@ -308,6 +309,7 @@ impl ToolRead for UvTool {
         let ceilings = lock.graph_ceilings();
         let declared_bounds = lock.declared_bounds();
         let exact_pins = crate::native::exact_pinned_names(&project.manifest);
+        let local = LocalConstraints::read(&project.manifest)?;
         // A uv project is a single package, so it is the source for every dependency it declares.
         let project_member = project_member(project, &lock)?;
         // The manifest's own `[tool.uv]` index keys are as much a reroute as a `uv.toml`: the
@@ -332,13 +334,16 @@ impl ToolRead for UvTool {
             // The project's own exact pin surfaces as `pinned` (held, with a repin target shown); the
             // ceiling is reserved for caps imposed by *other* requirers, so it is only set when the
             // dependency is not already pinned (mirroring the cargo adapter).
-            let pinned = exact_pins.contains(&pkg.name);
+            // An override replaces every declared requirement on the package, the project's own
+            // included, so none of them pins, caps, or bounds it.
+            let overridden = local.overrides(&pkg.name);
+            let pinned = !overridden && exact_pins.contains(&pkg.name);
             // A requirer's `==` pin caps this package only when it is *active*: some pinned version
             // must equal the version uv resolved here. A marker-gated or otherwise inactive pin
             // resolves to a different version and imposes no real bound, so it is ignored. The
             // resolved version is recorded as the ceiling so it is the canonical form that matches a
             // fetched release (the raw specifier may not be PEP 440-normalized).
-            let graph_ceiling = (!pinned)
+            let graph_ceiling = (!pinned && !overridden)
                 .then(|| ceilings.get(&pkg.name))
                 .flatten()
                 .filter(|pins| {
@@ -370,7 +375,7 @@ impl ToolRead for UvTool {
                 artifacts: pkg.artifact_ids(),
                 graph_floor: floors.get(&pkg.name).map(|v| Version::new(v.clone())),
                 graph_ceiling,
-                declared_bound: if is_direct {
+                declared_bound: if is_direct && !overridden {
                     declared_bounds.get(&pkg.name).cloned()
                 } else {
                     None
@@ -626,14 +631,26 @@ impl UvTool {
     /// exempt freeze) is re-capped to its target via uv's `--upgrade-package <name><=<target>` and the
     /// graph re-resolved, so a per-package window is enforced natively without pinning the rest of the
     /// graph. The uniform-window case adds no ceilings and is a single whole-graph resolve.
+    ///
+    /// Neither widening touches a candidate the project's own `[tool.uv]` declarations hold: an
+    /// override makes uv ignore the declared requirement, and a constraint excluding the target
+    /// turns a raised floor into an unsatisfiable resolve. The resolve then holds such a candidate,
+    /// and the held row names the declaration.
     async fn whole_graph_resolve(
         &self,
         project: &Project,
         plan: &Plan,
         upgrade: bool,
     ) -> Result<()> {
+        let local = LocalConstraints::read(&project.manifest)?;
+        let widenable = |change: &Change| {
+            !local.overrides(&change.package.name)
+                && local
+                    .excluding(&change.package.name, change.to.as_str())
+                    .is_none()
+        };
         if matches!(plan.rewrite, RewriteMode::Always) {
-            for change in &plan.changes {
+            for change in plan.changes.iter().filter(|change| widenable(change)) {
                 manifest::widen_dependency_constraint(
                     &project.manifest,
                     &change.package.name,
@@ -650,7 +667,7 @@ impl UvTool {
             for _ in 0..plan.changes.len() {
                 let after = locked_versions(&read_lock(project)?);
                 let mut widened_any = false;
-                for change in &plan.changes {
+                for change in plan.changes.iter().filter(|change| widenable(change)) {
                     let reached = after.get(&change.package.name).is_some_and(|current| {
                         version::compare(current, change.to.as_str()).is_ge()
                     });
@@ -693,19 +710,29 @@ impl UvTool {
         Ok(())
     }
 
-    /// The named blocker and the detail sentence of a held candidate's row: the package whose
-    /// requirement caps `change` below its target, with the requirement and the release that
-    /// lifts it when they can be read, or the candidate itself when nothing attributes the hold.
-    async fn ceiling_row(
+    /// The held row of a candidate the resolve left short of its target: the project's own
+    /// constraint that excludes the target, or the package whose requirement caps it, with the
+    /// requirement and the release that lifts it when they can be read.
+    /// When nothing attributes the hold the row names the candidate itself and keeps the generic
+    /// graph-ceiling message.
+    async fn held_row(
         &self,
         lock: &UvLock,
         project: &Project,
+        local: &LocalConstraints,
         change: &Change,
-    ) -> (String, Option<String>) {
+    ) -> Skipped {
         let held = change.package.name.as_str();
         let target = change.to.as_str();
-        let Some(ceiling) = crate::ceiling::attribute(lock, held, target, &self.pypi).await else {
-            return (held.to_string(), None);
+        let unattributed = Skipped {
+            change: change.clone(),
+            reason: SkipReason::GraphCeilingHeld,
+            offending: Some(change.package.clone()),
+            detail: None,
+        };
+        let Some(ceiling) = crate::ceiling::attribute(lock, held, target, local, &self.pypi).await
+        else {
+            return unattributed;
         };
         let lift = crate::ceiling::lift(lock, &ceiling, held, target, &self.pypi).await;
         // The lifting release is the blocker's, so it is dated against the blocker's own cutoff.
@@ -716,7 +743,16 @@ impl UvTool {
             cutoffs.for_package(&ceiling.blocker),
             jiff::Timestamp::now(),
         );
-        (ceiling.blocker, detail)
+        Skipped {
+            reason: ceiling.skip_reason(change.downgrade),
+            offending: Some(PackageId::new(
+                UV_ID,
+                ceiling.blocker,
+                Some(PYPI.to_string()),
+            )),
+            detail: Some(detail),
+            ..unattributed
+        }
     }
 
     async fn lock_once(
@@ -951,6 +987,7 @@ impl ToolWrite for UvTool {
 
         let after_lock = read_lock(project)?;
         let after = locked_versions(&after_lock);
+        let local = LocalConstraints::read(&project.manifest)?;
 
         // Each planned candidate either reached cooldown's target (its newest-within-window) — reported
         // applied — or fell short because a mutually-exclusive requirement won — reported held, naming
@@ -969,20 +1006,15 @@ impl ToolWrite for UvTool {
             if reached {
                 report.applied.push(change.clone());
             } else {
-                // uv could not place this candidate at its target without breaking the lock —
-                // another requirement won.
-                // Name the package whose requirement structurally holds it below the target, and
-                // the requirement itself when the lock or PyPI records it, so the report says
-                // "held: conflicts with <pkg> <version>, which requires <requirement>"; absent any
-                // attribution it falls back to the candidate itself (the unattributed
-                // graph-ceiling message).
-                let (offender, detail) = self.ceiling_row(&after_lock, project, change).await;
-                report.skipped.push(Skipped {
-                    change: change.clone(),
-                    reason: SkipReason::GraphCeilingHeld,
-                    offending: Some(PackageId::new(UV_ID, offender, Some(PYPI.to_string()))),
-                    detail,
-                });
+                // uv could not place this candidate at its target without breaking the lock:
+                // the project's own constraint or another package's requirement won.
+                // The row names the one that holds it, so it reads "held: pyproject.toml
+                // [tool.uv] constraint-dependencies declares …" or "held: conflicts with <pkg>
+                // <version>, which requires <requirement>"; absent any attribution it names the
+                // candidate itself (the unattributed graph-ceiling message).
+                report
+                    .skipped
+                    .push(self.held_row(&after_lock, project, &local, change).await);
             }
         }
 
@@ -1443,6 +1475,111 @@ mod tests {
             transitive.members.is_empty(),
             "transitive dependencies are not declared by the project member"
         );
+    }
+
+    /// uv replaces every declared requirement on an overridden package, so the project's own
+    /// exact pin, its explicit upper bound, and a workspace requirer's exact pin no longer hold
+    /// it; a marker-gated override replaces them as well.
+    #[tokio::test]
+    async fn an_override_vetoes_the_declared_pins_and_bounds_it_replaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
+        let manifest = root.join("pyproject.toml");
+        std::fs::write(
+            &manifest,
+            indoc! {r#"
+                [project]
+                name = "demo"
+                version = "0.1.0"
+                dependencies = ["idna==3.10", "certifi<2025", "charset-normalizer==3.4.1", "lib"]
+
+                [tool.uv]
+                override-dependencies = [
+                    "idna>=3.7",
+                    "certifi>=2024; python_version < '3.11'",
+                    "urllib3>=2",
+                ]
+            "#},
+        )
+        .expect("write manifest");
+        let lock = indoc! {r#"
+            version = 1
+            revision = 3
+
+            [[package]]
+            name = "demo"
+            version = "0.1.0"
+            source = { virtual = "." }
+            dependencies = [
+                { name = "certifi" },
+                { name = "charset-normalizer" },
+                { name = "idna" },
+                { name = "lib" },
+            ]
+
+            [package.metadata]
+            requires-dist = [
+                { name = "certifi", specifier = "<2025" },
+                { name = "charset-normalizer", specifier = "==3.4.1" },
+                { name = "idna", specifier = "==3.10" },
+                { name = "lib", editable = "libs/lib" },
+            ]
+
+            [[package]]
+            name = "lib"
+            version = "0.1.0"
+            source = { editable = "libs/lib" }
+            dependencies = [{ name = "urllib3" }]
+
+            [package.metadata]
+            requires-dist = [{ name = "urllib3", specifier = "==2.2.3" }]
+
+            [[package]]
+            name = "certifi"
+            version = "2024.8.30"
+            source = { registry = "https://pypi.org/simple" }
+
+            [[package]]
+            name = "charset-normalizer"
+            version = "3.4.1"
+            source = { registry = "https://pypi.org/simple" }
+
+            [[package]]
+            name = "idna"
+            version = "3.10"
+            source = { registry = "https://pypi.org/simple" }
+
+            [[package]]
+            name = "urllib3"
+            version = "2.2.3"
+            source = { registry = "https://pypi.org/simple" }
+        "#};
+        std::fs::write(root.join("uv.lock"), lock).expect("write lock");
+        let project = Project {
+            root: root.clone(),
+            kind: UV_ID,
+            manifest,
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        };
+
+        let graph = uv_tool()
+            .dependencies(&project, DepScope::Graph)
+            .await
+            .expect("deps");
+        let dep = |name: &str| {
+            graph
+                .iter()
+                .find(|dep| dep.package.name == name)
+                .unwrap_or_else(|| panic!("{name} is in the graph"))
+        };
+        // The overridden exact pin, upper bound, and requirer pin are all gone.
+        assert!(!dep("idna").pinned);
+        assert_eq!(dep("certifi").declared_bound, None);
+        assert_eq!(dep("urllib3").graph_ceiling, None);
+        // The pin nothing overrides still holds.
+        assert!(dep("charset-normalizer").pinned);
     }
 
     /// A private-index package sharing a public PyPI package's name must not inherit the public
