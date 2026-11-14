@@ -10,6 +10,43 @@
   under 2 MB. `--full-trace` (or `COOLDOWN_FULL_TRACE`) records everything as it happens, still
   compressed. `cooldown prune` also removes the uncompressed traces of earlier versions.
 
+- **The pnpm report credits a transitive upgrade only when its own copy moved.** A name can
+  resolve to several copies, and the report judged each planned move by the name's newest copy.
+  `inline-style-parser` 0.2.7 → 0.2.9 was reported applied while `style-to-object` 1.0.14 still
+  resolved 0.2.7 and only a new copy used 0.2.9, and the real `seroval` 1.6.11 → 1.6.12 move of the
+  copy `solid-js` binds was hidden behind the root's 1.7.4 → 1.7.5. Each move is now read from the
+  lock's edges into the copy: a copy that advanced for only some dependents, or whose target copy
+  was added for others, is held with a detail naming who moved and who stayed, and every copy's
+  own move is its own row. A dependent's change the lock cannot pair is reported as a new
+  `unpaired_move` warning, so `schemaVersion` is now `8`.
+
+- **Cargo upgrades no longer rerun a command whose inputs are unchanged.** An upgrade often runs
+  the same `cargo update` or `cargo metadata` again from byte-identical manifests and lock, for
+  example when a later pass retries a pin, or when Cargo completed a pin that the upgrade then
+  refused. cooldown now replays the earlier command's exit status, output and resulting
+  `Cargo.lock`, and judges the replayed result against the current plan exactly as before, so the
+  results are unchanged. Commands always run when an index-independent input could make them
+  resolve differently, such as a positive publish age or offline mode. `--no-memo` and `--fresh`
+  turn the replay off.
+
+- **Go upgrades let an indirect module follow the upgrades that need it newer.** When a planned
+  upgrade required a newer version of an `// indirect` module than the module's own planned
+  target, for example `otel/sdk/metric` v1.19.0 needing `otel/metric` v1.19.0 while
+  `otel/metric` was planned within v0, every joint resolve failed. Bisection then held whichever
+  candidates it happened to split off. The indirect module's target is now dropped, so it moves
+  to what its requirers need, and the upgrade lands. When `go` names a requirer that needs a
+  direct module newer than planned, or a version whose `go.mod` declares another module path, that
+  change alone is held with Go's explanation, and the rest is retried without bisecting.
+
+- **A uv upgrade held by the project's own constraint names that constraint.** A package held
+  by `[tool.uv] constraint-dependencies` or `override-dependencies`, such as `onnxruntime==1.31.0`,
+  was reported as conflicting with whichever package happened to pull it in, even when that
+  package admits the newer release. The held row and `outdated`'s blocked reason now name the
+  constraint and `pyproject.toml`, as a pin or declared-bound hold. A hold nothing explains is no
+  longer blamed on a package merely because it is the only one that depends on the candidate. An
+  upgrade no longer raises a dependency's own requirement past such a constraint, which made the
+  resolve fail, and an override now releases the pins and bounds it replaces, as it does in uv.
+
 - **Go reports and plans only modules that `go.mod` requires.** A module that sits in the module
   graph without a requirement in a `go 1.17`+ `go.mod` builds no code, and `go mod tidy` drops any
   requirement an upgrade adds for it. Such modules were still listed by `outdated` and `check` and

@@ -218,6 +218,25 @@ closed until cooldown can prove a trusted external recovery namespace on that pl
 
 Publish times come from each registry's own metadata — GOPROXY `@v/<ver>.info` for Go, crates.io for Rust, PyPI / anaconda.org for Python, the npm registry and JSR for JavaScript, and GitHub Releases for SwiftPM. Adapters that mix registries (Deno's `npm:` + `jsr:`, conda + PyPI, pixi + PyPI) resolve each dependency against its own source.
 
+### Which binary runs
+
+cooldown runs each package manager as the program its name finds on `PATH`.
+`COOLDOWN_<BIN>` names a different program, with the binary's name in upper case and `-` spelled
+`_`: `COOLDOWN_CARGO`, `COOLDOWN_GO`, `COOLDOWN_UV`, `COOLDOWN_PNPM`.
+
+When `PATH` leads to a [mise](https://mise.jdx.dev) shim, every command first runs mise, which picks
+the tool and its environment for the command's directory.
+That costs tens of milliseconds per call, and a cargo `upgrade` makes hundreds of calls.
+cooldown still goes through the shim, because the shim also applies the environment, wrappers and
+installs from the project's `mise.toml`, and a direct call would skip them.
+
+A tool that mise does not manage reaches its real binary through the shim's fallback anyway, so
+naming that binary directly loses nothing and skips the overhead.
+For a rustup-managed cargo, set `COOLDOWN_CARGO="$HOME/.cargo/bin/cargo"`, or put `~/.cargo/bin`
+ahead of mise's shims on `PATH`.
+An override names a program and nothing else: it applies no mise environment, so use it only for a
+tool whose mise configuration you do not need.
+
 ## Registries and native cooldowns
 
 Some ecosystems already ship a native cooldown — uv's `exclude-newer`, pnpm's `minimumReleaseAge`, yarn's `npmMinimalAgeGate`, Cargo's `min-publish-age`. Where one exists, [`cooldown sync`]({{< relref "../commands/other.md" >}}) (or the global `--sync` flag) writes the resolved policy *down* into that native config, so `cooldown.toml` stays the single source of truth and the native tool sees the same window you set once.

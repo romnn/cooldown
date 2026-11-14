@@ -19,6 +19,8 @@ struct CargoMutationStage {
         reason = "the field keeps the staged project directory alive"
     )]
     scratch: tempfile::TempDir,
+    /// The canonical directory the staged topology lives in, which only cooldown writes.
+    tree: Utf8PathBuf,
     source: Project,
     staged: Project,
     preimage: ProjectMutationJournal,
@@ -74,7 +76,7 @@ impl IsolatedMutationStrategy for CargoTool {
         coordination.validate_current()?;
         let recovery_authority = coordination.recovery_authority().cloned();
         let stage = CargoMutationStage::prepare(self.cargo(), source, recovery_authority).await?;
-        self.register_memo_origin(&stage.staged, source);
+        self.register_memo_origin(&stage.staged, source, &stage.tree);
         Ok(Box::new(stage))
     }
 }
@@ -188,6 +190,7 @@ impl CargoMutationStage {
 
         Ok(CargoMutationStage {
             scratch,
+            tree: canonical_utf8(&topology)?,
             source: source.clone(),
             staged,
             preimage,

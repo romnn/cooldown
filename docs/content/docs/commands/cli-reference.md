@@ -58,8 +58,8 @@ See [Exclusions]({{< relref "../configuration/excludes.md" >}}) for the folder, 
 | `--sync` | Sync the policy into native config before running (no-op under `--dry-run`). |
 | `-n, --dry-run` | Resolve and print the plan; never mutate. |
 | `--offline` | Cache only; a cache miss becomes `unknown-age`, never a false "ok". |
-| `--fresh` | Ignore the HTTP cache and Cargo rejection memo; always hit the registry (alias `--no-cache`; use in CI gates). |
-| `--no-memo` | Disable Cargo rejection memoization for this run while retaining HTTP caching. |
+| `--fresh` | Ignore the HTTP cache and Cargo memos; always hit the registry (alias `--no-cache`; use in CI gates). |
+| `--no-memo` | Disable Cargo's reuse of rejections and command outcomes for this run while retaining HTTP caching. |
 | `--concurrency <N>` | Registry request fan-out width and per-host in-flight cap (default `16`). |
 | `--jobs <N>` | How many ecosystems run at once (default: every detected tool in its own lane; `1` runs them one after another). |
 | `--allow-stale-lock` | Demote a stale/absent lock to a warning and skip that project's dependency evaluation. |
