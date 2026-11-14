@@ -91,6 +91,31 @@ pub(crate) struct ProjectAccessWriteGuard {
     #[expect(dead_code, reason = "the field keeps the repository read lease alive")]
     repo: Option<RepoToolReadGuard>,
     project: ProjectWriteGuard,
+    shared: Vec<SharedFileWriteGuard>,
+}
+
+/// Holds the exclusive lease on one file that projects beyond the leased one may rewrite; see
+/// [`ToolWrite::shared_write_files`](cooldown_core::ToolWrite::shared_write_files).
+#[derive(Debug)]
+struct SharedFileWriteGuard {
+    /// The file's path as [`cooldown_core::canonical_shared_file`] spells it.
+    path: camino::Utf8PathBuf,
+    #[expect(dead_code, reason = "the field keeps the shared file's lease alive")]
+    lease: ProjectWriteGuard,
+}
+
+impl SharedFileWriteGuard {
+    /// Leases `path` as the family named by its file name at its parent directory, so every
+    /// process resolving one file to one canonical spelling meets on one lease.
+    fn acquire(path: camino::Utf8PathBuf) -> Result<Self, CoreError> {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(CoreError::Filesystem(format!(
+                "shared mutation file {path} has no parent directory"
+            )));
+        };
+        let lease = ProjectWriteGuard::acquire(parent, &ManifestFamily::named(name))?;
+        Ok(SharedFileWriteGuard { path, lease })
+    }
 }
 
 impl ProjectReadGuard {
@@ -237,31 +262,55 @@ impl ProjectAccessWriteGuard {
         family: &ManifestFamily,
         tool: ToolId,
         repo_scoped: bool,
+        shared_files: Vec<camino::Utf8PathBuf>,
     ) -> Result<Self, CoreError> {
         let repo_root = repo_root.to_owned();
         let root = root.to_owned();
         let family = family.clone();
-        acquired(move || Self::acquire(&repo_root, &root, &family, tool, repo_scoped)).await
+        acquired(move || {
+            Self::acquire(&repo_root, &root, &family, tool, repo_scoped, &shared_files)
+        })
+        .await
     }
 
-    /// Acquires a shared repository-resource lease before exclusive project access.
+    /// Acquires a shared repository-resource lease, then an exclusive lease on each of
+    /// `shared_files`, then exclusive project access, which is the one global lease order.
     /// The project lease is the one of `family`, the tool's declared lease family, at `root`.
+    /// Shared files are leased in sorted canonical order, so two processes leasing the same
+    /// set never wait on each other crosswise.
     pub(crate) fn acquire(
         repo_root: &camino::Utf8Path,
         root: &camino::Utf8Path,
         family: &ManifestFamily,
         tool: ToolId,
         repo_scoped: bool,
+        shared_files: &[camino::Utf8PathBuf],
     ) -> Result<Self, CoreError> {
         let repo = repo_scoped
             .then(|| RepoToolReadGuard::acquire(repo_root, tool))
             .transpose()?;
+        let mut canonical = shared_files
+            .iter()
+            .map(|path| cooldown_core::canonical_shared_file(path))
+            .collect::<Result<Vec<_>, CoreError>>()?;
+        canonical.sort();
+        canonical.dedup();
+        let shared = canonical
+            .into_iter()
+            .map(SharedFileWriteGuard::acquire)
+            .collect::<Result<Vec<_>, CoreError>>()?;
         let project = ProjectWriteGuard::acquire(root, family)?;
         Ok(ProjectAccessWriteGuard {
             evidence: None,
             repo,
             project,
+            shared,
         })
+    }
+
+    /// The canonical paths of the shared files this guard leases.
+    pub(crate) fn shared_files(&self) -> impl Iterator<Item = &camino::Utf8Path> {
+        self.shared.iter().map(|guard| guard.path.as_path())
     }
 
     /// Returns the coordination identity captured by the project write lease.
@@ -555,6 +604,55 @@ mod tests {
                 lane.await??;
             }
         }
+        Ok(())
+    }
+
+    /// Two projects whose mutations share one file, like the modules of one Go workspace and its
+    /// `go.work`, take turns: while one holds write access the other's fails, although their
+    /// project leases are distinct and each alone is free.
+    #[test]
+    fn projects_sharing_a_file_take_turns_on_it() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let workspace = canonical_path(
+            camino::Utf8Path::from_path(directory.path())
+                .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?,
+        )?;
+        for module in ["a", "b"] {
+            std::fs::create_dir_all(workspace.join(module))?;
+        }
+        let work = workspace.join("go.work");
+        std::fs::write(&work, "go 1.24.0\n")?;
+        let family = ManifestFamily::named("go.mod");
+        let acquire = |module: &str, shared: &[camino::Utf8PathBuf]| {
+            ProjectAccessWriteGuard::acquire(
+                &workspace,
+                &workspace.join(module),
+                &family,
+                ToolId("go"),
+                false,
+                shared,
+            )
+        };
+
+        // The first module leases the workspace file under its canonical spelling.
+        let first = acquire("a", std::slice::from_ref(&work))?;
+        assert_eq!(first.shared_files().collect::<Vec<_>>(), [work.as_path()]);
+
+        // The sibling's project lease is free, but the shared file is not.
+        drop(acquire("b", &[])?);
+        std::assert_matches!(
+            acquire("b", std::slice::from_ref(&work)),
+            Err(CoreError::LockConflict(_))
+        );
+        // Another spelling of the same file on a case-insensitive volume meets the same lease.
+        #[cfg(windows)]
+        std::assert_matches!(
+            acquire("b", &[workspace.join("GO.WORK")]),
+            Err(CoreError::LockConflict(_))
+        );
+
+        drop(first);
+        drop(acquire("b", std::slice::from_ref(&work))?);
         Ok(())
     }
 

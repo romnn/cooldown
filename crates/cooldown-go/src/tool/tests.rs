@@ -360,9 +360,9 @@ fn fetch_ctx(project: &Project) -> FetchContext<'_> {
     }
 }
 
-#[tokio::test]
-async fn mutation_journal_restore_reverts_import_rewrites_and_removes_created_go_sum()
--> eyre::Result<()> {
+#[test]
+fn mutation_journal_restore_reverts_import_rewrites_and_removes_created_go_sum() -> eyre::Result<()>
+{
     let repo = tempfile::tempdir()?;
     let root = Utf8PathBuf::from_path_buf(repo.path().to_path_buf())
         .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
@@ -370,36 +370,25 @@ async fn mutation_journal_restore_reverts_import_rewrites_and_removes_created_go
     let source = root.join("main.go");
     std::fs::write(&manifest, "module example.com/demo\n\ngo 1.24\n")?;
     std::fs::write(&source, "package main\n\nimport \"example.com/foo\"\n")?;
-    let cache_dir = tempfile::tempdir()?;
-    let http = SharedHttp::new(cache_dir.path(), HttpOptions::default())?;
-    let tool = GoTool::new(crate::proxy::GoProxy::new(http, Vec::new()));
-    let project = Project {
-        root: root.clone(),
-        kind: GO_ID,
-        manifest,
-        exclude_newer: None,
-        exclude_newer_package: std::collections::BTreeMap::new(),
-        generated_members: cooldown_core::GeneratedMembers::undeclared(),
-    };
-
-    let journal = tool
-        .mutation_journal(
-            &project,
-            &Plan {
-                changes: vec![Change {
-                    package: PackageId::new(GO_ID, "example.com/foo/v2", None),
-                    from: Version::new("v1.0.0"),
-                    to: Version::new("v2.0.0"),
-                    kind: UpdateKind::Major,
-                    downgrade: false,
-                    direct: true,
-                    members: Vec::new(),
-                }],
-                rewrite: cooldown_core::RewriteMode::default(),
-                ..Plan::default()
-            },
-        )
-        .await?;
+    // The journal is captured without a workspace: `GoTool::mutation_journal` would ask a real
+    // `go` for one.
+    let journal = mutation::mutation_journal(
+        &root,
+        &Plan {
+            changes: vec![Change {
+                package: PackageId::new(GO_ID, "example.com/foo/v2", None),
+                from: Version::new("v1.0.0"),
+                to: Version::new("v2.0.0"),
+                kind: UpdateKind::Major,
+                downgrade: false,
+                direct: true,
+                members: Vec::new(),
+            }],
+            rewrite: cooldown_core::RewriteMode::default(),
+            ..Plan::default()
+        },
+        None,
+    )?;
     std::fs::write(&source, "package main\n\nimport \"example.com/foo/v2\"\n")?;
     std::fs::write(root.join("go.sum"), "generated")?;
 
@@ -409,6 +398,60 @@ async fn mutation_journal_restore_reverts_import_rewrites_and_removes_created_go
         "package main\n\nimport \"example.com/foo\"\n"
     );
     assert!(!root.join("go.sum").exists());
+    Ok(())
+}
+
+/// The workspace `go env GOWORK` reports is both the shared file a run leases and the one the
+/// mutation journal covers, and `GOWORK=off` yields neither.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_reported_workspace_is_leased_and_journaled() -> eyre::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = tempfile::tempdir()?;
+    let workspace = Utf8PathBuf::from_path_buf(std::fs::canonicalize(directory.path())?)
+        .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+    let root = workspace.join("app");
+    std::fs::create_dir_all(&root)?;
+    std::fs::write(root.join("go.mod"), "module example.com/app\n")?;
+    let work = workspace.join("go.work");
+    std::fs::write(&work, "go 1.24.0\n\nuse ./app\n")?;
+    let script = workspace.join("go");
+    std::fs::write(
+        &script,
+        indoc::formatdoc! {r#"
+            #!/bin/sh
+            [ "$1 $2" = "env GOWORK" ] || exit 1
+            cat {reported}
+        "#, reported = workspace.join("reported")},
+    )?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    let cache = tempfile::tempdir()?;
+    let http = SharedHttp::new(cache.path(), HttpOptions::default())?;
+    let tool = GoTool {
+        proxy: crate::proxy::GoProxy::new(http, Vec::new()),
+        go: Go::with_program(script.as_str()),
+        version_lists: Mutex::new(HashMap::new()),
+    };
+    let project = project(&root);
+
+    // Workspace mode
+    std::fs::write(workspace.join("reported"), format!("{work}\n"))?;
+    assert_eq!(
+        tool.shared_write_files(&project).await?,
+        std::slice::from_ref(&work)
+    );
+    let journal = tool.mutation_journal(&project, &Plan::default()).await?;
+    assert_eq!(journal.shared_files().collect::<Vec<_>>(), [work.as_path()]);
+
+    // Workspace mode turned off
+    std::fs::write(workspace.join("reported"), "off\n")?;
+    assert_eq!(
+        tool.shared_write_files(&project).await?,
+        Vec::<Utf8PathBuf>::new()
+    );
+    let journal = tool.mutation_journal(&project, &Plan::default()).await?;
+    assert_eq!(journal.shared_files().count(), 0);
     Ok(())
 }
 

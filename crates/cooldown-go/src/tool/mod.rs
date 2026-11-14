@@ -226,7 +226,18 @@ impl ToolWrite for GoTool {
         project: &Project,
         plan: &Plan,
     ) -> Result<ProjectMutationJournal> {
-        mutation::mutation_journal(&project.root, plan)
+        let workspace = self.go.workspace_file(&project.root).await?;
+        mutation::mutation_journal(&project.root, plan, workspace.as_deref())
+    }
+
+    async fn shared_write_files(&self, project: &Project) -> Result<Vec<Utf8PathBuf>> {
+        // Sibling modules of one workspace are separate projects that all write its `go.work`.
+        Ok(self
+            .go
+            .workspace_file(&project.root)
+            .await?
+            .into_iter()
+            .collect())
     }
 
     async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {

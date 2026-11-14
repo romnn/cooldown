@@ -3,7 +3,20 @@ use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{Change, CoreError, Plan, ProjectMutationJournal, Result};
 use std::collections::HashSet;
 
-pub(crate) fn mutation_journal(root: &Utf8Path, plan: &Plan) -> Result<ProjectMutationJournal> {
+/// Captures every file a Go apply of `plan` may write: `go.mod`, `go.sum`, the source files an
+/// import rewrite touches, and the active workspace's `go.work` (`workspace`, from
+/// `go env GOWORK`), whose `go` directive `go get` raises when the module needs a newer Go.
+///
+/// `go.work.sum` is deliberately left out.
+/// In workspace mode every `go` command, reads included, may add checksums to it, so cooldown's
+/// own graph reads and an editor's `gopls` write it at any time; journaling it would turn those
+/// writes into rollback conflicts.
+/// A rolled-back trial may therefore leave verified checksums there, or create the file.
+pub(crate) fn mutation_journal(
+    root: &Utf8Path,
+    plan: &Plan,
+    workspace: Option<&Utf8Path>,
+) -> Result<ProjectMutationJournal> {
     let mut seen = HashSet::new();
     let mut paths = Vec::new();
     for rel in [Utf8Path::new("go.mod"), Utf8Path::new("go.sum")] {
@@ -20,7 +33,9 @@ pub(crate) fn mutation_journal(root: &Utf8Path, plan: &Plan) -> Result<ProjectMu
         }
         capture_import_targets(root, root, &old_path, &mut seen, &mut paths)?;
     }
-    ProjectMutationJournal::capture(root, paths)
+    // The workspace file comes last, so a restore stopped partway has reverted `go.mod`'s `go`
+    // directive before `go.work`'s, never leaving the module above its workspace.
+    ProjectMutationJournal::capture_with_external(root, paths, workspace)
 }
 
 pub(crate) fn rewrite_imports(
@@ -384,6 +399,61 @@ mod tests {
             direct: true,
             members: Vec::new(),
         }
+    }
+
+    /// A workspace member's journal covers the workspace's `go.work`, so rolling back a trial in
+    /// which `go get` raised the workspace restores it.
+    /// `go.work.sum` stays out of the journal: every `go` command in workspace mode may add
+    /// checksums to it, so what a rolled-back trial added there is kept.
+    #[test]
+    fn a_workspace_journal_restores_go_work_and_leaves_go_work_sum() -> color_eyre::eyre::Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let workspace = Utf8PathBuf::from_path_buf(std::fs::canonicalize(directory.path())?)
+            .map_err(|path| color_eyre::eyre::eyre!("{} is not UTF-8", path.display()))?;
+        let project = workspace.join("app");
+        std::fs::create_dir_all(&project)?;
+        std::fs::write(
+            project.join("go.mod"),
+            "module example.com/app\n\ngo 1.24.0\n",
+        )?;
+        let work = workspace.join("go.work");
+        let work_sum = workspace.join("go.work.sum");
+        std::fs::write(&work, "go 1.24.0\n\nuse ./app\n")?;
+        std::fs::write(&work_sum, "")?;
+
+        let journal = mutation_journal(&project, &Plan::default(), Some(&work))?;
+
+        // The workspace file is the one shared entry; its checksum cache is not journaled.
+        let shared: Vec<&Utf8Path> = journal.shared_files().collect();
+        assert_eq!(shared, [work.as_path()]);
+        let entries: Vec<&str> = journal
+            .files()
+            .iter()
+            .map(|file| file.path().as_str())
+            .collect();
+        assert_eq!(entries, ["go.mod", "go.sum", work.as_str()]);
+
+        // A trial raises the module and its workspace, and records checksums, then is rejected.
+        std::fs::write(
+            project.join("go.mod"),
+            "module example.com/app\n\ngo 1.26.0\n",
+        )?;
+        std::fs::write(&work, "go 1.26.0\n\nuse ./app\n")?;
+        std::fs::write(&work_sum, "example.com/dep v1.0.0/go.mod h1:checksum\n")?;
+        let expected = journal.capture_state()?;
+        journal.restore_if_unchanged(&expected)?;
+
+        assert_eq!(std::fs::read_to_string(&work)?, "go 1.24.0\n\nuse ./app\n");
+        assert_eq!(
+            std::fs::read_to_string(project.join("go.mod"))?,
+            "module example.com/app\n\ngo 1.24.0\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&work_sum)?,
+            "example.com/dep v1.0.0/go.mod h1:checksum\n"
+        );
+        Ok(())
     }
 
     #[test]

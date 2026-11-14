@@ -1113,6 +1113,7 @@ impl Workspace {
             &self.lease_family(pctx),
             pctx.tool,
             writer.sync_scope() == cooldown_core::SyncScope::Repo,
+            Vec::new(),
         )
         .await?;
         let recovery = writer
