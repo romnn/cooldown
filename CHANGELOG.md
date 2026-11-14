@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Cargo upgrades run fewer `cargo metadata` reads and stop reparsing the same lock.** After a
+  whole-graph resolve that leaves `Cargo.lock` as it was, the locked reads of the same files that
+  follow, such as edge-policy enforcement and the final checks, now reuse its output instead of
+  running Cargo again. A recently parsed lock text is reused instead of parsed again. Results are
+  unchanged.
+
 - **`upgrade --fast` trades optimality for speed.** A Cargo `upgrade --major` on a large workspace
   spent most of its time retrying held candidates at older versions that rarely landed, and
   dropping one culprit per full resolve when a joint widen broke the acceptance rule. `--fast`

@@ -153,6 +153,7 @@ impl CargoTool {
             cargo: &self.cargo,
             memo: &self.rejection_memo,
             outcomes: &self.command_outcomes,
+            reads: &self.locked_reads,
             enabled: self.rejection_memo_enabled,
         }
     }

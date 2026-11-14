@@ -35,8 +35,9 @@ use crate::cargocmd::{
     Cargo, CommandLine, PackageKey, RESOLVE_ARGS, ResolvedGraph, as_strs,
     memoizable_resolver_rejection, update_precise_args, update_unlocking_args,
 };
+use crate::locked_reads::{LockedReader, LockedReads};
 use crate::publish_age::{CargoEnvironment, parse_age};
-use crate::rejection_memo::{LockSource, MemoKey, RejectionMemo};
+use crate::rejection_memo::{LockSource, MemoKey, MemoOperation, RejectionMemo};
 
 /// The recorded outcomes of the run, least recently used first.
 #[derive(Debug)]
@@ -214,6 +215,8 @@ pub(crate) struct MemoizedCargo<'a> {
     pub(crate) cargo: &'a Cargo,
     pub(crate) memo: &'a RejectionMemo,
     pub(crate) outcomes: &'a CommandOutcomes,
+    /// The run's locked reads, which a resolve that left the lock as it was feeds.
+    pub(crate) reads: &'a LockedReads,
     /// Whether outcomes are recorded and replayed at all, which the rejection memo's switch
     /// decides.
     pub(crate) enabled: bool,
@@ -344,8 +347,8 @@ impl MemoizedCargo<'_> {
     async fn run(&self, project: &Project, args: &[&str], needs: Needs) -> Result<Run, CoreError> {
         let command = self.cargo.command_line(&project.root, args)?;
         let key = self.key(project, &command);
-        if let Some(key) = &key
-            && let Some(outcome) = self.outcomes.get(&key.key, needs)
+        if let Some(pending) = &key
+            && let Some(outcome) = self.outcomes.get(&pending.key, needs)
         {
             // A replay has no subprocess to perform the supervisor's interruption check.
             cooldown_core::interrupt::ensure_not_requested("replaying a cargo command")?;
@@ -358,6 +361,7 @@ impl MemoizedCargo<'_> {
                 saved_ms = outcome.elapsed.as_millis(),
                 "cargo command replayed"
             );
+            self.share_unchanged_resolve(project, args, &pending.key.inputs, &outcome);
             return Ok(Run {
                 outcome,
                 record: None,
@@ -371,15 +375,51 @@ impl MemoizedCargo<'_> {
             Some(Settled { lock, key }) => (lock, Some(key)),
             None => (LockAfter::Unchanged, None),
         };
-        Ok(Run {
-            outcome: Arc::new(Outcome {
-                output,
-                stdout_kept: true,
-                lock,
-                elapsed,
-            }),
-            record,
-        })
+        let outcome = Arc::new(Outcome {
+            output,
+            stdout_kept: true,
+            lock,
+            elapsed,
+        });
+        if let Some(key) = &record {
+            self.share_unchanged_resolve(project, args, &key.inputs, &outcome);
+        }
+        Ok(Run { outcome, record })
+    }
+
+    /// Keeps the output of a whole-graph resolve that left the lock as it was among the run's
+    /// locked reads, so the locked reads of the same inputs that follow need not run Cargo.
+    ///
+    /// Cargo writes no lock when the resolve serializes to the lines it read, and a locked read of
+    /// the same inputs then succeeds with the same output.
+    /// The converse does not hold, so a kept locked read never stands in for a resolve: Cargo also
+    /// accepts a locked read whose lock lines differ from the serialized resolve as long as both
+    /// parse to the same resolve, and an unlocked resolve rewrites such a lock.
+    ///
+    /// Only an outcome with a key is shared, so only in a staged copy whose packages and target
+    /// sources all lie in its private tree, where the target files Cargo discovers stay as staged.
+    fn share_unchanged_resolve(
+        &self,
+        project: &Project,
+        args: &[&str],
+        inputs: &MemoKey,
+        outcome: &Outcome,
+    ) {
+        let unchanged = matches!(outcome.lock, LockAfter::Unchanged);
+        let succeeded = outcome.output.status.success();
+        if args != RESOLVE_ARGS || !unchanged || !succeeded || !outcome.stdout_kept {
+            return;
+        }
+        let reader = LockedReader {
+            cargo: self.cargo,
+            memo: self.memo,
+            reads: self.reads,
+        };
+        reader.keep_settled(
+            project,
+            inputs.clone().with_operation(MemoOperation::LockedRead),
+            &String::from_utf8_lossy(&outcome.output.stdout),
+        );
     }
 
     /// Records a fresh outcome, dropping a successful command's stdout unless `needs` reads it.
