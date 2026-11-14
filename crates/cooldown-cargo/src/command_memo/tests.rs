@@ -50,6 +50,7 @@ struct CommandFixture {
     cargo: Cargo,
     memo: RejectionMemo,
     outcomes: CommandOutcomes,
+    trees: StagedTrees,
     reads: LockedReads,
     #[expect(dead_code, reason = "dropping the guard deletes the fixture directory")]
     directory: tempfile::TempDir,
@@ -70,8 +71,7 @@ impl CommandFixture {
     }
 
     fn register_staged(&self) {
-        self.outcomes
-            .register_staged(&self.project.root, &self.fixture);
+        self.trees.register(&self.project.root, &self.fixture);
     }
 
     fn unstaged() -> eyre::Result<Self> {
@@ -101,6 +101,7 @@ impl CommandFixture {
             fixture,
             memo: RejectionMemo::default(),
             outcomes: CommandOutcomes::default(),
+            trees: StagedTrees::default(),
             reads: LockedReads::default(),
             directory,
         })
@@ -111,6 +112,7 @@ impl CommandFixture {
             cargo: &self.cargo,
             memo: &self.memo,
             outcomes: &self.outcomes,
+            trees: &self.trees,
             reads: &self.reads,
             enabled: true,
         }
@@ -120,6 +122,7 @@ impl CommandFixture {
         LockedReader {
             cargo: &self.cargo,
             memo: &self.memo,
+            trees: &self.trees,
             reads: &self.reads,
         }
     }
@@ -236,6 +239,31 @@ async fn an_unchanged_resolve_serves_the_next_locked_read() -> eyre::Result<()> 
     fixture.commands().metadata(&fixture.project).await?;
     fixture.reader().graph(&fixture.project).await?;
     assert_eq!(fixture.invocations()?, 1);
+    Ok(())
+}
+
+/// A staged copy registered again, as a new stage reusing a removed copy's path is, replays no
+/// command of the earlier registration, and none of its resolves serves a locked read of the new
+/// one.
+#[tokio::test]
+async fn a_reregistered_staged_copy_reuses_nothing_recorded_before() -> eyre::Result<()> {
+    let fixture = CommandFixture::staged()?;
+    // Cargo settles on the lock the project already has.
+    std::fs::write(fixture.fixture.join("resolved.lock"), LOCK)?;
+    fixture.commands().metadata(&fixture.project).await?;
+    fixture.register_staged();
+
+    // Neither the locked read the resolve kept nor the resolve itself is reused.
+    fixture.reader().graph(&fixture.project).await?;
+    assert_eq!(fixture.invocations()?, 2);
+    fixture.commands().metadata(&fixture.project).await?;
+    assert_eq!(fixture.invocations()?, 3);
+
+    // The new registration's own resolve serves its locked reads.
+    fixture.reads.clear();
+    fixture.commands().metadata(&fixture.project).await?;
+    fixture.reader().graph(&fixture.project).await?;
+    assert_eq!(fixture.invocations()?, 3);
     Ok(())
 }
 

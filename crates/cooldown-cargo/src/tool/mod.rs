@@ -30,7 +30,7 @@ use crate::cargocmd::{
     Cargo, ConflictParty, PackageKey, ResolvedGraph, conflict_parties,
     memoizable_resolver_rejection, seed_resolver_rejection,
 };
-use crate::command_memo::{CommandOutcomes, MemoizedCargo};
+use crate::command_memo::{CommandOutcomes, MemoizedCargo, StagedTrees};
 use crate::edges;
 use crate::index::{CRATES_IO, CratesIoIndex};
 use crate::locked_reads::{LockedReader, LockedReads};
@@ -129,7 +129,10 @@ pub struct CargoTool {
     rejection_memo_enabled: bool,
     /// Where earlier whole-graph resolves of the run ended, to warm-start later applies from.
     landings: landing::LandingMemo,
-    /// The run's recent `cargo metadata --locked` reads, reused for identical native inputs.
+    /// The run's staged copies, the only places Cargo outcomes are reused in.
+    staged_trees: StagedTrees,
+    /// The run's recent `cargo metadata --locked` reads in staged copies, reused for identical
+    /// native inputs.
     locked_reads: LockedReads,
     /// The run's recent lock-resolving commands in staged copies, replayed for identical native
     /// inputs.
@@ -142,6 +145,7 @@ impl CargoTool {
         LockedReader {
             cargo: &self.cargo,
             memo: &self.rejection_memo,
+            trees: &self.staged_trees,
             reads: &self.locked_reads,
         }
     }
@@ -153,6 +157,7 @@ impl CargoTool {
             cargo: &self.cargo,
             memo: &self.rejection_memo,
             outcomes: &self.command_outcomes,
+            trees: &self.staged_trees,
             reads: &self.locked_reads,
             enabled: self.rejection_memo_enabled,
         }
@@ -185,6 +190,7 @@ impl CargoTool {
             rejection_memo: RejectionMemo::default(),
             rejection_memo_enabled: true,
             landings: landing::LandingMemo::default(),
+            staged_trees: StagedTrees::default(),
             locked_reads: LockedReads::default(),
             command_outcomes: CommandOutcomes::default(),
         }
@@ -215,7 +221,7 @@ impl CargoTool {
         {
             tracing::debug!(%err, "cargo rejection memo origin unavailable; bypassing memo");
         }
-        self.command_outcomes.register_staged(&staged.root, tree);
+        self.staged_trees.register(&staged.root, tree);
     }
 
     /// The generated-member facts for `project`: the memoized ones, else established from a
