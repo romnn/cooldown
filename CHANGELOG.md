@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Cargo upgrades run fewer `cargo metadata` reads and stop reparsing the same lock.** After a
+  whole-graph resolve that leaves `Cargo.lock` as it was, the locked reads of the same files that
+  follow, such as edge-policy enforcement and the final checks, now reuse its output instead of
+  running Cargo again. A recently parsed lock text is reused instead of parsed again. Results are
+  unchanged.
+
 - **Cargo upgrades no longer rerun a command whose inputs are unchanged.** An upgrade often runs
   the same `cargo update` or `cargo metadata` again from byte-identical manifests and lock, for
   example when a later pass retries a pin, or when Cargo completed a pin that the upgrade then

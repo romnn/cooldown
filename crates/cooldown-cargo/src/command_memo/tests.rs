@@ -50,6 +50,7 @@ struct CommandFixture {
     cargo: Cargo,
     memo: RejectionMemo,
     outcomes: CommandOutcomes,
+    reads: LockedReads,
     #[expect(dead_code, reason = "dropping the guard deletes the fixture directory")]
     directory: tempfile::TempDir,
 }
@@ -100,6 +101,7 @@ impl CommandFixture {
             fixture,
             memo: RejectionMemo::default(),
             outcomes: CommandOutcomes::default(),
+            reads: LockedReads::default(),
             directory,
         })
     }
@@ -109,7 +111,16 @@ impl CommandFixture {
             cargo: &self.cargo,
             memo: &self.memo,
             outcomes: &self.outcomes,
+            reads: &self.reads,
             enabled: true,
+        }
+    }
+
+    fn reader(&self) -> LockedReader<'_> {
+        LockedReader {
+            cargo: &self.cargo,
+            memo: &self.memo,
+            reads: &self.reads,
         }
     }
 
@@ -204,6 +215,41 @@ async fn a_changed_argument_or_input_runs_again() -> eyre::Result<()> {
     std::fs::write(&fixture.project.manifest, format!("{MANIFEST}# edited\n"))?;
     fixture.pin("2.0.0").await.err();
     assert_eq!(fixture.invocations()?, 3);
+    Ok(())
+}
+
+/// A whole-graph resolve that left the lock as it was serves the locked read of the same inputs
+/// that follows, without running Cargo, whether the resolve ran or replayed.
+#[tokio::test]
+async fn an_unchanged_resolve_serves_the_next_locked_read() -> eyre::Result<()> {
+    let fixture = CommandFixture::staged()?;
+    // Cargo settles on the lock the project already has.
+    std::fs::write(fixture.fixture.join("resolved.lock"), LOCK)?;
+
+    // A resolve that ran, then a locked read
+    fixture.commands().metadata(&fixture.project).await?;
+    fixture.reader().graph(&fixture.project).await?;
+    assert_eq!(fixture.invocations()?, 1);
+
+    // A resolve that replayed, then a locked read the replay alone has to serve
+    fixture.reads.clear();
+    fixture.commands().metadata(&fixture.project).await?;
+    fixture.reader().graph(&fixture.project).await?;
+    assert_eq!(fixture.invocations()?, 1);
+    Ok(())
+}
+
+/// A resolve that rewrote the lock vouches for no locked read: once the earlier lock is back, a
+/// locked read runs Cargo, which may refuse that lock.
+#[tokio::test]
+async fn a_resolve_that_rewrote_the_lock_serves_no_locked_read() -> eyre::Result<()> {
+    let fixture = CommandFixture::staged()?;
+
+    fixture.commands().metadata(&fixture.project).await?;
+    fixture.restore_lock()?;
+    fixture.reader().graph(&fixture.project).await?;
+
+    assert_eq!(fixture.invocations()?, 2);
     Ok(())
 }
 

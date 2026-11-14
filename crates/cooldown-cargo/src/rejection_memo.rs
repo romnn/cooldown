@@ -97,6 +97,11 @@ impl MemoKey {
         self.cacheable
     }
 
+    /// The key of the same inputs for `operation`.
+    pub(crate) fn with_operation(self, operation: MemoOperation) -> Self {
+        Self { operation, ..self }
+    }
+
     #[cfg(test)]
     pub(crate) fn capture(
         project: &Project,

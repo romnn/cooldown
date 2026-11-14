@@ -2,9 +2,11 @@
 
 use crate::version;
 use cooldown_core::{CoreError, GeneratedMembers, Result};
+use sha2::{Digest as _, Sha256};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
 
 /// The `source` string Cargo records for crates.io packages.
 pub(crate) const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
@@ -372,6 +374,75 @@ impl DeclaredEndpoints {
     }
 }
 
+/// The process's recently parsed locks.
+static PARSED_LOCKS: ParsedLocks = ParsedLocks::new();
+
+/// Recently parsed locks, keyed by a digest of their text, most recently used last.
+///
+/// An upgrade parses the same few lock texts over and over: every step reparses the lock it
+/// started from, and a refused step restores it byte for byte.
+/// A parse is a function of the text alone, so a parsed lock is reused for the same text.
+struct ParsedLocks {
+    entries: Mutex<VecDeque<ParsedLock>>,
+    /// How many texts were parsed rather than reused.
+    #[cfg(test)]
+    misses: std::sync::atomic::AtomicUsize,
+}
+
+struct ParsedLock {
+    digest: [u8; 32],
+    lock: CargoLock,
+}
+
+impl ParsedLocks {
+    /// The locks kept; each takes a few megabytes for a large workspace.
+    const CAPACITY: usize = 8;
+
+    const fn new() -> Self {
+        Self {
+            entries: Mutex::new(VecDeque::new()),
+            #[cfg(test)]
+            misses: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn parse(&self, content: &str) -> Result<CargoLock> {
+        let digest: [u8; 32] = Sha256::digest(content.as_bytes()).into();
+        {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(position) = entries.iter().position(|entry| entry.digest == digest)
+                && let Some(entry) = entries.remove(position)
+            {
+                let lock = entry.lock.clone();
+                entries.push_back(entry);
+                return Ok(lock);
+            }
+        }
+        #[cfg(test)]
+        self.misses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let lock: CargoLock = toml::from_str(content)
+            .map_err(|err| CoreError::LockUnreadable(format!("Cargo.lock: {err}")))?;
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !entries.iter().any(|entry| entry.digest == digest) {
+            if entries.len() == Self::CAPACITY {
+                entries.pop_front();
+            }
+            entries.push_back(ParsedLock {
+                digest,
+                lock: lock.clone(),
+            });
+        }
+        Ok(lock)
+    }
+}
+
 /// The blocks each walk of [`CargoLock::reachability`] visits, by index into the lock.
 struct LockReachability {
     authored: HashSet<usize>,
@@ -380,9 +451,10 @@ struct LockReachability {
 
 impl CargoLock {
     /// Parses the subset of `Cargo.lock` used by the adapter.
+    ///
+    /// A text parsed earlier in the process is served from [`PARSED_LOCKS`].
     pub(crate) fn parse(content: &str) -> Result<Self> {
-        toml::from_str(content)
-            .map_err(|err| CoreError::LockUnreadable(format!("Cargo.lock: {err}")))
+        PARSED_LOCKS.parse(content)
     }
 
     /// Whether the lock carries the crates.io package `name` at exactly `version`.
@@ -723,8 +795,43 @@ pub(crate) fn rewrite_planned_nodes(lock_text: &str, moves: &[PlannedNodeMove]) 
 #[cfg(test)]
 mod tests {
     use super::LockPackageId;
-    use super::{CargoLock, PlannedNodeMove, rewrite_planned_nodes};
-    use indoc::indoc;
+    use super::{CargoLock, ParsedLocks, PlannedNodeMove, rewrite_planned_nodes};
+    use color_eyre::eyre;
+    use indoc::{formatdoc, indoc};
+    use std::sync::atomic::Ordering;
+
+    /// A lock text parsed before is reused, while a text of the same length that differs in one
+    /// version is parsed on its own.
+    #[test]
+    fn a_parsed_lock_is_reused_for_the_same_text_only() -> eyre::Result<()> {
+        let locks = ParsedLocks::new();
+        let lock = |version: &str| {
+            formatdoc! {r#"
+                version = 4
+
+                [[package]]
+                name = "dep"
+                version = "{version}"
+            "#}
+        };
+        let version = |lock: &CargoLock| {
+            lock.package
+                .first()
+                .and_then(|package| package.version.clone())
+        };
+
+        // The same text twice
+        let first = locks.parse(&lock("1.0.0"))?;
+        let again = locks.parse(&lock("1.0.0"))?;
+        assert_eq!(locks.misses.load(Ordering::Relaxed), 1);
+        assert_eq!(version(&again), version(&first));
+
+        // Another text of the same length
+        let other = locks.parse(&lock("1.0.1"))?;
+        assert_eq!(locks.misses.load(Ordering::Relaxed), 2);
+        assert_eq!(version(&other).as_deref(), Some("1.0.1"));
+        Ok(())
+    }
 
     /// `app → mid → dep 0.14` beside the generated hack's own `dep 0.13`, `dep 0.14`, and
     /// `orphan` entries; an external *path* namesake `hack 0.2.0` and a git `bridge` (qualified
