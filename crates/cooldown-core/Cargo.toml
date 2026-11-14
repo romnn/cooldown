@@ -16,7 +16,7 @@ workspace = true
 [dependencies]
 jiff.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 tracing.workspace = true
 toml.workspace = true
 globset.workspace = true

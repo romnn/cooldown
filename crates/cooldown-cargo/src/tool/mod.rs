@@ -26,7 +26,11 @@
 //! A converged graph re-applies to a byte-stable fixed point.
 
 use crate::CARGO_ID;
-use crate::cargocmd::{Cargo, ConflictParty, PackageKey, ResolvedGraph, conflict_parties};
+use crate::cargocmd::{
+    Cargo, ConflictParty, PackageKey, ResolvedGraph, conflict_parties,
+    memoizable_resolver_rejection, seed_resolver_rejection,
+};
+use crate::command_memo::{CommandOutcomes, MemoizedCargo};
 use crate::edges;
 use crate::index::{CRATES_IO, CratesIoIndex};
 use crate::locked_reads::{LockedReader, LockedReads};
@@ -51,8 +55,8 @@ use cooldown_core::{
     NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation, Project,
     ProjectMutationFile, ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder,
     ReleaseQuality, ResolveInputs, ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped,
-    SyncReport, SyncScope, TargetFallback, ToolId, ToolRead, ToolTermination, ToolWrite,
-    UpdateKind, VerifyReport, Version, fs::RecoveryAuthority,
+    SyncReport, SyncScope, TargetFallback, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport,
+    Version, fs::RecoveryAuthority,
 };
 use cooldown_registry::SharedHttp;
 use sha2::{Digest as _, Sha256};
@@ -127,6 +131,9 @@ pub struct CargoTool {
     landings: landing::LandingMemo,
     /// The run's recent `cargo metadata --locked` reads, reused for identical native inputs.
     locked_reads: LockedReads,
+    /// The run's recent lock-resolving commands in staged copies, replayed for identical native
+    /// inputs.
+    command_outcomes: CommandOutcomes,
 }
 
 impl CargoTool {
@@ -139,6 +146,17 @@ impl CargoTool {
         }
     }
 
+    /// Runs the lock-resolving commands of an apply, replaying an earlier outcome of the same
+    /// native inputs in this run.
+    fn commands(&self) -> MemoizedCargo<'_> {
+        MemoizedCargo {
+            cargo: &self.cargo,
+            memo: &self.rejection_memo,
+            outcomes: &self.command_outcomes,
+            enabled: self.rejection_memo_enabled,
+        }
+    }
+
     async fn metadata_with_observer(
         &self,
         project: &Project,
@@ -147,9 +165,7 @@ impl CargoTool {
         if let Some(observer) = observer {
             observer.resolver_started(None);
         }
-        self.cargo
-            .metadata(&project.root, &project.generated_members)
-            .await
+        self.commands().metadata(project).await
     }
 
     /// Creates an tool from an existing crates.io [`CratesIoIndex`] client.
@@ -169,24 +185,36 @@ impl CargoTool {
             rejection_memo_enabled: true,
             landings: landing::LandingMemo::default(),
             locked_reads: LockedReads::default(),
+            command_outcomes: CommandOutcomes::default(),
         }
     }
 
-    /// Enables or disables reuse of resolver rejections with identical resolution inputs.
+    /// Enables or disables reuse of resolver rejections and Cargo command outcomes with identical
+    /// resolution inputs.
     #[must_use]
     pub fn with_rejection_memo(mut self, enabled: bool) -> Self {
         self.rejection_memo_enabled = enabled;
         self
     }
 
-    pub(crate) fn register_memo_origin(&self, staged: &Project, original: &Project) {
-        if self.rejection_memo_enabled
-            && let Err(err) = self
-                .rejection_memo
-                .register_origin(&staged.root, &original.root)
+    /// Registers `staged` as a staged copy of `original` whose topology lives in `tree`, a
+    /// directory only cooldown writes.
+    pub(crate) fn register_memo_origin(
+        &self,
+        staged: &Project,
+        original: &Project,
+        tree: &Utf8Path,
+    ) {
+        if !self.rejection_memo_enabled {
+            return;
+        }
+        if let Err(err) = self
+            .rejection_memo
+            .register_origin(&staged.root, &original.root)
         {
             tracing::debug!(%err, "cargo rejection memo origin unavailable; bypassing memo");
         }
+        self.command_outcomes.register_staged(&staged.root, tree);
     }
 
     /// The generated-member facts for `project`: the memoized ones, else established from a
@@ -1228,6 +1256,7 @@ enum TentativeWiden {
     Rejected,
 }
 
+#[derive(Debug)]
 enum PrecisePinOutcome {
     Completed,
     Rejected {
@@ -1475,34 +1504,6 @@ fn log_pin_attempt(
         outcome,
         "cargo per-change pin attempt"
     );
-}
-
-fn seed_resolver_rejection(err: &CoreError) -> bool {
-    matches!(
-        err,
-        CoreError::Tool {
-            termination: ToolTermination::ExitCode(_),
-            ..
-        }
-    ) && !err.is_local_environment_failure()
-}
-
-fn memoizable_resolver_rejection(err: &CoreError) -> bool {
-    if !seed_resolver_rejection(err) {
-        return false;
-    }
-    let CoreError::Tool { stderr, .. } = err else {
-        return false;
-    };
-    // Numeric Cargo exits also cover transport failures; only resolver diagnostics are reusable.
-    // This eligibility check leaves the existing fallback and held-candidate behavior intact.
-    stderr
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("error: "))
-        .is_some_and(|sentence| {
-            sentence.starts_with("failed to select a version for")
-                || sentence.starts_with("no matching package named")
-        })
 }
 
 /// The [`PinRejections`] key of one planned change: its `(name, from, to)` line.
@@ -2397,8 +2398,8 @@ impl CargoTool {
         // candidates conflict with is released by name first.
         if !released.is_empty() {
             let unlocked = self
-                .cargo
-                .update_unlocking(&probe.project.root, released)
+                .commands()
+                .update_unlocking(probe.project, released)
                 .await;
             probe.journal.validate_project(&probe.project.root)?;
             match unlocked {
@@ -2412,10 +2413,7 @@ impl CargoTool {
                 Err(err) => return Err(err),
             }
         }
-        let resolved = self
-            .cargo
-            .metadata(&probe.project.root, &probe.project.generated_members)
-            .await;
+        let resolved = self.commands().metadata(probe.project).await;
         // Topology failure forbids any rejected-path restoration through another writer's files.
         probe.journal.validate_project(&probe.project.root)?;
         let graph = match resolved {
@@ -2871,7 +2869,10 @@ impl CargoTool {
             }
             // The re-resolve that lets cargo drop the node the projection no longer demands.
             journal.validate_project(&project.root)?;
-            self.metadata_with_observer(project, observer).await?;
+            if let Some(observer) = observer {
+                observer.resolver_started(None);
+            }
+            self.commands().resolve(project).await?;
             journal.validate_project(&project.root)?;
             let after = read_lock(project)?;
             if let Some(violation) = baseline.violation(&after, &project.generated_members, plan) {
@@ -3052,14 +3053,11 @@ impl CargoTool {
         if let Some((observer, change)) = notification {
             observer.resolver_started(Some(change));
         }
-        let resolved = self
-            .cargo
-            .metadata(&project.root, &project.generated_members)
-            .await;
+        let resolved = self.commands().resolve(project).await;
         // A coordination failure forbids restoring files that may now belong to another writer.
         journal.validate_project(&project.root)?;
         match resolved {
-            Ok(_) => {
+            Ok(()) => {
                 let after = read_lock(project)?;
                 if let Some(violation) =
                     baseline.violation(&after, &project.generated_members, group.plan)
@@ -3618,9 +3616,9 @@ impl CargoTool {
             stats.resolves += 1;
             stats.per_crate += 1;
             let updated = self
-                .cargo
+                .commands()
                 .update_precise_crates_io_unlocking(
-                    &project.root,
+                    project,
                     &change.package.name,
                     current,
                     change.to.as_str(),
@@ -3743,13 +3741,8 @@ impl CargoTool {
         let generated = &project.generated_members;
         let baseline = ResolveBaseline::capture(&CargoLock::parse(&before_text)?, generated);
         let pinned = match self
-            .cargo
-            .update_precise_crates_io(
-                &project.root,
-                &change.package.name,
-                current,
-                change.to.as_str(),
-            )
+            .commands()
+            .update_precise_crates_io(project, &change.package.name, current, change.to.as_str())
             .await
         {
             Ok(()) => self.repin_overshoot(scope, change).await,
@@ -3826,9 +3819,9 @@ impl CargoTool {
         if let Some(observer) = observer {
             observer.resolver_started(Some(change));
         }
-        self.cargo
+        self.commands()
             .update_precise_crates_io(
-                &project.root,
+                project,
                 &change.package.name,
                 &overshoot,
                 change.to.as_str(),

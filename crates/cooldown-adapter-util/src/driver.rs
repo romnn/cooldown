@@ -320,59 +320,84 @@ fn spawn_version_query(
     spawned
 }
 
-struct OutputCapture {
-    artifact: Option<u64>,
-    bytes: u64,
+/// One native output stream, retained for the driver and recorded in the trace's detail.
+///
+/// A full trace records each chunk as it arrives, keeping partial output of a process that is
+/// still running.
+/// A compact trace records the stream once it ends, including when the read fails or is
+/// cancelled, so identical output refers to an earlier copy instead of repeating it.
+struct OutputCapture<'s> {
+    source: Option<cooldown_core::trace::ArtifactSource<'s>>,
+    /// The run's subscriber, which the stream's end is recorded to.
+    ///
+    /// A cancelled capture is dropped wherever its future is, possibly outside the run's
+    /// subscriber or inside another run's.
+    dispatch: tracing::Dispatch,
+    /// The artifact a full trace streams chunks into.
+    streamed: Option<u64>,
+    output: Vec<u8>,
     completed: bool,
 }
 
-impl OutputCapture {
-    fn start(source: Option<cooldown_core::trace::ArtifactSource<'_>>) -> Self {
-        let artifact = source.map(|source| {
-            let artifact = cooldown_core::trace::operation_id();
-            cooldown_core::trace::Event::ArtifactStarted {
-                artifact,
-                snapshot: None,
-                source,
-                size: None,
-                sha256: None,
-            }
-            .emit();
-            artifact
-        });
+impl<'s> OutputCapture<'s> {
+    fn start(source: Option<cooldown_core::trace::ArtifactSource<'s>>) -> Self {
+        let detail = cooldown_core::trace::Detail::current();
+        let source = source.filter(|_| detail.is_some());
+        let streamed = source
+            .filter(|_| detail == Some(cooldown_core::trace::Detail::Full))
+            .map(|source| {
+                let artifact = cooldown_core::trace::operation_id();
+                cooldown_core::trace::Event::ArtifactStarted {
+                    artifact,
+                    snapshot: None,
+                    source,
+                    size: None,
+                    sha256: None,
+                }
+                .emit();
+                artifact
+            });
         Self {
-            artifact,
-            bytes: 0,
+            source,
+            dispatch: tracing::dispatcher::get_default(tracing::Dispatch::clone),
+            streamed,
+            output: Vec::new(),
             completed: false,
         }
     }
 
     fn chunk(&mut self, bytes: &[u8]) {
-        if let Some(artifact) = self.artifact {
+        if let Some(artifact) = self.streamed {
             cooldown_core::trace::Event::ArtifactChunk {
                 artifact,
-                offset: self.bytes,
+                offset: u64::try_from(self.output.len()).unwrap_or(u64::MAX),
                 content: cooldown_core::trace::Content::from_bytes(bytes),
             }
             .emit();
         }
-        self.bytes += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        self.output.extend_from_slice(bytes);
     }
 
-    fn finish(&mut self, outcome: cooldown_core::trace::ArtifactOutcome<'_>) {
-        if let Some(artifact) = self.artifact {
-            cooldown_core::trace::Event::ArtifactFinished {
+    /// Records the stream's end and returns everything it carried.
+    fn finish(&mut self, outcome: cooldown_core::trace::ArtifactOutcome<'_>) -> Vec<u8> {
+        tracing::dispatcher::with_default(&self.dispatch, || match (self.streamed, self.source) {
+            (Some(artifact), _) => cooldown_core::trace::Event::ArtifactFinished {
                 artifact,
-                bytes: self.bytes,
+                bytes: u64::try_from(self.output.len()).unwrap_or(u64::MAX),
                 outcome,
             }
-            .emit();
-        }
+            .emit(),
+            (None, Some(source)) => {
+                cooldown_core::trace::captured_artifact(source, &self.output, outcome);
+            }
+            (None, None) => {}
+        });
         self.completed = true;
+        std::mem::take(&mut self.output)
     }
 }
 
-impl Drop for OutputCapture {
+impl Drop for OutputCapture<'_> {
     fn drop(&mut self) {
         if !self.completed {
             self.finish(cooldown_core::trace::ArtifactOutcome::Failed {
@@ -388,7 +413,6 @@ async fn read_output<R: tokio::io::AsyncRead + Unpin>(
 ) -> std::io::Result<Vec<u8>> {
     use tokio::io::AsyncReadExt as _;
     let mut capture = OutputCapture::start(source);
-    let mut output = Vec::new();
     if let Some(mut stream) = stream {
         let mut buffer = vec![0; 64 * 1024];
         loop {
@@ -397,7 +421,6 @@ async fn read_output<R: tokio::io::AsyncRead + Unpin>(
                 Ok(count) => {
                     if let Some(bytes) = buffer.get(..count) {
                         capture.chunk(bytes);
-                        output.extend_from_slice(bytes);
                     }
                 }
                 Err(err) => {
@@ -409,8 +432,7 @@ async fn read_output<R: tokio::io::AsyncRead + Unpin>(
             }
         }
     }
-    capture.finish(cooldown_core::trace::ArtifactOutcome::Complete);
-    Ok(output)
+    Ok(capture.finish(cooldown_core::trace::ArtifactOutcome::Complete))
 }
 
 /// A handle to one package manager binary (e.g. `bundle`, `mix`, `mvn`). The binary defaults to
@@ -638,6 +660,203 @@ mod tests {
             find_exact(OsStr::new("go"), &search_path),
             Some(real_binary)
         );
+    }
+
+    mod output_capture {
+        use cooldown_core::trace::{ArtifactSource, Detail, TARGET};
+        use std::sync::{Arc, Mutex, PoisonError};
+        use tokio::io::AsyncWriteExt as _;
+        use tracing_subscriber::prelude::*;
+
+        /// The typed observations a recorder at some detail receives, in order.
+        #[derive(Clone, Default)]
+        struct Observed(Arc<Mutex<Vec<serde_json::Value>>>);
+
+        impl Observed {
+            fn events(&self) -> Vec<serde_json::Value> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+            }
+
+            fn kinds(&self) -> Vec<String> {
+                self.events()
+                    .iter()
+                    .filter_map(|event| event["kind"].as_str().map(str::to_string))
+                    .collect()
+            }
+
+            /// Installs a subscriber that records typed observations up to `detail`.
+            fn install(&self, detail: Detail) -> tracing::dispatcher::DefaultGuard {
+                tracing::dispatcher::set_default(&self.dispatch(detail))
+            }
+
+            /// A subscriber that records typed observations up to `detail`.
+            fn dispatch(&self, detail: Detail) -> tracing::Dispatch {
+                let level = match detail {
+                    Detail::Full => tracing::Level::TRACE,
+                    Detail::Compact => tracing::Level::DEBUG,
+                };
+                tracing::Dispatch::new(
+                    tracing_subscriber::registry().with(self.clone().with_filter(
+                        tracing_subscriber::filter::filter_fn(move |metadata| {
+                            metadata.target() == TARGET && *metadata.level() <= level
+                        }),
+                    )),
+                )
+            }
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Observed {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Payload(Option<serde_json::Value>);
+                impl tracing::field::Visit for Payload {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        if field.name() == "trace_event" {
+                            self.0 = serde_json::from_str(value).ok();
+                        }
+                    }
+                    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+                    }
+                }
+                let mut payload = Payload(None);
+                event.record(&mut payload);
+                if let Some(payload) = payload.0 {
+                    self.0
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(payload);
+                }
+            }
+        }
+
+        const STDOUT: ArtifactSource<'static> = ArtifactSource::Stdout { operation: 7 };
+
+        /// A compact trace records a stream once it ends, with the hash that lets identical output
+        /// refer to an earlier copy, and a full trace streams it as it arrives.
+        #[tokio::test]
+        async fn compact_output_is_recorded_whole_and_full_output_as_it_arrives()
+        -> cooldown_core::Result<()> {
+            for detail in [Detail::Compact, Detail::Full] {
+                let observed = Observed::default();
+                let _subscriber = observed.install(detail);
+                let (mut native, stream) = tokio::io::duplex(1024);
+                let reading = tokio::spawn(async move {
+                    super::super::read_output(Some(stream), Some(STDOUT)).await
+                });
+                native.write_all(b"first line\n").await?;
+                // Let the reader take the first chunk while the stream stays open.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let while_running = observed.kinds();
+                native.write_all(b"second line\n").await?;
+                drop(native);
+                let output = reading
+                    .await
+                    .map_err(|err| cooldown_core::CoreError::System(err.to_string()))??;
+                assert_eq!(output, b"first line\nsecond line\n");
+
+                let events = observed.events();
+                let started = events
+                    .iter()
+                    .find(|event| event["kind"] == "artifact_started")
+                    .ok_or_else(|| cooldown_core::CoreError::System("no start".into()))?;
+                let finished = events
+                    .iter()
+                    .find(|event| event["kind"] == "artifact_finished")
+                    .ok_or_else(|| cooldown_core::CoreError::System("no finish".into()))?;
+                assert_eq!(finished["outcome"]["kind"], "complete");
+                assert_eq!(finished["bytes"], 23);
+                match detail {
+                    // Nothing is recorded while the process runs; the whole output then follows
+                    // its hash in one chunk.
+                    Detail::Compact => {
+                        assert!(while_running.is_empty(), "{while_running:?}");
+                        assert_eq!(
+                            started["sha256"],
+                            "c2097f55f01fc297fc7f4acf21438123e06e4d409a818524428534e850642f4f"
+                        );
+                        assert_eq!(started["size"], 23);
+                    }
+                    // The first chunk is in the trace before the stream ends.
+                    Detail::Full => {
+                        assert_eq!(while_running, ["artifact_started", "artifact_chunk"]);
+                        assert!(started.get("sha256").is_none(), "{started}");
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// A compact capture that is cancelled, as an interrupted or timed-out command's is, still
+        /// records the output it had received.
+        #[tokio::test]
+        async fn a_cancelled_compact_capture_records_its_partial_output()
+        -> cooldown_core::Result<()> {
+            let observed = Observed::default();
+            let _subscriber = observed.install(Detail::Compact);
+            let (mut native, stream) = tokio::io::duplex(1024);
+            native.write_all(b"partial").await?;
+            let cancelled = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                super::super::read_output(Some(stream), Some(STDOUT)),
+            )
+            .await;
+            assert!(cancelled.is_err(), "the read waits for more output");
+            let events = observed.events();
+            assert_eq!(
+                observed.kinds(),
+                ["artifact_started", "artifact_chunk", "artifact_finished"]
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["content"]["data"] == "partial")
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["outcome"]["kind"] == "failed" && event["bytes"] == 7)
+            );
+            drop(native);
+            Ok(())
+        }
+
+        /// A run's capture that is dropped outside the run's subscriber, as a cancelled run's
+        /// future can be, still records its output to that run and to no other.
+        #[tokio::test]
+        async fn a_capture_dropped_outside_its_run_records_to_that_run() -> cooldown_core::Result<()>
+        {
+            use tracing::instrument::WithSubscriber as _;
+            let run = Observed::default();
+            let other = Observed::default();
+            let (mut native, stream) = tokio::io::duplex(1024);
+            native.write_all(b"partial").await?;
+            let mut reading = Box::pin(
+                super::super::read_output(Some(stream), Some(STDOUT))
+                    .with_subscriber(run.dispatch(Detail::Compact)),
+            );
+            // Poll the read under the run's subscriber until it waits for more output.
+            let pending =
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut reading).await;
+            assert!(pending.is_err(), "the read waits for more output");
+            assert_eq!(run.kinds(), Vec::<String>::new());
+
+            // Cancel it while another run's subscriber is the current one.
+            let _other = other.install(Detail::Compact);
+            drop(reading);
+            assert_eq!(
+                run.kinds(),
+                ["artifact_started", "artifact_chunk", "artifact_finished"]
+            );
+            assert_eq!(other.kinds(), Vec::<String>::new());
+            drop(native);
+            Ok(())
+        }
     }
 
     #[test]
