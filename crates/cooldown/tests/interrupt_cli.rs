@@ -13,11 +13,22 @@ use std::time::{Duration, Instant};
 /// with the interrupted status instead of waiting on the pipes forever.
 #[test]
 fn a_signal_stops_the_package_manager_tree_and_exits_130() -> eyre::Result<()> {
-    interrupted_command("check", false)?;
-    interrupted_command("outdated", true)
+    interrupted_command("check", Recording::None)?;
+    interrupted_command("outdated", Recording::Compact)?;
+    interrupted_command("outdated", Recording::Full)
 }
 
-fn interrupted_command(command: &str, recorded: bool) -> eyre::Result<()> {
+/// Whether and how the interrupted command records a trace.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Recording {
+    None,
+    /// The default trace, which records native output once its stream ends.
+    Compact,
+    /// A full trace, which records native output as it arrives.
+    Full,
+}
+
+fn interrupted_command(command: &str, recording: Recording) -> eyre::Result<()> {
     let directory = tempfile::tempdir()?;
     let root = directory.path();
     // A `.git` marks the repository root, so discovery stays inside the temporary directory.
@@ -65,10 +76,12 @@ fn interrupted_command(command: &str, recorded: bool) -> eyre::Result<()> {
     let mut cooldown = Command::new(env!("CARGO_BIN_EXE_cooldown"))
         .env("COOLDOWN_NO_TRACE", "false")
         .env_remove("COOLDOWN_TRACE_DIR")
+        .env_remove("COOLDOWN_FULL_TRACE")
         .env("XDG_CONFIG_HOME", root.join("trace-config"))
         .current_dir(root)
         .env("COOLDOWN_PNPM", &fake)
         .args([command, "--tool", "pnpm", "--offline", "--no-progress"])
+        .args((recording == Recording::Full).then_some("--full-trace"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -76,7 +89,10 @@ fn interrupted_command(command: &str, recorded: bool) -> eyre::Result<()> {
 
     // Interrupt only once the package manager and its descendant are running.
     let started = Instant::now();
-    while !root.join("descendant").exists() || (recorded && !output_recorded(root)?) {
+    // A full trace shows the package manager's output while it still runs.
+    while !root.join("descendant").exists()
+        || (recording == Recording::Full && !output_recorded(root)?)
+    {
         if started.elapsed() > Duration::from_mins(1) {
             let _ = cooldown.kill();
             eyre::bail!("the fake package manager never started");
@@ -114,7 +130,7 @@ fn interrupted_command(command: &str, recorded: bool) -> eyre::Result<()> {
     #[expect(unsafe_code, reason = "probing a process needs the libc call")]
     let alive = unsafe { libc::kill(descendant, 0) } == 0;
     assert!(!alive, "no descendant of the package manager survives");
-    if recorded {
+    if recording != Recording::None {
         assert_interrupted_trace(root)?;
     }
     Ok(())
@@ -125,10 +141,15 @@ fn assert_interrupted_trace(root: &std::path::Path) -> eyre::Result<()> {
     let trace = std::fs::read_dir(traces)?
         .next()
         .ok_or_else(|| eyre::eyre!("missing interrupted trace"))??;
-    let records: Vec<serde_json::Value> = std::fs::read_to_string(trace.path())?
-        .lines()
-        .map(serde_json::from_str)
-        .collect::<Result<_, _>>()?;
+    let mut records = cooldown::trace::records(&trace.path())?;
+    let records = {
+        let read = records.by_ref().collect::<Result<Vec<_>, _>>()?;
+        eyre::ensure!(
+            !records.truncated(),
+            "the interrupted run finished its trace"
+        );
+        read
+    };
     let terminal = records.last().ok_or_else(|| eyre::eyre!("empty trace"))?;
     assert_eq!(
         terminal
@@ -153,6 +174,13 @@ fn assert_interrupted_trace(root: &std::path::Path) -> eyre::Result<()> {
             .pointer("/event/kind")
             .is_some_and(|kind| kind == "command_finished")
     }));
+    // Either detail keeps the output the package manager printed before the interruption.
+    assert!(records.iter().any(|record| {
+        record
+            .pointer("/event/content/data")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|data| data.contains("native-process-started"))
+    }));
     Ok(())
 }
 
@@ -164,8 +192,15 @@ fn output_recorded(root: &std::path::Path) -> eyre::Result<bool> {
         Err(err) => return Err(err.into()),
     };
     for entry in entries {
-        if std::fs::read_to_string(entry?.path())?.contains("native-process-started") {
-            return Ok(true);
+        // The run is still recording, so its trace ends at the last flushed block.
+        for record in cooldown::trace::records(&entry?.path())? {
+            if record?
+                .pointer("/event/content/data")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|data| data.contains("native-process-started"))
+            {
+                return Ok(true);
+            }
         }
     }
     Ok(false)

@@ -172,6 +172,12 @@ pub(super) fn conflict_skip_message(
         (SkipReason::TransitiveInCooldown, Some(offending)) => {
             format!("{} ({offending})", reason.message())
         }
+        // Name the capped package the change would lift, since its ceiling is the one to raise.
+        (SkipReason::MaxMajorHeld, Some(offending)) if offending != changed => {
+            format!(
+                "held: would lift {offending} above its configured max-major; raise it in cooldown.toml to adopt"
+            )
+        }
         _ => reason.message().to_string(),
     }
 }

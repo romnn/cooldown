@@ -16,6 +16,50 @@
   running Cargo again. A recently parsed lock text is reused instead of parsed again. Results are
   unchanged.
 
+- **`upgrade --fast` trades optimality for speed.** A Cargo `upgrade --major` on a large workspace
+  spent most of its time retrying held candidates at older versions that rarely landed, and
+  dropping one culprit per full resolve when a joint widen broke the acceptance rule. `--fast`
+  (config `fast = true` under `[global]` or `[upgrade]`) skips those older-version retries and
+  drops every culprit of a resolve at once. Every landed version still passes the same gates, so
+  fewer upgrades may land but never an unchecked one, and a `config` warning names the candidates
+  that stayed held and the older versions not tried. `--no-fast` overrides the config. A run
+  without the flag searches exactly as before.
+
+- **pnpm advances each copy of a transitive package resolved at several versions.** A name with
+  more than one copy in the graph was held as `multi_version_held` outright, so ordinary in-range
+  updates such as `ansi-regex` 6.2.2 → 6.5.0 beside an unaffected 5.0.1 copy, or Babel helpers
+  moving on both their 7 and 8 lines, never landed. Each copy now advances through override
+  selectors that name the dependents binding it, so another copy of the name stays where it is,
+  and a dependent moving in the same run takes the copy with it. A copy is still held when no
+  selector reaches it alone, such as one required through an npm alias, and the row says why.
+
+- **A resolver can no longer carry a package across its configured `max-major`.** Only planned
+  targets were checked against the ceiling, so a version the resolver chose on its own could
+  cross it as an ordinary collateral row. Examples are Go raising an indirect module from v0 to
+  v1 and Cargo or npm adding a copy on a higher major. `upgrade` and `fix` now roll such a change
+  back and hold the candidate that caused it as `max_major_held`, naming the capped package. A
+  lock refresh that another project in the run forces, and that would cross the ceiling, fails
+  its project instead. A version that was already above the ceiling before the run does not fail
+  it.
+
+- **Run traces are compressed and compact by default.** A large `upgrade --major` run could write a
+  trace of more than 12 GB. Traces are now zstd-compressed on a background thread (`.jsonl.zst`,
+  readable with `zstd -dc`), and by default each distinct release list is recorded once and
+  referred to, rejected releases are summarized in their evaluation, and identical native command
+  output is recorded once. On this repository, an `upgrade --major` trace shrinks from 280 MB to
+  under 2 MB. `--full-trace` (or `COOLDOWN_FULL_TRACE`) records everything as it happens, still
+  compressed. `cooldown prune` also removes the uncompressed traces of earlier versions.
+
+- **The pnpm report credits a transitive upgrade only when its own copy moved.** A name can
+  resolve to several copies, and the report judged each planned move by the name's newest copy.
+  `inline-style-parser` 0.2.7 → 0.2.9 was reported applied while `style-to-object` 1.0.14 still
+  resolved 0.2.7 and only a new copy used 0.2.9, and the real `seroval` 1.6.11 → 1.6.12 move of the
+  copy `solid-js` binds was hidden behind the root's 1.7.4 → 1.7.5. Each move is now read from the
+  lock's edges into the copy: a copy that advanced for only some dependents, or whose target copy
+  was added for others, is held with a detail naming who moved and who stayed, and every copy's
+  own move is its own row. A dependent's change the lock cannot pair is reported as a new
+  `unpaired_move` warning, so `schemaVersion` is now `8`.
+
 - **Cargo upgrades no longer rerun a command whose inputs are unchanged.** An upgrade often runs
   the same `cargo update` or `cargo metadata` again from byte-identical manifests and lock, for
   example when a later pass retries a pin, or when Cargo completed a pin that the upgrade then
@@ -24,6 +68,15 @@
   results are unchanged. Commands always run when an index-independent input could make them
   resolve differently, such as a positive publish age or offline mode. `--no-memo` and `--fresh`
   turn the replay off.
+
+- **Go upgrades let an indirect module follow the upgrades that need it newer.** When a planned
+  upgrade required a newer version of an `// indirect` module than the module's own planned
+  target, for example `otel/sdk/metric` v1.19.0 needing `otel/metric` v1.19.0 while
+  `otel/metric` was planned within v0, every joint resolve failed. Bisection then held whichever
+  candidates it happened to split off. The indirect module's target is now dropped, so it moves
+  to what its requirers need, and the upgrade lands. When `go` names a requirer that needs a
+  direct module newer than planned, or a version whose `go.mod` declares another module path, that
+  change alone is held with Go's explanation, and the rest is retried without bisecting.
 
 - **A uv upgrade held by the project's own constraint names that constraint.** A package held
   by `[tool.uv] constraint-dependencies` or `override-dependencies`, such as `onnxruntime==1.31.0`,

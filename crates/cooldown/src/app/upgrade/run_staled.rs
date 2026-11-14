@@ -21,18 +21,24 @@
 //! The run therefore also snapshots the inputs each current lock resolves against, and a lock
 //! whose probe fails after one of those inputs changed gets the adapter's conflicted refresh,
 //! which releases only the locked packages the conflict names, before the same gate.
+//!
+//! A refresh can also lift a package above its configured `max-major`, which no `fix` pass
+//! reverses.
+//! So the run records, for each tracked project with a configured `max-major`, which locked
+//! versions were already outside their ceiling, and a refresh that adds one fails its project.
 
 use super::UpgradeAccum;
-use super::executor::PlanMode;
+use super::executor::{PlanMode, unauthorized_crossings, violation_identity};
 use crate::app::lanes::LaneAccess;
 use crate::app::workspace::LockRefreshKind;
 use crate::app::{
-    ProjectCtx, ProjectProgress, RunOpts, Workspace, diag_from_error, stale_evaluation_skipped,
+    FetchedRelease, ProjectCtx, ProjectProgress, RunOpts, Workspace, diag_from_error,
+    stale_evaluation_skipped,
 };
 use camino::Utf8PathBuf;
 use cooldown_core::{
-    CoreError, Diagnostic, DiagnosticKind, LockStatus, LockVerifyReport, ProjectInputSnapshot,
-    ToolId, ToolWrite,
+    BaselineViolation, CoreError, DepScope, Diagnostic, DiagnosticKind, LockStatus,
+    LockVerifyReport, ProjectInputSnapshot, ToolId, ToolWrite, exceeds_max_major,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -52,11 +58,36 @@ impl ProjectKey {
     }
 }
 
+/// What a tracked project's lock held outside its configured `max-major` ceilings when the run
+/// began.
+#[derive(Debug, Default)]
+enum CeilingEvidence {
+    /// No policy layer of the project configures a `max-major`.
+    #[default]
+    NotConfigured,
+    /// Every locked version outside its package's ceiling, extended by the versions the
+    /// project's own passes authorized since.
+    Captured(HashSet<BaselineViolation>),
+    /// The locked versions could not be judged, for the recorded reason.
+    Unavailable {
+        kind: DiagnosticKind,
+        detail: String,
+    },
+}
+
+/// A lock that was current when the run began.
+#[derive(Debug, Default)]
+struct TrackedLock {
+    /// The inputs the lock resolved against.
+    inputs: ProjectInputSnapshot,
+    ceilings: CeilingEvidence,
+}
+
 /// The projects whose lock was current when the run began and whose staleness the run therefore
 /// owns, each with the inputs its lock resolved against then.
 #[derive(Debug, Default)]
 pub(super) struct CurrentAtStart {
-    projects: HashMap<ProjectKey, ProjectInputSnapshot>,
+    projects: HashMap<ProjectKey, TrackedLock>,
 }
 
 impl CurrentAtStart {
@@ -69,7 +100,7 @@ impl CurrentAtStart {
     fn inputs_changed(&self, pctx: &ProjectCtx) -> bool {
         self.projects
             .get(&ProjectKey::of(pctx))
-            .is_some_and(|inputs| match inputs.changed() {
+            .is_some_and(|tracked| match tracked.inputs.changed() {
                 Ok(changed) => changed,
                 Err(err) => {
                     tracing::debug!(%err, project = %pctx.rel_path, "lock inputs unreadable");
@@ -88,9 +119,19 @@ impl CurrentAtStart {
 
     /// Stops tracking a project whose pass failed: the run has already reported it, and running
     /// it again would only repeat the failure.
+    ///
+    /// A pass that succeeded may have authorized versions outside a configured `max-major`, so a
+    /// later refresh of the project's lock may keep those too.
     pub(super) fn settle(&mut self, pctx: &ProjectCtx, acc: &UpgradeAccum) {
+        let key = ProjectKey::of(pctx);
         if !acc.errors.is_empty() {
-            self.projects.remove(&ProjectKey::of(pctx));
+            self.projects.remove(&key);
+        } else if let Some(TrackedLock {
+            ceilings: CeilingEvidence::Captured(allowed),
+            ..
+        }) = self.projects.get_mut(&key)
+        {
+            allowed.extend(acc.allowed_crossings.iter().cloned());
         }
     }
 }
@@ -215,7 +256,11 @@ impl Workspace {
                 if report.status != LockStatus::Current {
                     return None;
                 }
-                Some((ProjectKey::of(pctx), self.lock_input_snapshot(pctx).await))
+                let tracked = TrackedLock {
+                    inputs: self.lock_input_snapshot(pctx).await,
+                    ceilings: self.ceiling_evidence(pctx, opts).await,
+                };
+                Some((ProjectKey::of(pctx), tracked))
             })
             .await;
         CurrentAtStart {
@@ -264,6 +309,122 @@ impl Workspace {
                 tracing::debug!(%err, project = %pctx.rel_path, "lock inputs not captured");
                 ProjectInputSnapshot::default()
             })
+    }
+
+    /// What `pctx`'s lock holds outside its configured `max-major` ceilings now.
+    async fn ceiling_evidence(&self, pctx: &ProjectCtx, opts: &RunOpts) -> CeilingEvidence {
+        let configured = pctx
+            .policy
+            .layers
+            .iter()
+            .flat_map(|layer| &layer.rules)
+            .any(|rule| rule.max_major.is_some());
+        if !configured {
+            return CeilingEvidence::NotConfigured;
+        }
+        match self.locked_ceiling_crossings(pctx, opts).await {
+            Ok(crossings) => CeilingEvidence::Captured(crossings),
+            Err(err) => CeilingEvidence::Unavailable {
+                kind: err.diagnostic_kind(),
+                detail: cooldown_core::redact::url_secrets(&err.to_string()),
+            },
+        }
+    }
+
+    /// Every version `pctx`'s lock holds outside its package's configured `max-major`, judged
+    /// over the whole graph like the upgrade executor's residual gate.
+    async fn locked_ceiling_crossings(
+        &self,
+        pctx: &ProjectCtx,
+        opts: &RunOpts,
+    ) -> cooldown_core::Result<HashSet<BaselineViolation>> {
+        let reader = self
+            .adapter(pctx.tool)
+            .ok_or_else(|| CoreError::System(format!("no adapter for {}", pctx.tool.as_str())))?;
+        let deps = {
+            let _guard = self.project_read_guard(pctx).await?;
+            reader.dependencies(&pctx.project, DepScope::Graph).await?
+        };
+        let rctx = Workspace::resolve_ctx(pctx, opts);
+        let fctx = Workspace::fetch_context(pctx, opts);
+        let fetched = self
+            .fetch_locked_releases(
+                reader,
+                deps,
+                &fctx,
+                &ProjectProgress::default(),
+                opts.fanout(),
+            )
+            .await;
+        let mut crossings = HashSet::new();
+        for FetchedRelease { dependency, result } in fetched {
+            if exceeds_max_major(&dependency, &result?, &pctx.policy.layers, &rctx) {
+                crossings.insert(BaselineViolation {
+                    package: dependency.package,
+                    version: dependency.current,
+                });
+            }
+        }
+        Ok(crossings)
+    }
+
+    /// Whether a refresh of `pctx`'s lock kept every package within its configured `max-major`,
+    /// recording the error into `acc` when it did not or when that cannot be shown.
+    ///
+    /// The refreshed lock stays: restoring it would leave a lock the run staled, and the change
+    /// that forced the refresh has already been committed in another project.
+    pub(super) async fn refresh_kept_ceilings(
+        &self,
+        pctx: &ProjectCtx,
+        opts: &RunOpts,
+        tracked: &CurrentAtStart,
+        acc: &mut UpgradeAccum,
+    ) -> bool {
+        let Some(start) = tracked.projects.get(&ProjectKey::of(pctx)) else {
+            return true;
+        };
+        let root = &pctx.project.root;
+        let (kind, message) = match &start.ceilings {
+            CeilingEvidence::NotConfigured => return true,
+            CeilingEvidence::Unavailable { kind, detail } => (
+                *kind,
+                format!(
+                    "the lock in {root} was refreshed because another project in this run changed a manifest it resolves against, but its versions could not be checked against the configured max-major when the run began ({detail}); the project was not evaluated"
+                ),
+            ),
+            CeilingEvidence::Captured(before) => {
+                match self.locked_ceiling_crossings(pctx, opts).await {
+                    Ok(after) => {
+                        let crossed = unauthorized_crossings(&after, before);
+                        if crossed.is_empty() {
+                            return true;
+                        }
+                        let crossed: Vec<String> = crossed.iter().map(violation_identity).collect();
+                        (
+                            DiagnosticKind::Held,
+                            format!(
+                                "refreshing the lock in {root}, which another project in this run staled, moved {} outside the configured max-major; raise it in cooldown.toml or revert the other project's change; the project was not evaluated",
+                                crossed.join(", ")
+                            ),
+                        )
+                    }
+                    Err(err) => (
+                        err.diagnostic_kind(),
+                        format!(
+                            "the refreshed lock in {root} could not be checked against the configured max-major ({}); the project was not evaluated",
+                            cooldown_core::redact::url_secrets(&err.to_string())
+                        ),
+                    ),
+                }
+            }
+        };
+        acc.errors.push(
+            Diagnostic::new(kind, message)
+                .with_tool(pctx.tool.as_str())
+                .with_project(pctx.rel_path.as_str())
+                .with_path(pctx.manifest_report_path()),
+        );
+        false
     }
 
     /// Refreshes a tracked project's lock if another project in the run staled it, recording
@@ -443,12 +604,17 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{CurrentAtStart, PlanMode, ProjectKey, refresh_gate, tools_with_several_projects};
+    use super::{
+        CeilingEvidence, CurrentAtStart, PlanMode, ProjectKey, TrackedLock, refresh_gate,
+        tools_with_several_projects,
+    };
     use crate::app::TransitiveGate;
     use crate::app::upgrade::UpgradeAccum;
     use crate::app::workspace::tests::project_ctx;
     use camino::Utf8PathBuf;
-    use cooldown_core::{Diagnostic, DiagnosticKind, ProjectInputSnapshot, ToolId};
+    use cooldown_core::{
+        BaselineViolation, Diagnostic, DiagnosticKind, PackageId, ToolId, Version,
+    };
     use std::collections::{HashMap, HashSet};
 
     const CARGO: ToolId = ToolId("cargo");
@@ -499,7 +665,7 @@ mod tests {
     fn a_failed_pass_stops_tracking_its_project() {
         let project = project_ctx(CARGO, "/repo/fuzz");
         let mut tracked = CurrentAtStart {
-            projects: HashMap::from([(ProjectKey::of(&project), ProjectInputSnapshot::default())]),
+            projects: HashMap::from([(ProjectKey::of(&project), TrackedLock::default())]),
         };
 
         tracked.settle(&project, &UpgradeAccum::default());
@@ -514,6 +680,47 @@ mod tests {
         assert_eq!(tracked.len(), 0);
     }
 
+    /// A pass that succeeded hands the versions it authorized outside a `max-major` to the
+    /// project's tracked set, so a later refresh may keep them.
+    #[test]
+    fn a_settled_pass_extends_the_authorized_crossings() {
+        let project = project_ctx(CARGO, "/repo/fuzz");
+        let grandfathered = BaselineViolation {
+            package: PackageId::new(CARGO, "itoa", None),
+            version: Version::new("1.0.0"),
+        };
+        let continued = BaselineViolation {
+            version: Version::new("1.0.1"),
+            ..grandfathered.clone()
+        };
+        let mut tracked = CurrentAtStart {
+            projects: HashMap::from([(
+                ProjectKey::of(&project),
+                TrackedLock {
+                    ceilings: CeilingEvidence::Captured(HashSet::from([grandfathered.clone()])),
+                    ..TrackedLock::default()
+                },
+            )]),
+        };
+
+        tracked.settle(
+            &project,
+            &UpgradeAccum {
+                allowed_crossings: HashSet::from([continued.clone()]),
+                ..UpgradeAccum::default()
+            },
+        );
+
+        let Some(TrackedLock {
+            ceilings: CeilingEvidence::Captured(allowed),
+            ..
+        }) = tracked.projects.get(&ProjectKey::of(&project))
+        else {
+            panic!("the project stays tracked with its captured ceilings");
+        };
+        assert_eq!(*allowed, HashSet::from([grandfathered, continued]));
+    }
+
     /// Projects are told apart by tool and root.
     #[test]
     fn tracking_keys_on_tool_and_root() {
@@ -524,7 +731,7 @@ mod tests {
                     tool: CARGO,
                     root: Utf8PathBuf::from("/repo"),
                 },
-                ProjectInputSnapshot::default(),
+                TrackedLock::default(),
             )]),
         };
 

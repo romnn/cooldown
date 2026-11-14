@@ -152,9 +152,18 @@ gates every package for one run without naming any. A gated name is refused even
 copy is the one an exclusion asked for (an excluded importer left on the old version): the lock
 the workspace installs would still hold two copies.
 
+The report reads each move per copy, from the lock's edges into it. A transitive copy's planned
+move lands only when every dependent that bound the old copy now binds the target. A copy that
+advanced for only some dependents, or whose target copy was added for other dependents, is held,
+and the row names who moved and who stayed. Every copy's own move is a row, even when the copy is
+not the package's newest, such as an old copy a dependent's range kept on a newer patch. When a
+dependent's records change so that several versions sit on either side, no edge proves which
+version replaced which: the move is reported as an `unpaired_move` warning rather than a row, and a
+planned move of those copies is held.
+
 ## Transitive dependencies
 
-By default `upgrade` moves the **whole graph**: it advances each dependency — transitive ones included — to its newest matured version, and reconciles any too-fresh transitive a re-lock drags in back down, so the new lock is **gate-clean by construction** — a subsequent `check` won't reject it. Advancing a transitive requires an engine that can pin a package no manifest declares: cargo, pnpm, go, and uv have one; **every other adapter (npm, yarn, bun, deno, pip, …) plans direct dependencies only** (their per-package apply needs a declared requirement). A transitive whose parents exclude its matured release (an exact-pinning parent, a name resolved at several graph copies) is reported held rather than forced. `--transitive` relaxes the default:
+By default `upgrade` moves the **whole graph**: it advances each dependency — transitive ones included — to its newest matured version, and reconciles any too-fresh transitive a re-lock drags in back down, so the new lock is **gate-clean by construction** — a subsequent `check` won't reject it. Advancing a transitive requires an engine that can pin a package no manifest declares: cargo, pnpm, go, and uv have one; **every other adapter (npm, yarn, bun, deno, pip, …) plans direct dependencies only** (their per-package apply needs a declared requirement). A transitive whose parents exclude its matured release (an exact-pinning parent) is reported held rather than forced. On pnpm, each copy of a transitive resolved at several versions advances on its own, through overrides that name the dependents binding that copy; a copy no such override reaches alone (one required through an npm alias, say) is reported `multi_version_held`. `--transitive` relaxes the default:
 
 - **`--transitive hide`** — plan direct dependencies only. A re-lock can still move transitives; such moves stay visible as collateral rows.
 - **`--transitive allow`** — still advance the graph, but leave a floated-up too-fresh transitive in place (reported, not rolled back).
@@ -191,6 +200,41 @@ which of two things happened, because the way forward differs:
 
 Both fail a `--strict` run. `outdated` reports the same rows as `blocked`, with the same sentence
 in `blockedReason` and under `--why`.
+
+## Fast mode
+
+By default `upgrade` searches until it has landed every upgrade it can, however long that takes.
+`--fast` trades that optimality for speed. It never trades correctness: every version it lands
+passes the same cooldown, `max-major`, pin, and transitive gates and the same lock verification
+as a full run. It may land fewer upgrades, but each one it lands is a planned target in a
+resolve those gates checked.
+
+It shortens two Cargo searches; every other tool runs exactly as without it:
+
+- **Older-version fallback.** When the resolve cannot land a candidate's target, a full run
+  retries up to three older matured versions on the same line, first for all held candidates
+  together and then for each alone. `--fast` skips those retries and commits what the planned
+  targets landed.
+- **Joint widen culprits.** When a joint resolve of several widened requirements breaks the
+  acceptance rule, a full run drops the candidates the first violation names and resolves again,
+  one round per culprit. `--fast` drops every culprit the resolve names at once. Each dropped
+  candidate still gets its own attempt, but one that would only land together with another
+  culprit may stay held.
+
+A held candidate keeps the reason its planned target got, so `--strict` judges it as it would a
+held candidate of a full run. The run adds one `config` warning per project naming every candidate
+that stayed held, and the older matured versions it did not try, since a run without `--fast` may
+still land some of them:
+
+```text
+warning [config] --fast shortened the upgrade search, so a run without it (`--no-fast`) may still
+land some of these held candidates or an older matured version of them: web-sys 0.3.103 → 0.3.107
+(older matured versions not tried: 0.3.106, 0.3.105, 0.3.104)
+```
+
+`fast = true` under `[global]` or `[upgrade]` makes it the default; `--no-fast` runs the full search
+over such a config. Only `upgrade` reads it, so `outdated`'s blocked reasons always come from the
+full search.
 
 ## Lock edge bindings (cargo)
 
@@ -254,7 +298,8 @@ When `upgrade` holds a cross-major update back, it explains the required action:
 - `declared_bound_held` means pass `--rewrite` to cross and rewrite the manifest's explicit
   `<`/`<=` bound.
 - `max_major_held` means raise the package's `max-major` in `cooldown.toml`; no CLI flag overrides
-  this ceiling.
+  this ceiling. When the row names another package, adopting the candidate would lift that package
+  above its own ceiling.
 - `dist_tag_held` (npm family) means the target sits above the registry's current `latest`
   dist-tag, so it is not what a default `npm install` would resolve to today. Version-adopting
   commands (`upgrade`, `fix`) revalidate the package document against the registry so the mutable
@@ -350,6 +395,7 @@ mutates only a throwaway copy, so it never stales, probes, or refreshes a lock.
 | `--major` | Allow cross-major bumps; explicit manifest bounds, config `max-major` ceilings, and the npm `latest` dist-tag still hold. |
 | `--no-respect-dist-tags` | Adopt npm-family releases above the `latest` dist-tag too. |
 | `--strict` | Exit `1` if the mutation cannot complete cleanly. |
+| `--fast` | Trade optimality for speed: Cargo skips the older-version fallback trials and drops every joint-resolve culprit at once. Every landed version still passes the same gates; fewer upgrades may land, and a `config` warning names the candidates that stayed held (see [Fast mode](#fast-mode)). `--no-fast` overrides a config `fast = true`. Config: `[global]`/`[upgrade] fast`. |
 | `--fail-on-new-duplicate` | Cargo and pnpm: refuse a resolve that gives *any* package a second resolved copy — the candidate whose landing added it is held with the copy and its requirer named and the lock restored — instead of committing it with a `duplicate_copy` warning. Config: `[global]`/`[upgrade] fail-on-new-duplicate`; `[tool.pnpm] single-copy` gates named packages on every run. On a tool without Cargo or pnpm's settlement guard the flag has no effect and the run says so. |
 | `--dry-run` | Resolve and print the plan; never mutate. |
 

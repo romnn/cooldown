@@ -87,6 +87,9 @@ See [Precedence]({{< relref "../configuration/precedence.md" >}}) for how the la
 | `--paths` | Show the **Used by** column as workspace paths instead of package names. |
 | `--show-projects` | Add a **Project** column attributing each row to its project. |
 | `--no-suggestions` | Suppress actionable tips (the reports and their counts are unaffected). |
+| `--no-trace` | Do not record the diagnostic [run trace]({{< relref "../traces.md" >}}) of `upgrade`, `fix`, and `outdated`. |
+| `--trace-dir <PATH>` | Store run traces in this directory instead of the user configuration directory. |
+| `--full-trace` | Record the run trace in full instead of the compact default. |
 
 ## Environment variables
 
@@ -106,6 +109,9 @@ Several flags mirror an environment variable, so CI can set policy once:
 | `COOLDOWN_ADVISORY_MIN_AGE` | `--advisory-min-age` |
 | `COOLDOWN_ADVISORY_SEVERITY` | `--advisory-severity` |
 | `COOLDOWN_LOG` | `--log-level` |
+| `COOLDOWN_NO_TRACE` | `--no-trace` |
+| `COOLDOWN_TRACE_DIR` | `--trace-dir` |
+| `COOLDOWN_FULL_TRACE` | `--full-trace` |
 | `RUST_LOG` | overrides `--log-level` |
 
 A `COOLDOWN_*` environment layer also feeds config values; it sits above the file cascade and below CLI flags in [precedence]({{< relref "../configuration/precedence.md" >}}).

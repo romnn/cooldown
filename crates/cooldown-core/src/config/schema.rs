@@ -144,6 +144,10 @@ pub struct CommandConfig {
     pub strict: Option<bool>,
     /// Compile/sync after re-locking in `upgrade` (`--build`).
     pub build: Option<bool>,
+    /// Trade optimality for speed in `upgrade` (`--fast` / `--no-fast`): skip the slow searches
+    /// that can only find further upgrades, never the gates that keep a landed version within
+    /// policy.
+    pub fast: Option<bool>,
     /// Include transitive deps in `outdated`/`fix` (`--transitive`).
     pub transitive: Option<bool>,
     /// Allow `fix` to downgrade exact-pinned deps too (`--downgrade-pinned`).
@@ -192,6 +196,7 @@ impl CommandConfig {
             fail_on_new_duplicate,
             strict,
             build,
+            fast,
             transitive,
             downgrade_pinned,
             dry_run,
@@ -219,6 +224,7 @@ impl CommandConfig {
         self.fail_on_new_duplicate = fail_on_new_duplicate.or(self.fail_on_new_duplicate);
         self.strict = strict.or(self.strict);
         self.build = build.or(self.build);
+        self.fast = fast.or(self.fast);
         self.transitive = transitive.or(self.transitive);
         self.downgrade_pinned = downgrade_pinned.or(self.downgrade_pinned);
         self.dry_run = dry_run.or(self.dry_run);
@@ -258,6 +264,7 @@ impl CommandConfig {
             fail_on_new_duplicate,
             strict,
             build,
+            fast,
             transitive,
             downgrade_pinned,
             dry_run,
@@ -286,6 +293,7 @@ impl CommandConfig {
         self.fail_on_new_duplicate = (*fail_on_new_duplicate).or(self.fail_on_new_duplicate);
         self.strict = (*strict).or(self.strict);
         self.build = (*build).or(self.build);
+        self.fast = (*fast).or(self.fast);
         self.transitive = (*transitive).or(self.transitive);
         self.downgrade_pinned = (*downgrade_pinned).or(self.downgrade_pinned);
         self.dry_run = (*dry_run).or(self.dry_run);

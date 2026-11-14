@@ -688,3 +688,171 @@ fn a_module_only_the_graph_holds_is_neither_listed_nor_planned() {
         assert!(!names.contains(OBJX), "{command}: {names:?}");
     }
 }
+
+/// The cutoff for the `max-major` test, at which `go.opentelemetry.io/otel/sdk/metric` v1.19.0
+/// has matured.
+const FREEZE_MAX_MAJOR: &str = "2023-10-01T00:00:00Z";
+
+/// A pruned (`go 1.21`) module on `sdk/metric` v0.38.0, which requires `otel/metric` v0.38.0,
+/// with `otel/metric` capped at major 0.
+/// `sdk/metric` v1.19.0 requires `otel/metric` v1.19.0, the same module path in Go.
+fn max_major_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write(
+        "go.mod",
+        &indoc::formatdoc! {"
+            module example.com/cooldown-go-max-major
+
+            go 1.21
+
+            require {OTEL_SDK_METRIC} v0.38.0
+        "},
+    );
+    fixture.write(
+        "main.go",
+        &indoc::formatdoc! {r#"
+            package main
+
+            import "{OTEL_SDK_METRIC}"
+
+            func main() {{ _ = metric.NewMeterProvider }}
+        "#},
+    );
+    fixture.write(
+        "cooldown.toml",
+        &indoc::formatdoc! {r#"
+            [tool.go.package."{OTEL_METRIC}"]
+            max-major = 0
+        "#},
+    );
+    fixture
+        .run_tool("go", &["mod", "tidy"], &[("GOFLAGS", "")])
+        .expect_success();
+    fixture
+}
+
+/// An upgrade whose minimal version selection would raise a capped module onto its next major is
+/// rolled back and held for that module, even though the cap names a module the plan never moves.
+#[test]
+fn upgrade_holds_a_candidate_that_would_lift_a_capped_module_across_its_max_major() {
+    skip_if_missing!("go");
+    let fixture = max_major_fixture();
+    let go_mod_before = fixture.read_bytes("go.mod");
+    assert!(
+        go_mod_pins(&go_mod_before)
+            .get(OTEL_METRIC)
+            .is_some_and(|version| version.starts_with("v0.")),
+        "seed sanity: the capped module starts on v0"
+    );
+
+    // Only `sdk/metric` is planned, so its move to v1 drags `otel/metric` along as collateral.
+    let report = fixture.cooldown_json(&[
+        "upgrade",
+        "--major",
+        "--freeze",
+        FREEZE_MAX_MAJOR,
+        "--package",
+        OTEL_SDK_METRIC,
+    ]);
+
+    assert!(report.ok(), "a held candidate is not a failure: {report:?}");
+    assert!(
+        report
+            .skipped_reasons_for(OTEL_SDK_METRIC)
+            .contains("max_major_held"),
+        "{:?}",
+        report.skipped_reasons_for(OTEL_SDK_METRIC)
+    );
+    assert!(
+        report
+            .skipped_offending_for(OTEL_SDK_METRIC)
+            .is_some_and(|offending| offending.starts_with(OTEL_METRIC)),
+        "the hold names the capped module, got {:?}",
+        report.skipped_offending_for(OTEL_SDK_METRIC)
+    );
+    assert!(
+        report.applied_names().is_empty(),
+        "nothing lands, got {:?}",
+        report.applied_names()
+    );
+    assert_eq!(
+        go_mod_before,
+        fixture.read_bytes("go.mod"),
+        "the rolled-back trial leaves go.mod as it was"
+    );
+}
+
+/// The cutoff for the requirer-follow test: `go.opentelemetry.io/otel/sdk/metric` v1.19.0 has
+/// matured, and with it `go.opentelemetry.io/otel/metric` v1.19.0, which it requires.
+const FREEZE_OTEL: &str = "2023-10-01T00:00:00Z";
+
+const OTEL_SDK_METRIC: &str = "go.opentelemetry.io/otel/sdk/metric";
+const OTEL_METRIC: &str = "go.opentelemetry.io/otel/metric";
+
+/// A `go 1.21` module on `otel/sdk/metric` v0.38.0, which requires `otel/metric` v0.38.0 as an
+/// indirect requirement.
+fn otel_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write(
+        "go.mod",
+        &indoc::formatdoc! {"
+            module example.com/cooldown-go-otel
+
+            go 1.21
+
+            require {OTEL_SDK_METRIC} v0.38.0
+        "},
+    );
+    fixture.write(
+        "main.go",
+        &indoc::formatdoc! {r#"
+            package main
+
+            import "{OTEL_SDK_METRIC}"
+
+            func main() {{ _ = metric.NewMeterProvider }}
+        "#},
+    );
+    fixture
+        .run_tool("go", &["mod", "tidy"], &[("GOFLAGS", "")])
+        .expect_success();
+    fixture
+}
+
+/// Under `--major`, `otel/sdk/metric` v1.19.0 requires `otel/metric` v1.19.0, while the plan
+/// advances the indirect `otel/metric` only within v0, to v0.38.1.
+/// The indirect module follows the requirer instead of holding it: the upgrade lands, and the
+/// module's real move is reported.
+#[test]
+fn an_indirect_module_follows_a_requirer_that_needs_it_newer() {
+    skip_if_missing!("go");
+    let fixture = otel_fixture();
+
+    let report = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE_OTEL]);
+
+    assert!(report.ok(), "{report:?}");
+    assert_eq!(report.summary_errors(), 0, "{report:?}");
+    let pins = go_mod_pins(&fixture.read_bytes("go.mod"));
+    assert_eq!(
+        pins.get(OTEL_SDK_METRIC).map(String::as_str),
+        Some("v1.19.0")
+    );
+    assert_eq!(pins.get(OTEL_METRIC).map(String::as_str), Some("v1.19.0"));
+    // The requirer is not held, and the indirect module's dropped v0 target is a conservative skip
+    // beside its real move.
+    assert!(
+        report.skipped_reasons_for(OTEL_SDK_METRIC).is_empty(),
+        "{report:?}"
+    );
+    assert_eq!(
+        report.skipped_reasons_for(OTEL_METRIC),
+        std::collections::BTreeSet::from(["not_eligible".to_string()])
+    );
+    assert!(
+        report
+            .changes_for(OTEL_METRIC)
+            .iter()
+            .any(|change| change.to == "v1.19.0"),
+        "{report:?}"
+    );
+}

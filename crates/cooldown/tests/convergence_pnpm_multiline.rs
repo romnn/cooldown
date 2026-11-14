@@ -504,3 +504,262 @@ fn an_undeclared_copy_on_another_line_does_not_hold_the_declared_upgrade() {
     assert_eq!(second.summary_applied(), 0, "second run must be a no-op");
     assert_eq!(after, fixture.read_bytes("pnpm-lock.yaml"));
 }
+
+/// `solid-js` 1.9.17 requires `seroval ~1.6.8` and `@tanstack/router-core` 1.171.36 requires
+/// `seroval ^1.6.7`, both pinned exactly so neither moves.
+/// Seeded on 2026-10-15 both bind one undeclared `seroval` 1.6.9 copy (1.6.10 is 2026-10-18), whose
+/// advance under the freeze targets 1.7.2 (2026-10-24), a release only the caret range admits.
+const SHARED_COPY_PACKAGE_JSON: &str = indoc::indoc! {r#"
+    {
+      "name": "cooldown-pnpm-shared-copy",
+      "version": "0.1.0",
+      "private": true,
+      "dependencies": {
+        "@tanstack/router-core": "1.171.36",
+        "solid-js": "1.9.17"
+      }
+    }
+"#};
+
+const SHARED_COPY_SEED: &str = "2026-10-15T00:00:00Z";
+
+const SHARED_COPY_FREEZE: &str = "2026-10-25T00:00:00Z";
+
+/// Every version a `name@<version>:` package key in `lock` names.
+fn copies_of(lock: &[u8], name: &str) -> std::collections::BTreeSet<String> {
+    let prefix = format!("{name}@");
+    String::from_utf8_lossy(lock)
+        .lines()
+        .filter(|line| line.starts_with("  ") && !line.starts_with("   "))
+        .filter_map(|line| line.trim().strip_prefix(&prefix)?.strip_suffix(':'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A transitive advance the settlement keeps for one dependent and reverts for another advances
+/// the shared copy only partly: `@tanstack/router-core` keeps `seroval` 1.7.2, while `solid-js`'s
+/// tilde range settles on 1.6.12.
+/// The advance is held, naming who moved and who stayed, rather than credited from the copy at
+/// the target, and with nothing landed the run leaves the lock as it was.
+#[test]
+fn a_partly_advanced_shared_copy_is_held_not_credited() {
+    skip_if_missing!("pnpm");
+    let fixture = Fixture::pnpm().tag_independent();
+    fixture.write("package.json", SHARED_COPY_PACKAGE_JSON);
+    fixture.write(".npmrc", NPMRC);
+    seed_lock(&fixture, SHARED_COPY_SEED);
+    let seeded = fixture.read_bytes("pnpm-lock.yaml");
+    assert_eq!(
+        copies_of(&seeded, "seroval"),
+        ["1.6.9".to_string()].into(),
+        "seed sanity: both dependents share one copy"
+    );
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", SHARED_COPY_FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--freeze", SHARED_COPY_FREEZE])
+            .stderr_str()
+    );
+
+    // The advance is held with the copy's real outcome, never credited.
+    assert!(
+        !upgrade.applied_names().contains("seroval"),
+        "the partly advanced copy must not be credited, report: {:?}",
+        upgrade.items()
+    );
+    assert_eq!(
+        upgrade.skipped_reasons_for("seroval"),
+        ["graph_ceiling_held".to_string()].into(),
+        "report: {:?}",
+        upgrade.items()
+    );
+    let detail = upgrade.skip_detail_for("seroval").unwrap_or_default();
+    assert!(
+        detail.contains("moved to 1.7.2 only for @tanstack/router-core@1.171.36")
+            && detail.contains("solid-js@1.9.17 still resolves seroval 1.6.12"),
+        "{detail}"
+    );
+    // Nothing landed, so the batch's lock was restored.
+    assert_eq!(fixture.read_bytes("pnpm-lock.yaml"), seeded);
+}
+
+/// Every applied `from -> to` move of `name` the report lists, sorted.
+fn applied_moves(report: &support::Envelope, name: &str) -> Vec<String> {
+    let mut moves: Vec<String> = report
+        .items()
+        .iter()
+        .filter(|item| {
+            item.get("name").and_then(serde_json::Value::as_str) == Some(name)
+                && item.get("applied").and_then(serde_json::Value::as_bool) == Some(true)
+        })
+        .filter_map(|item| {
+            let from = item.get("from")?.as_str()?;
+            let to = item.get("to")?.as_str()?;
+            Some(format!("{from} -> {to}"))
+        })
+        .collect();
+    moves.sort();
+    moves
+}
+
+/// A project that declares neither `semver` copy: `make-dir` 3.1.0 requires `semver ^6.0.0` and
+/// `@npmcli/fs` 2.1.2 requires `semver ^7.3.5`, both pinned exactly so neither moves.
+/// Seeded on [`SEED`] the copies are 6.3.0 and 7.3.8, and under [`FREEZE`] each line has its own
+/// in-range move (6.3.1, 7.5.4).
+const UNDECLARED_LINES_PACKAGE_JSON: &str = indoc::indoc! {r#"
+    {
+      "name": "cooldown-pnpm-undeclared-lines",
+      "version": "0.1.0",
+      "private": true,
+      "dependencies": {
+        "@npmcli/fs": "2.1.2",
+        "make-dir": "3.1.0"
+      }
+    }
+"#};
+
+/// A graph with two major lines of an undeclared package takes the in-range update on each line:
+/// each copy is advanced through its own dependent, so neither move is held for the other copy.
+#[test]
+fn two_undeclared_major_lines_each_take_their_own_update() {
+    skip_if_missing!("pnpm");
+    let fixture = Fixture::pnpm().tag_independent();
+    fixture.write("package.json", UNDECLARED_LINES_PACKAGE_JSON);
+    fixture.write(".npmrc", NPMRC);
+    seed_lock(&fixture, SEED);
+    assert_eq!(
+        copies_of(&fixture.read_bytes("pnpm-lock.yaml"), "semver"),
+        ["6.3.0".to_string(), "7.3.8".to_string()].into(),
+        "seed sanity: one undeclared copy per line"
+    );
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--freeze", FREEZE])
+            .stderr_str()
+    );
+    assert_pnpm_lock_current(&upgrade);
+
+    // Each copy moved to its own line's target, and each move is its own applied row.
+    let after = fixture.read_bytes("pnpm-lock.yaml");
+    assert_eq!(
+        copies_of(&after, "semver"),
+        ["6.3.1".to_string(), "7.5.4".to_string()].into(),
+        "report: {:?}",
+        upgrade.items()
+    );
+    assert_eq!(
+        applied_moves(&upgrade, "semver"),
+        ["6.3.0 -> 6.3.1", "7.3.8 -> 7.5.4"],
+        "report: {:?}",
+        upgrade.items()
+    );
+    assert!(
+        upgrade.skipped_reasons_for("semver").is_empty(),
+        "report: {:?}",
+        upgrade.items()
+    );
+
+    // Converged: a second run moves nothing.
+    let second = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert_eq!(second.summary_applied(), 0, "second run must be a no-op");
+    assert_eq!(after, fixture.read_bytes("pnpm-lock.yaml"));
+}
+
+/// The issue's `ansi-regex` shape with a moving dependent, neither declared: the root pins
+/// `wrap-ansi` 8.0.1, whose `strip-ansi ^7.0.1` binds the `ansi-regex` 6 copy, and `cliui` 7.0.4,
+/// whose `strip-ansi` 6.0.1 keeps an `ansi-regex` 5.0.1 copy.
+/// Seeded on [`SEED`] the copies are `strip-ansi` 6.0.1 and 7.0.1 and `ansi-regex` 5.0.1 and
+/// 6.0.1; under [`MOVING_DEPENDENT_FREEZE`] `strip-ansi` 7 moves to 7.1.0 in the same run that
+/// advances `ansi-regex` 6 to 6.1.0, while neither 5.x nor 6.x of the other copies has a newer
+/// release.
+const MOVING_DEPENDENT_PACKAGE_JSON: &str = indoc::indoc! {r#"
+    {
+      "name": "cooldown-pnpm-moving-dependent",
+      "version": "0.1.0",
+      "private": true,
+      "dependencies": {
+        "cliui": "7.0.4",
+        "wrap-ansi": "8.0.1"
+      }
+    }
+"#};
+
+const MOVING_DEPENDENT_FREEZE: &str = "2024-12-01T00:00:00Z";
+
+/// One copy of a duplicated undeclared package advances while the other stays, even when the
+/// copy's own dependent, another duplicated undeclared package, moves in the same run: the
+/// advance follows the dependent to its target, so the run lands both moves and the next one is
+/// a no-op.
+#[test]
+fn one_copy_advances_beside_another_while_its_dependent_moves() {
+    skip_if_missing!("pnpm");
+    let fixture = Fixture::pnpm().tag_independent();
+    fixture.write("package.json", MOVING_DEPENDENT_PACKAGE_JSON);
+    fixture.write(".npmrc", NPMRC);
+    seed_lock(&fixture, SEED);
+    let seeded = fixture.read_bytes("pnpm-lock.yaml");
+    assert_eq!(
+        copies_of(&seeded, "ansi-regex"),
+        ["5.0.1".to_string(), "6.0.1".to_string()].into(),
+        "seed sanity: two ansi-regex copies"
+    );
+    assert_eq!(
+        copies_of(&seeded, "strip-ansi"),
+        ["6.0.1".to_string(), "7.0.1".to_string()].into(),
+        "seed sanity: two strip-ansi copies"
+    );
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", MOVING_DEPENDENT_FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--freeze", MOVING_DEPENDENT_FREEZE])
+            .stderr_str()
+    );
+    assert_pnpm_lock_current(&upgrade);
+
+    // Each 7/6 copy advanced with its moving dependent; the copies under `cliui` stayed.
+    let after = fixture.read_bytes("pnpm-lock.yaml");
+    assert_eq!(
+        copies_of(&after, "strip-ansi"),
+        ["6.0.1".to_string(), "7.1.0".to_string()].into(),
+        "report: {:?}",
+        upgrade.items()
+    );
+    assert_eq!(
+        copies_of(&after, "ansi-regex"),
+        ["5.0.1".to_string(), "6.1.0".to_string()].into(),
+        "report: {:?}",
+        upgrade.items()
+    );
+    assert_eq!(
+        applied_moves(&upgrade, "ansi-regex"),
+        ["6.0.1 -> 6.1.0"],
+        "report: {:?}",
+        upgrade.items()
+    );
+    assert_eq!(
+        applied_moves(&upgrade, "strip-ansi"),
+        ["7.0.1 -> 7.1.0"],
+        "report: {:?}",
+        upgrade.items()
+    );
+    assert!(
+        upgrade.skipped_reasons_for("ansi-regex").is_empty(),
+        "report: {:?}",
+        upgrade.items()
+    );
+
+    // Converged: a second run moves nothing.
+    let second = fixture.cooldown_json(&["upgrade", "--freeze", MOVING_DEPENDENT_FREEZE]);
+    assert_eq!(second.summary_applied(), 0, "second run must be a no-op");
+    assert_eq!(after, fixture.read_bytes("pnpm-lock.yaml"));
+}

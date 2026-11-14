@@ -63,31 +63,45 @@ impl ResolveBaseline {
         generated: &GeneratedMembers,
         plan: &[Change],
     ) -> Option<Violation> {
-        self.declared_violation(after, generated, plan)
-            .or_else(|| self.planned_violation(after, plan))
-            .or_else(|| self.split_violation(after, generated))
+        self.violations(after, generated, plan).next()
     }
 
-    /// The first crate an authored package declares that the step split, judged as the final
-    /// guard judges the whole apply.
+    /// Every way the step that produced `after` breaks the rule for `plan`, first to last.
+    ///
+    /// The order is fixed: moved declarations in declaration order, then planned crates in plan
+    /// order, then splits in identity order, so the first item is [`Self::violation`].
+    /// The planned and split checks run only when the iterator reaches them.
+    pub(super) fn violations<'s>(
+        &'s self,
+        after: &'s CargoLock,
+        generated: &'s GeneratedMembers,
+        plan: &'s [Change],
+    ) -> impl Iterator<Item = Violation> + 's {
+        self.declared_violations(after, generated, plan)
+            .chain(std::iter::once(()).flat_map(move |()| self.planned_violations(after, plan)))
+            .chain(std::iter::once(()).flat_map(move |()| self.split_violations(after, generated)))
+    }
+
+    /// Each crate an authored package declares that the step split, judged as the final guard
+    /// judges the whole apply.
     ///
     /// Refusing the step holds only the candidate that split the crate, where the final guard
     /// could only refuse the apply as a whole.
-    fn split_violation(
-        &self,
-        after: &CargoLock,
-        generated: &GeneratedMembers,
-    ) -> Option<Violation> {
+    fn split_violations<'s>(
+        &'s self,
+        after: &'s CargoLock,
+        generated: &'s GeneratedMembers,
+    ) -> impl Iterator<Item = Violation> + 's {
         let declared = after.declared_endpoints(generated);
         new_direct_lines(Some(&self.lock), after, generated)
             .into_iter()
-            .find(|(source, name)| {
+            .filter(move |(source, name)| {
                 declared.iter().any(|declared| {
                     declared.endpoint.name == *name
                         && declared.endpoint.source() == source.as_deref()
                 })
             })
-            .map(|identity| self.split(after, generated, &identity))
+            .map(move |identity| self.split(after, generated, &identity))
     }
 
     fn split(
@@ -141,43 +155,50 @@ impl ResolveBaseline {
         }
     }
 
-    fn declared_violation(
-        &self,
+    fn declared_violations<'s>(
+        &'s self,
         after: &CargoLock,
         generated: &GeneratedMembers,
-        plan: &[Change],
-    ) -> Option<Violation> {
+        plan: &'s [Change],
+    ) -> impl Iterator<Item = Violation> + 's {
         let declared_after = after.declared_endpoints(generated);
         // Cargo writes only the packages its resolve reaches, so a dependent absent from the lock
         // is one the step no longer resolves.
         let resolved: HashSet<LockPackageId> =
             after.package.iter().filter_map(LockPackage::id).collect();
-        let moved = self.declared.iter().find(|declared| {
-            resolved.contains(&declared.dependent)
-                && !declared_after.contains(declared)
-                && !planned_movement(plan, declared)
+        self.declared.iter().filter_map(move |moved| {
+            if !resolved.contains(&moved.dependent)
+                || declared_after.contains(moved)
+                || planned_movement(plan, moved)
                     .is_some_and(|movement| declared_after.contains(&movement))
-        })?;
-        let node = &moved.endpoint;
-        // The node the same dependent now binds under that name, when the step rebound it.
-        let to = declared_after
-            .iter()
-            .find(|candidate| {
-                candidate.dependent == moved.dependent
-                    && candidate.endpoint.name == node.name
-                    && !self.declared.contains(candidate)
+            {
+                return None;
+            }
+            let node = &moved.endpoint;
+            // The node the same dependent now binds under that name, when the step rebound it.
+            let to = declared_after
+                .iter()
+                .find(|candidate| {
+                    candidate.dependent == moved.dependent
+                        && candidate.endpoint.name == node.name
+                        && !self.declared.contains(candidate)
+                })
+                .map(|candidate| candidate.endpoint.version.clone());
+            Some(Violation::DeclaredMoved {
+                name: node.name.clone(),
+                from: node.version.clone(),
+                to,
             })
-            .map(|candidate| candidate.endpoint.version.clone());
-        Some(Violation::DeclaredMoved {
-            name: node.name.clone(),
-            from: node.version.clone(),
-            to,
         })
     }
 
-    fn planned_violation(&self, after: &CargoLock, plan: &[Change]) -> Option<Violation> {
+    fn planned_violations<'s>(
+        &'s self,
+        after: &'s CargoLock,
+        plan: &'s [Change],
+    ) -> impl Iterator<Item = Violation> + 's {
         let versions = after.crates_io_locked_versions();
-        plan.iter().find_map(|planned| {
+        plan.iter().filter_map(move |planned| {
             let name = &planned.package.name;
             let (from, target) = (planned.from.as_str(), planned.to.as_str());
             if reached(&self.versions, planned) {

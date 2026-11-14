@@ -1,8 +1,9 @@
 //! File-backed Cargo trials exercise real rollback, remediation, and bounded target fallback.
 
-use crate::app::upgrade::PreviewEvidence;
+use crate::app::upgrade::{PreviewEvidence, UpgradeOutcome};
 use crate::app::{
-    AdapterSet, Baseline, Exit, Progress, ProjectCtx, ProjectProgress, RunOpts, Workspace,
+    AdapterSet, Baseline, Exit, Progress, ProjectCtx, ProjectProgress, RunOpts, UpgradeItem,
+    Workspace,
 };
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -11,10 +12,11 @@ use cooldown_core::config::builtin_default_layer;
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, CoreError, DepScope, Dependency,
     EdgeBindingAction, EdgeRebind, FetchContext, GeneratedMembers, GraphHoldEdge, GraphHoldKind,
-    LockStatus, LockVerifyReport, MajorKey, NativePolicyLayer, PackageId, Plan, PolicyStack,
-    PreparedMutation, Project, ProjectMarker, ProjectMutationJournal, Release, ReleaseFetcher,
-    ReleaseOrder, ReleaseQuality, SkipReason, Skipped, TargetFallback, ToolId, ToolRead, ToolWrite,
-    UpdateKind, VerifyReport, Version,
+    LockStatus, LockVerifyReport, MajorKey, NativePolicyLayer, Origin, PackageId, PatternGlob,
+    Plan, PolicyLayer, PolicyStack, PreparedMutation, Project, ProjectMarker,
+    ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, Rule, Selector,
+    SkipReason, Skipped, TargetFallback, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport,
+    Version,
 };
 use indoc::indoc;
 use std::collections::{BTreeMap, HashSet};
@@ -53,6 +55,19 @@ enum Resolver {
     /// Offers `parent` only on its next major, which stays held, while the transitive `child` it
     /// requires has a matured release on its own line.
     MajorParent,
+    /// Resolves the transitive `child` on its next major exactly while `parent` sits on a minor in
+    /// `lowest..=highest`: on the fresh `2.1.0` when `fresh_major`, else on the matured `2.0.0`;
+    /// `child` is capped at major 1.
+    ///
+    /// The lock starts with `parent` on its `fresh_newest` release when set, and `child` on
+    /// `child_start`.
+    MajorChild {
+        lowest: u32,
+        highest: u32,
+        fresh_major: bool,
+        fresh_newest: bool,
+        child_start: &'static str,
+    },
 }
 
 struct FakeCargo {
@@ -90,6 +105,18 @@ fn release(version: &str, fresh: bool) -> Release {
         yanked: false,
         quality: ReleaseQuality::Stable,
     }
+}
+
+/// A repository config layer capping `child` at major 1.
+fn child_max_major_layer(root: &Utf8Path) -> eyre::Result<PolicyLayer> {
+    let mut layer = PolicyLayer::new(Origin::Repo(root.join("cooldown.toml")));
+    let mut rule = Rule::new(Selector::Package {
+        glob: PatternGlob::new("child")?,
+        tool: Some(CARGO),
+    });
+    rule.max_major = Some(1);
+    layer.rules.push(rule);
+    Ok(layer)
 }
 
 fn lock(project: &Project) -> cooldown_core::Result<BTreeMap<String, String>> {
@@ -246,6 +273,34 @@ impl FakeCargo {
             .collect()
     }
 
+    /// The `child` the resolve settles on beside the locked `parent`.
+    fn resolved_child(&self, versions: &BTreeMap<String, String>) -> &'static str {
+        if let Resolver::MajorChild {
+            lowest,
+            highest,
+            fresh_major,
+            ..
+        } = self.resolver
+        {
+            let minor = versions
+                .get("parent")
+                .and_then(|version| version.split('.').nth(1))
+                .and_then(|minor| minor.parse::<u32>().ok())
+                .unwrap_or_default();
+            if !(lowest..=highest).contains(&minor) {
+                "1.0.0"
+            } else if fresh_major {
+                "2.1.0"
+            } else {
+                "2.0.0"
+            }
+        } else if self.exact_child(versions) {
+            "1.1.0"
+        } else {
+            "1.0.0"
+        }
+    }
+
     fn exact_child(&self, versions: &BTreeMap<String, String>) -> bool {
         match self.resolver {
             Resolver::Caret
@@ -253,6 +308,7 @@ impl FakeCargo {
             | Resolver::PersistentParent { .. }
             | Resolver::PersistentPair { .. }
             | Resolver::MajorParent
+            | Resolver::MajorChild { .. }
             | Resolver::SnapshotFamily { .. } => false,
             Resolver::AnchoredPair => versions
                 .get("parent")
@@ -442,19 +498,10 @@ impl ToolWrite for FakeCargo {
         }
         let mut versions = lock(project)?;
         let baseline = versions.get("parent").cloned().unwrap_or_default();
-        let mut record = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(project.root.join("trials"))?;
-        writeln!(
-            record,
-            "{baseline}:{}",
-            plan.changes
-                .iter()
-                .map(|change| format!("{}@{}", change.package.name, change.to))
-                .collect::<Vec<_>>()
-                .join(",")
-        )?;
+        log_batch(&project.root.join("trials"), &baseline, plan)?;
+        // Which search each batch asked for, apart from `trials` so their expectations stay put.
+        let search = if plan.fast { "fast" } else { "exhaustive" };
+        log_batch(&project.root.join("searches"), search, plan)?;
         let mut skipped = Vec::new();
         let mut applied = Vec::new();
         if let Resolver::PersistentParent {
@@ -510,12 +557,9 @@ impl ToolWrite for FakeCargo {
                     | Resolver::HeldParent { .. }
                     | Resolver::PersistentPair { .. }
                     | Resolver::MajorParent
+                    | Resolver::MajorChild { .. }
                     | Resolver::PersistentParent { .. } => {
-                        let child = if self.exact_child(&versions) {
-                            "1.1.0"
-                        } else {
-                            "1.0.0"
-                        };
+                        let child = self.resolved_child(&versions);
                         versions.insert("child".to_string(), child.to_string());
                     }
                     Resolver::SnapshotFamily { .. } => {}
@@ -542,6 +586,24 @@ impl ToolWrite for FakeCargo {
             detail: String::new(),
         })
     }
+}
+
+/// Appends `label` and the batch's targets as one line to the log at `path`.
+fn log_batch(path: &Utf8Path, label: &str, plan: &Plan) -> cooldown_core::Result<()> {
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(
+        log,
+        "{label}:{}",
+        plan.changes
+            .iter()
+            .map(|change| format!("{}@{}", change.package.name, change.to))
+            .collect::<Vec<_>>()
+            .join(",")
+    )?;
+    Ok(())
 }
 
 struct CargoFixture {
@@ -619,6 +681,24 @@ fn fixture_adapter(
             vec![release("1.0.0", false), release("1.1.0", false)],
         );
     }
+    if let Resolver::MajorChild { fresh_newest, .. } = resolver {
+        // Only the newest parent is fresh, so `fix` matures it down to the next older minor.
+        fake.releases.insert(
+            "parent".to_string(),
+            (0..=newest)
+                .map(|minor| release(&format!("1.{minor}.0"), fresh_newest && minor == newest))
+                .collect(),
+        );
+        fake.releases.insert(
+            "child".to_string(),
+            vec![
+                release("1.0.0", false),
+                release("1.1.0", true),
+                release("2.0.0", false),
+                release("2.1.0", true),
+            ],
+        );
+    }
     if let Resolver::PersistentParent { companions, .. } = resolver {
         for index in 0..companions {
             fake.releases.insert(
@@ -628,6 +708,48 @@ fn fixture_adapter(
         }
     }
     fake
+}
+
+/// The fixture's starting lock for `resolver`.
+fn initial_lock(resolver: Resolver, newest: u32, sibling: bool) -> BTreeMap<String, String> {
+    let initial_direct = if matches!(resolver, Resolver::CoupledPatchFrom(_)) {
+        "49.0.0"
+    } else {
+        "1.0.0"
+    };
+    let newest_parent = format!("1.{newest}.0");
+    let (initial_parent, initial_child) = match resolver {
+        Resolver::MajorChild {
+            fresh_newest,
+            child_start,
+            ..
+        } => (
+            if fresh_newest {
+                newest_parent.as_str()
+            } else {
+                initial_direct
+            },
+            child_start,
+        ),
+        _ => (initial_direct, "1.0.0"),
+    };
+    let mut initial = BTreeMap::from([("parent", initial_parent), ("child", initial_child)]);
+    if matches!(resolver, Resolver::Caret) {
+        initial.insert("holder", "1.0.0");
+    }
+    if sibling {
+        initial.insert("sibling", initial_direct);
+    }
+    let mut initial: BTreeMap<String, String> = initial
+        .into_iter()
+        .map(|(name, version)| (name.to_string(), version.to_string()))
+        .collect();
+    if let Resolver::PersistentParent { companions, .. } = resolver {
+        for index in 0..companions {
+            initial.insert(format!("safe{index:03}"), initial_direct.to_string());
+        }
+    }
+    initial
 }
 
 fn fixture_with_edges(
@@ -671,27 +793,7 @@ fn fixture_with_edges(
         exclude_newer_package: std::collections::BTreeMap::new(),
         generated_members: GeneratedMembers::undeclared(),
     };
-    let initial_direct = if matches!(resolver, Resolver::CoupledPatchFrom(_)) {
-        "49.0.0"
-    } else {
-        "1.0.0"
-    };
-    let mut initial = BTreeMap::from([("parent", initial_direct), ("child", "1.0.0")]);
-    if matches!(resolver, Resolver::Caret) {
-        initial.insert("holder", "1.0.0");
-    }
-    if sibling {
-        initial.insert("sibling", initial_direct);
-    }
-    let mut initial: BTreeMap<String, String> = initial
-        .into_iter()
-        .map(|(name, version)| (name.to_string(), version.to_string()))
-        .collect();
-    if let Resolver::PersistentParent { companions, .. } = resolver {
-        for index in 0..companions {
-            initial.insert(format!("safe{index:03}"), initial_direct.to_string());
-        }
-    }
+    let initial = initial_lock(resolver, newest, sibling);
     std::fs::write(root.join("Cargo.lock"), serde_json::to_vec(&initial)?)?;
     let fake = fixture_adapter(resolver, newest, edge_rebinds_on_apply);
     let mut adapters = AdapterSet::new();
@@ -701,7 +803,11 @@ fn fixture_with_edges(
         project: project.clone(),
         rel_path: Utf8PathBuf::from("."),
         policy: PolicyStack {
-            layers: vec![builtin_default_layer()],
+            layers: if matches!(resolver, Resolver::MajorChild { .. }) {
+                vec![builtin_default_layer(), child_max_major_layer(&root)?]
+            } else {
+                vec![builtin_default_layer()]
+            },
             strict_native: false,
         },
         edge_policy: cooldown_core::EdgePolicy::default(),
@@ -1596,5 +1702,470 @@ async fn original_candidates_are_decided_after_landing_fallback_or_hold() -> eyr
         );
         assert_eq!(progress.decided_candidates(), 2, "{:?}", preview.items);
     }
+    Ok(())
+}
+
+/// The `--fast` run options.
+fn fast() -> RunOpts {
+    RunOpts {
+        fast: true,
+        ..RunOpts::default()
+    }
+}
+
+/// The Config notices `--fast` adds for the candidates it left held.
+fn fast_notices(warnings: &[cooldown_core::Diagnostic]) -> Vec<&str> {
+    warnings
+        .iter()
+        .filter(|warning| {
+            warning.kind == cooldown_core::DiagnosticKind::Config
+                && warning.message.starts_with("--fast")
+        })
+        .map(|warning| warning.message.as_str())
+        .collect()
+}
+
+/// `--fast` tries only the planned target of a held candidate, never its older matured versions,
+/// and names the versions it left untried.
+#[tokio::test]
+async fn fast_mode_skips_the_lower_targets_and_names_them() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(Resolver::ExactFrom(3), 6, false)?;
+    let before = std::fs::read(project.root.join("Cargo.lock"))?;
+    let outcome = workspace.upgrade(&fast()).await;
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+
+    // Only the planned target was tried, and the lock is untouched.
+    let trials = std::fs::read_to_string(project.root.join("trials"))?;
+    assert!(trials.contains("parent@1.6.0"), "{trials}");
+    for version in ["1.5.0", "1.4.0", "1.3.0"] {
+        assert!(!trials.contains(&format!("parent@{version}")), "{trials}");
+    }
+    assert_eq!(std::fs::read(project.root.join("Cargo.lock"))?, before);
+
+    // The held row keeps the reason its planned target got.
+    let parent = outcome
+        .items
+        .iter()
+        .find(|item| item.name == "parent")
+        .ok_or_else(|| eyre::eyre!("missing held parent"))?;
+    assert!(!parent.applied);
+    assert!(parent.skipped.is_some());
+
+    // One notice names the held candidate and the older versions a full run would try.
+    let notices = fast_notices(&outcome.warnings);
+    let [notice] = notices.as_slice() else {
+        eyre::bail!("expected one --fast notice, got {notices:?}");
+    };
+    assert!(notice.contains("--no-fast"), "{notice}");
+    assert!(
+        notice.contains(
+            "parent 1.0.0 → 1.6.0 (older matured versions not tried: 1.5.0, 1.4.0, 1.3.0)"
+        ),
+        "{notice}"
+    );
+    Ok(())
+}
+
+/// A lower target the default run lands stays unlanded under `--fast`, which leaves the lock
+/// gate-clean and fails `--strict` with the reason the planned target got.
+#[tokio::test]
+async fn fast_mode_lands_less_but_stays_within_policy() -> eyre::Result<()> {
+    let resolver = Resolver::RefuseLower {
+        blocked_from: 5,
+        refused: 4,
+    };
+
+    // The default run falls back to 1.3.0.
+    let CargoFixture {
+        directory: _default_directory,
+        workspace,
+        project,
+    } = fixture(resolver, 4, false)?;
+    let outcome = workspace.upgrade(&RunOpts::default()).await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    assert_eq!(
+        lock(&project)?.get("parent").map(String::as_str),
+        Some("1.3.0")
+    );
+    assert_eq!(fast_notices(&outcome.warnings), Vec::<&str>::new());
+
+    // `--fast` keeps parent where it was and the graph gate-clean.
+    let CargoFixture {
+        directory: _fast_directory,
+        workspace,
+        project,
+    } = fixture(resolver, 4, false)?;
+    let outcome = workspace
+        .upgrade(&RunOpts {
+            strict: true,
+            ..fast()
+        })
+        .await;
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!(outcome.exit, Exit::Policy);
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("parent").map(String::as_str), Some("1.0.0"));
+    assert_eq!(versions.get("child").map(String::as_str), Some("1.0.0"));
+    let parent = outcome
+        .items
+        .iter()
+        .find(|item| item.name == "parent")
+        .ok_or_else(|| eyre::eyre!("missing held parent"))?;
+    assert!(!parent.applied);
+    assert_eq!(
+        parent.skipped.as_ref().map(|skipped| skipped.reason),
+        Some(SkipReason::ResolverConflict)
+    );
+    assert_eq!(fast_notices(&outcome.warnings).len(), 1);
+    assert_clean(&workspace).await;
+    Ok(())
+}
+
+/// `--fast` still lands every candidate that settles: the safe companion of a held parent is
+/// replayed and committed, and nothing is noted when nothing stays held.
+#[tokio::test]
+async fn fast_mode_commits_the_settled_companions() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(
+        Resolver::PersistentParent {
+            companions: 1,
+            lower_conflicts: false,
+        },
+        4,
+        false,
+    )?;
+    let outcome = workspace.upgrade(&fast()).await;
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("parent").map(String::as_str), Some("1.0.0"));
+    assert_eq!(versions.get("safe000").map(String::as_str), Some("1.4.0"));
+    let parent = outcome
+        .items
+        .iter()
+        .find(|item| item.name == "parent")
+        .ok_or_else(|| eyre::eyre!("missing held parent"))?;
+    assert_eq!(
+        parent
+            .skipped
+            .as_ref()
+            .map(|skipped| skipped.message.as_str()),
+        Some("parent is held by requiring holder =1.0.0")
+    );
+    assert_eq!(fast_notices(&outcome.warnings).len(), 1);
+
+    // A run where everything lands has nothing to note.
+    let CargoFixture {
+        directory: _landed_directory,
+        workspace,
+        ..
+    } = fixture(
+        Resolver::SnapshotFamily {
+            pinned_child: false,
+            fresh_sibling: false,
+        },
+        2,
+        true,
+    )?;
+    let outcome = workspace.upgrade(&fast()).await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    assert_eq!(outcome.items.iter().filter(|item| item.applied).count(), 3);
+    assert_eq!(fast_notices(&outcome.warnings), Vec::<&str>::new());
+    Ok(())
+}
+
+/// `--fast` shortens only the forward upgrade batches: the remediation batch that reconciles a
+/// trial's fresh transitives back within policy asks the adapter for the full search.
+#[tokio::test]
+async fn fast_mode_keeps_remediation_batches_exhaustive() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(Resolver::Caret, 4, false)?;
+    let outcome = workspace.upgrade(&fast()).await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    assert_eq!(
+        lock(&project)?.get("parent").map(String::as_str),
+        Some("1.4.0")
+    );
+    let searches = std::fs::read_to_string(project.root.join("searches"))?;
+    assert!(
+        searches.lines().any(|line| line == "fast:parent@1.4.0"),
+        "{searches}"
+    );
+    assert!(
+        searches
+            .lines()
+            .filter(|line| line.contains("child@1.0.0"))
+            .all(|line| line.starts_with("exhaustive:")),
+        "{searches}"
+    );
+    assert!(
+        searches.lines().any(|line| line.contains("child@1.0.0")),
+        "{searches}"
+    );
+    assert_clean(&workspace).await;
+    Ok(())
+}
+
+/// The `--fast` notice names exactly the candidates held at the end: the held major parent, not
+/// the child its deferred second pass still upgrades, and no older version where none exists.
+#[tokio::test]
+async fn fast_mode_notes_only_the_finally_held_candidates() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(Resolver::MajorParent, 1, false)?;
+    let outcome = workspace
+        .upgrade(&RunOpts {
+            allow_major: true,
+            ..fast()
+        })
+        .await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("parent").map(String::as_str), Some("1.0.0"));
+    assert_eq!(versions.get("child").map(String::as_str), Some("1.1.0"));
+    let notices = fast_notices(&outcome.warnings);
+    let [notice] = notices.as_slice() else {
+        eyre::bail!("expected one --fast notice, got {notices:?}");
+    };
+    assert!(notice.ends_with(": parent 1.0.0 → 2.0.0"), "{notice}");
+    assert!(!notice.contains("child"), "{notice}");
+    Ok(())
+}
+
+/// The row reporting `name`, which must exist.
+fn item<'a>(outcome: &'a UpgradeOutcome, name: &str) -> eyre::Result<&'a UpgradeItem> {
+    outcome
+        .items
+        .iter()
+        .find(|item| item.name == name)
+        .ok_or_else(|| eyre::eyre!("no row for {name}: {:?}", outcome.items))
+}
+
+/// An upgrade whose resolve lifts a capped transitive onto its next major is rolled back, and the
+/// candidate is held for the capped package even after every lower target crossed too.
+#[tokio::test]
+async fn a_collateral_major_crossing_holds_its_candidate() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(
+        Resolver::MajorChild {
+            lowest: 1,
+            highest: 99,
+            fresh_major: false,
+            fresh_newest: false,
+            child_start: "1.0.0",
+        },
+        4,
+        false,
+    )?;
+    let outcome = workspace
+        .upgrade(&RunOpts {
+            strict: true,
+            ..RunOpts::default()
+        })
+        .await;
+
+    // A ceiling hold is a deliberate policy hold, so even a strict run passes.
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!(outcome.exit, Exit::Ok);
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("parent").map(String::as_str), Some("1.0.0"));
+    assert_eq!(versions.get("child").map(String::as_str), Some("1.0.0"));
+
+    // The parent reports the capped child as what holds it, and no row claims the child moved.
+    let parent = item(&outcome, "parent")?;
+    assert!(!parent.applied);
+    let skipped = parent.skipped.as_ref().expect("held parent");
+    assert_eq!(skipped.reason, SkipReason::MaxMajorHeld);
+    assert_eq!(skipped.offending.as_deref(), Some("child"));
+    assert!(skipped.message.contains("child"), "{}", skipped.message);
+    assert!(outcome.items.iter().all(|item| !item.applied));
+
+    // Every lower target was tried before the parent was held.
+    let trials = std::fs::read_to_string(project.root.join("trials"))?;
+    for target in ["1.4.0", "1.3.0", "1.2.0", "1.1.0"] {
+        assert!(trials.contains(&format!("parent@{target}")), "{trials}");
+    }
+    Ok(())
+}
+
+/// A lower target whose resolve keeps the capped transitive on its line lands instead.
+#[tokio::test]
+async fn a_collateral_major_crossing_falls_back_to_a_lower_target() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(
+        Resolver::MajorChild {
+            lowest: 4,
+            highest: 99,
+            fresh_major: false,
+            fresh_newest: false,
+            child_start: "1.0.0",
+        },
+        4,
+        false,
+    )?;
+    let outcome = workspace.upgrade(&RunOpts::default()).await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("parent").map(String::as_str), Some("1.3.0"));
+    assert_eq!(versions.get("child").map(String::as_str), Some("1.0.0"));
+    let parent = item(&outcome, "parent")?;
+    assert!(parent.applied);
+    assert_eq!(parent.to, "1.3.0");
+    Ok(())
+}
+
+/// A version the lock already held above its ceiling before the run does not hold an upgrade
+/// that leaves it in place.
+#[tokio::test]
+async fn a_major_crossing_already_in_the_lock_does_not_hold_upgrades() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(
+        Resolver::MajorChild {
+            lowest: 0,
+            highest: 99,
+            fresh_major: false,
+            fresh_newest: false,
+            child_start: "2.0.0",
+        },
+        4,
+        false,
+    )?;
+    let outcome = workspace.upgrade(&RunOpts::default()).await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("parent").map(String::as_str), Some("1.4.0"));
+    assert_eq!(versions.get("child").map(String::as_str), Some("2.0.0"));
+    let parent = item(&outcome, "parent")?;
+    assert!(parent.applied, "{parent:?}");
+    assert_eq!(parent.to, "1.4.0");
+    Ok(())
+}
+
+/// A `fix` downgrade whose resolve lifts a capped transitive onto its next major is rolled back
+/// and held for the capped package, leaving the cooldown violation, so a strict run fails.
+#[tokio::test]
+async fn fix_rolls_back_a_downgrade_that_crosses_a_major_ceiling() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(
+        Resolver::MajorChild {
+            lowest: 0,
+            highest: 3,
+            fresh_major: false,
+            fresh_newest: true,
+            child_start: "1.0.0",
+        },
+        4,
+        false,
+    )?;
+    let outcome = workspace
+        .fix(&RunOpts {
+            strict: true,
+            ..RunOpts::default()
+        })
+        .await;
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!(outcome.exit, Exit::Policy);
+
+    // The downgrade to the matured 1.3.0 was tried, then restored.
+    let trials = std::fs::read_to_string(project.root.join("trials"))?;
+    assert!(trials.contains("parent@1.3.0"), "{trials}");
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("parent").map(String::as_str), Some("1.4.0"));
+    assert_eq!(versions.get("child").map(String::as_str), Some("1.0.0"));
+
+    let parent = item(&outcome, "parent")?;
+    assert!(!parent.applied);
+    let skipped = parent.skipped.as_ref().expect("held parent");
+    assert_eq!(skipped.reason, SkipReason::MaxMajorHeld);
+    assert_eq!(skipped.offending.as_deref(), Some("child"));
+    Ok(())
+}
+
+/// A move the reconcile pass plans from a version only the trial put above the ceiling does not
+/// authorize its target: maturing a fresh `child` 2.1.0 down to 2.0.0 still leaves it above its
+/// cap, so the parent that dragged it there is held.
+#[tokio::test]
+async fn reconciling_a_collateral_crossing_down_does_not_authorize_it() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(
+        Resolver::MajorChild {
+            lowest: 1,
+            highest: 99,
+            fresh_major: true,
+            fresh_newest: false,
+            child_start: "1.0.0",
+        },
+        4,
+        false,
+    )?;
+    let outcome = workspace.upgrade(&RunOpts::default()).await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+
+    // The reconcile pass did mature the fresh child down before the trial was judged.
+    let trials = std::fs::read_to_string(project.root.join("trials"))?;
+    assert!(trials.contains("child@2.0.0"), "{trials}");
+
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("parent").map(String::as_str), Some("1.0.0"));
+    assert_eq!(versions.get("child").map(String::as_str), Some("1.0.0"));
+    let parent = item(&outcome, "parent")?;
+    let skipped = parent.skipped.as_ref().expect("held parent");
+    assert_eq!(skipped.reason, SkipReason::MaxMajorHeld);
+    assert_eq!(skipped.offending.as_deref(), Some("child"));
+    Ok(())
+}
+
+/// A `fix` downgrade of a version the lock already held above its ceiling continues that version,
+/// so it lands although its target is above the ceiling too.
+#[tokio::test]
+async fn fix_matures_a_version_already_above_its_ceiling() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(
+        Resolver::MajorChild {
+            lowest: 0,
+            highest: 99,
+            fresh_major: false,
+            fresh_newest: false,
+            child_start: "2.1.0",
+        },
+        4,
+        false,
+    )?;
+    let outcome = workspace.fix(&RunOpts::default()).await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("child").map(String::as_str), Some("2.0.0"));
+    let child = item(&outcome, "child")?;
+    assert!(child.applied, "{child:?}");
+    assert_eq!(child.to, "2.0.0");
     Ok(())
 }
