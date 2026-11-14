@@ -890,6 +890,7 @@ pub enum TargetFallback {
     /// target keeps its original target in the retries.
     /// The accepted subset is replayed from the restored baseline even when no candidate has a
     /// lower target.
+    /// `upgrade --fast` runs no fallback trial at all and replays the accepted subset directly.
     LowerOnSelectedLine,
     /// The highest adoptable target on the current version's major line, tried only for a
     /// candidate whose planned target crosses to another line.

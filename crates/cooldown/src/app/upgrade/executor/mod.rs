@@ -165,6 +165,18 @@ impl PlanMode {
 /// pathological cycle from looping forever.
 const MAX_FIX_ROUNDS: usize = 12;
 
+/// How far an adapter searches for the targets of one batch (see [`Plan::fast`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetSearch {
+    /// Every combination the adapter knows to try.
+    Exhaustive,
+    /// The shortened search `upgrade --fast` selects for its forward upgrade trials.
+    ///
+    /// Remediation batches never take it, so reconciling a trial back within policy is searched
+    /// as thoroughly as in a full run.
+    Fast,
+}
+
 /// A `fix` downgrade that could not be planned, deferred so the caller emits it only once the
 /// fixpoint settles — a dep held in an early round may become fixable in a later one, so its warning
 /// would be stale if emitted eagerly.
@@ -995,7 +1007,80 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let flow = self.run_lock_upgrade_trials(lock_changes, state).await;
         // Fallback changes target versions, but progress owns the original planned keys.
         self.ctx.progress.candidates_decided(&planned);
+        // A restore conflict leaves no final outcome to describe.
+        if flow.is_continue() {
+            self.note_fast_holds(&planned);
+        }
         flow
+    }
+
+    /// Names the planned candidates that stayed held under `--fast`, which a run without it may
+    /// still land.
+    ///
+    /// Only a writer with [`TargetFallback::LowerOnSelectedLine`] has a search `--fast` shortens:
+    /// its older-version fallback trials are skipped, and the adapter shortens its joint resolves.
+    /// The notice is built from the committed rows, so it names exactly the candidates held at
+    /// the end, whichever trial held them, and none that a replay landed after all.
+    fn note_fast_holds(&mut self, planned: &[Change]) {
+        if !self.ctx.opts.fast
+            || self.ctx.writer.target_fallback() != TargetFallback::LowerOnSelectedLine
+        {
+            return;
+        }
+        let tool = self.ctx.tool_name();
+        let mut held: Vec<String> = Vec::new();
+        for change in planned {
+            let is_held = self.acc.items.iter().any(|item| {
+                item.project == self.project_label
+                    && item.tool == tool
+                    && !item.applied
+                    && item.edge.is_none()
+                    && item.skipped.is_some()
+                    && item.from == change.from.as_str()
+                    && change_target_key_parts(
+                        &item.name,
+                        item.registry.as_deref(),
+                        &item.to,
+                        item.direct,
+                        &item.members,
+                    ) == change_target_key(change)
+            });
+            if !is_held {
+                continue;
+            }
+            let move_label = format!("{} {} → {}", change.package.name, change.from, change.to);
+            let older: Vec<&str> = self
+                .fallback_changes
+                .get(&change_provenance_key(change))
+                .into_iter()
+                .flatten()
+                .map(|alternative| alternative.to.as_str())
+                .collect();
+            let entry = if older.is_empty() {
+                move_label
+            } else {
+                format!(
+                    "{move_label} (older matured versions not tried: {})",
+                    older.join(", ")
+                )
+            };
+            if !held.contains(&entry) {
+                held.push(entry);
+            }
+        }
+        if held.is_empty() {
+            return;
+        }
+        let message = format!(
+            "--fast shortened the upgrade search, so a run without it (`--no-fast`) may still land some of these held candidates or an older matured version of them: {}",
+            held.join("; ")
+        );
+        // A usage note rather than a new diagnostic kind, which would be a JSON schema bump.
+        self.acc.warnings.push(
+            Diagnostic::new(DiagnosticKind::Config, message)
+                .with_tool(tool)
+                .with_project(self.project_label.clone()),
+        );
     }
 
     async fn run_lock_upgrade_trials(
@@ -1501,7 +1586,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         state: &mut TrialState,
         rollback: &mut TrialRollback,
     ) -> UpgradeSelectionResult {
-        if rejected.is_empty() {
+        // `--fast` skips the older-version trials, which can only add to what lands; the replay
+        // that commits the accepted set runs either way, exactly as when no candidate has an
+        // older target.
+        if rejected.is_empty() || self.ctx.opts.fast {
             return UpgradeSelectionResult::Selected { accepted, rejected };
         }
         let candidates = match self
@@ -1759,8 +1847,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         rollback: &mut TrialRollback,
     ) -> UpgradeTrialResult {
         let mut pending = Vec::new();
+        let search = if self.ctx.opts.fast {
+            TargetSearch::Fast
+        } else {
+            TargetSearch::Exhaustive
+        };
         let lock_outcome = self
-            .apply_batch_with_rollback(changes, state, Some(rollback), HashMap::new())
+            .apply_batch_with_rollback(changes, state, Some(rollback), HashMap::new(), search)
             .await;
         // Skip reconciliation when the lock upgrade made no clean forward progress: nothing floated
         // up, and a broken re-lock probe must not be re-hit.
@@ -2730,7 +2823,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .candidates(&changes, "checking cooldown fixes");
             let decided = changes.clone();
             let outcome = self
-                .apply_batch_with_rollback(changes, state, None, notes.into_iter().collect())
+                .apply_batch_with_rollback(
+                    changes,
+                    state,
+                    None,
+                    notes.into_iter().collect(),
+                    TargetSearch::Exhaustive,
+                )
                 .await;
             self.ctx.progress.candidates_decided(&decided);
             let applied = outcome.applied_count();
@@ -2838,6 +2937,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     state,
                     Some(rollback),
                     notes.into_iter().collect(),
+                    TargetSearch::Exhaustive,
                 )
                 .await;
             let applied = outcome.applied_count();
@@ -2883,8 +2983,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// restore and partition a policy-rejected multi-change trial, but this method's outcome remains
     /// invisible to the report until the caller keeps and merges it.
     async fn apply_batch(&mut self, changes: Vec<Change>, state: &TrialState) -> BatchOutcome {
-        self.apply_batch_with_rollback(changes, state, None, HashMap::new())
-            .await
+        self.apply_batch_with_rollback(
+            changes,
+            state,
+            None,
+            HashMap::new(),
+            TargetSearch::Exhaustive,
+        )
+        .await
     }
 
     /// `notes` carries the advisory-rollback warnings parked for this batch's changes, keyed by
@@ -2898,12 +3004,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         state: &TrialState,
         mut rollback: Option<&mut TrialRollback>,
         notes: HashMap<ChangeProvenanceKey, Diagnostic>,
+        search: TargetSearch,
     ) -> BatchOutcome {
         let mut outcome = BatchOutcome::default();
         if changes.is_empty() {
             return outcome;
         }
-        let plan = self.batch_plan(&changes, state);
+        let plan = self.batch_plan(&changes, state, search);
         let primary = changes
             .first()
             .map(|change| change.package.name.clone())
@@ -3019,7 +3126,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         Ok(prepared)
     }
 
-    fn batch_plan(&self, changes: &[Change], state: &TrialState) -> Plan {
+    fn batch_plan(&self, changes: &[Change], state: &TrialState, search: TargetSearch) -> Plan {
         Plan {
             changes: changes.to_vec(),
             evaluated_at: Some(self.ws.now()),
@@ -3044,6 +3151,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .initial_duplicate_snapshot
                 .as_ref()
                 .map(std::sync::Arc::clone),
+            fast: search == TargetSearch::Fast,
         }
     }
 

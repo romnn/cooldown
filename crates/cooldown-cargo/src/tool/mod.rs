@@ -1110,6 +1110,19 @@ impl<'a> WidenProbe<'a> {
         baseline.violation(after, &self.project.generated_members, self.plan)
     }
 
+    /// Every way `after` breaks the [acceptance rule](acceptance) against `baseline`, first to
+    /// last.
+    fn violations<'s>(
+        &self,
+        baseline: &'s ResolveBaseline,
+        after: &'s CargoLock,
+    ) -> impl Iterator<Item = Violation> + 's
+    where
+        'a: 's,
+    {
+        baseline.violations(after, &self.project.generated_members, self.plan)
+    }
+
     fn metadata_mode(&self) -> MemoMetadataMode {
         if self
             .candidates
@@ -1129,6 +1142,76 @@ struct WidenEvidence {
     graph: Option<ResolvedGraph>,
 }
 
+/// Which candidates a joint widen probe leaves out after a resolve breaks the
+/// [acceptance rule](acceptance).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CulpritDrop {
+    /// Those the first violation names, so the next resolve shows whether the rest still break
+    /// the rule without them.
+    First,
+    /// Those every violation of the resolve names, at once (`upgrade --fast`).
+    ///
+    /// It saves a resolve per further culprit, but may leave out a candidate that would have
+    /// landed once an earlier culprit was gone.
+    /// A candidate left out still gets its own per-change attempt.
+    All,
+}
+
+impl CulpritDrop {
+    /// The culprits a joint probe for `plan` drops: all at once under `upgrade --fast`.
+    fn of(plan: &Plan) -> Self {
+        if plan.fast { Self::All } else { Self::First }
+    }
+
+    /// The outcome of a resolve that broke the acceptance rule in `violations`, with the culprits
+    /// this mode drops, or `None` when it broke none.
+    fn violated(self, mut violations: impl Iterator<Item = Violation>) -> Option<GroupResolve> {
+        let violation = violations.next()?;
+        tracing::debug!(%violation, "cargo joint widen broke the acceptance rule");
+        let mut culprits: BTreeSet<String> = violation
+            .culprits()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        // Only a probe that drops them all reads the rest, so only it pays for finding them.
+        if self == Self::All {
+            for further in violations {
+                culprits.extend(further.culprits().into_iter().map(str::to_string));
+            }
+        }
+        Some(GroupResolve::Violated {
+            violation,
+            culprits,
+        })
+    }
+
+    /// The `candidates` a probe retries without after `outcome` refused or violated the group.
+    fn dropped<'c>(self, outcome: GroupResolve, candidates: &[&'c Change]) -> Vec<&'c Change> {
+        match outcome {
+            GroupResolve::Refused { parties, chain } => {
+                refused_candidates(candidates, &parties, &chain)
+            }
+            // A violation that names the planned crates whose own moves broke the rule retries
+            // without them like a refusal naming them.
+            GroupResolve::Violated {
+                violation,
+                culprits,
+            } => match self {
+                Self::First => violation
+                    .split_culprits(candidates)
+                    .map(|split| split.named)
+                    .unwrap_or_default(),
+                Self::All => candidates
+                    .iter()
+                    .copied()
+                    .filter(|change| culprits.contains(&change.package.name))
+                    .collect(),
+            },
+            GroupResolve::Resolved(_) | GroupResolve::Discarded => Vec::new(),
+        }
+    }
+}
+
 /// The outcome of resolving one widened group.
 enum GroupResolve {
     /// The group resolved within the acceptance rule.
@@ -1140,7 +1223,13 @@ enum GroupResolve {
         chain: BTreeSet<String>,
     },
     /// The resolve broke the acceptance rule.
-    Violated(Violation),
+    Violated {
+        /// The first way it broke the rule.
+        violation: Violation,
+        /// The planned crates the violations the resolve's [`CulpritDrop`] selects name as
+        /// culprits: the first violation's, or every violation's.
+        culprits: BTreeSet<String>,
+    },
     /// The resolve moved a seeded package to a version the plan does not name, or the seed could
     /// not be written.
     Discarded,
@@ -1150,7 +1239,7 @@ impl GroupResolve {
     fn into_evidence(self) -> Option<WidenEvidence> {
         match self {
             Self::Resolved(evidence) => Some(*evidence),
-            Self::Refused { .. } | Self::Violated(_) | Self::Discarded => None,
+            Self::Refused { .. } | Self::Violated { .. } | Self::Discarded => None,
         }
     }
 }
@@ -2125,6 +2214,7 @@ impl CargoTool {
             journal,
             observer,
         };
+        let culprit_drop = CulpritDrop::of(plan);
         // Carry post-command evidence between rounds; another unlocked preflight could displace it.
         let mut round = WidenRound::new(project, &plan.changes, graph)?;
         for _ in 0..plan.changes.len() {
@@ -2146,6 +2236,7 @@ impl CargoTool {
                         protected: &round.protected,
                         ..scope
                     },
+                    culprit_drop,
                     stats,
                 )
                 .await?
@@ -2228,6 +2319,7 @@ impl CargoTool {
     async fn joint_widen_probe(
         &self,
         probe: WidenProbe<'_>,
+        culprit_drop: CulpritDrop,
         stats: &mut WholeGraphStats,
     ) -> Result<Option<WidenEvidence>> {
         if probe.candidates.is_empty() {
@@ -2248,22 +2340,14 @@ impl CargoTool {
         // A candidate dropped wrongly only falls back to its own attempt.
         // Each retry drops at least one candidate, which bounds the loop by the group size.
         let resolved = loop {
-            match self.resolve_widened_group(&probe, &candidates, &[]).await? {
+            match self
+                .resolve_widened_group(&probe, &candidates, &[], culprit_drop)
+                .await?
+            {
                 GroupResolve::Resolved(evidence) => break Some(*evidence),
                 GroupResolve::Discarded => break None,
-                outcome @ (GroupResolve::Refused { .. } | GroupResolve::Violated(_)) => {
-                    let dropped = match outcome {
-                        GroupResolve::Refused { parties, chain } => {
-                            refused_candidates(&candidates, &parties, &chain)
-                        }
-                        // A violation that names the planned crates whose own moves broke the
-                        // rule retries without them like a refusal naming them.
-                        GroupResolve::Violated(violation) => violation
-                            .split_culprits(&candidates)
-                            .map(|split| split.named)
-                            .unwrap_or_default(),
-                        GroupResolve::Resolved(_) | GroupResolve::Discarded => Vec::new(),
-                    };
+                outcome @ (GroupResolve::Refused { .. } | GroupResolve::Violated { .. }) => {
+                    let dropped = culprit_drop.dropped(outcome, &candidates);
                     if dropped.is_empty() || dropped.len() == candidates.len() {
                         break None;
                     }
@@ -2320,7 +2404,7 @@ impl CargoTool {
         // Evidence from the full probe cannot authorize A without the failed B's edits.
         // Rebuild the subset from the checkpoint and resolve exactly those edits again.
         let replayed = self
-            .resolve_widened_group(&probe, &reached, &[])
+            .resolve_widened_group(&probe, &reached, &[], culprit_drop)
             .await?
             .into_evidence();
         if let Some(replayed) = replayed
@@ -2340,11 +2424,15 @@ impl CargoTool {
 
     /// Widens and seeds `candidates` together and resolves them in one step, also releasing the
     /// locked nodes `released` names so they may move wherever the candidates need them.
+    ///
+    /// A step that breaks the acceptance rule reports the culprits of the violations
+    /// `culprit_drop` selects.
     async fn resolve_widened_group(
         &self,
         probe: &WidenProbe<'_>,
         candidates: &[&Change],
         released: &[PackageKey],
+        culprit_drop: CulpritDrop,
     ) -> Result<GroupResolve> {
         let baseline =
             ResolveBaseline::capture(&read_lock(probe.project)?, &probe.project.generated_members);
@@ -2434,9 +2522,8 @@ impl CargoTool {
             tracing::debug!("cargo joint widen moved a seeded package to an unplanned version");
             return Ok(GroupResolve::Discarded);
         }
-        if let Some(violation) = probe.violation(&baseline, &lock) {
-            tracing::debug!(%violation, "cargo joint widen broke the acceptance rule");
-            return Ok(GroupResolve::Violated(violation));
+        if let Some(violated) = culprit_drop.violated(probe.violations(&baseline, &lock)) {
+            return Ok(violated);
         }
         Ok(GroupResolve::Resolved(Box::new(WidenEvidence {
             versions: lock.crates_io_locked_versions(),
@@ -2498,7 +2585,7 @@ impl CargoTool {
             let owners: Vec<&Change> = coalition.iter().chain(probe.protected).copied().collect();
             let checkpoint = widen_checkpoint(probe.project, &owners, probe.followers)?;
             let outcome = self
-                .resolve_widened_group(probe, &coalition, released)
+                .resolve_widened_group(probe, &coalition, released, CulpritDrop::First)
                 .await?;
             tracing::debug!(
                 change = ?rejection_key(change),
@@ -2515,7 +2602,7 @@ impl CargoTool {
                 {
                     return Ok(SplitCompletion::Landed(evidence));
                 }
-                GroupResolve::Violated(violation) => {
+                GroupResolve::Violated { violation, .. } => {
                     restore_widen_checkpoint(probe.project, probe.journal, &checkpoint)?;
                     let Some(next) = violation.heal() else {
                         break;

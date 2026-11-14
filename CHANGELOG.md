@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **`upgrade --fast` trades optimality for speed.** A Cargo `upgrade --major` on a large workspace
+  spent most of its time retrying held candidates at older versions that rarely landed, and
+  dropping one culprit per full resolve when a joint widen broke the acceptance rule. `--fast`
+  (config `fast = true` under `[global]` or `[upgrade]`) skips those older-version retries and
+  drops every culprit of a resolve at once. Every landed version still passes the same gates, so
+  fewer upgrades may land but never an unchecked one, and a `config` warning names the candidates
+  that stayed held and the older versions not tried. `--no-fast` overrides the config. A run
+  without the flag searches exactly as before.
+
 - **A uv upgrade held by the project's own constraint names that constraint.** A package held
   by `[tool.uv] constraint-dependencies` or `override-dependencies`, such as `onnxruntime==1.31.0`,
   was reported as conflicting with whichever package happened to pull it in, even when that

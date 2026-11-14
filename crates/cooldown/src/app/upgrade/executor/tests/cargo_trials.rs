@@ -442,19 +442,10 @@ impl ToolWrite for FakeCargo {
         }
         let mut versions = lock(project)?;
         let baseline = versions.get("parent").cloned().unwrap_or_default();
-        let mut record = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(project.root.join("trials"))?;
-        writeln!(
-            record,
-            "{baseline}:{}",
-            plan.changes
-                .iter()
-                .map(|change| format!("{}@{}", change.package.name, change.to))
-                .collect::<Vec<_>>()
-                .join(",")
-        )?;
+        log_batch(&project.root.join("trials"), &baseline, plan)?;
+        // Which search each batch asked for, apart from `trials` so their expectations stay put.
+        let search = if plan.fast { "fast" } else { "exhaustive" };
+        log_batch(&project.root.join("searches"), search, plan)?;
         let mut skipped = Vec::new();
         let mut applied = Vec::new();
         if let Resolver::PersistentParent {
@@ -542,6 +533,24 @@ impl ToolWrite for FakeCargo {
             detail: String::new(),
         })
     }
+}
+
+/// Appends `label` and the batch's targets as one line to the log at `path`.
+fn log_batch(path: &Utf8Path, label: &str, plan: &Plan) -> cooldown_core::Result<()> {
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(
+        log,
+        "{label}:{}",
+        plan.changes
+            .iter()
+            .map(|change| format!("{}@{}", change.package.name, change.to))
+            .collect::<Vec<_>>()
+            .join(",")
+    )?;
+    Ok(())
 }
 
 struct CargoFixture {
@@ -1596,5 +1605,243 @@ async fn original_candidates_are_decided_after_landing_fallback_or_hold() -> eyr
         );
         assert_eq!(progress.decided_candidates(), 2, "{:?}", preview.items);
     }
+    Ok(())
+}
+
+/// The `--fast` run options.
+fn fast() -> RunOpts {
+    RunOpts {
+        fast: true,
+        ..RunOpts::default()
+    }
+}
+
+/// The Config notices `--fast` adds for the candidates it left held.
+fn fast_notices(warnings: &[cooldown_core::Diagnostic]) -> Vec<&str> {
+    warnings
+        .iter()
+        .filter(|warning| {
+            warning.kind == cooldown_core::DiagnosticKind::Config
+                && warning.message.starts_with("--fast")
+        })
+        .map(|warning| warning.message.as_str())
+        .collect()
+}
+
+/// `--fast` tries only the planned target of a held candidate, never its older matured versions,
+/// and names the versions it left untried.
+#[tokio::test]
+async fn fast_mode_skips_the_lower_targets_and_names_them() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(Resolver::ExactFrom(3), 6, false)?;
+    let before = std::fs::read(project.root.join("Cargo.lock"))?;
+    let outcome = workspace.upgrade(&fast()).await;
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+
+    // Only the planned target was tried, and the lock is untouched.
+    let trials = std::fs::read_to_string(project.root.join("trials"))?;
+    assert!(trials.contains("parent@1.6.0"), "{trials}");
+    for version in ["1.5.0", "1.4.0", "1.3.0"] {
+        assert!(!trials.contains(&format!("parent@{version}")), "{trials}");
+    }
+    assert_eq!(std::fs::read(project.root.join("Cargo.lock"))?, before);
+
+    // The held row keeps the reason its planned target got.
+    let parent = outcome
+        .items
+        .iter()
+        .find(|item| item.name == "parent")
+        .ok_or_else(|| eyre::eyre!("missing held parent"))?;
+    assert!(!parent.applied);
+    assert!(parent.skipped.is_some());
+
+    // One notice names the held candidate and the older versions a full run would try.
+    let notices = fast_notices(&outcome.warnings);
+    let [notice] = notices.as_slice() else {
+        eyre::bail!("expected one --fast notice, got {notices:?}");
+    };
+    assert!(notice.contains("--no-fast"), "{notice}");
+    assert!(
+        notice.contains(
+            "parent 1.0.0 → 1.6.0 (older matured versions not tried: 1.5.0, 1.4.0, 1.3.0)"
+        ),
+        "{notice}"
+    );
+    Ok(())
+}
+
+/// A lower target the default run lands stays unlanded under `--fast`, which leaves the lock
+/// gate-clean and fails `--strict` with the reason the planned target got.
+#[tokio::test]
+async fn fast_mode_lands_less_but_stays_within_policy() -> eyre::Result<()> {
+    let resolver = Resolver::RefuseLower {
+        blocked_from: 5,
+        refused: 4,
+    };
+
+    // The default run falls back to 1.3.0.
+    let CargoFixture {
+        directory: _default_directory,
+        workspace,
+        project,
+    } = fixture(resolver, 4, false)?;
+    let outcome = workspace.upgrade(&RunOpts::default()).await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    assert_eq!(
+        lock(&project)?.get("parent").map(String::as_str),
+        Some("1.3.0")
+    );
+    assert_eq!(fast_notices(&outcome.warnings), Vec::<&str>::new());
+
+    // `--fast` keeps parent where it was and the graph gate-clean.
+    let CargoFixture {
+        directory: _fast_directory,
+        workspace,
+        project,
+    } = fixture(resolver, 4, false)?;
+    let outcome = workspace
+        .upgrade(&RunOpts {
+            strict: true,
+            ..fast()
+        })
+        .await;
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!(outcome.exit, Exit::Policy);
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("parent").map(String::as_str), Some("1.0.0"));
+    assert_eq!(versions.get("child").map(String::as_str), Some("1.0.0"));
+    let parent = outcome
+        .items
+        .iter()
+        .find(|item| item.name == "parent")
+        .ok_or_else(|| eyre::eyre!("missing held parent"))?;
+    assert!(!parent.applied);
+    assert_eq!(
+        parent.skipped.as_ref().map(|skipped| skipped.reason),
+        Some(SkipReason::ResolverConflict)
+    );
+    assert_eq!(fast_notices(&outcome.warnings).len(), 1);
+    assert_clean(&workspace).await;
+    Ok(())
+}
+
+/// `--fast` still lands every candidate that settles: the safe companion of a held parent is
+/// replayed and committed, and nothing is noted when nothing stays held.
+#[tokio::test]
+async fn fast_mode_commits_the_settled_companions() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(
+        Resolver::PersistentParent {
+            companions: 1,
+            lower_conflicts: false,
+        },
+        4,
+        false,
+    )?;
+    let outcome = workspace.upgrade(&fast()).await;
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("parent").map(String::as_str), Some("1.0.0"));
+    assert_eq!(versions.get("safe000").map(String::as_str), Some("1.4.0"));
+    let parent = outcome
+        .items
+        .iter()
+        .find(|item| item.name == "parent")
+        .ok_or_else(|| eyre::eyre!("missing held parent"))?;
+    assert_eq!(
+        parent
+            .skipped
+            .as_ref()
+            .map(|skipped| skipped.message.as_str()),
+        Some("parent is held by requiring holder =1.0.0")
+    );
+    assert_eq!(fast_notices(&outcome.warnings).len(), 1);
+
+    // A run where everything lands has nothing to note.
+    let CargoFixture {
+        directory: _landed_directory,
+        workspace,
+        ..
+    } = fixture(
+        Resolver::SnapshotFamily {
+            pinned_child: false,
+            fresh_sibling: false,
+        },
+        2,
+        true,
+    )?;
+    let outcome = workspace.upgrade(&fast()).await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    assert_eq!(outcome.items.iter().filter(|item| item.applied).count(), 3);
+    assert_eq!(fast_notices(&outcome.warnings), Vec::<&str>::new());
+    Ok(())
+}
+
+/// `--fast` shortens only the forward upgrade batches: the remediation batch that reconciles a
+/// trial's fresh transitives back within policy asks the adapter for the full search.
+#[tokio::test]
+async fn fast_mode_keeps_remediation_batches_exhaustive() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(Resolver::Caret, 4, false)?;
+    let outcome = workspace.upgrade(&fast()).await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    assert_eq!(
+        lock(&project)?.get("parent").map(String::as_str),
+        Some("1.4.0")
+    );
+    let searches = std::fs::read_to_string(project.root.join("searches"))?;
+    assert!(
+        searches.lines().any(|line| line == "fast:parent@1.4.0"),
+        "{searches}"
+    );
+    assert!(
+        searches
+            .lines()
+            .filter(|line| line.contains("child@1.0.0"))
+            .all(|line| line.starts_with("exhaustive:")),
+        "{searches}"
+    );
+    assert!(
+        searches.lines().any(|line| line.contains("child@1.0.0")),
+        "{searches}"
+    );
+    assert_clean(&workspace).await;
+    Ok(())
+}
+
+/// The `--fast` notice names exactly the candidates held at the end: the held major parent, not
+/// the child its deferred second pass still upgrades, and no older version where none exists.
+#[tokio::test]
+async fn fast_mode_notes_only_the_finally_held_candidates() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(Resolver::MajorParent, 1, false)?;
+    let outcome = workspace
+        .upgrade(&RunOpts {
+            allow_major: true,
+            ..fast()
+        })
+        .await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("parent").map(String::as_str), Some("1.0.0"));
+    assert_eq!(versions.get("child").map(String::as_str), Some("1.1.0"));
+    let notices = fast_notices(&outcome.warnings);
+    let [notice] = notices.as_slice() else {
+        eyre::bail!("expected one --fast notice, got {notices:?}");
+    };
+    assert!(notice.ends_with(": parent 1.0.0 → 2.0.0"), "{notice}");
+    assert!(!notice.contains("child"), "{notice}");
     Ok(())
 }

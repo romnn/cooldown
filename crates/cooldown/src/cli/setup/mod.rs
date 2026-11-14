@@ -71,6 +71,11 @@ impl SetupCommand {
         matches!(self, Self::Outdated)
     }
 
+    /// Whether the command runs the upgrade search that `fast` may shorten.
+    const fn shortens_search(self) -> bool {
+        matches!(self, Self::Upgrade)
+    }
+
     const fn is_check(self) -> bool {
         matches!(self, Self::Check)
     }
