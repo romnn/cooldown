@@ -23,7 +23,7 @@ pub struct Records {
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::Io`] when the file cannot be opened or its first bytes cannot be read.
+/// Returns [`CoreError::Filesystem`] when the file cannot be opened or its first bytes cannot be read.
 pub fn records(path: &Path) -> Result<Records, CoreError> {
     Ok(Records {
         path: path.to_owned(),
