@@ -17,13 +17,16 @@
 //! - Offline resolution chooses from the crates downloaded so far, which other processes change.
 //!
 //! Only staged copies take part, and only while every package Cargo loads lies in the copy's
-//! private tree.
+//! private tree and Cargo reads no configuration from outside it (see
+//! [`StagedTrees::reusable_inputs`]).
 //! cooldown stages regular files there and writes nothing but the lock and manifests the key
 //! captures, so the target files Cargo discovers stay as staged, and a package or target source
 //! outside the tree, which anything may change, makes a command run instead.
 //! An outcome is reused only in the directory it was recorded in, whose paths its output names.
 
-use std::collections::{HashMap, VecDeque};
+mod staged;
+
+use std::collections::VecDeque;
 use std::process::Output;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -37,15 +40,15 @@ use crate::cargocmd::{
 };
 use crate::locked_reads::{LockedReader, LockedReads};
 use crate::publish_age::{CargoEnvironment, parse_age};
-use crate::rejection_memo::{LockSource, MemoKey, MemoOperation, RejectionMemo};
+use crate::rejection_memo::{LockSource, MemoOperation, RejectionMemo};
+
+pub(crate) use staged::{StagedInputs, StagedTrees};
 
 /// The recorded outcomes of the run, least recently used first.
 #[derive(Debug)]
 pub(crate) struct CommandOutcomes {
     store: Mutex<Store>,
     budget: Budget,
-    /// The private tree of each registered staged project root.
-    trees: Mutex<HashMap<Utf8PathBuf, Utf8PathBuf>>,
 }
 
 /// What [`CommandOutcomes`] keeps at most.
@@ -111,7 +114,7 @@ impl Recorded {
 struct CommandKey {
     /// The directory Cargo runs in, which its output and diagnostics name.
     root: Utf8PathBuf,
-    inputs: MemoKey,
+    inputs: StagedInputs,
     /// The arguments as spawned, the crates.io publish-age override included.
     args: Vec<String>,
 }
@@ -151,26 +154,7 @@ impl CommandOutcomes {
         Self {
             store: Mutex::new(Store::default()),
             budget,
-            trees: Mutex::new(HashMap::new()),
         }
-    }
-
-    /// Registers `staged` as a staged project root whose copy lives in the canonical directory
-    /// `tree`, which only cooldown writes.
-    pub(crate) fn register_staged(&self, staged: &Utf8Path, tree: &Utf8Path) {
-        self.trees
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(staged.to_owned(), tree.to_owned());
-    }
-
-    /// The private tree of the staged project root `root`, if it was registered.
-    fn tree(&self, root: &Utf8Path) -> Option<Utf8PathBuf> {
-        self.trees
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(root)
-            .cloned()
     }
 
     fn get(&self, key: &CommandKey, needs: Needs) -> Option<Arc<Outcome>> {
@@ -215,6 +199,8 @@ pub(crate) struct MemoizedCargo<'a> {
     pub(crate) cargo: &'a Cargo,
     pub(crate) memo: &'a RejectionMemo,
     pub(crate) outcomes: &'a CommandOutcomes,
+    /// The run's staged copies, the only places outcomes are reused in.
+    pub(crate) trees: &'a StagedTrees,
     /// The run's locked reads, which a resolve that left the lock as it was feeds.
     pub(crate) reads: &'a LockedReads,
     /// Whether outcomes are recorded and replayed at all, which the rejection memo's switch
@@ -370,7 +356,7 @@ impl MemoizedCargo<'_> {
         let started = Instant::now();
         let output = self.cargo.spawn(&project.root, &command.args).await?;
         let elapsed = started.elapsed();
-        let settled = key.and_then(|key| self.settle(project, key, &output));
+        let settled = key.and_then(|key| self.settle(project, &command, key, &output));
         let (lock, record) = match settled {
             Some(Settled { lock, key }) => (lock, Some(key)),
             None => (LockAfter::Unchanged, None),
@@ -402,7 +388,7 @@ impl MemoizedCargo<'_> {
         &self,
         project: &Project,
         args: &[&str],
-        inputs: &MemoKey,
+        inputs: &StagedInputs,
         outcome: &Outcome,
     ) {
         let unchanged = matches!(outcome.lock, LockAfter::Unchanged);
@@ -413,6 +399,7 @@ impl MemoizedCargo<'_> {
         let reader = LockedReader {
             cargo: self.cargo,
             memo: self.memo,
+            trees: self.trees,
             reads: self.reads,
         };
         reader.keep_settled(
@@ -447,72 +434,50 @@ impl MemoizedCargo<'_> {
         if !self.enabled {
             return None;
         }
-        let tree = self.outcomes.tree(&project.root)?;
-        if !stable_resolution(
-            &project.root,
-            &CargoEnvironment::current(),
-            command.crates_io_age.as_deref(),
-        ) {
-            return None;
-        }
         let lock = read_lock(&project.root).ok()?;
-        let inputs = self.inputs(project, &tree, lock.clone())?;
+        let inputs = self.inputs(project, command, lock.clone())?;
         Some(PendingKey {
             key: CommandKey {
                 root: project.root.clone(),
                 inputs,
                 args: command.args.clone(),
             },
-            tree,
             lock,
         })
     }
 
-    /// The key of `project`'s native inputs with `lock` as its lock, or `None` when they cannot
-    /// all be captured or Cargo would load a package or target source outside `tree`.
-    fn inputs(&self, project: &Project, tree: &Utf8Path, lock: Option<Vec<u8>>) -> Option<MemoKey> {
-        let inputs = self
-            .memo
-            .command_inputs(project, LockSource::Contents(lock))
-            .inspect_err(|err| tracing::debug!(%err, "cargo command memo input capture bypassed"))
-            .ok()?;
-        if !inputs.key.is_cacheable() {
-            return None;
-        }
-        let private = inputs.manifests.iter().all(|manifest| {
-            within(&manifest.directory, tree)
-                && declared_targets(&manifest.directory, &manifest.document)
-                    .iter()
-                    .all(|target| within(target, tree))
-        });
-        if !private {
-            tracing::debug!(
-                dir = %project.root,
-                "cargo command memo bypassed because a package or target source lies outside the staged copy"
-            );
-            return None;
-        }
-        Some(inputs.key)
+    /// The inputs of `command` run in `project` with `lock` as its lock, or `None` when its
+    /// outcome is not reusable (see [`StagedTrees::reusable_inputs`]).
+    fn inputs(
+        &self,
+        project: &Project,
+        command: &CommandLine,
+        lock: Option<Vec<u8>>,
+    ) -> Option<StagedInputs> {
+        self.trees
+            .reusable_inputs(self.memo, project, command, LockSource::Contents(lock))
     }
 
     /// The lock a command left behind and the key to record it under, when its outcome is
     /// reusable: a success or a resolver refusal, after which every input but the lock stands as
     /// it was keyed.
-    fn settle(&self, project: &Project, pending: PendingKey, output: &Output) -> Option<Settled> {
+    fn settle(
+        &self,
+        project: &Project,
+        command: &CommandLine,
+        pending: PendingKey,
+        output: &Output,
+    ) -> Option<Settled> {
         let reproducible =
             output.status.success() || memoizable_resolver_rejection(&self.cargo.failure(output));
         if !reproducible {
             return None;
         }
-        let PendingKey {
-            key,
-            tree,
-            lock: before,
-        } = pending;
+        let PendingKey { key, lock: before } = pending;
         let after = read_lock(&project.root).ok()?;
         // The inputs are captured again with the lock the command started from, so the lock the
         // command itself wrote is the only change they tolerate.
-        if self.inputs(project, &tree, before.clone())? != key.inputs {
+        if self.inputs(project, command, before.clone())? != key.inputs {
             return None;
         }
         let lock = if after == before {
@@ -525,11 +490,9 @@ impl MemoizedCargo<'_> {
     }
 }
 
-/// A key computed before a command ran, with the private tree it was checked against and the lock
-/// it was computed from.
+/// A key computed before a command ran, with the lock it was computed from.
 struct PendingKey {
     key: CommandKey,
-    tree: Utf8PathBuf,
     lock: Option<Vec<u8>>,
 }
 
@@ -537,43 +500,6 @@ struct PendingKey {
 struct Settled {
     lock: LockAfter,
     key: CommandKey,
-}
-
-/// Whether `path`, with every symbolic link resolved, lies in `tree`; `false` when it does not
-/// exist.
-fn within(path: &Utf8Path, tree: &Utf8Path) -> bool {
-    std::fs::canonicalize(path)
-        .ok()
-        .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
-        .is_some_and(|path| path.starts_with(tree))
-}
-
-/// The path a target table of a manifest names, if any.
-fn path_of(table: &toml::Value) -> Option<&str> {
-    table.get("path").and_then(toml::Value::as_str)
-}
-
-/// The target sources the manifest `document` in `directory` names by path.
-///
-/// A target named without a path is inferred from the package directory itself.
-fn declared_targets(directory: &Utf8Path, document: &toml::Value) -> Vec<Utf8PathBuf> {
-    let mut paths: Vec<&str> = Vec::new();
-    paths.extend(document.get("lib").and_then(path_of));
-    for kind in ["bin", "example", "test", "bench"] {
-        let tables = document.get(kind).and_then(toml::Value::as_array);
-        paths.extend(tables.into_iter().flatten().filter_map(path_of));
-    }
-    match document
-        .get("package")
-        .and_then(|package| package.get("build"))
-    {
-        Some(toml::Value::String(build)) => paths.push(build),
-        Some(toml::Value::Array(builds)) => {
-            paths.extend(builds.iter().filter_map(toml::Value::as_str));
-        }
-        _ => {}
-    }
-    paths.into_iter().map(|path| directory.join(path)).collect()
 }
 
 fn lock_path(root: &Utf8Path) -> Utf8PathBuf {

@@ -569,8 +569,8 @@ async fn a_replayed_pin_is_judged_against_the_plan_of_its_step() -> eyre::Result
         .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
     fixture
         .tool
-        .command_outcomes
-        .register_staged(&fixture.project.root, &tree);
+        .staged_trees
+        .register(&fixture.project.root, &tree);
     let planned = change("pkg", "1.0.0", "1.2.0", false);
     let collateral = change("declared", "1.0.0", "0.9.0", true);
     let alone = [planned.clone()];

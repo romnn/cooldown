@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Cargo reads of a project's own files are no longer reused.** A `cargo metadata --locked` read
+  was reused within a run while the manifests, lock and configuration stayed the same. In the
+  project itself, Cargo also reads target files that this check missed, such as a removed
+  `src/<name>.rs`, a deleted symlink target or a path dependency that gained a library, so a later
+  read could return a stale graph or stale-lock refusal. Reads and replayed commands are now reused
+  only in cooldown's private staged copies, and only while no Cargo configuration from outside the
+  copy applies. `check` runs one more `cargo metadata` per Cargo project.
+
 - **A rolled-back Go upgrade restores the workspace's `go.work`.** In a `go.work` workspace,
   `go get` raises the workspace's `go` directive when an upgrade needs a newer Go. When cooldown
   then rejected the trial, for example because it would move a commit pin, it restored `go.mod`
