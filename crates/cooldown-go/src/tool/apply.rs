@@ -52,6 +52,9 @@ pub(super) async fn apply(
             .collect();
         match go.get_many(&project.root, &targets).await {
             Ok(()) => break,
+            // A `go` that was killed or ran in a broken environment may have printed a conflict, but
+            // it proves nothing, so that failure propagates as the environment failure it is.
+            Err(err) if err.is_local_environment_failure() => return Err(err),
             Err(CoreError::Tool { stderr, .. }) if isolation.settle(&stderr) => {}
             Err(err) => return Err(err),
         }
@@ -972,7 +975,8 @@ mod tests {
 
     /// The scripted `go`: `go mod edit -json` prints `before` until `go mod tidy` switches it to
     /// `tidied`. The n-th `go get` (counting from 1) fails with `failures[n - 1]` as its stderr while
-    /// one is given, and succeeds after that. Every `go get` logs its arguments, one run per line.
+    /// one is given, and succeeds after that. A failing run exits with status 1, unless a
+    /// `get.<n>.status` file names another. Every `go get` logs its arguments, one run per line.
     #[cfg(unix)]
     fn scripted_gets(
         before: &str,
@@ -1003,7 +1007,10 @@ mod tests {
                     echo "$run" > gets.count
                     shift
                     echo "$*" >> gets.log
-                    if [ -f "get.$run.stderr" ]; then cat "get.$run.stderr" >&2; exit 1; fi ;;
+                    if [ -f "get.$run.stderr" ]; then
+                      cat "get.$run.stderr" >&2
+                      exit "$(cat "get.$run.status" 2>/dev/null || echo 1)"
+                    fi ;;
                   *) exit 1 ;;
                 esac
             "#},
@@ -1413,6 +1420,43 @@ mod tests {
                 "example.com/m v0.21.0 -> v0.22.0"
             ]
         );
+        Ok(())
+    }
+
+    /// A `go` killed after printing a conflict it could settle proves nothing, so the failure
+    /// propagates as an environment failure and no retry runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_killed_resolve_propagates_its_failure() -> color_eyre::eyre::Result<()> {
+        let before = go_mod_json(
+            &[
+                direct("example.com/x", "v1.0.0"),
+                direct("example.com/d", "v1.0.0"),
+            ],
+            &[],
+        );
+        let scripted = scripted_gets(
+            &before,
+            &before,
+            &["go: example.com/x@v1.2.0 requires example.com/d@v1.3.0, not example.com/d@v1.1.0\n"],
+        )?;
+        // Exit status 143 is a SIGTERM delivered through a shell.
+        std::fs::write(scripted.project.root.join("get.1.status"), "143")?;
+        let plan = plan_of(vec![
+            forward("example.com/x", "v1.0.0", "v1.2.0", true),
+            forward("example.com/d", "v1.0.0", "v1.1.0", true),
+        ]);
+        let journal = mutation::mutation_journal(&scripted.project.root, &plan)?;
+
+        let result = apply(&scripted.go, &scripted.project, &plan, &journal).await;
+
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(CoreError::is_local_environment_failure),
+            "{result:?}"
+        );
+        assert_eq!(get_runs(&scripted)?.len(), 1);
         Ok(())
     }
 }

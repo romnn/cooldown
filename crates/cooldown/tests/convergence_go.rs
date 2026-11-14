@@ -740,11 +740,17 @@ fn an_indirect_module_follows_a_requirer_that_needs_it_newer() {
     assert!(report.ok(), "{report:?}");
     assert_eq!(report.summary_errors(), 0, "{report:?}");
     let pins = go_mod_pins(&fixture.read_bytes("go.mod"));
-    assert_eq!(pins.get(OTEL_SDK_METRIC).map(String::as_str), Some("v1.19.0"));
+    assert_eq!(
+        pins.get(OTEL_SDK_METRIC).map(String::as_str),
+        Some("v1.19.0")
+    );
     assert_eq!(pins.get(OTEL_METRIC).map(String::as_str), Some("v1.19.0"));
     // The requirer is not held, and the indirect module's dropped v0 target is a conservative skip
     // beside its real move.
-    assert!(report.skipped_reasons_for(OTEL_SDK_METRIC).is_empty(), "{report:?}");
+    assert!(
+        report.skipped_reasons_for(OTEL_SDK_METRIC).is_empty(),
+        "{report:?}"
+    );
     assert_eq!(
         report.skipped_reasons_for(OTEL_METRIC),
         std::collections::BTreeSet::from(["not_eligible".to_string()])
