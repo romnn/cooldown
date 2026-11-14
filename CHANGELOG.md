@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Cargo upgrades no longer rerun a command whose inputs are unchanged.** An upgrade often runs
+  the same `cargo update` or `cargo metadata` again from byte-identical manifests and lock, for
+  example when a later pass retries a pin, or when Cargo completed a pin that the upgrade then
+  refused. cooldown now replays the earlier command's exit status, output and resulting
+  `Cargo.lock`, and judges the replayed result against the current plan exactly as before, so the
+  results are unchanged. Commands always run when an index-independent input could make them
+  resolve differently, such as a positive publish age or offline mode. `--no-memo` and `--fresh`
+  turn the replay off.
+
 - **Registry connections no longer trust distrusted intermediate certificates.** cooldown's TLS
   stack now uses `rustls-webpki` 0.103.16 and `webpki-root-certs` 1.0.11, which fix
   RUSTSEC-2026-0382 and RUSTSEC-2026-0383.

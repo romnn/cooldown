@@ -540,10 +540,10 @@ pub(in crate::cli) struct GlobalArgs {
     /// Cache only; cache misses become `UnknownAge` (never a false "ok").
     #[arg(long, global = true, env = "COOLDOWN_OFFLINE")]
     pub(in crate::cli) offline: bool,
-    /// Ignore the HTTP cache and Cargo rejection memo; always hit the registry (use in CI gates).
+    /// Ignore the HTTP cache and Cargo memos; always hit the registry (use in CI gates).
     #[arg(long, global = true, visible_alias = "no-cache")]
     pub(in crate::cli) fresh: bool,
-    /// Disable Cargo rejection memoization while retaining HTTP caching.
+    /// Disable Cargo's reuse of rejections and command outcomes while retaining HTTP caching.
     #[arg(long, global = true, env = "COOLDOWN_NO_MEMO")]
     pub(in crate::cli) no_memo: bool,
     /// How many registry requests to run concurrently — sets both the fan-out width and the

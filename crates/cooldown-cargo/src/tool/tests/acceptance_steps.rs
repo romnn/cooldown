@@ -550,3 +550,61 @@ async fn a_reachable_path_crates_declared_dependency_still_holds() -> eyre::Resu
     assert_eq!(detail, "would move directly declared leaf 1.0.0 to 1.2.0");
     Ok(())
 }
+
+/// A pin replayed from the outcome Cargo returned before is judged again under the plan of the
+/// step that replays it: the same native result is refused while it moves a declared crate the
+/// plan leaves alone, and lands once the plan moves that crate there too.
+#[tokio::test]
+async fn a_replayed_pin_is_judged_against_the_plan_of_its_step() -> eyre::Result<()> {
+    let fixture = DeclaredFixture::new(DECLARING, "1.2.0")?;
+    fixture
+        .tool
+        .rejection_memo
+        .register_origin(&fixture.project.root, &fixture.project.root)?;
+    fixture
+        .tool
+        .command_outcomes
+        .register_staged(&fixture.project.root, &fixture.project.root);
+    let planned = change("pkg", "1.0.0", "1.2.0", false);
+    let collateral = change("declared", "1.0.0", "0.9.0", true);
+    let alone = [planned.clone()];
+    let together = [planned.clone(), collateral];
+    let journal = fixture
+        .tool
+        .mutation_journal(&fixture.project, &DeclaredFixture::plan(&planned))
+        .await?;
+    let pin = |plan| {
+        fixture.tool.update_precise(
+            PinScope {
+                project: &fixture.project,
+                plan,
+                journal: &journal,
+                observer: None,
+            },
+            &planned,
+            "1.0.0",
+        )
+    };
+
+    // The plan of the pin alone refuses the move of `declared` and restores the lock.
+    let refused = pin(&alone).await?;
+    assert!(
+        matches!(&refused, PrecisePinOutcome::Rejected { detail: Some(detail), .. }
+            if detail == "would move directly declared declared 1.0.0 to 0.9.0"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        fixture.read("Cargo.lock")?,
+        lock(DECLARING, "1.0.0", "1.0.0")
+    );
+
+    // The plan that moves `declared` too keeps the replayed landing, without running Cargo again.
+    let landed = pin(&together).await?;
+    assert!(matches!(landed, PrecisePinOutcome::Completed), "{landed:?}");
+    assert_eq!(
+        fixture.read("Cargo.lock")?,
+        lock(DECLARING, "1.2.0", "0.9.0")
+    );
+    assert_eq!(fixture.read("invocations")?.lines().count(), 1);
+    Ok(())
+}

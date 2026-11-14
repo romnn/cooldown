@@ -5,6 +5,7 @@
 //! the repository window back as that age.
 
 pub mod cargocmd;
+mod command_memo;
 mod edges;
 pub mod index;
 mod locked_reads;
