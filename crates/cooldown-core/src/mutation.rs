@@ -5,10 +5,28 @@ use camino::{Utf8Path, Utf8PathBuf};
 use sha2::{Digest as _, Sha256};
 
 /// The project-bound pre-change state a planned mutation may rewrite.
+///
+/// Entries are project-relative, except for shared files captured through
+/// [`capture_with_external`](Self::capture_with_external) outside the project root, which are
+/// recorded under their canonical absolute path.
 #[derive(Debug, Clone)]
 pub struct ProjectMutationJournal {
     project: ProjectMutationRoot,
     files: Vec<ProjectMutationFile>,
+    shared: Vec<SharedMutationFile>,
+}
+
+/// A file outside the project's ownership that a mutation may rewrite, such as a Go workspace's
+/// `go.work`, bound to the directory it was resolved in.
+#[derive(Debug, Clone)]
+struct SharedMutationFile {
+    /// The file as the caller named it, whose directory is resolved again on every validation so
+    /// a retargeted symbolic link in it is refused like a replaced project root.
+    named: Utf8PathBuf,
+    /// The canonical parent directory and its filesystem identity.
+    parent: ProjectMutationRoot,
+    /// The canonical path of the file, which [`ProjectMutationJournal::shared_files`] reports.
+    path: Utf8PathBuf,
 }
 
 /// The post-apply state observed at a rollback boundary.
@@ -105,6 +123,17 @@ impl ProjectMutationState {
     /// project lease may govern their resolved target.
     /// Existing multiply-linked files are rejected for the same reason.
     pub fn capture(root: &Utf8Path, write_set: &ProjectMutationJournal) -> Result<Self> {
+        // A shared file outside the project has no position under another root.
+        if let Some(file) = write_set
+            .files
+            .iter()
+            .find(|file| !safe_mutation_path(&file.path))
+        {
+            return Err(CoreError::LockConflict(format!(
+                "cannot capture shared file {} under another project root",
+                file.path
+            )));
+        }
         let project = ProjectMutationRoot::capture(root)?;
         let files = write_set
             .files
@@ -545,12 +574,63 @@ impl ProjectMutationJournal {
         I: IntoIterator<Item = P>,
         P: AsRef<Utf8Path>,
     {
+        Self::capture_with_external(root, paths, std::iter::empty::<&Utf8Path>())
+    }
+
+    /// Captures a project-bound journal whose write set also covers shared files that may live
+    /// outside the project root, such as a Go workspace's `go.work` in an ancestor directory.
+    ///
+    /// Each `external` path is absolute and is resolved by [`canonical_shared_file`].
+    /// A file that lands inside the project root joins the write set under its project-relative
+    /// path, unless `paths` already names it; any other file joins it under its canonical
+    /// absolute path.
+    /// Either way the journal binds the file's parent directory, so [`Self::validate_project`]
+    /// and every restore refuse a parent that was replaced or whose spelling now resolves
+    /// elsewhere.
+    /// [`Self::shared_files`] reports every external file, wherever it landed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::capture`], plus [`CoreError::Filesystem`] when an external
+    /// path is relative or names no file, and a filesystem error when its parent directory cannot
+    /// be resolved.
+    /// External files follow the same rules as `paths`: a symbolic link, special file, or
+    /// multiply-linked file is rejected, and so is a symbolic-link ancestor of the resolved path.
+    pub fn capture_with_external<I, P, E, Q>(root: &Utf8Path, paths: I, external: E) -> Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Utf8Path>,
+        E: IntoIterator<Item = Q>,
+        Q: AsRef<Utf8Path>,
+    {
         let project = ProjectMutationRoot::capture(root)?;
-        let files = paths
+        let mut files = paths
             .into_iter()
-            .map(|path| ProjectMutationFile::capture(project.path(), path.as_ref()))
+            .map(|path| {
+                let path = path.as_ref();
+                if !safe_mutation_path(path) {
+                    return Err(CoreError::Filesystem(format!(
+                        "refusing unsafe project-relative mutation path `{path}`"
+                    )));
+                }
+                ProjectMutationFile::capture(project.path(), path)
+            })
             .collect::<Result<Vec<_>>>()?;
-        Self::from_bound_snapshot(project, files)
+        let mut shared: Vec<SharedMutationFile> = Vec::new();
+        for path in external {
+            let file = SharedMutationFile::capture(path.as_ref())?;
+            let entry = match file.path.strip_prefix(project.path()) {
+                Ok(relative) => relative.to_owned(),
+                Err(_) => file.path.clone(),
+            };
+            if files.iter().all(|existing| existing.path != entry) {
+                files.push(ProjectMutationFile::capture(project.path(), &entry)?);
+            }
+            if shared.iter().all(|existing| existing.path != file.path) {
+                shared.push(file);
+            }
+        }
+        Self::from_bound_snapshot(project, files, shared)
     }
 
     /// Binds validated portable snapshots to one project restore authority.
@@ -564,15 +644,21 @@ impl ProjectMutationJournal {
     /// invalid.
     /// Writable paths with a symbolic-link ancestor or final entry are rejected, as are existing
     /// multiply-linked files.
+    /// Portable snapshots are project-relative, so an absolute entry is rejected too.
     pub fn from_snapshot(root: &Utf8Path, files: Vec<ProjectMutationFile>) -> Result<Self> {
-        Self::from_bound_snapshot(ProjectMutationRoot::capture(root)?, files)
+        Self::from_bound_snapshot(ProjectMutationRoot::capture(root)?, files, Vec::new())
     }
 
     fn from_bound_snapshot(
         project: ProjectMutationRoot,
         files: Vec<ProjectMutationFile>,
+        shared: Vec<SharedMutationFile>,
     ) -> Result<Self> {
-        if !valid_mutation_files(&files) {
+        // An absolute entry is legitimate only as a shared file this journal binds.
+        let unbound = files.iter().any(|file| {
+            file.path.is_absolute() && shared.iter().all(|shared| shared.path != file.path)
+        });
+        if unbound || !valid_mutation_files(&files) {
             return Err(CoreError::Filesystem(
                 "mutation journal contains an unsafe, duplicate, or inconsistent project file"
                     .to_string(),
@@ -581,7 +667,11 @@ impl ProjectMutationJournal {
         for file in &files {
             validate_mutation_target(project.path(), &file.path)?;
         }
-        Ok(ProjectMutationJournal { project, files })
+        Ok(ProjectMutationJournal {
+            project,
+            files,
+            shared,
+        })
     }
 
     /// The ordered captured entries in this journal's write set.
@@ -590,13 +680,43 @@ impl ProjectMutationJournal {
         &self.files
     }
 
+    /// The canonical paths of the shared files this journal covers, in capture order.
+    ///
+    /// These are the files captured through [`Self::capture_with_external`], including one that
+    /// lies inside the project root and was journaled under its relative path.
+    /// Each path is spelled as [`canonical_shared_file`] spells it, so a caller that leases these
+    /// files can compare its own resolution with them directly.
+    pub fn shared_files(&self) -> impl Iterator<Item = &Utf8Path> {
+        self.shared.iter().map(|shared| shared.path.as_path())
+    }
+
+    /// The shared files as [`Self::capture_with_external`] was handed them, in the order of
+    /// [`Self::shared_files`].
+    ///
+    /// A tool that resolves paths relative to the file, as `go` resolves a `go.work`'s `use`
+    /// entries, must be handed this spelling rather than the canonical one: through a symbolic
+    /// link in its directory, `../lib` names another directory than it does from the target.
+    /// [`Self::validate_project`] checks that this spelling still resolves to the captured
+    /// directory.
+    pub fn shared_files_as_named(&self) -> impl Iterator<Item = &Utf8Path> {
+        self.shared.iter().map(|shared| shared.named.as_path())
+    }
+
+    /// Checks that every shared file's parent directory is still the one captured.
+    fn validate_shared(&self) -> Result<()> {
+        self.shared
+            .iter()
+            .try_for_each(SharedMutationFile::validate)
+    }
+
     /// Checks that this journal still belongs to `root` and has a safe writable topology.
     ///
     /// # Errors
     ///
     /// Returns [`CoreError::LockConflict`] when `root` names another project, its directory was
-    /// replaced after journal capture, a writable ancestor is no longer a regular directory, or a
-    /// final target became a symbolic link, special file, or multiply-linked regular file.
+    /// replaced after journal capture, a shared file's parent directory was replaced or now
+    /// resolves elsewhere, a writable ancestor is no longer a regular directory, or a final target
+    /// became a symbolic link, special file, or multiply-linked regular file.
     pub fn validate_project(&self, root: &Utf8Path) -> Result<()> {
         let live = ProjectMutationRoot::capture(root).map_err(|error| {
             CoreError::LockConflict(format!(
@@ -604,6 +724,7 @@ impl ProjectMutationJournal {
             ))
         })?;
         self.project.ensure_same(&live)?;
+        self.validate_shared()?;
         for file in &self.files {
             validate_mutation_target(self.project.path(), &file.path).map_err(|error| {
                 CoreError::LockConflict(format!(
@@ -619,9 +740,20 @@ impl ProjectMutationJournal {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::LockConflict`] when the journals belong to different projects.
+    /// Returns [`CoreError::LockConflict`] when the journals belong to different projects, or
+    /// when they bind one shared file path to two different parent directories.
     pub fn extend_missing(&mut self, other: &ProjectMutationJournal) -> Result<()> {
         self.project.ensure_same(&other.project)?;
+        for shared in &other.shared {
+            match self
+                .shared
+                .iter()
+                .find(|existing| existing.path == shared.path)
+            {
+                Some(existing) => existing.parent.ensure_same(&shared.parent)?,
+                None => self.shared.push(shared.clone()),
+            }
+        }
         for file in &other.files {
             if self.files.iter().all(|existing| existing.path != file.path) {
                 self.files.push(file.clone());
@@ -630,7 +762,7 @@ impl ProjectMutationJournal {
         Ok(())
     }
 
-    /// Capture the current contents of one project-relative file.
+    /// Capture the current contents of one write-set entry.
     ///
     /// Missing files are recorded as `None`, which tells [`restore`](Self::restore) to remove them
     /// if a trial created them.
@@ -651,6 +783,7 @@ impl ProjectMutationJournal {
     /// be read safely.
     pub fn capture_state(&self) -> Result<ProjectMutationState> {
         self.project.validate_live()?;
+        self.validate_shared()?;
         let files = self
             .files
             .iter()
@@ -718,6 +851,7 @@ impl ProjectMutationJournal {
     fn restore_if_unchanged_inner(&self, expected: &ProjectMutationState) -> Result<()> {
         self.project.ensure_same(&expected.project)?;
         self.project.validate_live()?;
+        self.validate_shared()?;
         let root = self.project.path();
         if !matching_write_sets(&self.files, &expected.files) || !valid_mutation_files(&self.files)
         {
@@ -785,6 +919,7 @@ impl ProjectMutationJournal {
 
     fn restore_inner(&self) -> Result<()> {
         self.project.validate_live()?;
+        self.validate_shared()?;
         if !valid_mutation_files(&self.files) {
             return Err(CoreError::Filesystem(
                 "mutation journal contains an unsafe or duplicate project path".to_string(),
@@ -806,7 +941,11 @@ impl ProjectMutationFile {
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return ProjectMutationFile::from_snapshot(rel.to_owned(), None, None);
+                return Ok(ProjectMutationFile {
+                    path: rel.to_owned(),
+                    contents: None,
+                    permissions: None,
+                });
             }
             Err(error) => return Err(error.into()),
         };
@@ -847,11 +986,11 @@ impl ProjectMutationFile {
             },
             &bytes,
         );
-        ProjectMutationFile::from_snapshot(
-            rel.to_owned(),
-            Some(bytes),
-            Some(final_opened.permissions()),
-        )
+        Ok(ProjectMutationFile {
+            path: rel.to_owned(),
+            contents: Some(bytes),
+            permissions: Some(final_opened.permissions()),
+        })
     }
 }
 
@@ -901,6 +1040,81 @@ impl ProjectMutationRoot {
             )))
         }
     }
+}
+
+impl SharedMutationFile {
+    fn capture(path: &Utf8Path) -> Result<Self> {
+        let (named_parent, _) = split_shared_file(path)?;
+        let parent = ProjectMutationRoot::capture(named_parent)?;
+        let canonical = canonical_shared_file(path)?;
+        // Resolving the parent twice leaves a window in which it could be retargeted.
+        if canonical.parent() != Some(parent.path()) {
+            return Err(CoreError::LockConflict(format!(
+                "{named_parent} changed while cooldown resolved a shared mutation file"
+            )));
+        }
+        Ok(SharedMutationFile {
+            named: path.to_owned(),
+            parent,
+            path: canonical,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.parent.validate_live()?;
+        let (named_parent, _) = split_shared_file(&self.named)?;
+        let live = ProjectMutationRoot::capture(named_parent).map_err(|error| {
+            CoreError::LockConflict(format!(
+                "could not revalidate the directory of shared mutation file {}: {error}",
+                self.path
+            ))
+        })?;
+        self.parent.ensure_same(&live)
+    }
+}
+
+/// Resolves the absolute path of a shared mutation file to the one spelling every cooldown
+/// process derives for it.
+///
+/// The parent directory is canonicalized.
+/// When the file exists as a regular file, its name is taken from the filesystem too, so on a
+/// case-insensitive volume `GO.WORK` and `go.work` resolve to the same path.
+/// Any other final entry keeps the given name: a symbolic link is not followed, so a journal
+/// still refuses it rather than writing through it.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Filesystem`] when `path` is relative or names no file, a filesystem error
+/// when its parent directory cannot be resolved, and [`CoreError::PathEncoding`] when the
+/// resolved path is not valid UTF-8.
+pub fn canonical_shared_file(path: &Utf8Path) -> Result<Utf8PathBuf> {
+    let (parent, name) = split_shared_file(path)?;
+    let joined = canonical_utf8(parent)?.join(name);
+    match std::fs::symlink_metadata(&joined) {
+        Ok(metadata) if metadata.file_type().is_file() => canonical_utf8(&joined),
+        Ok(_) => Ok(joined),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(joined),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn split_shared_file(path: &Utf8Path) -> Result<(&Utf8Path, &str)> {
+    match (path.is_absolute(), path.parent(), path.file_name()) {
+        (true, Some(parent), Some(name)) => Ok((parent, name)),
+        _ => Err(CoreError::Filesystem(format!(
+            "a shared mutation file needs an absolute file path, got `{path}`"
+        ))),
+    }
+}
+
+fn canonical_utf8(path: &Utf8Path) -> Result<Utf8PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    Utf8PathBuf::from_path_buf(canonical).map_err(|path| {
+        CoreError::PathEncoding(format!(
+            "shared mutation path is not valid UTF-8: {}",
+            path.display()
+        ))
+    })
 }
 
 fn projected_files(
@@ -1054,12 +1268,13 @@ fn matching_write_sets(left: &[ProjectMutationFile], right: &[ProjectMutationFil
 fn valid_mutation_files(files: &[ProjectMutationFile]) -> bool {
     let mut paths = std::collections::BTreeSet::new();
     files.iter().all(|file| {
-        safe_mutation_path(&file.path)
+        safe_journal_path(&file.path)
             && file.contents.is_some() == file.permissions.is_some()
             && paths.insert(file.path.as_str())
     })
 }
 
+/// Whether `path` is a project-relative path made only of normal components.
 fn safe_mutation_path(path: &Utf8Path) -> bool {
     !path.as_str().is_empty()
         && !path.is_absolute()
@@ -1068,8 +1283,23 @@ fn safe_mutation_path(path: &Utf8Path) -> bool {
             .all(|component| matches!(component, camino::Utf8Component::Normal(_)))
 }
 
+/// Whether `path` is a valid journal entry: project-relative, or the canonical absolute path of a
+/// shared file, which has no `.` or `..` component either.
+fn safe_journal_path(path: &Utf8Path) -> bool {
+    if !path.is_absolute() {
+        return safe_mutation_path(path);
+    }
+    let mut components = path.components().peekable();
+    if let Some(camino::Utf8Component::Prefix(_)) = components.peek() {
+        components.next();
+    }
+    components.next() == Some(camino::Utf8Component::RootDir)
+        && components.peek().is_some()
+        && components.all(|component| matches!(component, camino::Utf8Component::Normal(_)))
+}
+
 fn validate_mutation_ancestors(root: &Utf8Path, path: &Utf8Path) -> Result<()> {
-    if !safe_mutation_path(path) {
+    if !safe_journal_path(path) {
         return Err(CoreError::Filesystem(format!(
             "refusing unsafe project-relative mutation path `{path}`"
         )));
@@ -1077,12 +1307,28 @@ fn validate_mutation_ancestors(root: &Utf8Path, path: &Utf8Path) -> Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    let mut current = root.to_owned();
+    // A shared file's absolute path is checked from the filesystem root, so every directory
+    // above it must be a real directory, as every directory between a project root and its own
+    // files must be.
+    let mut current = if path.is_absolute() {
+        Utf8PathBuf::new()
+    } else {
+        root.to_owned()
+    };
     for component in parent.components() {
-        let camino::Utf8Component::Normal(component) = component else {
-            return Err(CoreError::Filesystem(format!(
-                "refusing unsafe project-relative mutation path `{path}`"
-            )));
+        let component = match component {
+            camino::Utf8Component::Normal(component) => component,
+            camino::Utf8Component::Prefix(_) | camino::Utf8Component::RootDir
+                if path.is_absolute() =>
+            {
+                current.push(component);
+                continue;
+            }
+            _ => {
+                return Err(CoreError::Filesystem(format!(
+                    "refusing unsafe project-relative mutation path `{path}`"
+                )));
+            }
         };
         current.push(component);
         match std::fs::symlink_metadata(&current) {
@@ -1597,6 +1843,209 @@ mod mutation_journal_tests {
             std::fs::read_to_string(external_root.join("Cargo.toml"))?,
             "external"
         );
+        Ok(())
+    }
+
+    /// A temporary workspace directory holding a `go.work` and the project directory below it,
+    /// the layout of a Go module that is one member of a workspace.
+    struct SharedLayout {
+        _directory: tempfile::TempDir,
+        workspace: Utf8PathBuf,
+        project: Utf8PathBuf,
+    }
+
+    fn shared_layout() -> eyre::Result<SharedLayout> {
+        let directory = tempfile::tempdir()?;
+        let workspace = canonical_utf8(&root(&directory)?)?;
+        let project = workspace.join("app");
+        std::fs::create_dir_all(&project)?;
+        std::fs::write(project.join("go.mod"), "module app\n")?;
+        std::fs::write(workspace.join("go.work"), "go 1.24.0\n")?;
+        Ok(SharedLayout {
+            _directory: directory,
+            workspace,
+            project,
+        })
+    }
+
+    /// A shared file outside the project joins the write set under its canonical absolute path,
+    /// so a checked rollback restores the edited one and removes the one the trial created.
+    #[test]
+    fn checked_restore_reverts_shared_files_outside_the_project() -> eyre::Result<()> {
+        let layout = shared_layout()?;
+        let work = layout.workspace.join("go.work");
+        let created = layout.workspace.join("other.work");
+        let journal = ProjectMutationJournal::capture_with_external(
+            &layout.project,
+            ["go.mod"],
+            [&work, &created],
+        )?;
+
+        // Both shared files are journaled and reported by their canonical paths.
+        let entries: Vec<&str> = journal
+            .files()
+            .iter()
+            .map(|file| file.path().as_str())
+            .collect();
+        assert_eq!(entries, ["go.mod", work.as_str(), created.as_str()]);
+        let shared: Vec<&Utf8Path> = journal.shared_files().collect();
+        assert_eq!(shared, [work.as_path(), created.as_path()]);
+
+        // A trial raises the workspace and creates a second shared file.
+        std::fs::write(&work, "go 1.26.0\n")?;
+        std::fs::write(&created, "candidate")?;
+        let expected = journal.capture_state()?;
+        journal.restore_if_unchanged(&expected)?;
+
+        assert_eq!(std::fs::read_to_string(&work)?, "go 1.24.0\n");
+        assert!(!created.exists());
+        Ok(())
+    }
+
+    /// A shared file inside the project joins the write set once, under its relative path, yet
+    /// still counts as shared.
+    #[test]
+    fn a_shared_file_inside_the_project_is_journaled_relative() -> eyre::Result<()> {
+        let layout = shared_layout()?;
+        std::fs::write(layout.project.join("go.work"), "go 1.24.0\n")?;
+        let work = layout.project.join("go.work");
+
+        let journal = ProjectMutationJournal::capture_with_external(
+            &layout.project,
+            ["go.mod", "go.work"],
+            [&work],
+        )?;
+
+        let entries: Vec<&str> = journal
+            .files()
+            .iter()
+            .map(|file| file.path().as_str())
+            .collect();
+        assert_eq!(entries, ["go.mod", "go.work"]);
+        let shared: Vec<&Utf8Path> = journal.shared_files().collect();
+        assert_eq!(shared, [work.as_path()]);
+        Ok(())
+    }
+
+    /// A shared file's directory replaced after capture voids the journal's authority over it:
+    /// revalidation and rollback both refuse, and the replacement is left alone.
+    #[test]
+    fn a_replaced_shared_directory_is_a_conflict() -> eyre::Result<()> {
+        let layout = shared_layout()?;
+        let directory = layout.workspace.join("shared");
+        std::fs::create_dir_all(&directory)?;
+        let work = directory.join("go.work");
+        std::fs::write(&work, "original")?;
+        let journal =
+            ProjectMutationJournal::capture_with_external(&layout.project, ["go.mod"], [&work])?;
+        let expected = journal.capture_state()?;
+
+        std::fs::rename(&directory, layout.workspace.join("shared.old"))?;
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(&work, "replacement")?;
+
+        std::assert_matches!(
+            journal.validate_project(&layout.project),
+            Err(CoreError::LockConflict(_))
+        );
+        std::assert_matches!(
+            journal.restore_if_unchanged(&expected),
+            Err(CoreError::LockConflict(_))
+        );
+        assert_eq!(std::fs::read_to_string(&work)?, "replacement");
+        Ok(())
+    }
+
+    /// The directory a shared file was named through is resolved again on every validation, so
+    /// retargeting a symbolic link in that spelling is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_retargeted_shared_directory_spelling_is_a_conflict() -> eyre::Result<()> {
+        let layout = shared_layout()?;
+        let other = layout.workspace.join("other");
+        std::fs::create_dir_all(&other)?;
+        std::fs::write(other.join("go.work"), "other")?;
+        let alias = layout.workspace.join("alias");
+        std::os::unix::fs::symlink(&layout.workspace, &alias)?;
+        let journal = ProjectMutationJournal::capture_with_external(
+            &layout.project,
+            ["go.mod"],
+            [alias.join("go.work")],
+        )?;
+        journal.validate_project(&layout.project)?;
+
+        std::fs::remove_file(&alias)?;
+        std::os::unix::fs::symlink(&other, &alias)?;
+
+        std::assert_matches!(
+            journal.validate_project(&layout.project),
+            Err(CoreError::LockConflict(_))
+        );
+        Ok(())
+    }
+
+    /// A shared file that is a symbolic link is refused like any other journaled link, even when
+    /// it points into the project.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_shared_file_is_refused() -> eyre::Result<()> {
+        let layout = shared_layout()?;
+        std::fs::write(layout.project.join("go.work"), "go 1.24.0\n")?;
+        std::fs::remove_file(layout.workspace.join("go.work"))?;
+        std::os::unix::fs::symlink(
+            layout.project.join("go.work"),
+            layout.workspace.join("go.work"),
+        )?;
+
+        let result = ProjectMutationJournal::capture_with_external(
+            &layout.project,
+            ["go.mod"],
+            [layout.workspace.join("go.work")],
+        );
+
+        std::assert_matches!(result, Err(CoreError::Filesystem(_)));
+        Ok(())
+    }
+
+    /// Shared files never leave the journal that bound them: a portable snapshot, a capture under
+    /// another root, and a plain capture all refuse an absolute path.
+    #[test]
+    fn absolute_entries_stay_inside_the_binding_journal() -> eyre::Result<()> {
+        let layout = shared_layout()?;
+        let work = layout.workspace.join("go.work");
+        let journal =
+            ProjectMutationJournal::capture_with_external(&layout.project, ["go.mod"], [&work])?;
+
+        std::assert_matches!(
+            ProjectMutationJournal::from_snapshot(&layout.project, journal.files().to_vec()),
+            Err(CoreError::Filesystem(_))
+        );
+        let copy = tempfile::tempdir()?;
+        std::assert_matches!(
+            ProjectMutationState::capture(&root(&copy)?, &journal),
+            Err(CoreError::LockConflict(_))
+        );
+        std::assert_matches!(
+            ProjectMutationJournal::capture(&layout.project, [&work]),
+            Err(CoreError::Filesystem(_))
+        );
+        std::assert_matches!(
+            ProjectMutationJournal::capture_with_external(&layout.project, ["go.mod"], ["go.work"]),
+            Err(CoreError::Filesystem(_))
+        );
+        Ok(())
+    }
+
+    /// On a case-insensitive volume two spellings of one file resolve to one shared path, which
+    /// is what keys its lease.
+    #[cfg(windows)]
+    #[test]
+    fn shared_file_spellings_resolve_to_the_on_disk_name() -> eyre::Result<()> {
+        let layout = shared_layout()?;
+        let lower = canonical_shared_file(&layout.workspace.join("go.work"))?;
+        let upper = canonical_shared_file(&layout.workspace.join("GO.WORK"))?;
+        assert_eq!(lower, upper);
+        assert_eq!(lower.file_name(), Some("go.work"));
         Ok(())
     }
 }

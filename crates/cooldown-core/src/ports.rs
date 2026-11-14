@@ -986,6 +986,9 @@ pub trait ToolWrite: Send + Sync {
     /// if the trial is rejected or if `apply` fails after mutating files.
     /// The journal is scoped to this exact `project` and `plan`, so adapters should capture the
     /// smallest file set they may rewrite under `project.root`.
+    /// A file outside the project the apply may rewrite, such as a shared workspace file, is
+    /// captured through [`ProjectMutationJournal::capture_with_external`] and named by
+    /// [`shared_write_files`](ToolWrite::shared_write_files).
     /// [`PreparedMutation::prepare`] binds the journal to the project and plan before handing the
     /// resulting capability to [`apply`](ToolWrite::apply).
     ///
@@ -997,6 +1000,26 @@ pub trait ToolWrite: Send + Sync {
         project: &Project,
         plan: &Plan,
     ) -> Result<ProjectMutationJournal>;
+
+    /// Names the files outside `project`'s own ownership that its mutations may rewrite, such as
+    /// a Go workspace's `go.work` that sibling projects share.
+    ///
+    /// A run that mutates the project in place leases each file for the whole project run,
+    /// before any journal is captured, so two cooldown processes never trial one shared file at
+    /// once.
+    /// Every file a [`mutation_journal`](ToolWrite::mutation_journal) declares through
+    /// [`ProjectMutationJournal::capture_with_external`] must be among these, or the run refuses
+    /// the mutation; paths are absolute and compared after
+    /// [`canonical_shared_file`](crate::canonical_shared_file).
+    /// The default names none.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`] if the adapter cannot determine the files, such as when the tool
+    /// that reports them fails.
+    async fn shared_write_files(&self, _project: &Project) -> Result<Vec<camino::Utf8PathBuf>> {
+        Ok(Vec::new())
+    }
 
     /// Captures the read-only files every trial of this mutation is judged against, such as
     /// manifests the adapter must not write but whose declarations bind the resolve, and any fact

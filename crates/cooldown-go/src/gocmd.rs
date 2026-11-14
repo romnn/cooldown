@@ -151,12 +151,25 @@ fn restore_unchanged(path: &Utf8Path, snapshot: Option<&[u8]>) {
 #[derive(Clone)]
 pub struct Go {
     bin: String,
+    workspace: WorkspaceBinding,
+}
+
+/// Which workspace file the driver's `go` commands use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WorkspaceBinding {
+    /// Whatever `go` discovers, from `GOWORK` or a `go.work` above the command's directory.
+    Discovered,
+    /// No workspace: `GOWORK=off`.
+    Off,
+    /// Exactly this workspace file.
+    File(Utf8PathBuf),
 }
 
 impl Default for Go {
     fn default() -> Self {
         Go {
             bin: std::env::var("COOLDOWN_GO").unwrap_or_else(|_| "go".to_string()),
+            workspace: WorkspaceBinding::Discovered,
         }
     }
 }
@@ -180,7 +193,26 @@ impl Go {
     /// The scripts are shell scripts, so only Unix tests use it.
     #[cfg(all(test, unix))]
     pub(crate) fn with_program(bin: impl Into<String>) -> Self {
-        Go { bin: bin.into() }
+        Go {
+            bin: bin.into(),
+            workspace: WorkspaceBinding::Discovered,
+        }
+    }
+
+    /// This driver with every command bound to `workspace`, or to no workspace at all
+    /// (`GOWORK=off`) for `None`, whatever `go` would discover on its own.
+    ///
+    /// A mutation binds its commands to the workspace file its journal captured, so `go` cannot
+    /// write a workspace the journal does not cover, such as a `go.work` created above the
+    /// project after the capture.
+    #[must_use]
+    pub fn bound_to_workspace(&self, workspace: Option<&Utf8Path>) -> Self {
+        Go {
+            bin: self.bin.clone(),
+            workspace: workspace.map_or(WorkspaceBinding::Off, |file| {
+                WorkspaceBinding::File(file.to_owned())
+            }),
+        }
     }
 
     async fn output(
@@ -206,6 +238,15 @@ impl Go {
             // a single space instead: present in the environment, yet holding no flags.
             .env("GOFLAGS", " ")
             .current_dir(dir.as_std_path());
+        match &self.workspace {
+            WorkspaceBinding::Discovered => {}
+            WorkspaceBinding::Off => {
+                command.env("GOWORK", "off");
+            }
+            WorkspaceBinding::File(file) => {
+                command.env("GOWORK", file.as_std_path());
+            }
+        }
         let result = supervised_output(&mut command, &self.bin, || {
             format!("{} {}", self.bin, args.join(" "))
         })
@@ -432,10 +473,10 @@ impl Go {
     ///
     /// Returns [`CoreError::ToolSpawn`] if `go` fails to spawn, or [`CoreError::Tool`] if it exits
     /// non-zero.
-    pub async fn workspace_file(&self, dir: &Utf8Path) -> Result<Option<String>, CoreError> {
+    pub async fn workspace_file(&self, dir: &Utf8Path) -> Result<Option<Utf8PathBuf>, CoreError> {
         let stdout = self.run(dir, &["env", "GOWORK"]).await?;
         let value = stdout.trim();
-        Ok((!value.is_empty() && value != "off").then(|| value.to_string()))
+        Ok((!value.is_empty() && value != "off").then(|| Utf8PathBuf::from(value)))
     }
 
     /// `go mod edit -json`: Go's own parse of the project's `go.mod`, as JSON.

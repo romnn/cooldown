@@ -25,6 +25,11 @@ pub(super) async fn apply(
     if plan.changes.is_empty() {
         return Ok(report);
     }
+    // Every command runs against the workspace the journal captured, or none, so `go get` can
+    // only rewrite a `go.work` the caller can roll back and has leased.
+    // It is named as `go env GOWORK` named it, since `go` resolves the `use` entries against
+    // that spelling.
+    let go = &go.bound_to_workspace(journal.shared_files_as_named().next());
 
     // The pre-apply `go.mod` requires, read before the re-resolve touches the file (the journal holds
     // the same bytes for restoring). The whole-graph `go get` emits one consistent `go.mod`; the
@@ -714,7 +719,7 @@ mod tests {
                 case "$1 $2" in
                   "mod edit") cat go.mod.json ;;
                   "mod tidy") cp go.mod.tidied.json go.mod.json ;;
-                  get\ *) ;;
+                  get\ *) printf '%s\n' "${GOWORK-unset}" >> gowork.log ;;
                   *) exit 1 ;;
                 esac
             "#},
@@ -755,7 +760,7 @@ mod tests {
     async fn a_commit_pin_that_tidy_moves_rejects_the_apply() -> color_eyre::eyre::Result<()> {
         let scripted = scripted_project(&tidied_go_mod(OTHER_COMMIT, "v1.0.0", "v0.21.2"))?;
         let plan = plan_moving("example.com/upgraded");
-        let journal = mutation::mutation_journal(&scripted.project.root, &plan)?;
+        let journal = mutation::mutation_journal(&scripted.project.root, &plan, None)?;
 
         let result = apply(&scripted.go, &scripted.project, &plan, &journal).await;
 
@@ -773,6 +778,33 @@ mod tests {
         Ok(())
     }
 
+    /// `go get` runs against exactly the workspace the journal captured, and with no workspace
+    /// at all when the journal captured none, whatever `go` would discover on its own.
+    /// The workspace keeps the spelling it was named by, since `go` resolves relative `use`
+    /// entries against it, and through a symbolic link `../lib` names another directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_get_is_bound_to_the_journaled_workspace() -> color_eyre::eyre::Result<()> {
+        let scripted = scripted_project(&tidied_go_mod(PINNED, "v1.0.0", "v0.21.2"))?;
+        let plan = plan_moving("example.com/upgraded");
+        let directory = tempfile::tempdir()?;
+        let base = camino::Utf8PathBuf::from_path_buf(std::fs::canonicalize(directory.path())?)
+            .map_err(|path| color_eyre::eyre::eyre!("non-UTF-8 path {}", path.display()))?;
+        std::fs::create_dir_all(base.join("real"))?;
+        std::fs::write(base.join("real/go.work"), "go 1.24.0\n")?;
+        std::os::unix::fs::symlink(base.join("real"), base.join("alias"))?;
+        let work = base.join("alias/go.work");
+
+        let unbound = mutation::mutation_journal(&scripted.project.root, &plan, None)?;
+        apply(&scripted.go, &scripted.project, &plan, &unbound).await?;
+        let bound = mutation::mutation_journal(&scripted.project.root, &plan, Some(&work))?;
+        apply(&scripted.go, &scripted.project, &plan, &bound).await?;
+
+        let log = std::fs::read_to_string(scripted.project.root.join("gowork.log"))?;
+        assert_eq!(log.lines().collect::<Vec<_>>(), ["off", work.as_str()]);
+        Ok(())
+    }
+
     /// An unplanned move of a tagged direct requirement is reported as a direct collateral row.
     #[cfg(unix)]
     #[tokio::test]
@@ -780,7 +812,7 @@ mod tests {
     {
         let scripted = scripted_project(&tidied_go_mod(PINNED, "v1.1.0", "v0.21.2"))?;
         let plan = plan_moving("example.com/upgraded");
-        let journal = mutation::mutation_journal(&scripted.project.root, &plan)?;
+        let journal = mutation::mutation_journal(&scripted.project.root, &plan, None)?;
 
         let report = apply(&scripted.go, &scripted.project, &plan, &journal).await?;
 
@@ -1109,7 +1141,7 @@ mod tests {
             forward("example.com/x", "v1.0.0", "v1.2.0", true),
             forward("example.com/d", "v1.0.0", "v1.1.0", true),
         ]);
-        let journal = mutation::mutation_journal(&scripted.project.root, &plan)?;
+        let journal = mutation::mutation_journal(&scripted.project.root, &plan, None)?;
 
         let report = apply(&scripted.go, &scripted.project, &plan, &journal).await?;
 
@@ -1177,7 +1209,7 @@ mod tests {
             forward("example.com/x", "v1.0.0", "v1.2.0", true),
             forward("example.com/m", "v0.21.0", "v0.22.0", false),
         ]);
-        let journal = mutation::mutation_journal(&scripted.project.root, &plan)?;
+        let journal = mutation::mutation_journal(&scripted.project.root, &plan, None)?;
 
         let report = apply(&scripted.go, &scripted.project, &plan, &journal).await?;
 
@@ -1241,7 +1273,7 @@ mod tests {
             forward("example.com/c", "v0.29.2", "v0.32.0", true),
             forward("example.com/x", "v1.0.0", "v1.2.0", true),
         ]);
-        let journal = mutation::mutation_journal(&scripted.project.root, &plan)?;
+        let journal = mutation::mutation_journal(&scripted.project.root, &plan, None)?;
 
         let report = apply(&scripted.go, &scripted.project, &plan, &journal).await?;
 
@@ -1291,7 +1323,7 @@ mod tests {
         ];
         for (failures, runs) in [(&[unknown][..], 1), (&chain[..], 2)] {
             let scripted = scripted_gets(&before, &before, failures)?;
-            let journal = mutation::mutation_journal(&scripted.project.root, &plan)?;
+            let journal = mutation::mutation_journal(&scripted.project.root, &plan, None)?;
 
             let result = apply(&scripted.go, &scripted.project, &plan, &journal).await;
 
@@ -1341,7 +1373,7 @@ mod tests {
             cross_major,
             forward("example.com/d", "v1.0.0", "v1.1.0", true),
         ]);
-        let journal = mutation::mutation_journal(&scripted.project.root, &plan)?;
+        let journal = mutation::mutation_journal(&scripted.project.root, &plan, None)?;
 
         let report = apply(&scripted.go, &scripted.project, &plan, &journal).await?;
 
@@ -1394,7 +1426,7 @@ mod tests {
             forward("example.com/d", "v1.0.0", "v1.1.0", true),
             forward("example.com/m", "v0.21.0", "v0.22.0", false),
         ]);
-        let journal = mutation::mutation_journal(&scripted.project.root, &plan)?;
+        let journal = mutation::mutation_journal(&scripted.project.root, &plan, None)?;
 
         let report = apply(&scripted.go, &scripted.project, &plan, &journal).await?;
 
@@ -1446,7 +1478,7 @@ mod tests {
             forward("example.com/x", "v1.0.0", "v1.2.0", true),
             forward("example.com/d", "v1.0.0", "v1.1.0", true),
         ]);
-        let journal = mutation::mutation_journal(&scripted.project.root, &plan)?;
+        let journal = mutation::mutation_journal(&scripted.project.root, &plan, None)?;
 
         let result = apply(&scripted.go, &scripted.project, &plan, &journal).await;
 

@@ -133,6 +133,15 @@ struct FakeNode {
     /// Each apply's plan as `name@target` entries, kept outside the project because a policy
     /// preview runs in a throwaway copy.
     trials: Mutex<Vec<Vec<String>>>,
+    shared: Option<SharedFile>,
+}
+
+/// A file outside the project that every apply rewrites, the way `go get` rewrites the `go.work`
+/// a Go workspace's modules share.
+struct SharedFile {
+    path: Utf8PathBuf,
+    /// Whether the fake names the file for the run to lease.
+    leased: bool,
 }
 
 impl FakeNode {
@@ -143,7 +152,13 @@ impl FakeNode {
             releases: BTreeMap::new(),
             advisory_ecosystem: None,
             trials: Mutex::new(Vec::new()),
+            shared: None,
         }
+    }
+
+    fn with_shared_file(mut self, path: Utf8PathBuf, leased: bool) -> Self {
+        self.shared = Some(SharedFile { path, leased });
+        self
     }
 
     fn with_releases(mut self, name: &str, versions: &[(&str, bool)]) -> Self {
@@ -327,10 +342,23 @@ impl ToolWrite for FakeNode {
         project: &Project,
         _plan: &Plan,
     ) -> cooldown_core::Result<ProjectMutationJournal> {
-        ProjectMutationJournal::capture(
+        ProjectMutationJournal::capture_with_external(
             &project.root,
             [Utf8Path::new(LOCKFILE), Utf8Path::new(MANIFEST)],
+            self.shared.iter().map(|shared| &shared.path),
         )
+    }
+
+    async fn shared_write_files(
+        &self,
+        _project: &Project,
+    ) -> cooldown_core::Result<Vec<Utf8PathBuf>> {
+        Ok(self
+            .shared
+            .iter()
+            .filter(|shared| shared.leased)
+            .map(|shared| shared.path.clone())
+            .collect())
     }
 
     async fn apply(&self, mutation: &PreparedMutation) -> cooldown_core::Result<ApplyReport> {
@@ -341,6 +369,9 @@ impl ToolWrite for FakeNode {
             .iter()
             .map(|change| format!("{}@{}", change.package.name, change.to))
             .collect();
+        if let Some(shared) = &self.shared {
+            std::fs::write(&shared.path, targets.join(","))?;
+        }
         let earlier = {
             let mut trials = self.trials.lock().expect("trial log");
             let earlier = self.script.refused_after_first.map_or(0, |refused| {
@@ -1343,5 +1374,97 @@ async fn singleton_policy_blocked_major_lands_its_current_line_target() -> eyre:
         .ok_or_else(|| eyre::eyre!("missing held major row: {rows:?}"))?;
     assert!(!major.applied);
     assert_eq!(major.reason, Some(SkipReason::TransitiveInCooldown));
+    Ok(())
+}
+
+/// `safe` pinned at `1.0.0` with a matured `1.1.0` the resolver refuses, and a shared file
+/// outside the project holding `original`.
+fn refused_safe_with_shared_file(
+    leased: bool,
+) -> eyre::Result<(tempfile::TempDir, Utf8PathBuf, NodeFixture)> {
+    let outside = tempfile::tempdir()?;
+    let shared = Utf8PathBuf::from_path_buf(std::fs::canonicalize(outside.path())?)
+        .map_err(|path| eyre::eyre!("non-UTF-8 root: {}", path.display()))?
+        .join("shared.work");
+    std::fs::write(&shared, "original")?;
+    let fake = FakeNode::new(
+        TargetFallback::None,
+        Script {
+            holds: vec![Hold {
+                target: "safe@1.1.0",
+                reason: SkipReason::ResolverConflict,
+                offending: None,
+                detail: Some("the resolver refuses safe@1.1.0"),
+            }],
+            ..Script::default()
+        },
+    )
+    .with_releases("safe", &[("1.0.0", false), ("1.1.0", false)])
+    .with_shared_file(shared.clone(), leased);
+    let fixture = fixture(fake, &[("safe", "1.0.0")])?;
+    Ok((outside, shared, fixture))
+}
+
+/// A trial the executor rejects after the apply returned restores the shared file the apply
+/// rewrote, not only the project's own files.
+#[tokio::test]
+async fn a_rejected_trial_restores_a_leased_shared_file() -> eyre::Result<()> {
+    let (_outside, shared, fixture) = refused_safe_with_shared_file(true)?;
+
+    let outcome = fixture.workspace.upgrade(&RunOpts::default()).await;
+
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    // The refused target was tried, which rewrote the shared file, and then rolled back.
+    assert_ne!(fixture.fake.trials(), Vec::<Vec<String>>::new());
+    assert_eq!(locked(&fixture, "safe")?.as_deref(), Some("1.0.0"));
+    assert_eq!(std::fs::read_to_string(&shared)?, "original");
+    Ok(())
+}
+
+/// A journal that reaches a shared file the run does not lease is refused before any trial, so
+/// two cooldown processes never trial one shared file at once.
+#[tokio::test]
+async fn a_shared_file_the_run_does_not_lease_is_refused() -> eyre::Result<()> {
+    let (_outside, shared, fixture) = refused_safe_with_shared_file(false)?;
+
+    let outcome = fixture.workspace.upgrade(&RunOpts::default()).await;
+
+    assert!(
+        outcome
+            .errors
+            .iter()
+            .any(|error| error.message.contains("which this run does not hold")),
+        "{:?}",
+        outcome.errors
+    );
+    assert_eq!(fixture.fake.trials(), Vec::<Vec<String>>::new());
+    assert_eq!(std::fs::read_to_string(&shared)?, "original");
+    Ok(())
+}
+
+/// A dry run trials a throwaway copy, so a shared file outside that copy is the real one, and
+/// the trial is refused rather than allowed to write it.
+#[tokio::test]
+async fn a_dry_run_refuses_a_shared_file_outside_its_copy() -> eyre::Result<()> {
+    let (_outside, shared, fixture) = refused_safe_with_shared_file(true)?;
+
+    let outcome = fixture
+        .workspace
+        .upgrade(&RunOpts {
+            dry_run: true,
+            ..RunOpts::default()
+        })
+        .await;
+
+    assert!(
+        outcome
+            .errors
+            .iter()
+            .any(|error| error.message.contains("which this run does not hold")),
+        "{:?}",
+        outcome.errors
+    );
+    assert_eq!(fixture.fake.trials(), Vec::<Vec<String>>::new());
+    assert_eq!(std::fs::read_to_string(&shared)?, "original");
     Ok(())
 }
