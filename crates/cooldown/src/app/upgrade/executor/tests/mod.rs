@@ -11,7 +11,7 @@ use super::{
     package_label, planned_changes_landed, preserve_rollback_entries, sort_planned_changes,
     unauthorized_crossings, verify_applied_targets, violation_identity,
 };
-use crate::app::change_key::change_provenance_key;
+use crate::app::change_key::ChangeKey;
 use crate::app::{TransitiveGate, UpgradeItem};
 use color_eyre::eyre;
 use cooldown_core::{
@@ -758,8 +758,8 @@ fn collateral_rows_keep_a_held_candidates_real_movement() {
     );
 }
 
-/// Two copies of one transitive converging on one target share its target key, but only the
-/// planned copy's row is the plan's own: the other copy's move is collateral and must surface.
+/// Two copies of one transitive converging on one target are two changes, and only the planned
+/// copy's row is the plan's own: the other copy's move is collateral and must surface.
 #[test]
 fn collateral_rows_keep_a_sibling_copy_move_to_a_planned_target() {
     let planned = vec![change("seroval", "1.6.11", "1.7.5")];
@@ -924,12 +924,14 @@ fn verify_applied_targets_keeps_each_held_member_when_targets_collide() {
     assert!(held.contains(&&held_b));
 }
 
+/// Transitive members only attribute a copy, so two rows for one copy's move that differ only in
+/// the members reaching it are one change and get one skip.
 #[test]
 fn verify_applied_targets_does_not_split_transitive_attribution_by_member() {
     let mut held_a = change("shared", "1.0.0", "1.2.0");
     held_a.direct = false;
     held_a.members = vec![member("app-a", "crates/app-a")];
-    let mut held_b = change("shared", "1.1.0", "1.2.0");
+    let mut held_b = change("shared", "1.0.0", "1.2.0");
     held_b.direct = false;
     held_b.members = vec![member("app-b", "crates/app-b")];
     let planned = vec![held_a.clone(), held_b];
@@ -943,6 +945,31 @@ fn verify_applied_targets_does_not_split_transitive_attribution_by_member() {
     assert_eq!(verified.applied, []);
     assert_eq!(verified.skipped.len(), 1);
     assert_eq!(verified.skipped[0].change, held_a);
+}
+
+/// Two copies of one transitive converging on one target are two changes, so when neither
+/// reaches it, each keeps its own hold instead of collapsing into the first one's.
+#[test]
+fn verify_applied_targets_keeps_each_held_copy_when_targets_collide() {
+    let mut older = change("shared", "1.0.0", "1.2.0");
+    older.direct = false;
+    let mut newer = change("shared", "1.1.0", "1.2.0");
+    newer.direct = false;
+    let planned = vec![older.clone(), newer.clone()];
+    let report = ApplyReport {
+        applied: planned.clone(),
+        ..ApplyReport::default()
+    };
+
+    let verified = verify_applied_targets(
+        report,
+        &planned,
+        &[dep("shared", "1.0.0"), dep("shared", "1.1.0")],
+    );
+
+    assert_eq!(verified.applied, []);
+    let held: Vec<&Change> = verified.skipped.iter().map(|skip| &skip.change).collect();
+    assert_eq!(held, vec![&older, &newer]);
 }
 
 #[test]
@@ -968,7 +995,20 @@ fn verify_applied_targets_keeps_lock_diff_collateral_outside_dependency_graph() 
 fn planned_changes_landed_rejects_collateral_only_results() {
     let planned = change("serde", "1.0.0", "1.0.1");
     let collateral = change("itoa", "1.0.0", "1.0.1");
-    let applied = HashSet::from([super::change_target_key(&collateral)]);
+    let applied = HashSet::from([ChangeKey::of(&collateral)]);
+
+    assert!(!planned_changes_landed(&[planned], &applied));
+}
+
+/// Another copy's move onto a planned copy's target lands nothing of the plan, so a batch whose
+/// only applied row is that move is not committed as the planned copy's landing.
+#[test]
+fn planned_changes_landed_rejects_a_sibling_copy_move_to_the_target() {
+    let mut planned = change("shared", "1.0.0", "1.2.0");
+    planned.direct = false;
+    let mut sibling = change("shared", "1.1.0", "1.2.0");
+    sibling.direct = false;
+    let applied = HashSet::from([ChangeKey::of(&sibling)]);
 
     assert!(!planned_changes_landed(&[planned], &applied));
 }
@@ -1205,7 +1245,7 @@ fn only_authorized_versions_may_stay_outside_a_ceiling() {
 fn a_planned_move_authorizes_only_a_continuation_of_an_authorized_version() {
     let allowed = HashSet::from([crossing("foo", "2.0.0")]);
     let admitted = |planned: Change, applied: &[Change]| {
-        let applied = applied.iter().map(change_provenance_key).collect();
+        let applied = applied.iter().map(ChangeKey::of).collect();
         admitted_crossings(&[planned], &applied, &allowed)
     };
 
@@ -1741,7 +1781,7 @@ fn an_attested_hold_does_not_cover_a_change_from_another_version() {
     let mut outcome = BatchOutcome::default();
     outcome.attestation = Some(Box::new(HoldAttestation {
         applied: HashSet::new(),
-        holds: HashSet::from([crate::app::change_key::change_provenance_key(&held)]),
+        holds: HashSet::from([ChangeKey::of(&held)]),
     }));
     let required = HashSet::new();
     let mut attested = AttestedHolds::default();

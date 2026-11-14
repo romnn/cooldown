@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **A held copy no longer holds back its sibling's move to the same target.** When two copies of
+  one package were planned onto the same version, for example `seroval` 1.6.12 under `solid-js`
+  and 1.7.1 under `@tanstack/router-core`, both onto 1.7.2, cooldown identified the two moves by
+  their target alone. pnpm then dropped the landed copy's row so the held copy would not be
+  credited with it, and with nothing else landed the run restored the lock, so the valid move
+  waited for a later run. Cargo could credit a held copy with its sibling's landing the same way.
+  A move is now identified by the version it starts from as well, so each copy is applied, held,
+  verified, and reported on its own, and a lower-line retry can still land the held copy.
+  A copy a retry leaves out, during recovery or the replay of verified candidates, counts as moved
+  by the other upgrades only when every dependent of that copy moved; a partial move of it is an
+  `unpaired_move` warning, and the copy stays held.
+
 - **A rolled-back Go upgrade restores the workspace's `go.work`.** In a `go.work` workspace,
   `go get` raises the workspace's `go` directive when an upgrade needs a newer Go. When cooldown
   then rejected the trial, for example because it would move a commit pin, it restored `go.mod`

@@ -2,7 +2,7 @@
 //! candidate set; informational, so per-dep failures never change the exit code.
 
 use super::advisories::{ClassifiedAdvisories, ProjectAdvisories};
-use super::change_key::{ChangeTargetKey, change_target_key, change_target_key_parts};
+use super::change_key::ChangeKey;
 use super::lanes::LaneAccess;
 use super::lock::ProjectAccessWriteGuard;
 use super::read::ReadProjectCtx;
@@ -820,23 +820,20 @@ struct VerificationCandidate {
     /// cross-path move leaves the tree on the source path, so the adapter's skip row truthfully
     /// carries that source identity while `change` names the target path; the preview join must
     /// accept either spelling or the item stays adoptable although `upgrade` would hold it.
-    source_key: Option<ChangeTargetKey>,
+    source_key: Option<ChangeKey>,
 }
 
 impl VerificationCandidate {
     fn new(item_index: usize, dep: &Dependency, change: Change) -> Self {
         // `target_package_for` rewrote the planned identity away from the dependency's own only
         // for a cross-path move; everywhere else the two spellings coincide and no alias is kept.
-        // Only the name differs between the spellings: the rewrite preserves registry, target,
+        // Only the package differs between the spellings: the rewrite preserves the versions,
         // directness, and members, so the alias reuses the change's own fields for those.
         let source_key = (change.package != dep.package).then(|| {
-            change_target_key_parts(
-                &dep.package.name,
-                dep.package.registry.as_deref(),
-                change.to.as_str(),
-                change.direct,
-                &change.members,
-            )
+            ChangeKey::of(&Change {
+                package: dep.package.clone(),
+                ..change.clone()
+            })
         });
         VerificationCandidate {
             item_index,
@@ -866,18 +863,6 @@ fn adoptable_change(dep: &Dependency, releases: &[Release], item: &OutdatedItem)
     })
 }
 
-/// The change identity of a preview report row — [`change_target_key`] over the row's fields, so
-/// preview outcomes and verification candidates key identically.
-fn held_key_for_upgrade(item: &UpgradeItem) -> ChangeTargetKey {
-    change_target_key_parts(
-        &item.name,
-        item.registry.as_deref(),
-        &item.to,
-        item.direct,
-        &item.members,
-    )
-}
-
 /// What the preview's skip row says about one held candidate: the named blocker (`None` when the
 /// row blames itself, a ceiling or rejection nothing could be pinned on) and the row's own
 /// message, which is the reason `upgrade` would print.
@@ -888,10 +873,10 @@ struct BlockedVerdict {
 }
 
 /// The preview's held set: every skipped row keyed by change identity, with its verdict.
-fn held_from_preview(preview: Vec<UpgradeItem>) -> HashMap<ChangeTargetKey, BlockedVerdict> {
+fn held_from_preview(preview: Vec<UpgradeItem>) -> HashMap<ChangeKey, BlockedVerdict> {
     let mut held = HashMap::new();
     for item in preview {
-        let key = held_key_for_upgrade(&item);
+        let key = ChangeKey::of_item(&item);
         let Some(skipped) = item.skipped else {
             continue;
         };
@@ -916,11 +901,11 @@ fn held_from_preview(preview: Vec<UpgradeItem>) -> HashMap<ChangeTargetKey, Bloc
 fn apply_held(
     items: &mut [OutdatedItem],
     candidates: &[VerificationCandidate],
-    held: &HashMap<ChangeTargetKey, BlockedVerdict>,
+    held: &HashMap<ChangeKey, BlockedVerdict>,
 ) {
     for candidate in candidates {
         let verdict = held
-            .get(&change_target_key(&candidate.change))
+            .get(&ChangeKey::of(&candidate.change))
             .or_else(|| candidate.source_key.as_ref().and_then(|key| held.get(key)));
         if let Some(verdict) = verdict
             && let Some(item) = items.get_mut(candidate.item_index)
@@ -966,7 +951,7 @@ fn summarize(items: &[OutdatedItem]) -> OutdatedSummary {
 #[cfg(test)]
 mod tests {
     use super::{
-        VerificationCandidate, adoptable_change, apply_held, change_target_key, held_from_preview,
+        ChangeKey, VerificationCandidate, adoptable_change, apply_held, held_from_preview,
     };
     use crate::app::{OutdatedItem, OutdatedStatus, SkippedInfo, UpgradeItem, Window};
     use cooldown_core::{
@@ -1206,7 +1191,7 @@ mod tests {
         )]);
 
         // The planned-identity key alone misses — the held row is spelled under the base path.
-        assert!(!held.contains_key(&change_target_key(&candidates[0].change)));
+        assert!(!held.contains_key(&ChangeKey::of(&candidates[0].change)));
 
         let mut items = vec![item];
         apply_held(&mut items, &candidates, &held);
@@ -1284,11 +1269,11 @@ mod tests {
         )]);
 
         assert_eq!(
-            held.get(&change_target_key(&candidates[0].change))
+            held.get(&ChangeKey::of(&candidates[0].change))
                 .map(|verdict| verdict.blocker.as_deref()),
             Some(Some("huggingface-hub"))
         );
-        assert!(!held.contains_key(&change_target_key(&candidates[1].change)));
+        assert!(!held.contains_key(&ChangeKey::of(&candidates[1].change)));
 
         apply_held(&mut items, &candidates, &held);
         let typer = items.iter().find(|i| i.name == "typer").expect("typer");
@@ -1309,6 +1294,31 @@ mod tests {
         assert_eq!(requests.blocked_by, None);
     }
 
+    /// Two coexisting copies of one package adoptable at the same target are verified apart: the
+    /// preview holding one copy's move blocks that copy only, while the other copy's move, which
+    /// the preview landed, stays adoptable.
+    #[test]
+    fn a_held_copy_does_not_block_a_sibling_copy_at_the_same_target() {
+        let mut items = vec![
+            adoptable("shared", "1.2.0", "1.4.0"),
+            adoptable("shared", "1.3.0", "1.4.0"),
+        ];
+        for item in &mut items {
+            item.direct = false;
+        }
+        let candidates = vec![candidate(0, &items[0]), candidate(1, &items[1])];
+        let mut held_row = skipped("shared", "1.2.0", "1.4.0", "keeper");
+        held_row.direct = false;
+        let held = held_from_preview(vec![held_row]);
+
+        apply_held(&mut items, &candidates, &held);
+
+        assert_eq!(items[0].status, OutdatedStatus::Blocked);
+        assert_eq!(items[0].blocked_by.as_deref(), Some("keeper"));
+        assert_eq!(items[1].status, OutdatedStatus::Adoptable);
+        assert_eq!(items[1].blocked_by, None);
+    }
+
     #[test]
     fn held_candidate_does_not_block_same_package_at_a_different_current_version() {
         let mut items = vec![
@@ -1323,8 +1333,8 @@ mod tests {
             "legacy-framework",
         )]);
 
-        assert!(held.contains_key(&change_target_key(&candidates[0].change)));
-        assert!(!held.contains_key(&change_target_key(&candidates[1].change)));
+        assert!(held.contains_key(&ChangeKey::of(&candidates[0].change)));
+        assert!(!held.contains_key(&ChangeKey::of(&candidates[1].change)));
 
         apply_held(&mut items, &candidates, &held);
 

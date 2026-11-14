@@ -1,68 +1,108 @@
-//! The identity of a planned [`Change`] for landed/held bookkeeping. The upgrade executor decides
-//! "did my planned change land?" and the resilient-apply recovery decides "which sibling is held?"
-//! with the **same** key, so the two can never disagree on what counts as one change — a change
-//! recovery drops must always resurface as a held row, never vanish behind an accepted sibling.
+//! The identity of one [`Change`] for landed and held bookkeeping and report provenance.
+//!
+//! The upgrade executor decides "did my planned change land?" and the resilient-apply recovery
+//! decides "which candidate is held?" with the **same** key, so the two can never disagree on
+//! what counts as one change.
+//! A change recovery drops resurfaces as a held row, never hidden behind an accepted sibling,
+//! unless the committed subset itself moved it onto its target.
+//! The executor also keys security evidence, advisory notes, and fallback targets by it.
+//!
+//! The key includes the version a change moves *from*.
+//! Coexisting copies of one package converging on one target are distinct changes: a hold on one
+//! copy must never hide or borrow another copy's landing, and an advisory affecting one copy's
+//! current version must never label the other copy's row.
 
+use crate::app::UpgradeItem;
 use cooldown_core::{Change, MemberRef};
 
-pub(crate) type MemberTargetKey = (String, String);
-pub(crate) type ChangeTargetKey = (String, Option<String>, String, Vec<MemberTargetKey>);
-
-pub(crate) fn change_target_key(change: &Change) -> ChangeTargetKey {
-    change_target_key_parts(
-        &change.package.name,
-        change.package.registry.as_deref(),
-        change.to.as_str(),
-        change.direct,
-        &change.members,
-    )
-}
-
-/// [`change_target_key`] over borrowed parts, for callers holding a report row (e.g. an
-/// `UpgradeItem`) rather than a [`Change`] value.
-pub(crate) fn change_target_key_parts(
-    name: &str,
-    registry: Option<&str>,
-    target: &str,
-    direct: bool,
-    source_members: &[MemberRef],
-) -> ChangeTargetKey {
-    // Two members upgrading the same crate to the same target from different current versions are
-    // distinct direct changes that share `(name, registry, to)`. Keying them member-blind lets the
-    // member-aware `target_reached` collapse them, masking a held member behind an applied one or
-    // recording the held one as both applied and skipped. Transitive members are attribution context,
-    // not separate editable targets, so only direct changes include members in the key.
-    let mut members: Vec<MemberTargetKey> = if direct {
-        source_members.iter().map(member_key).collect()
-    } else {
-        Vec::new()
-    };
-    members.sort();
-    members.dedup();
-    (
-        name.to_string(),
-        registry.map(str::to_string),
-        target.to_string(),
-        members,
-    )
-}
-
-fn member_key(member: &MemberRef) -> MemberTargetKey {
-    (member.name.clone(), member.path.clone())
-}
-
-/// The identity of a planned change for **report provenance** — security blocks and
-/// advisory-rollback notes: [`change_target_key`] plus the *source* version.
+/// The identity of one change: its package, the versions it moves from and to, and, for a direct
+/// change, the workspace members that declare it.
 ///
-/// The landed/held bookkeeping above is deliberately source-blind so recovery can collapse
-/// siblings onto one target; provenance must not be. Two coexisting transitive copies of a
-/// package converging on one target are distinct report rows, and an advisory can affect one
-/// copy's current version without affecting the other's — a source-blind key would stamp the
-/// one row's security evidence onto both.
-pub(crate) type ChangeProvenanceKey = (String, ChangeTargetKey);
+/// Two members upgrading the same crate to the same target from different current versions are
+/// distinct direct changes, and so are two copies of one package converging on one target.
+/// Transitive members are attribution context, not separate editable targets, so only a direct
+/// change's members are part of its identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ChangeKey {
+    name: String,
+    registry: Option<String>,
+    from: String,
+    to: String,
+    /// Sorted and deduplicated, so the order an adapter lists members in never splits a change.
+    members: Vec<MemberKey>,
+}
 
-pub(crate) fn change_provenance_key(change: &Change) -> ChangeProvenanceKey {
-    (change.from.as_str().to_string(), change_target_key(change))
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct MemberKey {
+    name: String,
+    path: String,
+}
+
+/// The fields of a change or report row that make up its [`ChangeKey`].
+struct KeyParts<'a> {
+    name: &'a str,
+    registry: Option<&'a str>,
+    from: &'a str,
+    to: &'a str,
+    direct: bool,
+    members: &'a [MemberRef],
+}
+
+impl ChangeKey {
+    pub(crate) fn of(change: &Change) -> Self {
+        Self::from_parts(&KeyParts {
+            name: &change.package.name,
+            registry: change.package.registry.as_deref(),
+            from: change.from.as_str(),
+            to: change.to.as_str(),
+            direct: change.direct,
+            members: &change.members,
+        })
+    }
+
+    /// The key of the version change a report row describes.
+    pub(crate) fn of_item(item: &UpgradeItem) -> Self {
+        Self::from_parts(&KeyParts {
+            name: &item.name,
+            registry: item.registry.as_deref(),
+            from: &item.from,
+            to: &item.to,
+            direct: item.direct,
+            members: &item.members,
+        })
+    }
+
+    /// The key with the declaring members left out, which matches a direct change against an
+    /// adapter's collateral row for the same move: that row is transitive and unattributed, so its
+    /// key never carries members.
+    pub(crate) fn member_blind(mut self) -> Self {
+        self.members.clear();
+        self
+    }
+
+    fn from_parts(parts: &KeyParts<'_>) -> Self {
+        let mut members: Vec<MemberKey> = if parts.direct {
+            parts
+                .members
+                .iter()
+                .map(|member| MemberKey {
+                    name: member.name.clone(),
+                    path: member.path.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        members.sort();
+        members.dedup();
+        ChangeKey {
+            name: parts.name.to_string(),
+            registry: parts.registry.map(str::to_string),
+            from: parts.from.to_string(),
+            to: parts.to.to_string(),
+            members,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -70,12 +110,8 @@ mod tests {
     use super::*;
     use cooldown_core::{PackageId, ToolId, UpdateKind, Version};
 
-    /// Two coexisting copies of one transitive converging on the same target share the
-    /// (deliberately source-blind) target key but keep distinct provenance keys, so security
-    /// evidence recorded for one copy's move never labels the other's row.
-    #[test]
-    fn provenance_keys_distinguish_source_versions_that_target_keys_collapse() {
-        let change = |from: &str| Change {
+    fn change(from: &str, direct: bool, members: &[(&str, &str)]) -> Change {
+        Change {
             package: PackageId {
                 tool: ToolId("cargo"),
                 name: "widget".to_string(),
@@ -85,14 +121,52 @@ mod tests {
             to: Version::new("2.0.0"),
             kind: UpdateKind::Minor,
             downgrade: false,
-            direct: false,
-            members: Vec::new(),
-        };
-        let (affected, clean) = (change("1.0.0"), change("1.5.0"));
-        assert_eq!(change_target_key(&affected), change_target_key(&clean));
+            direct,
+            members: members
+                .iter()
+                .map(|(name, path)| MemberRef {
+                    name: (*name).to_string(),
+                    path: (*path).to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Two coexisting copies of one transitive converging on the same target are two changes, so a
+    /// hold on one copy can never be read as the other's landing.
+    #[test]
+    fn copies_converging_on_one_target_are_distinct_changes() {
+        let (held, landed) = (change("1.0.0", false, &[]), change("1.5.0", false, &[]));
+
+        assert_ne!(ChangeKey::of(&held), ChangeKey::of(&landed));
+    }
+
+    /// Members split direct changes, in any listed order, but never transitive ones, whose members
+    /// only attribute the copy.
+    #[test]
+    fn only_a_direct_change_is_split_by_its_declaring_members() {
+        let (a, b) = (("app-a", "crates/app-a"), ("app-b", "crates/app-b"));
+
+        // Direct
         assert_ne!(
-            change_provenance_key(&affected),
-            change_provenance_key(&clean)
+            ChangeKey::of(&change("1.0.0", true, &[a])),
+            ChangeKey::of(&change("1.0.0", true, &[b]))
+        );
+        assert_eq!(
+            ChangeKey::of(&change("1.0.0", true, &[a, b])),
+            ChangeKey::of(&change("1.0.0", true, &[b, a, b]))
+        );
+
+        // Transitive
+        assert_eq!(
+            ChangeKey::of(&change("1.0.0", false, &[a])),
+            ChangeKey::of(&change("1.0.0", false, &[b]))
+        );
+
+        // Member-blind
+        assert_eq!(
+            ChangeKey::of(&change("1.0.0", true, &[a])).member_blind(),
+            ChangeKey::of(&change("1.0.0", false, &[]))
         );
     }
 }

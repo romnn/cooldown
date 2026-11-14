@@ -9,7 +9,7 @@
 //! line names its tool and project, so a transcript stays interpretable when lanes interleave.
 //! The default is silent, which keeps library callers and tests free of unsolicited output.
 
-use super::change_key::{ChangeTargetKey, change_target_key};
+use super::change_key::ChangeKey;
 use cooldown_core::{Change, ToolId};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -81,8 +81,8 @@ struct ProjectTracker {
 
 #[derive(Default)]
 struct CandidateTracker {
-    targets: HashSet<ChangeTargetKey>,
-    decided: HashSet<ChangeTargetKey>,
+    targets: HashSet<ChangeKey>,
+    decided: HashSet<ChangeKey>,
     policy_passes: u64,
     resolver_operations: u64,
 }
@@ -90,14 +90,14 @@ struct CandidateTracker {
 impl CandidateTracker {
     fn start(changes: &[Change]) -> Self {
         Self {
-            targets: changes.iter().map(change_target_key).collect(),
+            targets: changes.iter().map(ChangeKey::of).collect(),
             ..Self::default()
         }
     }
 
     fn decide(&mut self, changes: &[Change]) {
         for change in changes {
-            let key = change_target_key(change);
+            let key = ChangeKey::of(change);
             if self.targets.contains(&key) {
                 self.decided.insert(key);
             }
@@ -834,6 +834,30 @@ mod tests {
         project.candidates_decided(&[first, second]);
 
         assert_eq!(decided_candidates(&project), 2);
+    }
+
+    /// Two copies of one transitive converging on one target are two decisions, so deciding one
+    /// copy leaves the other pending.
+    #[test]
+    fn transitive_copies_converging_on_one_target_are_counted_separately() {
+        let progress = Progress::plain();
+        let project = progress.project(CARGO, ".");
+        let copy = |from: &str| Change {
+            package: PackageId::new(CARGO, "shared", None),
+            from: Version::new(from),
+            to: Version::new("1.2.0"),
+            kind: UpdateKind::Minor,
+            downgrade: false,
+            direct: false,
+            members: Vec::new(),
+        };
+        let (older, newer) = (copy("1.0.0"), copy("1.1.0"));
+        project.candidates(&[older.clone(), newer], "checking");
+
+        project.candidates_decided(&[older]);
+
+        assert_eq!(decided_candidates(&project), 1);
+        assert_eq!(candidate_summary(&project, ""), "1/2 decided");
     }
 
     #[test]

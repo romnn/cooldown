@@ -159,7 +159,10 @@ and the row names who moved and who stayed. Every copy's own move is a row, even
 not the package's newest, such as an old copy a dependent's range kept on a newer patch. When a
 dependent's records change so that several versions sit on either side, no edge proves which
 version replaced which: the move is reported as an `unpaired_move` warning rather than a row, and a
-planned move of those copies is held.
+planned move of those copies is held. Two copies planned onto the same version are two moves: one
+can land while the other is held. When a retry leaves a copy's planned move out and the other
+moves advance that copy for only some dependents, that move is an `unpaired_move` warning too,
+and the copy stays held.
 
 ## Transitive dependencies
 
