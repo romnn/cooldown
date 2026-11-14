@@ -2,6 +2,7 @@
 //! graph reading, release discovery, and `go`-driven apply/build helpers.
 
 mod apply;
+mod conflicts;
 mod graph;
 mod releases;
 #[cfg(test)]
