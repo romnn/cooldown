@@ -580,18 +580,89 @@ fn evaluate_with_filters(
     now: Timestamp,
     filters: CeilingFilters,
 ) -> Verdict {
-    let verdict = evaluate_filtered(dep, releases, advisory, layers, ctx, now, filters);
-    crate::trace::Event::Evaluation {
+    let Evaluated { verdict, filtered } =
+        evaluate_filtered(dep, releases, advisory, layers, ctx, now, filters);
+    crate::trace::evaluation(&crate::trace::EvaluationRecord {
         project: ctx.project.as_str(),
         dependency: dep,
         releases,
+        filtered: &filtered,
         context: ctx,
         evaluation_at: now,
         decision: crate::trace::Decision::Upgrade(&verdict),
         filters: Some(filters),
-    }
-    .emit();
+    });
     verdict
+}
+
+/// An upgrade verdict and the releases its candidate filters rejected.
+struct Evaluated<'r> {
+    verdict: Verdict,
+    /// Every rejection, collected only while a recorder listens.
+    filtered: Vec<crate::trace::FilteredRelease<'r>>,
+}
+
+impl From<Verdict> for Evaluated<'_> {
+    fn from(verdict: Verdict) -> Self {
+        Self {
+            verdict,
+            filtered: Vec::new(),
+        }
+    }
+}
+
+/// The candidate filter rejections of one evaluation of `dependency`, as its trace records them.
+struct FilterLog<'r, 'e> {
+    dependency: &'e Dependency,
+    project: &'e str,
+    detail: Option<crate::trace::Detail>,
+    filtered: Vec<crate::trace::FilteredRelease<'r>>,
+}
+
+impl<'r, 'e> FilterLog<'r, 'e> {
+    fn new(dependency: &'e Dependency, ctx: &'e ResolveContext<'_>) -> Self {
+        Self {
+            dependency,
+            project: ctx.project.as_str(),
+            detail: crate::trace::Detail::current(),
+            filtered: Vec::new(),
+        }
+    }
+
+    /// `verdict` with the rejections recorded on the way to it.
+    fn evaluated(self, verdict: Verdict) -> Evaluated<'r> {
+        Evaluated {
+            verdict,
+            filtered: self.filtered,
+        }
+    }
+
+    /// Whether `release` passes the filter that yielded `reason`, recording a rejection.
+    fn passes(
+        &mut self,
+        release: &'r Release,
+        reason: Option<crate::trace::ReleaseFilter>,
+    ) -> bool {
+        let Some(reason) = reason else {
+            return true;
+        };
+        if self.detail.is_some() {
+            self.filtered.push(crate::trace::FilteredRelease {
+                version: &release.version,
+                reason,
+            });
+        }
+        if self.detail == Some(crate::trace::Detail::Full) {
+            crate::trace::Event::ReleaseFiltered {
+                project: self.project,
+                dependency: self.dependency,
+                release,
+                reason,
+            }
+            .emit();
+        }
+        false
+    }
 }
 
 fn eligibility_rejection(
@@ -613,24 +684,6 @@ fn eligibility_rejection(
     } else {
         None
     }
-}
-
-fn release_passes(
-    dep: &Dependency,
-    release: &Release,
-    ctx: &ResolveContext<'_>,
-    reason: Option<crate::trace::ReleaseFilter>,
-) -> bool {
-    if let Some(reason) = reason {
-        crate::trace::Event::ReleaseFiltered {
-            project: ctx.project.as_str(),
-            dependency: dep,
-            release,
-            reason,
-        }
-        .emit();
-    }
-    reason.is_none()
 }
 
 impl CeilingFilters {
@@ -657,15 +710,15 @@ impl CeilingFilters {
     }
 }
 
-fn evaluate_filtered(
+fn evaluate_filtered<'r>(
     dep: &Dependency,
-    releases: &[Release],
+    releases: &'r [Release],
     advisory: Option<&AdvisoryContext<'_>>,
     layers: &[PolicyLayer],
     ctx: &ResolveContext<'_>,
     now: Timestamp,
     filters: CeilingFilters,
-) -> Verdict {
+) -> Evaluated<'r> {
     debug_assert!(
         releases.is_sorted_by(|a, b| a.order <= b.order),
         "releases must be sorted ascending by ReleaseOrder"
@@ -677,20 +730,20 @@ fn evaluate_filtered(
     // That way its `adoptable_target` still reports the newest matured version, i.e. exactly which
     // version could be manually pinned to.
     if let Some(verdict) = commit_pin_verdict(dep, releases, now) {
-        return verdict;
+        return Evaluated::from(verdict);
     }
 
     let Some(current) = releases.iter().find(|r| r.version == dep.current) else {
         // Defensive: the adapter is expected to include the current pin among `releases`. Without
         // its order we cannot classify upgrades, so we conservatively report up-to-date rather
         // than inventing spurious candidates (`check` is the real gate and does not rely on this).
-        return Verdict {
+        return Evaluated::from(Verdict {
             status: Status::UpToDate,
             adoptable_target: None,
             latest: Some(dep.current.clone()),
             candidates: Vec::new(),
             held_reason: None,
-        };
+        });
     };
     let current_order = current.order.clone();
     let current_major = current.major.clone();
@@ -713,13 +766,12 @@ fn evaluate_filtered(
 
     // Eligible = the releases adoption could target (quality + major filter + not yanked, and not
     // dated after `now`), current included, so `latest` is well-defined even when up to date.
+    let mut log = FilterLog::new(dep, ctx);
     let eligible: Vec<&Release> = releases
         .iter()
         .filter(|release| {
-            release_passes(
-                dep,
+            log.passes(
                 release,
-                ctx,
                 eligibility_rejection(release, dep, &current_major, ctx, now),
             )
         })
@@ -745,7 +797,7 @@ fn evaluate_filtered(
             } else {
                 filters.rejection(release, dep, max_major.as_ref(), latest_tagged.is_some())
             };
-            release_passes(dep, release, ctx, reason)
+            log.passes(release, reason)
         })
         .filter_map(|r| classify_candidate(r, current, dep, advisory, layers, ctx, now))
         .collect();
@@ -764,7 +816,7 @@ fn evaluate_filtered(
             latest_tagged,
             filters,
         );
-        return Verdict {
+        return log.evaluated(Verdict {
             status: if held_reason.is_some() {
                 Status::Held
             } else {
@@ -774,7 +826,7 @@ fn evaluate_filtered(
             latest,
             candidates,
             held_reason,
-        };
+        });
     };
     let adoptable_target = candidates
         .iter()
@@ -799,13 +851,13 @@ fn evaluate_filtered(
         headline.status
     };
 
-    Verdict {
+    log.evaluated(Verdict {
         status,
         adoptable_target,
         latest,
         candidates,
         held_reason: dep.pinned.then_some(HeldReason::ExactPin),
-    }
+    })
 }
 
 /// Finds the newest matured target hidden by a declared bound, a configured `max-major`, or the
@@ -1083,16 +1135,16 @@ pub fn check_pin_advised(
         published_at: locked.published_at,
         security,
     };
-    crate::trace::Event::Evaluation {
+    crate::trace::evaluation(&crate::trace::EvaluationRecord {
         project: ctx.project.as_str(),
         dependency: dep,
         releases: std::slice::from_ref(locked),
+        filtered: &[],
         context: ctx,
         evaluation_at: now,
         decision: crate::trace::Decision::Pin(&verdict),
         filters: None,
-    }
-    .emit();
+    });
     verdict
 }
 
@@ -1144,16 +1196,16 @@ pub fn evaluate_fix_advised(
     now: Timestamp,
 ) -> FixVerdict {
     let verdict = evaluate_fix_inner(dep, releases, advisory, layers, ctx, now);
-    crate::trace::Event::Evaluation {
+    crate::trace::evaluation(&crate::trace::EvaluationRecord {
         project: ctx.project.as_str(),
         dependency: dep,
         releases,
+        filtered: &[],
         context: ctx,
         evaluation_at: now,
         decision: crate::trace::Decision::Fix(&verdict),
         filters: None,
-    }
-    .emit();
+    });
     verdict
 }
 

@@ -1414,20 +1414,46 @@ impl Cargo {
         Ok(enforced.map(|_| "0".to_owned()))
     }
 
+    /// The command line of a command run in `dir`: the crates.io publish-age override, if any,
+    /// followed by `args`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Config`] when a publish-age setting cannot be read.
+    pub(crate) fn command_line(
+        &self,
+        dir: &Utf8Path,
+        args: &[&str],
+    ) -> Result<CommandLine, CoreError> {
+        let crates_io_age = self.crates_io_age_override(dir)?;
+        let age_config = crates_io_age
+            .as_ref()
+            .map(|age| format!("{}=\"{age}\"", CRATES_IO_AGE_KEY.join(".")));
+        let args = age_config
+            .into_iter()
+            .flat_map(|config| ["--config".to_owned(), config])
+            .chain(args.iter().map(|&arg| arg.to_owned()))
+            .collect();
+        Ok(CommandLine {
+            args,
+            crates_io_age,
+        })
+    }
+
     async fn output(
         &self,
         dir: &Utf8Path,
         args: &[&str],
     ) -> Result<std::process::Output, CoreError> {
-        let age_config = self
-            .crates_io_age_override(dir)?
-            .map(|age| format!("{}=\"{age}\"", CRATES_IO_AGE_KEY.join(".")));
-        let args: Vec<&str> = age_config
-            .iter()
-            .flat_map(|config| ["--config", config.as_str()])
-            .chain(args.iter().copied())
-            .collect();
-        let args = args.as_slice();
+        self.spawn(dir, &self.command_line(dir, args)?.args).await
+    }
+
+    /// Runs Cargo in `dir` with exactly `args`, as [`Self::command_line`] spells them.
+    pub(crate) async fn spawn(
+        &self,
+        dir: &Utf8Path,
+        args: &[String],
+    ) -> Result<std::process::Output, CoreError> {
         tracing::debug!(bin = self.bin, args = ?args, dir = %dir, "spawn cargo");
         let started = std::time::Instant::now();
         let result = supervised_output(
@@ -1465,15 +1491,28 @@ impl Cargo {
     }
 
     async fn run(&self, dir: &Utf8Path, args: &[&str]) -> Result<String, CoreError> {
-        let out = self.output(dir, args).await?;
+        self.stdout_of(&self.output(dir, args).await?)
+    }
+
+    /// The stdout of a command that succeeded, or the tool error of one that did not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Tool`] with Cargo's failure detail when `out` did not exit successfully.
+    pub(crate) fn stdout_of(&self, out: &std::process::Output) -> Result<String, CoreError> {
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         } else {
-            Err(CoreError::Tool {
-                tool: self.bin.clone(),
-                termination: ToolTermination::from_exit_status(out.status),
-                stderr: failure_detail(&out),
-            })
+            Err(self.failure(out))
+        }
+    }
+
+    /// The tool error of a command that exited unsuccessfully.
+    pub(crate) fn failure(&self, out: &std::process::Output) -> CoreError {
+        CoreError::Tool {
+            tool: self.bin.clone(),
+            termination: ToolTermination::from_exit_status(out.status),
+            stderr: failure_detail(out),
         }
     }
 
@@ -1503,11 +1542,7 @@ impl Cargo {
         if let Some(lock) = stale_lock_diagnostic(&stderr) {
             return Err(CoreError::StaleLock(stale_lock_detail(dir, lock)));
         }
-        Err(CoreError::Tool {
-            tool: self.bin.clone(),
-            termination: ToolTermination::from_exit_status(out.status),
-            stderr: failure_detail(&out),
-        })
+        Err(self.failure(&out))
     }
 
     /// Resolves the lock-generation graph for `dir` via `cargo metadata --all-features`,
@@ -1525,12 +1560,7 @@ impl Cargo {
         dir: &Utf8Path,
         generated: &GeneratedMembers,
     ) -> Result<ResolvedGraph, CoreError> {
-        let stdout = self
-            .run(
-                dir,
-                &["metadata", "--all-features", "--format-version", "1"],
-            )
-            .await?;
+        let stdout = self.run(dir, &RESOLVE_ARGS).await?;
         Self::parse_graph(&stdout, generated)
     }
 
@@ -1751,63 +1781,6 @@ impl Cargo {
         Self::parse_graph(&stdout, generated)
     }
 
-    /// Pins the crates.io `name@from` node to exactly `to` via `cargo update -p <spec>
-    /// --precise <to>`, with the spec source-qualified as [`CRATES_IO_SPEC_SOURCE`].
-    ///
-    /// The qualified spec cannot address a same-name package from another registry, and
-    /// `@<from>` disambiguates a crate resolved at multiple versions. One spec per invocation,
-    /// never several: cargo accepts multiple `-p` specs alongside `--precise` but silently
-    /// applies the pin to only the first spec and exits 0 (observed on cargo 1.96), so batching
-    /// crates that share a target version into one call loses every pin but the first.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CoreError::ToolSpawn`] if `cargo` cannot be spawned, or [`CoreError::Tool`] if the
-    /// update is rejected (e.g. a `=`-pin or resolver conflict blocks the precise move, or `from`
-    /// no longer names a locked node). A rejection is the caller's signal that the candidate stays
-    /// where the resolver placed it.
-    pub(crate) async fn update_precise_crates_io(
-        &self,
-        dir: &Utf8Path,
-        name: &str,
-        from: &str,
-        to: &str,
-    ) -> Result<(), CoreError> {
-        self.update_precise_crates_io_unlocking(dir, name, from, to, &[])
-            .await
-    }
-
-    /// Pins the crates.io `name@from` node to exactly `to` like
-    /// [`update_precise_crates_io`](Self::update_precise_crates_io), with each crates.io node in
-    /// `unlocked` also released for the same resolve.
-    ///
-    /// Cargo applies `--precise` to the first spec only and re-resolves every other named node
-    /// freely, which is what lets a pin land when its target needs a version of another locked
-    /// crate (pest 2.9.3 requires `psm = "=0.1.24"` while another dependent holds psm 0.1.32).
-    /// The caller has to verify the outcome: an unlocked node may land anywhere its requirements
-    /// admit.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same errors as [`update_precise_crates_io`](Self::update_precise_crates_io).
-    pub(crate) async fn update_precise_crates_io_unlocking(
-        &self,
-        dir: &Utf8Path,
-        name: &str,
-        from: &str,
-        to: &str,
-        unlocked: &[PackageKey],
-    ) -> Result<(), CoreError> {
-        let mut specs = vec![format!("{CRATES_IO_SPEC_SOURCE}#{name}@{from}")];
-        specs.extend(unlocked.iter().map(crates_io_spec));
-        let mut args = vec!["update"];
-        for spec in &specs {
-            args.extend(["-p", spec.as_str()]);
-        }
-        args.extend(["--precise", to]);
-        self.run(dir, &args).await.map(|_| ())
-    }
-
     /// Releases each crates.io node in `unlocked` from the lock and re-resolves them together with
     /// `cargo update -p …`, keeping every other locked version.
     ///
@@ -1820,12 +1793,8 @@ impl Cargo {
         dir: &Utf8Path,
         unlocked: &[PackageKey],
     ) -> Result<(), CoreError> {
-        let specs: Vec<String> = unlocked.iter().map(crates_io_spec).collect();
-        let mut args = vec!["update"];
-        for spec in &specs {
-            args.extend(["-p", spec.as_str()]);
-        }
-        self.run(dir, &args).await.map(|_| ())
+        let args = update_unlocking_args(unlocked);
+        self.run(dir, &as_strs(&args)).await.map(|_| ())
     }
 
     /// Runs `cargo build` as the opt-in compile verification, reporting success in the [`VerifyReport`].
@@ -1873,6 +1842,45 @@ impl Cargo {
             detail: "Cargo.lock refreshed (cargo update --workspace)".into(),
         })
     }
+}
+
+/// Whether Cargo refused a command itself, by exit code, rather than the environment failing it.
+pub(crate) fn seed_resolver_rejection(err: &CoreError) -> bool {
+    matches!(
+        err,
+        CoreError::Tool {
+            termination: ToolTermination::ExitCode(_),
+            ..
+        }
+    ) && !err.is_local_environment_failure()
+}
+
+/// Whether `err` is a resolver refusal, which the same native inputs reproduce.
+pub(crate) fn memoizable_resolver_rejection(err: &CoreError) -> bool {
+    if !seed_resolver_rejection(err) {
+        return false;
+    }
+    let CoreError::Tool { stderr, .. } = err else {
+        return false;
+    };
+    // Numeric Cargo exits also cover transport failures; only resolver diagnostics are reusable.
+    // This eligibility check leaves the existing fallback and held-candidate behavior intact.
+    stderr
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("error: "))
+        .is_some_and(|sentence| {
+            sentence.starts_with("failed to select a version for")
+                || sentence.starts_with("no matching package named")
+        })
+}
+
+/// The arguments of one Cargo command, as spawned.
+#[derive(Debug, Clone)]
+pub(crate) struct CommandLine {
+    pub(crate) args: Vec<String>,
+    /// The crates.io publish age the arguments pass, which Cargo ranks above every configured
+    /// one.
+    pub(crate) crates_io_age: Option<String>,
 }
 
 /// Which `--locked` refusal cargo raised: one condition for cooldown (`stale_lock`), two remedies.
@@ -1929,6 +1937,40 @@ fn stale_lock_diagnostic(stderr: &str) -> Option<LockRefusal> {
 /// The `cargo update -p` spec addressing exactly one crates.io node.
 fn crates_io_spec(node: &PackageKey) -> String {
     format!("{CRATES_IO_SPEC_SOURCE}#{}@{}", node.name, node.version)
+}
+
+/// The arguments of an unlocked resolve of the whole graph, which writes the lock it settles on.
+pub(crate) const RESOLVE_ARGS: [&str; 4] = ["metadata", "--all-features", "--format-version", "1"];
+
+/// The arguments of `cargo update` pinning the crates.io `name@from` node to exactly `to`, with
+/// each node of `unlocked` released for the same resolve.
+pub(crate) fn update_precise_args(
+    name: &str,
+    from: &str,
+    to: &str,
+    unlocked: &[PackageKey],
+) -> Vec<String> {
+    let mut args = vec!["update".to_owned()];
+    let specs = std::iter::once(format!("{CRATES_IO_SPEC_SOURCE}#{name}@{from}"))
+        .chain(unlocked.iter().map(crates_io_spec));
+    for spec in specs {
+        args.extend(["-p".to_owned(), spec]);
+    }
+    args.extend(["--precise".to_owned(), to.to_owned()]);
+    args
+}
+
+/// The arguments of `cargo update` releasing each node of `unlocked` and re-resolving them.
+pub(crate) fn update_unlocking_args(unlocked: &[PackageKey]) -> Vec<String> {
+    let mut args = vec!["update".to_owned()];
+    for node in unlocked {
+        args.extend(["-p".to_owned(), crates_io_spec(node)]);
+    }
+    args
+}
+
+pub(crate) fn as_strs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
 }
 
 /// A package on one side of a Cargo version-selection conflict, at the version its lock entry

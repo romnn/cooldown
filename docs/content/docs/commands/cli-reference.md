@@ -58,8 +58,8 @@ See [Exclusions]({{< relref "../configuration/excludes.md" >}}) for the folder, 
 | `--sync` | Sync the policy into native config before running (no-op under `--dry-run`). |
 | `-n, --dry-run` | Resolve and print the plan; never mutate. |
 | `--offline` | Cache only; a cache miss becomes `unknown-age`, never a false "ok". |
-| `--fresh` | Ignore the HTTP cache and Cargo rejection memo; always hit the registry (alias `--no-cache`; use in CI gates). |
-| `--no-memo` | Disable Cargo rejection memoization for this run while retaining HTTP caching. |
+| `--fresh` | Ignore the HTTP cache and Cargo memos; always hit the registry (alias `--no-cache`; use in CI gates). |
+| `--no-memo` | Disable Cargo's reuse of rejections and command outcomes for this run while retaining HTTP caching. |
 | `--concurrency <N>` | Registry request fan-out width and per-host in-flight cap (default `16`). |
 | `--jobs <N>` | How many ecosystems run at once (default: every detected tool in its own lane; `1` runs them one after another). |
 | `--allow-stale-lock` | Demote a stale/absent lock to a warning and skip that project's dependency evaluation. |
@@ -87,6 +87,9 @@ See [Precedence]({{< relref "../configuration/precedence.md" >}}) for how the la
 | `--paths` | Show the **Used by** column as workspace paths instead of package names. |
 | `--show-projects` | Add a **Project** column attributing each row to its project. |
 | `--no-suggestions` | Suppress actionable tips (the reports and their counts are unaffected). |
+| `--no-trace` | Do not record the diagnostic [run trace]({{< relref "../traces.md" >}}) of `upgrade`, `fix`, and `outdated`. |
+| `--trace-dir <PATH>` | Store run traces in this directory instead of the user configuration directory. |
+| `--full-trace` | Record the run trace in full instead of the compact default. |
 
 ## Environment variables
 
@@ -106,6 +109,9 @@ Several flags mirror an environment variable, so CI can set policy once:
 | `COOLDOWN_ADVISORY_MIN_AGE` | `--advisory-min-age` |
 | `COOLDOWN_ADVISORY_SEVERITY` | `--advisory-severity` |
 | `COOLDOWN_LOG` | `--log-level` |
+| `COOLDOWN_NO_TRACE` | `--no-trace` |
+| `COOLDOWN_TRACE_DIR` | `--trace-dir` |
+| `COOLDOWN_FULL_TRACE` | `--full-trace` |
 | `RUST_LOG` | overrides `--log-level` |
 
 A `COOLDOWN_*` environment layer also feeds config values; it sits above the file cascade and below CLI flags in [precedence]({{< relref "../configuration/precedence.md" >}}).

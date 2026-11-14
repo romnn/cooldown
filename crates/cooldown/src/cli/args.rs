@@ -500,6 +500,10 @@ pub(in crate::cli) struct GlobalArgs {
     /// Disable the diagnostic run trace recorded for upgrade, fix, and outdated.
     #[arg(long = "no-trace", global = true, env = "COOLDOWN_NO_TRACE")]
     pub(in crate::cli) no_trace: bool,
+    /// Record the run trace in full: every release list and filtered release where it occurs, and
+    /// native output as it arrives. The default compacts repeated evidence.
+    #[arg(long = "full-trace", global = true, env = "COOLDOWN_FULL_TRACE")]
+    pub(in crate::cli) full_trace: bool,
     /// Store traces in this directory instead of the user configuration directory.
     #[arg(long = "trace-dir", global = true, env = "COOLDOWN_TRACE_DIR")]
     pub(in crate::cli) trace_dir: Option<Utf8PathBuf>,
@@ -540,10 +544,10 @@ pub(in crate::cli) struct GlobalArgs {
     /// Cache only; cache misses become `UnknownAge` (never a false "ok").
     #[arg(long, global = true, env = "COOLDOWN_OFFLINE")]
     pub(in crate::cli) offline: bool,
-    /// Ignore the HTTP cache and Cargo rejection memo; always hit the registry (use in CI gates).
+    /// Ignore the HTTP cache and Cargo memos; always hit the registry (use in CI gates).
     #[arg(long, global = true, visible_alias = "no-cache")]
     pub(in crate::cli) fresh: bool,
-    /// Disable Cargo rejection memoization while retaining HTTP caching.
+    /// Disable Cargo's reuse of rejections and command outcomes while retaining HTTP caching.
     #[arg(long, global = true, env = "COOLDOWN_NO_MEMO")]
     pub(in crate::cli) no_memo: bool,
     /// How many registry requests to run concurrently — sets both the fan-out width and the
