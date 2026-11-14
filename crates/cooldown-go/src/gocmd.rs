@@ -425,6 +425,19 @@ impl Go {
         self.run(dir, &args).await.map(|_| ())
     }
 
+    /// The workspace file `go` uses in `dir` (`go env GOWORK`), or `None` outside workspace mode,
+    /// including when `GOWORK=off` disables it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ToolSpawn`] if `go` fails to spawn, or [`CoreError::Tool`] if it exits
+    /// non-zero.
+    pub async fn workspace_file(&self, dir: &Utf8Path) -> Result<Option<String>, CoreError> {
+        let stdout = self.run(dir, &["env", "GOWORK"]).await?;
+        let value = stdout.trim();
+        Ok((!value.is_empty() && value != "off").then(|| value.to_string()))
+    }
+
     /// `go mod edit -json`: Go's own parse of the project's `go.mod`, as JSON.
     /// It reads the file without writing it or resolving anything.
     ///

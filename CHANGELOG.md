@@ -11,6 +11,22 @@
   upgrade no longer raises a dependency's own requirement past such a constraint, which made the
   resolve fail, and an override now releases the pins and bounds it replaces, as it does in uv.
 
+- **Go reports and plans only modules that `go.mod` requires.** A module that sits in the module
+  graph without a requirement in a `go 1.17`+ `go.mod` builds no code, and `go mod tidy` drops any
+  requirement an upgrade adds for it. Such modules were still listed by `outdated` and `check` and
+  planned by `upgrade`. Each one was then reported as held by a ceiling Go does not have. They are
+  now left out. In a `go.work` workspace, or with an older `go` directive, every module stays,
+  because one `go.mod` may not list everything the build compiles there.
+
+- **Go no longer plans a version whose `go.mod` declares another module path.** A version such as
+  `github.com/google/cel-go` v0.32.0, which declares `cel.dev/cel-go`, can never land, so every
+  upgrade containing it failed. Such versions are now skipped, and the newest version under the
+  module's own path is planned instead.
+
+- **Registry connections no longer trust distrusted intermediate certificates.** cooldown's TLS
+  stack now uses `rustls-webpki` 0.103.16 and `webpki-root-certs` 1.0.11, which fix
+  RUSTSEC-2026-0382 and RUSTSEC-2026-0383.
+
 - **A pnpm upgrade of a declared package is no longer held by an undeclared copy of it.** When the
   graph also held a copy of the same name on another line, such as `globals` 16 under a dependency
   beside a declared `globals` 17, that copy's own planned move counted as a second target, so the
