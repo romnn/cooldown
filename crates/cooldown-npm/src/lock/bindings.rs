@@ -5,7 +5,7 @@
 
 use super::{
     PnpmSnapshotsDocument, parse_pnpm_document_strict, parse_pnpm_yaml, snapshot_edge_target,
-    split_name_version, strip_pnpm_peer_suffixes, walk_pnpm_document_importers,
+    strip_pnpm_peer_suffixes, walk_pnpm_document_importers,
 };
 use cooldown_core::Result;
 
@@ -21,7 +21,8 @@ pub enum BindingContext {
         key: String,
         /// The package's name.
         name: String,
-        /// The package's version, peer suffix stripped.
+        /// The package's version, peer suffix stripped, or its source reference (a tarball, git, or
+        /// `file:` location) when it has no registry version.
         version: String,
     },
 }
@@ -62,13 +63,13 @@ pub(super) fn parse_pnpm_copy_bindings(content: &str) -> Result<Vec<CopyBinding>
         let Some(snapshot) = snapshot.known() else {
             continue;
         };
-        let Some(parent) = split_name_version(strip_pnpm_peer_suffixes(key)) else {
+        let Some((name, version)) = split_snapshot_key(strip_pnpm_peer_suffixes(key)) else {
             continue;
         };
         let dependent = BindingContext::Package {
             key: key.to_string(),
-            name: parent.name,
-            version: parent.version,
+            name: name.to_string(),
+            version: version.to_string(),
         };
         for group in [&snapshot.dependencies, &snapshot.optional_dependencies] {
             for (slot, value) in group.entries() {
@@ -88,4 +89,14 @@ pub(super) fn parse_pnpm_copy_bindings(content: &str) -> Result<Vec<CopyBinding>
         }
     }
     Ok(bindings)
+}
+
+/// Splits a snapshot key into the package name and its version or source reference, at the first
+/// `@` after a scope's leading one: a git or tarball reference can itself contain an `@`
+/// (`p@git+ssh://git@github.com/acme/p.git#…`), which a split at the last one would fold into the
+/// name.
+fn split_snapshot_key(key: &str) -> Option<(&str, &str)> {
+    let at = key.get(1..)?.find('@')? + 1;
+    let (name, reference) = key.split_at_checked(at)?;
+    Some((name, reference.strip_prefix('@')?))
 }
