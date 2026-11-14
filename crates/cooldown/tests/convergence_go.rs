@@ -623,3 +623,68 @@ fn upgrade_holds_a_commit_pin_that_saved_goflags_would_hide() {
     let report = upgrade_kustomize(&fixture, &[("GOENV", goenv)]);
     assert_commit_pin_held(&fixture, &report, &go_mod_before);
 }
+
+/// The module only the testify fixture's module graph holds: testify's own `go.mod` requires it for
+/// `testify/mock`, which the fixture does not import.
+const OBJX: &str = "github.com/stretchr/objx";
+
+/// The testify fixture's `main.go`, which imports only `testify/assert`.
+const GRAPH_ONLY_MAIN: &str = indoc::indoc! {r#"
+    package main
+
+    import "github.com/stretchr/testify/assert"
+
+    func main() { _ = assert.Equal }
+"#};
+
+/// A pruned (`go 1.21`) module on testify v1.8.4, which requires objx v0.5.0.
+/// Under `FREEZE` both testify v1.9.0 and objx v0.5.2 have matured.
+fn graph_only_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write(
+        "go.mod",
+        indoc::indoc! {"
+            module example.com/cooldown-go-graph-only
+
+            go 1.21
+
+            require github.com/stretchr/testify v1.8.4
+        "},
+    );
+    fixture.write("main.go", GRAPH_ONLY_MAIN);
+    fixture
+        .run_tool("go", &["mod", "tidy"], &[("GOFLAGS", "")])
+        .expect_success();
+    fixture
+}
+
+/// A module that is in the module graph but not required by a pruned `go.mod` builds nothing, and
+/// `go mod tidy` drops a requirement an upgrade would add, so it is neither listed nor planned.
+#[test]
+fn a_module_only_the_graph_holds_is_neither_listed_nor_planned() {
+    skip_if_missing!("go");
+    let fixture = graph_only_fixture();
+
+    // objx is in the module graph, while `go.mod` does not require it.
+    let graph = fixture
+        .run_tool("go", &["list", "-m", "all"], &[("GOFLAGS", "")])
+        .expect_success()
+        .stdout_str();
+    assert!(graph.contains(OBJX), "{graph}");
+    let go_mod = String::from_utf8(fixture.read_bytes("go.mod")).expect("UTF-8 go.mod");
+    assert!(!go_mod.contains(OBJX), "{go_mod}");
+
+    // The required testify upgrade is reported, and objx appears in neither report.
+    let outdated = fixture.cooldown_json(&["outdated", "--freeze", FREEZE, "--transitive"]);
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE, "--dry-run"]);
+    for (command, report) in [("outdated", &outdated), ("upgrade", &upgrade)] {
+        assert!(report.ok(), "{command} failed: {report:?}");
+        assert_eq!(report.summary_errors(), 0, "{command}: {report:?}");
+        let names = report.item_names();
+        assert!(
+            names.contains("github.com/stretchr/testify"),
+            "{command}: {names:?}"
+        );
+        assert!(!names.contains(OBJX), "{command}: {names:?}");
+    }
+}

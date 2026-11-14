@@ -1,5 +1,5 @@
-//! The parts of a `go.mod` that the Go adapter's apply reads: every `require` with its `// indirect`
-//! marker, and every `replace` rule.
+//! The parts of a `go.mod` that the Go adapter reads: the `go` directive, every `require` with its
+//! `// indirect` marker, and every `replace` rule.
 //!
 //! The facts come from `go mod edit -json`, Go's own parse of the file, rather than from reading the
 //! text here.
@@ -27,14 +27,28 @@ struct ReplaceRule {
     target: ModuleVersion,
 }
 
-/// The `require` and `replace` directives of a `go.mod`.
+/// The `go`, `require` and `replace` directives of a `go.mod`.
 #[derive(Default)]
 pub(crate) struct GoModFacts {
+    /// The `go` directive's version, or `None` when the file has none.
+    go_version: Option<String>,
     pub(crate) requires: HashMap<String, Require>,
     replaces: Vec<ReplaceRule>,
 }
 
 impl GoModFacts {
+    /// Whether the module's `go.mod` requires every module that provides a package to its build.
+    ///
+    /// From `go 1.17` on, the module graph is pruned, and `go.mod` then lists every module providing
+    /// a package that a package or test of the main module imports, directly or transitively.
+    /// Below that, or without a `go` directive, which Go reads as `go 1.16`, a transitively imported
+    /// module may be required only by the module that imports it.
+    pub(crate) fn requires_every_build_module(&self) -> bool {
+        self.go_version
+            .as_deref()
+            .is_some_and(|version| language_at_least(version, 17))
+    }
+
     /// The replacement that serves `path` at `version`, as Go selects it: a rule for exactly that
     /// version, else a rule for every version, else none.
     fn effective_replacement(&self, path: &str, version: &str) -> Option<&ModuleVersion> {
@@ -62,6 +76,8 @@ impl GoModFacts {
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct GoModJson {
+    #[serde(default)]
+    go: Option<String>,
     #[serde(default)]
     require: Option<Vec<RequireJson>>,
     #[serde(default)]
@@ -126,7 +142,72 @@ pub(crate) fn from_json(json: &str) -> Result<GoModFacts, CoreError> {
             target: replace.new,
         })
         .collect();
-    Ok(GoModFacts { requires, replaces })
+    Ok(GoModFacts {
+        go_version: parsed.go,
+        requires,
+        replaces,
+    })
+}
+
+/// The path the `module` directive of the `go.mod` text `content` declares.
+///
+/// The result only ever excludes a version, so the reading is deliberately narrow: it returns a
+/// path only for exactly one `module` line holding one bare or double-quoted path, optionally
+/// followed by a `//` comment, and `None` for anything else, which keeps the version.
+pub(crate) fn declared_module_path(content: &str) -> Option<&str> {
+    let mut declared = None;
+    let mut in_block = false;
+    for line in content.lines() {
+        let line = line.split_once("//").map_or(line, |(code, _)| code).trim();
+        // A `require (` block can hold a line that starts with `module`, so blocks are skipped.
+        if in_block {
+            in_block = line != ")";
+            continue;
+        }
+        if line.ends_with('(') && !line.starts_with("module") {
+            in_block = true;
+            continue;
+        }
+        let Some(argument) = line.strip_prefix("module") else {
+            continue;
+        };
+        if !argument.starts_with([' ', '\t']) {
+            continue;
+        }
+        if declared.is_some() {
+            return None;
+        }
+        let argument = argument.trim();
+        let path = match argument.strip_prefix('"') {
+            Some(quoted) => quoted.strip_suffix('"')?,
+            None => argument,
+        };
+        let plain = !path.is_empty()
+            && !path.contains(|c: char| c.is_whitespace() || "\"`()\\".contains(c));
+        if !plain {
+            return None;
+        }
+        declared = Some(path);
+    }
+    declared
+}
+
+/// Whether the Go language version `version` (`1.21`, `1.21.3`, `1.21rc1`) is at least `1.<minor>`.
+/// A version that does not parse is treated as older.
+fn language_at_least(version: &str, minor: u32) -> bool {
+    let mut parts = version.split('.');
+    let major = parts.next().and_then(|major| major.parse::<u32>().ok());
+    let release = parts.next().and_then(|release| {
+        let digits = release
+            .find(|c: char| !c.is_ascii_digit())
+            .map_or(release, |end| release.get(..end).unwrap_or_default());
+        digits.parse::<u32>().ok()
+    });
+    match (major, release) {
+        (Some(major), _) if major > 1 => true,
+        (Some(1), Some(release)) => release >= minor,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -189,6 +270,55 @@ mod tests {
         // Without a rule the required version selects the source.
         assert!(!facts.same_replacement("example.com/none", PINNED, OTHER_COMMIT));
         Ok(())
+    }
+
+    #[test]
+    fn a_pruned_go_directive_requires_every_build_module() -> color_eyre::eyre::Result<()> {
+        let requires_all = |go: &str| -> color_eyre::eyre::Result<bool> {
+            Ok(from_json(&format!(r#"{{"Go": {go}}}"#))?.requires_every_build_module())
+        };
+        // Graph pruning starts at `go 1.17`, whatever the patch or prerelease suffix.
+        assert!(requires_all(r#""1.17""#)?);
+        assert!(requires_all(r#""1.21.3""#)?);
+        assert!(requires_all(r#""1.27rc1""#)?);
+        // An older or missing directive, or one that does not parse, keeps the unpruned layout.
+        assert!(!requires_all(r#""1.16""#)?);
+        assert!(!requires_all("null")?);
+        assert!(!requires_all(r#""go1.21""#)?);
+        Ok(())
+    }
+
+    #[test]
+    fn the_module_directive_names_the_declared_path() {
+        // Comments, other directives and a quoted path all read the same declaration.
+        let declared = declared_module_path(indoc::indoc! {r#"
+            // Deprecated: use cel.dev/expr instead.
+            module "cel.dev/cel-go" // moved
+
+            go 1.22
+            require example.com/modulefoo v1.0.0
+        "#});
+        assert_eq!(declared, Some("cel.dev/cel-go"));
+        assert_eq!(
+            declared_module_path("go 1.21\nmodule\texample.com/m/v2\n"),
+            Some("example.com/m/v2")
+        );
+    }
+
+    #[test]
+    fn an_unusual_module_directive_declares_nothing() {
+        // Anything but one plain path keeps the version, so the apply has the last word on it.
+        for content in [
+            "",
+            "go 1.21\n",
+            "module (\n\texample.com/m\n)\n",
+            "module \"example.com/\\u006d\"\n",
+            "module example.com/a example.com/b\n",
+            "module example.com/a\nmodule example.com/b\n",
+            "require (\n\tmodule v1.0.0\n)\n",
+        ] {
+            assert_eq!(declared_module_path(content), None, "{content:?}");
+        }
     }
 
     #[test]
