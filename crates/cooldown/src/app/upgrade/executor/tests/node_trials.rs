@@ -71,6 +71,21 @@ fn package(name: &str) -> PackageId {
     PackageId::new(NODE, name, None)
 }
 
+/// The package name of a lock key: a `<name>#<copy>` key holds a further copy of `<name>`.
+fn copy_name(key: &str) -> &str {
+    key.split_once('#').map_or(key, |(name, _)| name)
+}
+
+/// The lock key of `change`'s own copy: the one whose name is `change`'s and whose version is its
+/// source, or the bare name when no copy holds that version.
+fn copy_slot(lock: &BTreeMap<String, String>, change: &Change) -> String {
+    lock.iter()
+        .find(|(key, version)| {
+            copy_name(key) == change.package.name && version.as_str() == change.from.as_str()
+        })
+        .map_or_else(|| change.package.name.clone(), |(key, _)| key.clone())
+}
+
 fn lock(project: &Project) -> cooldown_core::Result<BTreeMap<String, String>> {
     serde_json::from_slice(&std::fs::read(project.root.join(LOCKFILE))?)
         .map_err(|err| CoreError::LockUnreadable(err.to_string()))
@@ -100,6 +115,31 @@ struct Straggler {
     member: &'static str,
 }
 
+/// One copy's move the resolver leaves short of its target, matched by its source version, while
+/// another copy of the same name may still land on that target.
+struct HeldCopy {
+    name: &'static str,
+    from: &'static str,
+    to: &'static str,
+}
+
+impl HeldCopy {
+    fn matches(&self, change: &Change) -> bool {
+        self.name == change.package.name
+            && self.from == change.from.as_str()
+            && self.to == change.to.as_str()
+    }
+}
+
+/// A batch landing a planned move of `trigger` also moves `copy` onto its target for only some of
+/// its dependents, the way a pnpm resolve can.
+/// Like pnpm, the fake reports that move as the copy's own row only while the batch neither
+/// plans the copy's move nor withholds it, since otherwise the move's own verdict stands.
+struct PartialFloat {
+    trigger: &'static str,
+    copy: HeldCopy,
+}
+
 /// Two packages that only resolve at one shared version.
 struct Coupled {
     left: &'static str,
@@ -110,6 +150,8 @@ struct Coupled {
 #[derive(Default)]
 struct Script {
     holds: Vec<Hold>,
+    held_copies: Vec<HeldCopy>,
+    partial_float: Option<PartialFloat>,
     coupled: Option<Coupled>,
     float: Option<Float>,
     /// `dom` on its 2.x line requires `child` at exactly its fresh `1.1.0`.
@@ -127,6 +169,8 @@ struct Script {
 
 struct FakeNode {
     fallback: TargetFallback,
+    /// Whether the fake can pin an undeclared package, so `upgrade` plans transitive copies too.
+    transitive_advance: bool,
     script: Script,
     releases: BTreeMap<String, Vec<Release>>,
     advisory_ecosystem: Option<&'static str>,
@@ -148,12 +192,18 @@ impl FakeNode {
     fn new(fallback: TargetFallback, script: Script) -> Self {
         FakeNode {
             fallback,
+            transitive_advance: false,
             script,
             releases: BTreeMap::new(),
             advisory_ecosystem: None,
             trials: Mutex::new(Vec::new()),
             shared: None,
         }
+    }
+
+    fn with_transitive_advance(mut self) -> Self {
+        self.transitive_advance = true;
+        self
     }
 
     fn with_shared_file(mut self, path: Utf8PathBuf, leased: bool) -> Self {
@@ -174,6 +224,63 @@ impl FakeNode {
 
     fn trials(&self) -> Vec<Vec<String>> {
         self.trials.lock().expect("trial log").clone()
+    }
+
+    /// The skip the resolver reports for `change` instead of landing it, if any; `earlier` counts
+    /// the trials before this one that carried the target refused after the first.
+    fn refusal(&self, change: &Change, earlier: usize) -> Option<Skipped> {
+        let target = format!("{}@{}", change.package.name, change.to);
+        if self
+            .script
+            .held_copies
+            .iter()
+            .any(|held| held.matches(change))
+        {
+            return Some(Skipped {
+                change: change.clone(),
+                reason: SkipReason::GraphCeilingHeld,
+                offending: Some(package("keeper")),
+                detail: None,
+            });
+        }
+        if let Some(hold) = self.script.holds.iter().find(|hold| hold.target == target) {
+            return Some(Skipped {
+                change: change.clone(),
+                reason: hold.reason,
+                offending: hold.offending.map(package),
+                detail: hold.detail.map(str::to_string),
+            });
+        }
+        (self.script.refused_after_first == Some(target.as_str()) && earlier > 0).then(|| Skipped {
+            change: change.clone(),
+            reason: SkipReason::ResolverConflict,
+            offending: None,
+            detail: Some("the registry moved between trials".to_string()),
+        })
+    }
+
+    /// The row of the scripted partial float, when the batch landed a planned move of its trigger
+    /// and neither plans nor withholds the floated copy's move.
+    fn partial_float_row(&self, mutation: &PreparedMutation, applied: &[Change]) -> Option<Change> {
+        let PartialFloat { trigger, copy } = self.script.partial_float.as_ref()?;
+        let (_, plan, _) = mutation.parts_for(self).ok()?;
+        let triggered = applied
+            .iter()
+            .any(|row| row.package.name == *trigger && plan.changes.contains(row));
+        let judged = plan
+            .changes
+            .iter()
+            .chain(mutation.withheld())
+            .any(|change| copy.matches(change));
+        (triggered && !judged).then(|| Change {
+            package: package(copy.name),
+            from: Version::new(copy.from),
+            to: Version::new(copy.to),
+            kind: UpdateKind::Major,
+            downgrade: false,
+            direct: false,
+            members: Vec::new(),
+        })
     }
 }
 
@@ -242,6 +349,7 @@ impl ToolRead for FakeNode {
             let (name, straggler) = key
                 .split_once('@')
                 .map_or((key.as_str(), None), |(name, member)| (name, Some(member)));
+            let name = copy_name(name);
             let mut dep = dependency(name, version);
             if dep.direct {
                 dep.members = self
@@ -337,6 +445,10 @@ impl ToolWrite for FakeNode {
         self.fallback
     }
 
+    fn supports_transitive_advance(&self) -> bool {
+        self.transitive_advance
+    }
+
     async fn mutation_journal(
         &self,
         project: &Project,
@@ -383,28 +495,15 @@ impl ToolWrite for FakeNode {
             trials.push(targets);
             earlier
         };
+        // Each change moves its own copy, the one the starting lock holds at its source version.
+        let starting = versions.clone();
         let mut report = ApplyReport::default();
         for change in &plan.changes {
-            let target = format!("{}@{}", change.package.name, change.to);
-            if let Some(hold) = self.script.holds.iter().find(|hold| hold.target == target) {
-                report.skipped.push(Skipped {
-                    change: change.clone(),
-                    reason: hold.reason,
-                    offending: hold.offending.map(package),
-                    detail: hold.detail.map(str::to_string),
-                });
+            if let Some(refusal) = self.refusal(change, earlier) {
+                report.skipped.push(refusal);
                 continue;
             }
-            if self.script.refused_after_first == Some(target.as_str()) && earlier > 0 {
-                report.skipped.push(Skipped {
-                    change: change.clone(),
-                    reason: SkipReason::ResolverConflict,
-                    offending: None,
-                    detail: Some("the registry moved between trials".to_string()),
-                });
-                continue;
-            }
-            versions.insert(change.package.name.clone(), change.to.to_string());
+            versions.insert(copy_slot(&starting, change), change.to.to_string());
             report.applied.push(change.clone());
             if self.script.fresh_child_on_major && change.package.name == "dom" {
                 let child = if change.to.as_str().starts_with("2.") {
@@ -445,6 +544,9 @@ impl ToolWrite for FakeNode {
                     members: Vec::new(),
                 });
             }
+        }
+        if let Some(row) = self.partial_float_row(mutation, &report.applied) {
+            report.applied.push(row);
         }
         if let Some(Coupled { left, right }) = &self.script.coupled
             && versions.get(*left) != versions.get(*right)
@@ -1466,5 +1568,214 @@ async fn a_dry_run_refuses_a_shared_file_outside_its_copy() -> eyre::Result<()> 
     );
     assert_eq!(fixture.fake.trials(), Vec::<Vec<String>>::new());
     assert_eq!(std::fs::read_to_string(&shared)?, "original");
+    Ok(())
+}
+
+/// Two copies of the undeclared `child`, at `1.2.0` and `1.3.0`, both planned onto the matured
+/// `1.4.0`, with the resolver leaving the older copy's move short of it.
+fn converging_copies(fallback: TargetFallback) -> eyre::Result<NodeFixture> {
+    let fake = FakeNode::new(
+        fallback,
+        Script {
+            held_copies: vec![HeldCopy {
+                name: "child",
+                from: "1.2.0",
+                to: "1.4.0",
+            }],
+            ..Script::default()
+        },
+    )
+    .with_transitive_advance()
+    .with_releases(
+        "child",
+        &[("1.2.0", false), ("1.3.0", false), ("1.4.0", false)],
+    );
+    fixture(fake, &[("child", "1.2.0"), ("child#newer", "1.3.0")])
+}
+
+/// A held copy and a landed sibling on the same target are two changes: the sibling's move
+/// commits and is reported applied, and the held copy is reported held without being credited
+/// with the sibling's landing.
+#[tokio::test]
+async fn a_held_copy_and_its_landed_sibling_are_credited_separately() -> eyre::Result<()> {
+    let fixture = converging_copies(TargetFallback::CurrentLine)?;
+
+    let outcome = fixture.workspace.upgrade(&RunOpts::default()).await;
+
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    // The batch committed with the sibling's move, and the held copy stayed where it was.
+    assert_eq!(locked(&fixture, "child")?.as_deref(), Some("1.2.0"));
+    assert_eq!(locked(&fixture, "child#newer")?.as_deref(), Some("1.4.0"));
+    // One row per copy: the sibling's landing, and the held copy's hold with no applied row
+    // borrowed from the sibling.
+    assert_eq!(
+        rows(&outcome.items),
+        sorted(vec![
+            applied("child", "1.3.0", "1.4.0"),
+            skipped(
+                "child",
+                "1.2.0",
+                "1.4.0",
+                SkipReason::GraphCeilingHeld,
+                "held: conflicts with keeper"
+            ),
+        ])
+    );
+    Ok(())
+}
+
+/// Once the held copy is told apart from its landed sibling, a writer with a lower-line fallback
+/// retries the held copy at an older matured target on top of the sibling's landing, and both
+/// moves commit.
+#[tokio::test]
+async fn a_held_copy_falls_back_beside_its_landed_sibling() -> eyre::Result<()> {
+    let fixture = converging_copies(TargetFallback::LowerOnSelectedLine)?;
+
+    let outcome = fixture.workspace.upgrade(&RunOpts::default()).await;
+
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    assert_eq!(locked(&fixture, "child")?.as_deref(), Some("1.3.0"));
+    assert_eq!(locked(&fixture, "child#newer")?.as_deref(), Some("1.4.0"));
+    // The held copy lands its fallback target, so it has no held row left.
+    assert_eq!(
+        rows(&outcome.items),
+        sorted(vec![
+            applied("child", "1.2.0", "1.3.0"),
+            applied("child", "1.3.0", "1.4.0"),
+        ])
+    );
+    Ok(())
+}
+
+/// A held copy whose current-line retry is held too reaches the replay of its landed sibling,
+/// which moves the held copy onto the shared target for only some of its dependents.
+/// The replay withholds the held copy from the writer, so that partial move never reads as the
+/// held copy landing, and the copy keeps its hold.
+#[tokio::test]
+async fn a_held_copy_keeps_its_hold_when_the_sibling_replay_moves_it_partly() -> eyre::Result<()> {
+    let held = |to| HeldCopy {
+        name: "dom",
+        from: "1.0.0",
+        to,
+    };
+    let fake = FakeNode::new(
+        TargetFallback::CurrentLine,
+        Script {
+            held_copies: vec![held("2.0.0"), held("1.9.0")],
+            partial_float: Some(PartialFloat {
+                trigger: "dom",
+                copy: held("2.0.0"),
+            }),
+            ..Script::default()
+        },
+    )
+    .with_releases(
+        "dom",
+        &[
+            ("1.0.0", false),
+            ("1.5.0", false),
+            ("1.9.0", false),
+            ("2.0.0", false),
+        ],
+    );
+    let fixture = fixture(fake, &[("dom", "1.0.0"), ("dom#newer", "1.5.0")])?;
+
+    let outcome = fixture.workspace.upgrade(&major()).await;
+
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    assert_eq!(locked(&fixture, "dom")?.as_deref(), Some("1.0.0"));
+    assert_eq!(locked(&fixture, "dom#newer")?.as_deref(), Some("2.0.0"));
+    // The sibling's landing commits, and the older copy keeps its own hold with no applied row
+    // standing in for it.
+    assert_eq!(
+        rows(&outcome.items),
+        sorted(vec![
+            applied("dom", "1.5.0", "2.0.0"),
+            skipped(
+                "dom",
+                "1.0.0",
+                "2.0.0",
+                SkipReason::GraphCeilingHeld,
+                "held: conflicts with keeper"
+            ),
+        ])
+    );
+    // The initial trial, the held copy's current-line retry beside the sibling, and the replay.
+    assert_eq!(
+        fixture.fake.trials().len(),
+        3,
+        "{:?}",
+        fixture.fake.trials()
+    );
+    Ok(())
+}
+
+/// A reconciling batch that moves a held copy onto its target for only some of its dependents
+/// lands nothing of that copy: every trial withholds its own changes from its reconciling
+/// batches, so the copy keeps its hold beside its sibling's landing.
+#[tokio::test]
+async fn a_held_copy_keeps_its_hold_when_reconciliation_moves_it_partly() -> eyre::Result<()> {
+    let held = |to| HeldCopy {
+        name: "dom",
+        from: "1.0.0",
+        to,
+    };
+    // The sibling's landing floats `child` onto its fresh `1.1.0`, whose reconciliation back to
+    // `1.0.0` is the batch that moves the held copy partly.
+    let fake = FakeNode::new(
+        TargetFallback::CurrentLine,
+        Script {
+            held_copies: vec![held("2.0.0"), held("1.9.0")],
+            partial_float: Some(PartialFloat {
+                trigger: "child",
+                copy: held("2.0.0"),
+            }),
+            float: Some(Float {
+                trigger: "dom",
+                floated: "child",
+                from: "1.0.0",
+                to: "1.1.0",
+            }),
+            ..Script::default()
+        },
+    )
+    .with_releases(
+        "dom",
+        &[
+            ("1.0.0", false),
+            ("1.5.0", false),
+            ("1.9.0", false),
+            ("2.0.0", false),
+        ],
+    )
+    .with_releases("child", &[("1.0.0", false), ("1.1.0", true)]);
+    let fixture = fixture(
+        fake,
+        &[("child", "1.0.0"), ("dom", "1.0.0"), ("dom#newer", "1.5.0")],
+    )?;
+
+    let outcome = fixture.workspace.upgrade(&major()).await;
+
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    assert_eq!(locked(&fixture, "child")?.as_deref(), Some("1.0.0"));
+    assert_eq!(locked(&fixture, "dom")?.as_deref(), Some("1.0.0"));
+    assert_eq!(locked(&fixture, "dom#newer")?.as_deref(), Some("2.0.0"));
+    // The held copy is never credited, so it keeps its own hold beside the sibling's landing.
+    let rows = rows(&outcome.items);
+    assert!(rows.contains(&applied("dom", "1.5.0", "2.0.0")), "{rows:?}");
+    assert!(
+        rows.contains(&skipped(
+            "dom",
+            "1.0.0",
+            "2.0.0",
+            SkipReason::GraphCeilingHeld,
+            "held: conflicts with keeper"
+        )),
+        "{rows:?}"
+    );
+    assert!(
+        !rows.contains(&applied("dom", "1.0.0", "2.0.0")),
+        "{rows:?}"
+    );
     Ok(())
 }

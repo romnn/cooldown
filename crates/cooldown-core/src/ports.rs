@@ -640,6 +640,8 @@ pub enum ApplyAttemptOutcome {
 pub struct PreparedMutation {
     project: Project,
     plan: Plan,
+    /// The changes planned beside this operation but left out of it (see [`Self::withheld`]).
+    withheld: Vec<Change>,
     journal: Arc<ProjectMutationJournal>,
     baseline: Arc<MutationBaseline>,
     tool: ToolId,
@@ -715,6 +717,7 @@ impl PreparedMutation {
         Ok(PreparedMutation {
             project: project.clone(),
             plan: plan.clone(),
+            withheld: Vec::new(),
             journal: Arc::new(journal),
             baseline: Arc::new(baseline),
             tool,
@@ -768,6 +771,36 @@ impl PreparedMutation {
     #[must_use]
     pub fn journal(&self) -> &ProjectMutationJournal {
         self.journal.as_ref()
+    }
+
+    /// The changes planned beside this operation but left out of it: the ones a caller withholds
+    /// explicitly ([`Self::withholding`]), and the prepared changes a retry subset leaves out,
+    /// accumulated across nested subsets.
+    ///
+    /// They are observation-only: an adapter never applies, pins, widens, or authorizes them.
+    /// An adapter that reports moves per copy and incoming edge reads them so that a partial move of
+    /// a withheld change's copy, which carries that change's exact source and target, is never
+    /// reported as an applied row the caller would read as the withheld change landing.
+    #[must_use]
+    pub fn withheld(&self) -> &[Change] {
+        &self.withheld
+    }
+
+    /// Withholds `changes` from this operation as well, as changes planned beside it that it
+    /// leaves out ([`Self::withheld`]).
+    ///
+    /// A change this operation applies is never withheld from it, so one listed here too is
+    /// ignored.
+    #[must_use]
+    pub fn withholding(mut self, changes: &[Change]) -> Self {
+        let planned = &self.plan.changes;
+        self.withheld.extend(
+            changes
+                .iter()
+                .filter(|change| !planned.contains(change))
+                .cloned(),
+        );
+        self
     }
 
     /// The read-only files the adapter captured when this operation was prepared
@@ -825,6 +858,7 @@ impl PreparedMutation {
     /// Derives a retry operation containing only changes authorized by this operation.
     ///
     /// All non-change plan policy remains identical to the prepared operation.
+    /// The changes left out join [`Self::withheld`].
     ///
     /// # Errors
     ///
@@ -843,9 +877,12 @@ impl PreparedMutation {
         }
         let mut plan = self.plan.clone();
         plan.changes = changes;
+        let mut withheld = self.withheld.clone();
+        withheld.extend(available);
         Ok(PreparedMutation {
             project: self.project.clone(),
             plan,
+            withheld,
             journal: Arc::clone(&self.journal),
             baseline: Arc::clone(&self.baseline),
             tool: self.tool,

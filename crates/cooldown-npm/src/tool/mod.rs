@@ -2370,7 +2370,10 @@ impl<L: NodeLock> NpmTool<L> {
                 journal,
                 &evidence,
                 &protected_pins,
-                transitive_held,
+                Unresolved {
+                    held: transitive_held,
+                    withheld: mutation.withheld(),
+                },
             )
             .await?
         } else {
@@ -2555,8 +2558,8 @@ impl<L: NodeLock> NpmTool<L> {
     /// The diff is read per copy and incoming edge ([`CopyLedger`]), so a change without declaring
     /// members lands only when its own copy moved to the target, and a move of a copy that is not
     /// the name's newest surfaces too.
-    /// `held` are the transitive candidates the advance pass held before the resolve
-    /// ([`transitive_partition`]), judged against the settled lock like the plan's own.
+    /// `unresolved` are the candidates judged against the settled lock without being resolved:
+    /// the ones the advance pass held, and the ones the caller withheld.
     /// A resolver failure after the repair retry marks the conflicting candidates held.
     /// The accepted result is
     /// post-verified against the pre-apply peer contracts *between workspace-declared packages in
@@ -2571,12 +2574,12 @@ impl<L: NodeLock> NpmTool<L> {
         journal: &ProjectMutationJournal,
         evidence: &PeerEvidence,
         protected_pins: &ProtectedPins,
-        held: Vec<Skipped>,
+        mut unresolved: Unresolved<'_>,
     ) -> Result<ApplyReport> {
         let mut report = ApplyReport::default();
         if plan.changes.is_empty() {
             // Nothing resolves, so the lock stays as it was and every hold stands.
-            report.skipped.extend(held);
+            report.skipped.extend(unresolved.held);
             return Ok(report);
         }
         let workspace = &evidence.workspace;
@@ -2602,7 +2605,7 @@ impl<L: NodeLock> NpmTool<L> {
         if plan.changes.is_empty() {
             // Nothing left to resolve; the catalog holds and the advance holds are the whole
             // report.
-            report.skipped.extend(held);
+            report.skipped.extend(unresolved.held);
             return Ok(report);
         }
         let plan = &plan;
@@ -2680,7 +2683,6 @@ impl<L: NodeLock> NpmTool<L> {
         // the sibling that landed.
         let rejected = |change: &Change| rejections.iter().any(|skip| skip.change == *change);
         let ledger = CopyLedger::read::<L>(before_content, &after_content)?;
-        let mut advance_held = held;
         for change in &plan.changes {
             let name = change.package.name.as_str();
             if rejected(change) {
@@ -2690,7 +2692,7 @@ impl<L: NodeLock> NpmTool<L> {
                 Settled::Applied => report.applied.push(change.clone()),
                 Settled::Held(row) => report.skipped.push(*row),
                 // Judged with the holds `apply_with_runner` split off before the resolve.
-                Settled::AdvanceHeld(row) => advance_held.push(*row),
+                Settled::AdvanceHeld(row) => unresolved.held.push(*row),
                 Settled::Unmoved => {}
                 Settled::Short(_) if multi_version.contains(name) => {
                     report.skipped.push(multi_version_hold(
@@ -2712,7 +2714,7 @@ impl<L: NodeLock> NpmTool<L> {
 
         report.skipped.extend(rejections);
 
-        settle_copies::<L>(&mut report, &ledger, advance_held, &before, &after);
+        settle_copies::<L>(&mut report, &ledger, unresolved, &before, &after);
         Ok(report)
     }
 
@@ -3541,6 +3543,17 @@ fn transitive_override_pins(
     pins
 }
 
+/// The candidates a whole-graph resolve judges against the settled lock without resolving them.
+#[derive(Default)]
+struct Unresolved<'a> {
+    /// The hold row of each transitive candidate the advance pass held before the resolve
+    /// ([`transitive_partition`]).
+    held: Vec<Skipped>,
+    /// The changes the caller left out of this resolve ([`PreparedMutation::withheld`]), which
+    /// get no row of their own ([`withhold_partial_moves`]).
+    withheld: &'a [Change],
+}
+
 /// A plan split by the transitive-advance verdicts ([`transitive_partition`]).
 struct TransitivePartition {
     /// The plan without the held transitive candidates; every other plan setting passes through.
@@ -3659,18 +3672,22 @@ fn settled_verdict<L: NodeLock>(
 }
 
 /// Completes a whole-graph report from the resolve's edges ([`CopyLedger`]): settles the advance
-/// holds, adds the collateral rows and the unpaired-move warnings, and keeps each hold's target its
-/// own ([`hold_wins`]).
+/// holds, adds the collateral rows and the unpaired-move warnings, and keeps each held or withheld
+/// change's own move from reading as its landing ([`hold_wins`], [`withhold_partial_moves`]).
 ///
 /// `before` and `after` are the locks' newest copies per name ([`locked_versions`]), the evidence
 /// for a name no edge records.
 fn settle_copies<L: NodeLock>(
     report: &mut ApplyReport,
     ledger: &CopyLedger,
-    advance_held: Vec<Skipped>,
+    unresolved: Unresolved<'_>,
     before: &HashMap<String, String>,
     after: &HashMap<String, String>,
 ) {
+    let Unresolved {
+        held: advance_held,
+        withheld,
+    } = unresolved;
     // Holding a transitive candidate keeps it out of the resolve but does not freeze its copy:
     // pnpm updating the declared copy of the same name re-resolves an undeclared copy within its
     // own range too.
@@ -3692,7 +3709,56 @@ fn settle_copies<L: NodeLock>(
     report
         .warnings
         .extend(ledger.unpaired().iter().map(unpaired_move_warning));
+    withhold_partial_moves(report, ledger, withheld);
     hold_wins(report);
+}
+
+/// Keeps a partial move of a withheld change's copy from reading as that change's landing.
+///
+/// A change the caller left out of this resolve can still have its copy moved by the rest of the
+/// plan, and the caller credits an applied row with the change's exact identity as the change
+/// landing.
+/// That holds only when every dependent of the copy now binds the target
+/// ([`CopyLanding::replaced`]).
+/// A row for a copy that advanced for only some dependents leaves the applied list, and an
+/// `unpaired_move` warning names the move instead, since the caller reports the change's own
+/// verdict and this report must not add a second one.
+fn withhold_partial_moves(report: &mut ApplyReport, ledger: &CopyLedger, withheld: &[Change]) {
+    for change in withheld.iter().filter(|change| memberless_key(change)) {
+        let landing = ledger.landing(change);
+        if landing.replaced() || !take_own_move(&mut report.applied, change) {
+            continue;
+        }
+        let Change {
+            package, from, to, ..
+        } = change;
+        report.warnings.push(
+            Diagnostic::new(
+                DiagnosticKind::UnpairedMove,
+                format!(
+                    "{}; no row reports this move, which would read as the {} {from} → {to} \
+                     candidate landing although it was left out of this resolve",
+                    landing.hold_detail(change),
+                    package.name
+                ),
+            )
+            .with_package(package.name.clone()),
+        );
+    }
+}
+
+/// Takes every applied row stating `change`'s own move out of `applied`: a row without declaring
+/// members in its executor key ([`memberless_key`]) from `change`'s source to its target, and
+/// returns whether there was one.
+fn take_own_move(applied: &mut Vec<Change>, change: &Change) -> bool {
+    let before = applied.len();
+    applied.retain(|row| {
+        !(memberless_key(row)
+            && row.package == change.package
+            && row.from == change.from
+            && row.to == change.to)
+    });
+    applied.len() != before
 }
 
 /// The hold row of a change without declaring members whose copy the resolve did not replace,
@@ -3786,14 +3852,16 @@ fn memberless_key(change: &Change) -> bool {
     !change.direct || change.members.is_empty()
 }
 
-/// Keeps each held change's target its own in the finished report.
+/// Keeps each held change from reading as landed in the finished report.
 ///
-/// The executor matches applied rows to planned changes by package and target, and leaves out the
-/// source version and, for a change without members in its key ([`memberless_key`]), the members.
-/// An applied row with such a held change's target, whether a collateral move or another planned
-/// copy converging on it, would therefore count the held change as landed.
+/// The executor identifies a change by its package, source, and target, plus the members of a
+/// change that has them in its key ([`memberless_key`]).
+/// A copy the resolve advanced for only some dependents still yields an edge move with a held
+/// change's exact source and target, which the executor would count as the held change landing.
 /// The hold wins: each such row leaves the applied list and its move is named in the hold's
 /// detail instead.
+/// Another copy's move to the same target starts from another version, so it stays a row of its
+/// own.
 fn hold_wins(report: &mut ApplyReport) {
     let ApplyReport {
         applied, skipped, ..
@@ -3802,22 +3870,16 @@ fn hold_wins(report: &mut ApplyReport) {
         .iter_mut()
         .filter(|hold| memberless_key(&hold.change))
     {
-        let mut moves = Vec::new();
-        applied.retain(|row| {
-            let shares_target = memberless_key(row)
-                && row.package == hold.change.package
-                && row.to == hold.change.to;
-            if shares_target {
-                moves.push(format!("{} {} → {}", row.package.name, row.from, row.to));
-            }
-            !shares_target
-        });
-        if moves.is_empty() {
+        if !take_own_move(applied, &hold.change) {
             continue;
         }
+        let Change {
+            package, from, to, ..
+        } = &hold.change;
         let note = format!(
-            "the resolve still moved {}, which shares this candidate's target and is reported here",
-            moves.join(", ")
+            "the resolve still moved {} {from} → {to} for part of the graph, which is reported here \
+             rather than as this candidate landing",
+            package.name
         );
         hold.detail = Some(match hold.detail.take() {
             Some(detail) => format!("{detail}; {note}"),
@@ -7683,7 +7745,7 @@ packages:
                 &journal,
                 &evidence,
                 &ProtectedPins::default(),
-                Vec::new(),
+                Unresolved::default(),
             )
             .await?;
 
@@ -7799,7 +7861,7 @@ packages:
             &journal,
             &evidence,
             &protected_pins,
-            Vec::new(),
+            Unresolved::default(),
         );
         tokio::pin!(apply);
 
@@ -7936,7 +7998,7 @@ packages:
                 &journal,
                 &evidence,
                 &ProtectedPins::default(),
-                Vec::new(),
+                Unresolved::default(),
             )
             .await
             .expect_err("an unparsable post-resolve lock must fail the batch, not read as held");
@@ -9681,7 +9743,7 @@ mod whole_graph_tests {
                 &journal,
                 &evidence,
                 &ProtectedPins::default(),
-                Vec::new(),
+                Unresolved::default(),
             )
             .await?;
 
@@ -9923,8 +9985,9 @@ mod whole_graph_tests {
     }
 
     /// A transitive advance the settlement kept for one dependent and reverted for another is
-    /// held, and its partial move cannot borrow the advance's target: the executor would count a
-    /// row with that target as the advance landing, so the move is named in the hold instead.
+    /// held, and its partial move cannot be a row: the executor would count a row with the
+    /// advance's exact source and target as the advance landing, so the move is named in the hold
+    /// instead.
     /// The other dependent's real move is its own row.
     #[tokio::test]
     async fn a_partly_advanced_copy_is_held_and_names_its_moves() -> eyre::Result<()> {
@@ -9958,9 +10021,126 @@ mod whole_graph_tests {
             Some(
                 "the leaf 1.0.0 copy moved to 1.2.0 only for p@1.0.0; \
                  q@1.0.0 still resolves leaf 1.0.1; \
-                 the resolve still moved leaf 1.0.0 → 1.2.0, which shares this candidate's \
-                 target and is reported here"
+                 the resolve still moved leaf 1.0.0 → 1.2.0 for part of the graph, which is \
+                 reported here rather than as this candidate landing"
             )
+        );
+        Ok(())
+    }
+
+    /// Two copies converging on one target are two changes: the copy the settlement left behind
+    /// is held, and the sibling copy that moved onto the same target keeps its applied row instead
+    /// of being folded into that hold.
+    #[tokio::test]
+    async fn a_sibling_copy_on_the_target_of_a_held_copy_keeps_its_row() -> eyre::Result<()> {
+        use super::copies::tests::shared_copy;
+        let (_directory, root, tool) = settling_project(
+            &serde_json::json!({ "p": "^1.0.0", "q": "^1.0.0" }),
+            &shared_copy("1.2.0", "1.3.0"),
+            &shared_copy("1.2.0", "1.4.0"),
+        )?;
+        let older = transitive("leaf", "1.2.0", "1.4.0");
+        let landed = transitive("leaf", "1.3.0", "1.4.0");
+        let plan = Plan {
+            changes: vec![older.clone(), landed.clone()],
+            ..Plan::default()
+        };
+
+        let report = apply(&tool, &project(&root), plan).await?;
+
+        // The sibling's move is its own landing, reported once as applied.
+        assert_eq!(report.applied, vec![landed], "{report:?}");
+        // The held copy keeps a hold of its own that says nothing of the sibling's move.
+        let [hold] = report.skipped.as_slice() else {
+            panic!("only the older copy is held: {report:?}");
+        };
+        assert_eq!(hold.change, older);
+        assert!(
+            hold.detail
+                .as_deref()
+                .is_some_and(|detail| !detail.contains("1.3.0")),
+            "{:?}",
+            hold.detail
+        );
+        Ok(())
+    }
+
+    /// Applies only `replayed` of a plan that also prepared `withheld`, the way recovery replays
+    /// its accepted subset, against a scripted pnpm whose resolve settles on `after`.
+    async fn apply_withholding(
+        before: &str,
+        after: &str,
+        withheld: &Change,
+    ) -> eyre::Result<ApplyReport> {
+        let (_directory, root, tool) = settling_project(
+            &serde_json::json!({ "p": "^1.0.0", "q": "^1.0.0" }),
+            before,
+            after,
+        )?;
+        let replayed = change("q", "1.0.0", "1.0.1", &[("app", ".")]);
+        let plan = Plan {
+            changes: vec![withheld.clone(), replayed.clone()],
+            ..Plan::default()
+        };
+        let prepared = PreparedMutation::prepare(&tool, &project(&root), &plan).await?;
+        Ok(tool.apply(&prepared.subset(vec![replayed])?).await?)
+    }
+
+    /// A change left out of the resolve whose copy the rest of the plan moved for only some of
+    /// its dependents gets no row with its exact move, which the caller would credit as the
+    /// change landing; a warning names the move instead.
+    #[tokio::test]
+    async fn a_withheld_copy_moved_for_some_dependents_is_not_reported_as_its_landing()
+    -> eyre::Result<()> {
+        use super::copies::tests::shared_copy;
+        let withheld = transitive("leaf", "1.0.0", "1.2.0");
+
+        let report = apply_withholding(
+            &shared_copy("1.0.0", "1.0.0"),
+            &shared_copy("1.2.0", "1.0.0"),
+            &withheld,
+        )
+        .await?;
+
+        assert!(
+            report.applied.iter().all(|row| row.package.name != "leaf"),
+            "{report:?}"
+        );
+        assert!(
+            report.warnings.iter().any(|warning| {
+                warning.kind == DiagnosticKind::UnpairedMove
+                    && warning
+                        .message
+                        .starts_with("the leaf 1.0.0 copy moved to 1.2.0 only for p@1.0.0")
+            }),
+            "{:?}",
+            report.warnings
+        );
+        Ok(())
+    }
+
+    /// A change left out of the resolve whose copy the rest of the plan replaced for every
+    /// dependent keeps the row with its exact move, so the caller credits the change as landed.
+    #[tokio::test]
+    async fn a_withheld_copy_replaced_for_every_dependent_keeps_its_row() -> eyre::Result<()> {
+        use super::copies::tests::shared_copy;
+        let withheld = transitive("leaf", "1.0.0", "1.2.0");
+
+        let report = apply_withholding(
+            &shared_copy("1.0.0", "1.0.0"),
+            &shared_copy("1.2.0", "1.2.0"),
+            &withheld,
+        )
+        .await?;
+
+        assert!(report.applied.contains(&withheld), "{report:?}");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|warning| warning.kind != DiagnosticKind::UnpairedMove),
+            "{:?}",
+            report.warnings
         );
         Ok(())
     }

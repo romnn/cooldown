@@ -1,6 +1,6 @@
 //! Defines graph policy-violation identities and residual comparisons.
 
-use crate::app::change_key::{ChangeProvenanceKey, change_provenance_key};
+use crate::app::change_key::ChangeKey;
 use cooldown_core::{BaselineViolation, Change, Dependency, PackageId};
 use std::collections::{HashMap, HashSet};
 
@@ -49,12 +49,12 @@ pub(in crate::app::upgrade) fn unauthorized_crossings(
 /// collateral move of another copy onto the same target proves nothing about the planned one.
 pub(super) fn admitted_crossings(
     planned: &[Change],
-    applied: &HashSet<ChangeProvenanceKey>,
+    applied: &HashSet<ChangeKey>,
     allowed: &HashSet<BaselineViolation>,
 ) -> HashSet<BaselineViolation> {
     planned
         .iter()
-        .filter(|change| applied.contains(&change_provenance_key(change)))
+        .filter(|change| applied.contains(&ChangeKey::of(change)))
         .filter(|change| {
             allowed.contains(&BaselineViolation {
                 package: change.package.clone(),

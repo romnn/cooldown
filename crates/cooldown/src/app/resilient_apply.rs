@@ -23,7 +23,7 @@ use cooldown_core::{
     Skipped, ToolWrite,
 };
 
-use super::change_key::{ChangeTargetKey, change_target_key};
+use super::change_key::ChangeKey;
 use super::lock::EnvironmentWriteGuard;
 
 #[derive(Debug)]
@@ -219,10 +219,12 @@ pub(crate) async fn apply_resilient_with_observer(
 
     let (accepted, dropped, trial_state) =
         verified_satisfiable_subset(writer, mutation, first_state, observer, environment).await?;
-    // Direct workspace members can emit sibling changes that share `(name, registry, target)`.
-    // Include the sorted direct-member set so recovery never hides an excluded sibling behind an
-    // accepted one. Transitive members remain attribution context, not distinct editable targets.
-    let accepted_keys: HashSet<ChangeTargetKey> = accepted.iter().map(change_target_key).collect();
+    // Sibling changes can share `(name, registry, target)`: two direct members bumping one crate,
+    // or two copies of one package converging on one version.
+    // Keying each by its full identity (`ChangeKey`, which includes the source version and a
+    // direct change's members) keeps recovery from hiding an excluded sibling behind an accepted
+    // one.
+    let accepted_keys: HashSet<ChangeKey> = accepted.iter().map(ChangeKey::of).collect();
 
     // Commit exactly the accepted subset (restore first so the failed full-set attempt leaves nothing).
     journal
@@ -264,21 +266,43 @@ pub(crate) async fn apply_resilient_with_observer(
         }
     };
 
-    // Every candidate the subset excluded is accounted for, split by *why* its singleton trial
-    // failed: a tool rejection (the resolver could not place it) stays a held skip carrying the
-    // tool's own explanation, and so does a resolve cooldown itself refused to commit (its
-    // detail names the split or the excluded member it moved), while any other failure —
-    // verification, stale lock — is a per-candidate error the caller reports as such, never a
-    // policy skip.
-    let mut rejection_errors: std::collections::HashMap<ChangeTargetKey, cooldown_core::CoreError> =
+    let rejected = account_for_excluded(&plan.changes, &accepted_keys, dropped, &mut report);
+    Ok(AppliedMutation {
+        report,
+        expected,
+        rejected,
+    })
+}
+
+/// Accounts for every planned change the committed subset (`accepted_keys`) excluded: a held row in
+/// `report`, or a per-candidate error in the returned list.
+///
+/// Each verdict follows *why* the change's singleton trial failed (`dropped`): a tool rejection
+/// (the resolver could not place it) stays a held skip carrying the tool's own explanation, and so
+/// does a resolve cooldown itself refused to commit (its detail names the split or the excluded
+/// member it moved), while any other failure — verification, stale lock — is a per-candidate error
+/// the caller reports as such, never a policy skip.
+/// An excluded change the committed subset moved onto its target anyway is the exception: the
+/// replay's applied row with its exact identity reports it, and a hold or error beside that row
+/// would contradict it.
+/// The writer reports such a row only for a move that replaced the excluded change's copy
+/// ([`PreparedMutation::withheld`]), never for one that advanced it for only some dependents.
+fn account_for_excluded(
+    planned: &[Change],
+    accepted_keys: &HashSet<ChangeKey>,
+    dropped: Vec<(Change, cooldown_core::CoreError)>,
+    report: &mut ApplyReport,
+) -> Vec<RejectedChange> {
+    let landed: HashSet<ChangeKey> = report.applied.iter().map(ChangeKey::of).collect();
+    let mut rejection_errors: std::collections::HashMap<ChangeKey, cooldown_core::CoreError> =
         dropped
             .into_iter()
-            .map(|(change, error)| (change_target_key(&change), error))
+            .map(|(change, error)| (ChangeKey::of(&change), error))
             .collect();
     let mut rejected = Vec::new();
-    for change in &plan.changes {
-        let key = change_target_key(change);
-        if accepted_keys.contains(&key) {
+    for change in planned {
+        let key = ChangeKey::of(change);
+        if accepted_keys.contains(&key) || landed.contains(&key) {
             continue;
         }
         match rejection_errors.remove(&key) {
@@ -294,11 +318,7 @@ pub(crate) async fn apply_resilient_with_observer(
             None => report.skipped.push(held(change, None)),
         }
     }
-    Ok(AppliedMutation {
-        report,
-        expected,
-        rejected,
-    })
+    rejected
 }
 
 /// A deterministic subset of `changes` that `apply` can resolve together, found by
@@ -676,6 +696,9 @@ mod tests {
         reject_error: RejectError,
         apply_calls: AtomicUsize,
         installs: bool,
+        /// Whether a successful apply also moves every withheld change onto its target, reported as
+        /// a transitive collateral row the way a lock diff reports it.
+        lands_withheld: bool,
     }
 
     impl MockWriter {
@@ -687,6 +710,7 @@ mod tests {
                 reject_error: RejectError::Tool,
                 apply_calls: AtomicUsize::new(0),
                 installs: false,
+                lands_withheld: false,
             }
         }
 
@@ -706,6 +730,11 @@ mod tests {
 
         fn with_tool(mut self, tool: ToolId) -> Self {
             self.tool = tool;
+            self
+        }
+
+        fn landing_withheld(mut self) -> Self {
+            self.lands_withheld = true;
             self
         }
 
@@ -763,8 +792,17 @@ mod tests {
                 .map(|change| change.package.name.clone())
                 .collect();
             if (self.resolves)(&names) {
+                let collateral = mutation
+                    .withheld()
+                    .iter()
+                    .filter(|_| self.lands_withheld)
+                    .map(|change| Change {
+                        direct: false,
+                        members: Vec::new(),
+                        ..change.clone()
+                    });
                 Ok(ApplyReport {
-                    applied: plan.changes.clone(),
+                    applied: plan.changes.iter().cloned().chain(collateral).collect(),
                     ..ApplyReport::default()
                 })
             } else {
@@ -1219,6 +1257,114 @@ mod tests {
             skipped_from_versions(&report),
             std::iter::once("0.30.0".to_string()).collect()
         );
+    }
+
+    /// A copy of the transitive `shared` moving from `from` onto `1.2.0`.
+    fn shared_copy(from: &str) -> Change {
+        Change {
+            direct: false,
+            ..change_from("shared", from, "1.2.0")
+        }
+    }
+
+    /// Two copies of `shared` that cannot move in one resolve.
+    fn exclusive_copies() -> (Plan, impl Fn(&[String]) -> bool + Send + Sync + 'static) {
+        let plan = Plan {
+            changes: vec![shared_copy("1.0.0"), shared_copy("1.1.0")],
+            rewrite: RewriteMode::Auto,
+            ..Plan::default()
+        };
+        let resolves = |names: &[String]| names.iter().filter(|name| *name == "shared").count() < 2;
+        (plan, resolves)
+    }
+
+    /// Two copies converging on one target share it but not their identity: recovery that accepts
+    /// one copy still reports the excluded one as held instead of hiding it behind the accepted
+    /// copy's target.
+    #[tokio::test]
+    async fn an_excluded_copy_resurfaces_held_beside_its_accepted_sibling() -> eyre::Result<()> {
+        let (plan, resolves) = exclusive_copies();
+        let writer = MockWriter::new(resolves);
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
+
+        let report = apply_resilient(&writer, &project, &plan).await?;
+
+        assert_eq!(report.applied, vec![shared_copy("1.0.0")]);
+        assert_eq!(
+            skipped_from_versions(&report),
+            BTreeSet::from(["1.1.0".to_string()])
+        );
+        Ok(())
+    }
+
+    /// An excluded copy the accepted subset's replay moved onto its own target anyway is reported
+    /// once, by the replay's applied row, with no hold contradicting that row.
+    #[tokio::test]
+    async fn an_excluded_copy_the_replay_landed_is_reported_once() -> eyre::Result<()> {
+        let (plan, resolves) = exclusive_copies();
+        let writer = MockWriter::new(resolves).landing_withheld();
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
+
+        let mutation = apply_resilient_full(&writer, &project, &plan).await?;
+
+        assert_eq!(
+            mutation.report.applied,
+            vec![shared_copy("1.0.0"), shared_copy("1.1.0")]
+        );
+        assert!(
+            mutation.report.skipped.is_empty(),
+            "{:?}",
+            mutation.report.skipped
+        );
+        assert!(mutation.rejected.is_empty());
+        Ok(())
+    }
+
+    /// A retry subset withholds the prepared changes it leaves out, and a subset of that subset
+    /// withholds them too, beside its own exclusions.
+    #[tokio::test]
+    async fn subsets_withhold_every_prepared_change_they_leave_out() -> eyre::Result<()> {
+        let writer = MockWriter::new(|_| true);
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
+        std::fs::write(project.root.join("requirements.txt"), "original")?;
+        let prepared =
+            PreparedMutation::prepare(&writer, &project, &plan(&["a", "b", "c"])).await?;
+        assert_eq!(prepared.withheld(), []);
+
+        let subset = prepared.subset(vec![change("a"), change("b")])?;
+        assert_eq!(subset.withheld(), [change("c")]);
+
+        let nested = subset.subset(vec![change("a")])?;
+        assert_eq!(nested.withheld(), [change("c"), change("b")]);
+        Ok(())
+    }
+
+    /// A caller withholds changes it planned beside an operation, but never one the operation
+    /// applies itself.
+    #[tokio::test]
+    async fn withholding_skips_a_change_the_operation_applies() -> eyre::Result<()> {
+        let writer = MockWriter::new(|_| true);
+        let TempProject {
+            directory: _directory,
+            project,
+        } = temp_project();
+        std::fs::write(project.root.join("requirements.txt"), "original")?;
+        let prepared = PreparedMutation::prepare(&writer, &project, &plan(&["a"])).await?;
+
+        let observing = prepared.withholding(&[change("a"), change("b")]);
+
+        assert_eq!(observing.withheld(), [change("b")]);
+        assert_eq!(observing.plan().changes, [change("a")]);
+        Ok(())
     }
 
     #[tokio::test]

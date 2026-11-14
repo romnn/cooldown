@@ -763,3 +763,115 @@ fn one_copy_advances_beside_another_while_its_dependent_moves() {
     assert_eq!(second.summary_applied(), 0, "second run must be a no-op");
     assert_eq!(after, fixture.read_bytes("pnpm-lock.yaml"));
 }
+
+/// The shared-copy project seeded with a temporary override that sends
+/// `@tanstack/router-core`'s `seroval` to 1.7.1 (2026-10-23), which the lock keeps once the
+/// override is gone: `solid-js`'s tilde range then binds its own 1.6.12 copy, the newest
+/// `~1.6.8` release at [`SPLIT_COPY_SEED`].
+/// Each `seroval` copy brings its own `seroval-plugins` copy at the same version.
+/// Under [`SHARED_COPY_FREEZE`] both copies of each name are planned onto 1.7.2, which only the
+/// caret range admits.
+const SPLIT_COPY_OVERRIDDEN_PACKAGE_JSON: &str = indoc::indoc! {r#"
+    {
+      "name": "cooldown-pnpm-shared-copy",
+      "version": "0.1.0",
+      "private": true,
+      "dependencies": {
+        "@tanstack/router-core": "1.171.36",
+        "solid-js": "1.9.17"
+      },
+      "pnpm": {
+        "overrides": {
+          "@tanstack/router-core>seroval": "1.7.1"
+        }
+      }
+    }
+"#};
+
+const SPLIT_COPY_SEED: &str = "2026-10-23T12:00:00Z";
+
+/// Every `from -> to` move of `name` the report holds, sorted.
+fn held_moves(report: &support::Envelope, name: &str) -> Vec<String> {
+    let mut moves: Vec<String> = report
+        .items()
+        .iter()
+        .filter(|item| {
+            item.get("name").and_then(serde_json::Value::as_str) == Some(name)
+                && item.get("skipped").is_some()
+        })
+        .filter_map(|item| {
+            let from = item.get("from")?.as_str()?;
+            let to = item.get("to")?.as_str()?;
+            Some(format!("{from} -> {to}"))
+        })
+        .collect();
+    moves.sort();
+    moves
+}
+
+/// Two copies of one undeclared package planned onto one target, where only one copy's
+/// dependents admit it: the copy `solid-js`'s tilde range keeps is held, and its sibling's move
+/// onto that same target lands and commits instead of being folded into the hold and restored
+/// with the batch.
+#[test]
+fn a_held_copy_does_not_hold_back_its_sibling_on_the_same_target() {
+    skip_if_missing!("pnpm");
+    let fixture = Fixture::pnpm().tag_independent();
+    fixture.write("package.json", SPLIT_COPY_OVERRIDDEN_PACKAGE_JSON);
+    fixture.write(".npmrc", NPMRC);
+    seed_lock(&fixture, SPLIT_COPY_SEED);
+    fixture.write("package.json", SHARED_COPY_PACKAGE_JSON);
+    seed_lock(&fixture, SPLIT_COPY_SEED);
+    let seeded = fixture.read_bytes("pnpm-lock.yaml");
+    assert_eq!(
+        copies_of(&seeded, "seroval"),
+        ["1.6.12".to_string(), "1.7.1".to_string()].into(),
+        "seed sanity: one copy per dependent"
+    );
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", SHARED_COPY_FREEZE]);
+    assert!(
+        upgrade.ok(),
+        "upgrade should succeed: {}",
+        fixture
+            .cooldown(&["upgrade", "--freeze", SHARED_COPY_FREEZE])
+            .stderr_str()
+    );
+    assert_pnpm_lock_current(&upgrade);
+
+    // The caret dependent's copies land on the shared target and the batch commits them.
+    let after = fixture.read_bytes("pnpm-lock.yaml");
+    assert_eq!(
+        copies_of(&after, "seroval"),
+        ["1.6.12".to_string(), "1.7.2".to_string()].into(),
+        "report: {:?}",
+        upgrade.items()
+    );
+    for name in ["seroval", "seroval-plugins"] {
+        assert_eq!(
+            applied_moves(&upgrade, name),
+            ["1.7.1 -> 1.7.2"],
+            "report: {:?}",
+            upgrade.items()
+        );
+        // The tilde dependent's copy keeps its own hold, which does not absorb the sibling's
+        // move.
+        assert_eq!(
+            held_moves(&upgrade, name),
+            ["1.6.12 -> 1.7.2"],
+            "report: {:?}",
+            upgrade.items()
+        );
+        let detail = upgrade.skip_detail_for(name).unwrap_or_default();
+        assert!(
+            detail.contains(&format!("solid-js@1.9.17 still resolves {name} 1.6.12"))
+                && !detail.contains("1.7.1"),
+            "{detail}"
+        );
+    }
+
+    // Converged: a second run moves nothing.
+    let second = fixture.cooldown_json(&["upgrade", "--freeze", SHARED_COPY_FREEZE]);
+    assert_eq!(second.summary_applied(), 0, "second run must be a no-op");
+    assert_eq!(after, fixture.read_bytes("pnpm-lock.yaml"));
+}

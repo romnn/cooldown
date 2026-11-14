@@ -466,6 +466,11 @@ diagnostic_kinds! {
     /// incoming edge proves which version replaced which.
     /// The move is committed but reported only by this diagnostic, never as an applied row, and a
     /// planned move of one of those copies is held rather than credited.
+    ///
+    /// It also reports a move that advanced a copy for only some of its dependents while the
+    /// copy's own planned move was left out of the resolve, such as a candidate recovery or a
+    /// policy replay set aside: a row with the move's exact source and target would read as that
+    /// planned move landing.
     UnpairedMove = "unpaired_move",
     /// The advisory feed could not be reached or its response could not be parsed.
     ///

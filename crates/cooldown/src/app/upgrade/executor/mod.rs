@@ -23,10 +23,7 @@ pub(super) use self::transitive_gate::{unauthorized_crossings, violation_identit
 use crate::app::advisories::{
     AdvisoryPackages, ClassifiedAdvisories, ProjectAdvisories, advisory_fetch_policy,
 };
-use crate::app::change_key::{
-    ChangeProvenanceKey, ChangeTargetKey, change_provenance_key, change_target_key,
-    change_target_key_parts,
-};
+use crate::app::change_key::ChangeKey;
 use crate::app::{
     FetchedRelease, SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error,
     recovery_diagnostics, stale_evaluation_skipped,
@@ -48,8 +45,8 @@ use std::ops::ControlFlow;
 /// The attestation holds only while the accepted set is the one it was made against.
 #[derive(Default)]
 struct AttestedHolds {
-    against: Option<HashSet<ChangeProvenanceKey>>,
-    holds: HashMap<usize, HashSet<ChangeProvenanceKey>>,
+    against: Option<HashSet<ChangeKey>>,
+    holds: HashMap<usize, HashSet<ChangeKey>>,
 }
 
 impl AttestedHolds {
@@ -58,12 +55,11 @@ impl AttestedHolds {
     fn record(
         &mut self,
         attempt: usize,
-        required: &HashSet<ChangeProvenanceKey>,
+        required: &HashSet<ChangeKey>,
         landed: &[Change],
         outcomes: &[BatchOutcome],
     ) {
-        let landed: HashSet<ChangeProvenanceKey> =
-            landed.iter().map(change_provenance_key).collect();
+        let landed: HashSet<ChangeKey> = landed.iter().map(ChangeKey::of).collect();
         let Some(attestation) = outcomes
             .first()
             .and_then(|outcome| outcome.attestation.as_ref())
@@ -82,17 +78,12 @@ impl AttestedHolds {
 
     /// Whether the writer attested it would refuse `alternative` retried at `attempt` beside
     /// exactly `required`.
-    fn covers(
-        &self,
-        attempt: usize,
-        required: &HashSet<ChangeProvenanceKey>,
-        alternative: &Change,
-    ) -> bool {
+    fn covers(&self, attempt: usize, required: &HashSet<ChangeKey>, alternative: &Change) -> bool {
         self.against.as_ref() == Some(required)
             && self
                 .holds
                 .get(&attempt)
-                .is_some_and(|holds| holds.contains(&change_provenance_key(alternative)))
+                .is_some_and(|holds| holds.contains(&ChangeKey::of(alternative)))
     }
 }
 
@@ -198,10 +189,10 @@ struct FixPlan {
     /// never happened.
     /// They never mark the run incomplete: the change each one annotates did apply.
     ///
-    /// Keyed by [`ChangeProvenanceKey`] — source version included — because two coexisting
+    /// Keyed by [`ChangeKey`] — source version included — because two coexisting
     /// copies of one package can converge on the same rollback target while only one of them
     /// re-enters the advisory.
-    notes: Vec<(ChangeProvenanceKey, Diagnostic)>,
+    notes: Vec<(ChangeKey, Diagnostic)>,
     errors: Vec<Diagnostic>,
 }
 
@@ -486,10 +477,10 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     /// The report's rows are built from [`Change`]s, which carry no policy provenance, so the
     /// advisory evidence that made a target adoptable is parked here rather than pushed into the
     /// apply instruction.
-    /// Keyed by [`ChangeProvenanceKey`], *not* the source-blind landed/held key: two coexisting
-    /// copies of one package can converge on the same target while an advisory affects only one
-    /// copy's current version, and only that copy's row is security-relevant.
-    security_by_change: HashMap<ChangeProvenanceKey, crate::app::SecurityInfo>,
+    /// Keyed by [`ChangeKey`], source version included: two coexisting copies of one package can
+    /// converge on the same target while an advisory affects only one copy's current version,
+    /// and only that copy's row is security-relevant.
+    security_by_change: HashMap<ChangeKey, crate::app::SecurityInfo>,
     /// The alternative targets of each planned change, in retry order, as the writer's
     /// [`TargetFallback`] selects them.
     ///
@@ -497,7 +488,7 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     /// Current-line alternatives are only ever read from here: they come from the pre-lock graph
     /// (the planner's, or [`prepare_current_line_fallbacks`](Self::prepare_current_line_fallbacks)
     /// for preselected targets), never from a trial that already moved the graph.
-    fallback_changes: HashMap<ChangeProvenanceKey, Vec<Change>>,
+    fallback_changes: HashMap<ChangeKey, Vec<Change>>,
     /// The advisory relevance of locked pins, keyed by `(name, version, registry)`, captured on
     /// every residual-gate pass ([`graph_violations`](Self::graph_violations)).
     ///
@@ -1087,20 +1078,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let tool = self.ctx.tool_name();
         let mut held: Vec<String> = Vec::new();
         for change in planned {
+            let key = ChangeKey::of(change);
             let is_held = self.acc.items.iter().any(|item| {
                 item.project == self.project_label
                     && item.tool == tool
                     && !item.applied
                     && item.edge.is_none()
                     && item.skipped.is_some()
-                    && item.from == change.from.as_str()
-                    && change_target_key_parts(
-                        &item.name,
-                        item.registry.as_deref(),
-                        &item.to,
-                        item.direct,
-                        &item.members,
-                    ) == change_target_key(change)
+                    && ChangeKey::of_item(item) == key
             });
             if !is_held {
                 continue;
@@ -1108,7 +1093,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             let move_label = format!("{} {} → {}", change.package.name, change.from, change.to);
             let older: Vec<&str> = self
                 .fallback_changes
-                .get(&change_provenance_key(change))
+                .get(&key)
                 .into_iter()
                 .flatten()
                 .map(|alternative| alternative.to.as_str())
@@ -1160,6 +1145,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let initial = self
             .try_upgrade_group(
                 lock_changes.clone(),
+                &[],
                 &baseline_before_lock,
                 state,
                 &mut rollback,
@@ -1256,7 +1242,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .filter(|change| {
                 !accepted
                     .iter()
-                    .any(|item| change_target_key(item) == change_target_key(change))
+                    .any(|item| ChangeKey::of(item) == ChangeKey::of(change))
             })
             .cloned()
             .collect();
@@ -1376,7 +1362,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             let mut trial_changes = accepted.clone();
             trial_changes.extend(group.iter().cloned());
             let result = self
-                .try_upgrade_group(trial_changes, baseline, state, rollback)
+                .try_upgrade_group(trial_changes, &[], baseline, state, rollback)
                 .await;
             match result {
                 UpgradeTrialResult::Settled(outcomes) => {
@@ -1386,14 +1372,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     let preserves_accepted = accepted.iter().all(|change| {
                         landed
                             .iter()
-                            .any(|item| change_target_key(item) == change_target_key(change))
+                            .any(|item| ChangeKey::of(item) == ChangeKey::of(change))
                     });
                     let held: Vec<_> = group
                         .iter()
                         .filter(|change| {
                             !landed
                                 .iter()
-                                .any(|item| change_target_key(item) == change_target_key(change))
+                                .any(|item| ChangeKey::of(item) == ChangeKey::of(change))
                         })
                         .cloned()
                         .collect();
@@ -1416,7 +1402,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     for change in group {
                         if held
                             .iter()
-                            .any(|item| change_target_key(item) == change_target_key(&change))
+                            .any(|item| ChangeKey::of(item) == ChangeKey::of(&change))
                         {
                             rejected.push(RejectedUpgrade {
                                 skipped: held_upgrade_info(&change, &outcomes),
@@ -1476,8 +1462,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         self.ctx
             .progress
             .phase("replaying verified candidates from baseline");
+        // The rejected candidates are withheld from the replay, so a writer that reports moves
+        // per copy never states a partial move of a rejected candidate's copy as the exact move
+        // `landed_as_collateral` would credit below.
+        let withheld: Vec<Change> = rejected.iter().map(|item| item.change.clone()).collect();
         match self
-            .try_upgrade_group(accepted.clone(), baseline, state, rollback)
+            .try_upgrade_group(accepted.clone(), &withheld, baseline, state, rollback)
             .await
         {
             UpgradeTrialResult::Settled(outcomes) => {
@@ -1547,11 +1537,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     async fn try_upgrade_group(
         &mut self,
         changes: Vec<Change>,
+        withheld: &[Change],
         policy_baseline: &TrialState,
         state: &mut TrialState,
         rollback: &mut TrialRollback,
     ) -> UpgradeTrialResult {
-        self.try_upgrade_group_once(changes, policy_baseline, state, rollback)
+        self.try_upgrade_group_once(changes, withheld, policy_baseline, state, rollback)
             .await
     }
 
@@ -1663,8 +1654,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .map(Some),
         ) {
             let required = accepted.clone();
-            let required_keys: HashSet<ChangeProvenanceKey> =
-                required.iter().map(change_provenance_key).collect();
+            let required_keys: HashSet<ChangeKey> = required.iter().map(ChangeKey::of).collect();
             let mut best = accepted.clone();
             for attempt in 0..3 {
                 if individual
@@ -1681,7 +1671,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     continue;
                 };
                 let result = self
-                    .try_upgrade_group_once(retry.clone(), baseline, state, rollback)
+                    .try_upgrade_group_once(retry.clone(), &[], baseline, state, rollback)
                     .await;
                 match result {
                     UpgradeTrialResult::Settled(outcomes) => {
@@ -1695,7 +1685,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                         if required.iter().all(|change| {
                             landed
                                 .iter()
-                                .any(|item| change_target_key(item) == change_target_key(change))
+                                .any(|item| ChangeKey::of(item) == ChangeKey::of(change))
                         }) && landed.len() > best.len()
                         {
                             best = landed;
@@ -1784,7 +1774,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.observe_fallback(change);
             }
             let result = self
-                .try_upgrade_group_once(retry.clone(), baseline, state, rollback)
+                .try_upgrade_group_once(retry.clone(), &[], baseline, state, rollback)
                 .await;
             let mut improved = None;
             match result {
@@ -1838,7 +1828,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             })
             .filter_map(|item| {
                 self.fallback_changes
-                    .get(&change_provenance_key(&item.change))
+                    .get(&ChangeKey::of(&item.change))
                     .and_then(|alternatives| alternatives.first())
             })
             .cloned()
@@ -1867,30 +1857,42 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     fn try_upgrade_group_once(
         &mut self,
         changes: Vec<Change>,
+        withheld: &[Change],
         policy_baseline: &TrialState,
         state: &mut TrialState,
         rollback: &mut TrialRollback,
     ) -> impl std::future::Future<Output = UpgradeTrialResult> {
         // A trial is polled beneath fallback and reconciliation scopes; own its state once.
-        Box::pin(self.run_upgrade_trial(changes, policy_baseline, state, rollback))
+        Box::pin(self.run_upgrade_trial(changes, withheld, policy_baseline, state, rollback))
     }
 
     #[tracing::instrument(name = "try_upgrade_group_once", skip_all, fields(project = %self.ctx.pctx.rel_path, tool = %self.ctx.pctx.tool))]
     async fn run_upgrade_trial(
         &mut self,
         changes: Vec<Change>,
+        withheld: &[Change],
         policy_baseline: &TrialState,
         state: &mut TrialState,
         rollback: &mut TrialRollback,
     ) -> UpgradeTrialResult {
         let mut pending = Vec::new();
+        // A reconciling resolve can still move a copy forward, so its batches withhold every
+        // change this trial plans or withholds: none of their rows may stand in for those moves.
+        let observed: Vec<Change> = changes.iter().chain(withheld).cloned().collect();
         let search = if self.ctx.opts.fast {
             TargetSearch::Fast
         } else {
             TargetSearch::Exhaustive
         };
         let lock_outcome = self
-            .apply_batch_with_rollback(changes, state, Some(rollback), HashMap::new(), search)
+            .apply_batch_with_rollback(
+                changes,
+                withheld,
+                state,
+                Some(rollback),
+                HashMap::new(),
+                search,
+            )
             .await;
         // Skip reconciliation when the lock upgrade made no clean forward progress: nothing floated
         // up, and a broken re-lock probe must not be re-hit.
@@ -1909,7 +1911,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             && upgraded_cleanly
             && state.reconcile_needed
         {
-            pending.extend(self.reconcile_to_fixpoint(state, rollback).await);
+            pending.extend(self.reconcile_to_fixpoint(state, rollback, &observed).await);
         }
         if pending.iter().any(|outcome| outcome.errored_count() > 0) {
             return UpgradeTrialResult::Aborted(pending);
@@ -1937,7 +1939,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     async fn upgrade_fallbacks(&mut self, change: &Change) -> cooldown_core::Result<Vec<Change>> {
-        let key = change_provenance_key(change);
+        let key = ChangeKey::of(change);
         if let Some(alternatives) = self.fallback_changes.get(&key) {
             return Ok(alternatives.clone());
         }
@@ -1984,11 +1986,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     ) -> Result<(), Box<Diagnostic>> {
         let pending: Vec<&Change> = changes
             .iter()
-            .filter(|change| {
-                !self
-                    .fallback_changes
-                    .contains_key(&change_provenance_key(change))
-            })
+            .filter(|change| !self.fallback_changes.contains_key(&ChangeKey::of(change)))
             .collect();
         if pending.is_empty() {
             return Ok(());
@@ -2004,7 +2002,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .find(|dep| dep.package == change.package && dep.current == change.from)
             else {
                 self.fallback_changes
-                    .insert(change_provenance_key(change), Vec::new());
+                    .insert(ChangeKey::of(change), Vec::new());
                 continue;
             };
             if !evaluated
@@ -2092,7 +2090,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 };
                 if let Some(relevance) = &candidate.security {
                     self.security_by_change.insert(
-                        change_provenance_key(&alternative),
+                        ChangeKey::of(&alternative),
                         crate::app::workspace::security_info(relevance, &alternative.to),
                     );
                 }
@@ -2100,7 +2098,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             })
             .collect();
         self.fallback_changes
-            .insert(change_provenance_key(change), alternatives);
+            .insert(ChangeKey::of(change), alternatives);
     }
 
     /// Collapse this project's multi-leg applied rows into net rows (see [`collapse_applied_legs`]).
@@ -2509,10 +2507,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             // The advisory evidence lives on the verdict, but the report is built from the
             // `Change` — an apply instruction that deliberately carries no policy provenance —
             // so keep it beside the plan, keyed by the exact (from, target) change it belongs
-            // to (see [`ChangeProvenanceKey`]).
+            // to (see [`ChangeKey`]).
             if let Some(security) = security {
                 self.security_by_change
-                    .insert(change_provenance_key(&change), security);
+                    .insert(ChangeKey::of(&change), security);
             }
             self.remember_upgrade_fallbacks(&change, &releases, &verdict);
             planned.push(change);
@@ -2570,7 +2568,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         // skip exactly when the security window is the only reason the target matured.
         if let Some(relevance) = &hold.security {
             self.security_by_change.insert(
-                change_provenance_key(&change),
+                ChangeKey::of(&change),
                 crate::app::workspace::security_info(relevance, &change.to),
             );
         }
@@ -2639,7 +2637,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         // `needs --major` still says why taking it matters.
         if let Some(security) = security {
             self.security_by_change
-                .insert(change_provenance_key(&change), security);
+                .insert(ChangeKey::of(&change), security);
         }
         self.record_change_skip(
             &change,
@@ -2814,7 +2812,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.ctx.opts.dry_run,
             ) {
                 notes.push((
-                    change_provenance_key(&change),
+                    ChangeKey::of(&change),
                     note.with_tool(self.ctx.tool_name())
                         .with_project(self.project_label.clone()),
                 ));
@@ -2884,6 +2882,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             let outcome = self
                 .apply_batch_with_rollback(
                     changes,
+                    &[],
                     state,
                     None,
                     notes.into_iter().collect(),
@@ -2946,11 +2945,15 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// put under `zbus_names`), and that unblocking raises no *new* violation — so re-arming on new
     /// violations alone would stop after one round and leave the now-plannable violation fresh, for
     /// the final residual gate to then roll the whole batch back.
+    ///
+    /// Every round withholds `withheld` from the writer: the trial's own planned and withheld
+    /// changes, which a reconciling resolve can still move partly forward.
     #[tracing::instrument(skip_all, fields(project = %self.ctx.pctx.rel_path, tool = %self.ctx.pctx.tool))]
     async fn reconcile_to_fixpoint(
         &mut self,
         state: &mut TrialState,
         rollback: &mut TrialRollback,
+        withheld: &[Change],
     ) -> Vec<BatchOutcome> {
         let mut outcomes = Vec::new();
         if !state.reconcile_needed {
@@ -2993,6 +2996,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             let outcome = self
                 .apply_batch_with_rollback(
                     changes,
+                    withheld,
                     state,
                     Some(rollback),
                     notes.into_iter().collect(),
@@ -3044,6 +3048,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     async fn apply_batch(&mut self, changes: Vec<Change>, state: &TrialState) -> BatchOutcome {
         self.apply_batch_with_rollback(
             changes,
+            &[],
             state,
             None,
             HashMap::new(),
@@ -3052,6 +3057,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         .await
     }
 
+    /// `withheld` are planned candidates the batch leaves out, which the writer only observes
+    /// ([`PreparedMutation::withheld`](cooldown_core::PreparedMutation::withheld)).
     /// `notes` carries the advisory-rollback warnings parked for this batch's changes, keyed by
     /// the change each one describes; a note whose change never verifiably lands is dropped
     /// with the batch, so a rejected apply or a restored batch cannot publish a claim about a
@@ -3060,9 +3067,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     async fn apply_batch_with_rollback(
         &mut self,
         changes: Vec<Change>,
+        withheld: &[Change],
         state: &TrialState,
         mut rollback: Option<&mut TrialRollback>,
-        notes: HashMap<ChangeProvenanceKey, Diagnostic>,
+        notes: HashMap<ChangeKey, Diagnostic>,
         search: TargetSearch,
     ) -> BatchOutcome {
         let mut outcome = BatchOutcome::default();
@@ -3079,7 +3087,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .phase(format!("applying {} planned changes", changes.len()));
         self.ctx.progress.policy_pass(&changes);
         let prepared = match self
-            .prepare_batch_journal(&plan, rollback.as_deref_mut())
+            .prepare_batch_journal(&plan, withheld, rollback.as_deref_mut())
             .await
         {
             Ok(prepared) => prepared,
@@ -3171,12 +3179,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     async fn prepare_batch_journal(
         &self,
         plan: &Plan,
+        withheld: &[Change],
         rollback: Option<&mut TrialRollback>,
     ) -> cooldown_core::Result<cooldown_core::PreparedMutation> {
         let prepared = self
             .ctx
             .prepare_mutation(plan, &self.leased_shared_files)
-            .await?;
+            .await?
+            .withholding(withheld);
         if let Some(rollback) = rollback {
             rollback.preserve(prepared.journal())?;
         }
@@ -3218,10 +3228,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         changes: &[Change],
         outcome: &mut BatchOutcome,
     ) -> VerifiedBatchReport {
-        let applied: HashSet<ChangeTargetKey> =
-            report.applied.iter().map(change_target_key).collect();
-        let applied_provenance: HashSet<ChangeProvenanceKey> =
-            report.applied.iter().map(change_provenance_key).collect();
+        let applied: HashSet<ChangeKey> = report.applied.iter().map(ChangeKey::of).collect();
         let planned_applied = planned_changes_landed(changes, &applied);
         // Net version changes the resolve forced beyond the plan's own claimed rows (a transitive
         // pushed backward for consistency, matured down by a downgrade, or a held candidate's real
@@ -3232,7 +3239,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         self.add_batch_skips(outcome, report.skipped);
         VerifiedBatchReport {
             applied,
-            applied_provenance,
             collateral,
             edge_rebinds: report.edge_rebinds,
             warnings: report.warnings,
@@ -3264,16 +3270,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     &error,
                     changes
                         .iter()
-                        .filter(|change| applied.contains(&change_target_key(change))),
+                        .filter(|change| applied.contains(&ChangeKey::of(change))),
                 );
                 return None;
             }
         };
-        let admitted = admitted_crossings(
-            changes,
-            &report.applied_provenance,
-            &baseline.allowed_crossings,
-        );
+        let admitted = admitted_crossings(changes, &report.applied, &baseline.allowed_crossings);
         // `fix` has no isolating trial around its batches, so a batch that lifts a package above
         // its configured `max-major` rolls back here; an `upgrade` batch is kept for its trial,
         // whose residual check holds the candidate responsible after reconciliation.
@@ -3325,11 +3327,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         changes: &[Change],
         report: VerifiedBatchReport,
         committed: CommittedBatch,
-        mut notes: HashMap<ChangeProvenanceKey, Diagnostic>,
+        mut notes: HashMap<ChangeKey, Diagnostic>,
     ) {
         let VerifiedBatchReport {
             applied,
-            applied_provenance: _,
             collateral,
             edge_rebinds,
             warnings,
@@ -3353,14 +3354,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 }),
         );
         for change in changes {
-            let key = change_target_key(change);
+            let key = ChangeKey::of(change);
             if applied.contains(&key) {
                 // This is the first point that knows the change verifiably landed, so it is
                 // where a parked advisory-rollback note may finally surface. A planned move
                 // can abandon a fix with no parked note to say so — an upgrade landing where
                 // an OSV range reintroduces the vulnerability — so the gate's pin evidence is
                 // consulted for exactly the changes the notes do not already cover.
-                if let Some(note) = notes.remove(&change_provenance_key(change)) {
+                if let Some(note) = notes.remove(&key) {
                     outcome.warnings.push(note);
                 } else if let Some(warning) = self.fix_loss_warning(change) {
                     outcome.warnings.push(warning);
@@ -3486,7 +3487,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         };
         let targets: Vec<Dependency> = changes
             .iter()
-            .filter(|change| report.applied.contains(&change_target_key(change)))
+            .filter(|change| report.applied.contains(&ChangeKey::of(change)))
             .chain(report.collateral.iter())
             .filter(|change| !change.downgrade && self.abandons_a_fix(change))
             .filter_map(|change| {
@@ -3668,7 +3669,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         after: &HashMap<BaselineViolation, bool>,
         after_keys: &HashSet<BaselineViolation>,
         changes: &[Change],
-        applied: &HashSet<ChangeTargetKey>,
+        applied: &HashSet<ChangeKey>,
         baseline_violations: &HashSet<BaselineViolation>,
     ) -> TransitiveGateVerdict {
         let keep = |reconcile_needed| TransitiveGateVerdict::Keep { reconcile_needed };
@@ -3732,12 +3733,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         &self,
         outcome: &mut BatchOutcome,
         changes: &[Change],
-        applied: &HashSet<ChangeTargetKey>,
+        applied: &HashSet<ChangeKey>,
         reason: SkipReason,
         offender: &str,
     ) {
         for change in changes {
-            if applied.contains(&change_target_key(change)) {
+            if applied.contains(&ChangeKey::of(change)) {
                 outcome.items.push(self.change_skip_item(
                     change,
                     Some(SkippedInfo {
@@ -4121,10 +4122,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             applied,
             skipped,
         );
-        item.security = self
-            .security_by_change
-            .get(&change_provenance_key(change))
-            .cloned();
+        item.security = self.security_by_change.get(&ChangeKey::of(change)).cloned();
         item
     }
 
@@ -4207,21 +4205,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 }
 
 fn held_upgrade_info(change: &Change, outcomes: &[BatchOutcome]) -> Option<SkippedInfo> {
+    let key = ChangeKey::of(change);
     outcomes
         .iter()
         .flat_map(|outcome| &outcome.items)
         .find_map(|item| {
-            if !item.applied
-                && item.edge.is_none()
-                && item.from == change.from.as_str()
-                && change_target_key_parts(
-                    &item.name,
-                    item.registry.as_deref(),
-                    &item.to,
-                    item.direct,
-                    &item.members,
-                ) == change_target_key(change)
-            {
+            if !item.applied && item.edge.is_none() && ChangeKey::of_item(item) == key {
                 item.skipped.clone()
             } else {
                 None
@@ -4257,9 +4246,8 @@ fn conservative_hold(reason: SkipReason, mode: PlanMode) -> bool {
 
 /// Whether `changes` holds `change` itself: the same target from the same version.
 fn contains_upgrade(changes: &[Change], change: &Change) -> bool {
-    changes.iter().any(|item| {
-        change_target_key(item) == change_target_key(change) && item.from == change.from
-    })
+    let key = ChangeKey::of(change);
+    changes.iter().any(|item| ChangeKey::of(item) == key)
 }
 
 fn same_upgrade_candidate(change: &Change, original: &Change) -> bool {
@@ -4280,22 +4268,14 @@ fn landed_upgrade_changes(
     changes
         .iter()
         .filter(|change| {
+            let key = ChangeKey::of(change);
             target_reached(graph, change)
                 && outcomes
                     .iter()
                     .filter(|outcome| outcome.is_committed())
                     .any(|outcome| {
                         outcome.items.iter().any(|item| {
-                            item.applied
-                                && item.edge.is_none()
-                                && item.from == change.from.as_str()
-                                && change_target_key_parts(
-                                    &item.name,
-                                    item.registry.as_deref(),
-                                    &item.to,
-                                    item.direct,
-                                    &item.members,
-                                ) == change_target_key(change)
+                            item.applied && item.edge.is_none() && ChangeKey::of_item(item) == key
                         })
                     })
         })
@@ -4308,17 +4288,11 @@ fn landed_upgrade_changes(
 ///
 /// Unlike [`landed_upgrade_changes`], the committed row is matched member-blind: an adapter
 /// reports collateral movement as a transitive row (`direct: false`, members filled in later
-/// from the graph), whose target key never carries the members a direct change's key does.
+/// from the graph), whose key never carries the members a direct change's key does.
 /// The member requirement is proven against the graph instead, so a move that left one declaring
 /// member behind keeps its hold.
 fn landed_as_collateral(change: &Change, outcomes: &[BatchOutcome], graph: &[Dependency]) -> bool {
-    let target = change_target_key_parts(
-        &change.package.name,
-        change.package.registry.as_deref(),
-        change.to.as_str(),
-        false,
-        &[],
-    );
+    let key = ChangeKey::of(change).member_blind();
     target_reached(graph, change)
         && outcomes
             .iter()
@@ -4327,14 +4301,7 @@ fn landed_as_collateral(change: &Change, outcomes: &[BatchOutcome], graph: &[Dep
             .any(|item| {
                 item.applied
                     && item.edge.is_none()
-                    && item.from == change.from.as_str()
-                    && change_target_key_parts(
-                        &item.name,
-                        item.registry.as_deref(),
-                        &item.to,
-                        false,
-                        &[],
-                    ) == target
+                    && ChangeKey::of_item(item).member_blind() == key
             })
 }
 
@@ -4392,11 +4359,11 @@ fn verify_applied_targets(
     planned: &[Change],
     deps: &[Dependency],
 ) -> ApplyReport {
-    let planned: HashSet<ChangeTargetKey> = planned.iter().map(change_target_key).collect();
-    let mut skipped_keys: HashSet<ChangeTargetKey> = report
+    let planned: HashSet<ChangeKey> = planned.iter().map(ChangeKey::of).collect();
+    let mut skipped_keys: HashSet<ChangeKey> = report
         .skipped
         .iter()
-        .map(|skip| change_target_key(&skip.change))
+        .map(|skip| ChangeKey::of(&skip.change))
         .collect();
     let mut verified = ApplyReport {
         applied: Vec::new(),
@@ -4408,7 +4375,7 @@ fn verify_applied_targets(
     };
 
     for change in report.applied {
-        let key = change_target_key(&change);
+        let key = ChangeKey::of(&change);
         if !planned.contains(&key) {
             verified.applied.push(change);
             continue;
@@ -4466,10 +4433,10 @@ fn unreached_target_hold(change: &Change) -> Skipped {
     }
 }
 
-fn planned_changes_landed(changes: &[Change], applied: &HashSet<ChangeTargetKey>) -> bool {
+fn planned_changes_landed(changes: &[Change], applied: &HashSet<ChangeKey>) -> bool {
     changes
         .iter()
-        .any(|change| applied.contains(&change_target_key(change)))
+        .any(|change| applied.contains(&ChangeKey::of(change)))
 }
 
 /// One locked pin's identity in [`pin_security`](ProjectUpgradeExecutor::pin_security):
@@ -4497,20 +4464,16 @@ fn advisory_id_list(ids: &[&cooldown_core::AdvisoryId]) -> String {
 /// The applied rows the plan did not itself claim — the collateral movement recorded as its own
 /// applied rows when the batch commits.
 ///
-/// Filtered by exact change identity ([`change_target_key`]), not by package: a held candidate's
+/// Filtered by exact change identity ([`ChangeKey`]), not by package: a held candidate's
 /// package is planned, but the row reporting its real off-target float is not, and a package-level
 /// filter would silently drop that movement behind the held skip.
-/// The source version is part of that identity here, though the target key leaves it out: another
-/// copy of a planned transitive moving to the same target is a move of its own, which the
-/// planned row does not report.
+/// The source version is part of that identity, so another copy of a planned transitive moving to
+/// the same target is a move of its own, which the planned row does not report.
 fn collateral_rows(applied: &[Change], planned: &[Change]) -> Vec<Change> {
-    let planned: HashSet<(ChangeTargetKey, &str)> = planned
-        .iter()
-        .map(|change| (change_target_key(change), change.from.as_str()))
-        .collect();
+    let planned: HashSet<ChangeKey> = planned.iter().map(ChangeKey::of).collect();
     applied
         .iter()
-        .filter(|change| !planned.contains(&(change_target_key(change), change.from.as_str())))
+        .filter(|change| !planned.contains(&ChangeKey::of(change)))
         .cloned()
         .collect()
 }

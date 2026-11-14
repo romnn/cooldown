@@ -2,7 +2,7 @@
 
 use super::super::UpgradeAccum;
 use crate::app::UpgradeItem;
-use crate::app::change_key::{ChangeProvenanceKey, ChangeTargetKey, change_provenance_key};
+use crate::app::change_key::ChangeKey;
 use cooldown_core::{ApplyReport, BaselineViolation, Change, Diagnostic, EdgeRebind};
 use std::collections::HashSet;
 
@@ -32,26 +32,21 @@ pub(super) struct BatchReport {
 /// reason.
 pub(super) struct HoldAttestation {
     /// The planned changes the apply reported applied, before any verification of the graph.
-    pub(super) applied: HashSet<ChangeProvenanceKey>,
-    pub(super) holds: HashSet<ChangeProvenanceKey>,
+    pub(super) applied: HashSet<ChangeKey>,
+    pub(super) holds: HashSet<ChangeKey>,
 }
 
 impl HoldAttestation {
     pub(super) fn of(report: &ApplyReport, planned: &[Change]) -> Self {
-        let planned: HashSet<ChangeProvenanceKey> =
-            planned.iter().map(change_provenance_key).collect();
+        let planned: HashSet<ChangeKey> = planned.iter().map(ChangeKey::of).collect();
         HoldAttestation {
             applied: report
                 .applied
                 .iter()
-                .map(change_provenance_key)
+                .map(ChangeKey::of)
                 .filter(|key| planned.contains(key))
                 .collect(),
-            holds: report
-                .independent_holds
-                .iter()
-                .map(change_provenance_key)
-                .collect(),
+            holds: report.independent_holds.iter().map(ChangeKey::of).collect(),
         }
     }
 }
@@ -218,10 +213,9 @@ pub(super) fn indeterminate_trial(outcomes: Vec<BatchOutcome>) -> BatchOutcome {
 
 /// The adapter evidence retained after graph verification accepts one batch.
 pub(super) struct VerifiedBatchReport {
-    pub(super) applied: HashSet<ChangeTargetKey>,
     /// The applied changes keyed with their source version, which tells a planned move that
-    /// landed apart from a collateral move onto the same target.
-    pub(super) applied_provenance: HashSet<ChangeProvenanceKey>,
+    /// landed apart from another copy's move onto the same target.
+    pub(super) applied: HashSet<ChangeKey>,
     pub(super) collateral: Vec<cooldown_core::Change>,
     /// Lock edges the adapter's edge policy corrected or observed rebound.
     pub(super) edge_rebinds: Vec<EdgeRebind>,
