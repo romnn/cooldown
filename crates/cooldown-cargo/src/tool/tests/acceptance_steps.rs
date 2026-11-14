@@ -249,6 +249,7 @@ async fn a_joint_widen_that_moves_a_declared_crate_restores_its_manifest_edit() 
                 journal: &journal,
                 observer: None,
             },
+            CulpritDrop::First,
             &mut stats,
         )
         .await?;
@@ -289,6 +290,7 @@ async fn a_joint_widen_that_keeps_declared_crates_is_retained() -> eyre::Result<
                 journal: &journal,
                 observer: None,
             },
+            CulpritDrop::First,
             &mut stats,
         )
         .await?

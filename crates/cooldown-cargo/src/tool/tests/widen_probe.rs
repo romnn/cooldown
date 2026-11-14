@@ -176,6 +176,16 @@ impl WidenFixture {
         journal: &ProjectMutationJournal,
         stats: &mut WholeGraphStats,
     ) -> Result<Option<WidenEvidence>> {
+        self.probe_dropping(journal, CulpritDrop::First, stats)
+            .await
+    }
+
+    async fn probe_dropping(
+        &self,
+        journal: &ProjectMutationJournal,
+        culprit_drop: CulpritDrop,
+        stats: &mut WholeGraphStats,
+    ) -> Result<Option<WidenEvidence>> {
         let candidates: Vec<_> = self.changes.iter().collect();
         self.tool
             .joint_widen_probe(
@@ -189,6 +199,7 @@ impl WidenFixture {
                     journal,
                     observer: None,
                 },
+                culprit_drop,
                 stats,
             )
             .await
@@ -317,6 +328,121 @@ async fn a_joint_probe_retries_without_the_candidate_its_refusal_chain_cites() -
     assert_eq!(stats.joint_retries, 1);
     let manifest = std::fs::read_to_string(&fixture.project.manifest)?;
     assert!(manifest.contains("pkg001 = \"1\""), "{manifest}");
+    Ok(())
+}
+
+/// The lock the fake `cargo` of [`a_fast_joint_probe_drops_every_culprit_of_one_resolve`]
+/// writes when `widened` names which of `pkg000`..`pkg002` moved to 2.0.0.
+///
+/// `app` declares `shared0` and `shared1` 1, which `pkg000` and `pkg001` 1.0.0 share with it.
+/// Their 2.0.0 releases require `shared0` and `shared1` 2, so widening either one splits the
+/// crate `app` declares, a violation naming that candidate; `pkg002` moves freely.
+fn splitting_lock(widened: [bool; 3]) -> String {
+    let [pkg000, pkg001, pkg002] = widened.map(|moved| if moved { "2.0.0" } else { "1.0.0" });
+    let shared = |name: &str, moved: bool| {
+        if moved {
+            (format!("\"{name} 1.0.0\""), format!("\"{name} 2.0.0\""))
+        } else {
+            (format!("\"{name}\""), format!("\"{name}\""))
+        }
+    };
+    let [moved0, moved1, _] = widened;
+    let (app0, pkg0) = shared("shared0", moved0);
+    let (app1, pkg1) = shared("shared1", moved1);
+    let mut content = formatdoc! {r#"
+        version = 4
+
+        [[package]]
+        name = "app"
+        version = "0.1.0"
+        dependencies = ["pkg000", "pkg001", "pkg002", {app0}, {app1}]
+
+        [[package]]
+        name = "pkg000"
+        version = "{pkg000}"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+        dependencies = [{pkg0}]
+
+        [[package]]
+        name = "pkg001"
+        version = "{pkg001}"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+        dependencies = [{pkg1}]
+
+        [[package]]
+        name = "pkg002"
+        version = "{pkg002}"
+        source = "registry+https://github.com/rust-lang/crates.io-index"
+    "#};
+    for (name, moved) in [("shared0", moved0), ("shared1", moved1)] {
+        let versions: &[&str] = if moved {
+            &["1.0.0", "2.0.0"]
+        } else {
+            &["1.0.0"]
+        };
+        for version in versions {
+            content.push_str(&formatdoc! {r#"
+
+                [[package]]
+                name = "{name}"
+                version = "{version}"
+                source = "registry+https://github.com/rust-lang/crates.io-index"
+            "#});
+        }
+    }
+    content
+}
+
+/// Under `upgrade --fast` a joint probe leaves out every culprit one resolve names at once: two
+/// candidates that each split a declared crate cost one retry instead of one each, and the
+/// candidate that splits nothing lands either way.
+#[tokio::test]
+async fn a_fast_joint_probe_drops_every_culprit_of_one_resolve() -> eyre::Result<()> {
+    for (culprit_drop, resolves) in [(CulpritDrop::First, 3), (CulpritDrop::All, 2)] {
+        let fixture = WidenFixture::new(
+            3,
+            indoc! {r#"
+            widened=''
+            for name in pkg000 pkg001 pkg002; do
+              if grep -q "$name = \"2" Cargo.toml; then widened="${widened}1"; else widened="${widened}0"; fi
+            done
+            cp "lock-$widened" Cargo.lock
+        "#},
+        )?;
+        let root = &fixture.project.root;
+        std::fs::write(root.join("Cargo.lock"), splitting_lock([false; 3]))?;
+        for widened in 0..8_u8 {
+            let moved = [widened & 4 != 0, widened & 2 != 0, widened & 1 != 0];
+            let name = moved.map(|moved| if moved { '1' } else { '0' });
+            std::fs::write(
+                root.join(format!("lock-{}", name.iter().collect::<String>())),
+                splitting_lock(moved),
+            )?;
+        }
+        let journal = fixture.journal().await?;
+        let mut stats = WholeGraphStats::default();
+        let retained = fixture
+            .probe_dropping(&journal, culprit_drop, &mut stats)
+            .await?;
+
+        // The probe keeps the one widen that splits nothing.
+        let retained = retained.ok_or_else(|| eyre::eyre!("{culprit_drop:?}: pkg002 must land"))?;
+        let [pkg000, pkg001, pkg002] = [0, 1, 2].map(|index| fixture.changes.get(index));
+        assert!(pkg002.is_some_and(|change| retained.reached(change)));
+        assert!(!pkg000.is_some_and(|change| retained.reached(change)));
+        assert!(!pkg001.is_some_and(|change| retained.reached(change)));
+
+        // Dropping one culprit per resolve takes a retry per splitting candidate; dropping every
+        // culprit of the first resolve takes one.
+        assert_eq!(fixture.invocations()?.len(), resolves, "{culprit_drop:?}");
+        assert_eq!(stats.joint_retries, resolves - 1, "{culprit_drop:?}");
+
+        // The splitting candidates keep their original requirements for their own attempts.
+        let manifest = std::fs::read_to_string(&fixture.project.manifest)?;
+        assert!(manifest.contains("pkg000 = \"1\""), "{manifest}");
+        assert!(manifest.contains("pkg001 = \"1\""), "{manifest}");
+        assert!(manifest.contains("pkg002 = \"2"), "{manifest}");
+    }
     Ok(())
 }
 
@@ -542,6 +668,7 @@ async fn protected_member_reach_cannot_be_replaced_by_a_disconnected_target_copy
                     journal: &journal,
                     observer: None
                 },
+                CulpritDrop::First,
                 &mut stats
             )
             .await?
@@ -664,6 +791,7 @@ async fn rejected_metadata_restores_removed_and_renamed_follower_entries_and_loc
                     journal: &journal,
                     observer: None
                 },
+                CulpritDrop::First,
                 &mut stats
             )
             .await?

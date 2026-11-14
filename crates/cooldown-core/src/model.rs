@@ -1058,6 +1058,14 @@ pub struct Plan {
     /// remediation batches; each batch's journal remains the rollback and version-diff baseline.
     /// The format matches [`ToolWrite::lock_edge_snapshot`](crate::ToolWrite::lock_edge_snapshot).
     pub initial_lock_snapshot: Option<std::sync::Arc<[u8]>>,
+    /// Whether the adapter may shorten its search for the changes' targets (`upgrade --fast`).
+    ///
+    /// A shortened search may land fewer of the changes, never a different or unverified one:
+    /// every resolve it keeps still passes the same acceptance rule and verification.
+    /// The caller sets it only on forward upgrade batches, never on the remediation batches that
+    /// reconcile a trial back within policy.
+    /// Defaults to `false`, the exhaustive search.
+    pub fast: bool,
 }
 
 /// Declares [`SkipReason`] together with its [`ALL`](SkipReason::ALL) enumeration and per-variant
