@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **pnpm advances each copy of a transitive package resolved at several versions.** A name with
+  more than one copy in the graph was held as `multi_version_held` outright, so ordinary in-range
+  updates such as `ansi-regex` 6.2.2 → 6.5.0 beside an unaffected 5.0.1 copy, or Babel helpers
+  moving on both their 7 and 8 lines, never landed. Each copy now advances through override
+  selectors that name the dependents binding it, so another copy of the name stays where it is,
+  and a dependent moving in the same run takes the copy with it. A copy is still held when no
+  selector reaches it alone, such as one required through an npm alias, and the row says why.
+
 - **The pnpm report credits a transitive upgrade only when its own copy moved.** A name can
   resolve to several copies, and the report judged each planned move by the name's newest copy.
   `inline-style-parser` 0.2.7 → 0.2.9 was reported applied while `style-to-object` 1.0.14 still
