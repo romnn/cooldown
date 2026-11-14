@@ -7,6 +7,7 @@ mod ambient;
 mod artifact;
 mod build_requires;
 mod ceiling;
+mod constraints;
 pub mod cutoff;
 pub mod lock;
 mod manifest;

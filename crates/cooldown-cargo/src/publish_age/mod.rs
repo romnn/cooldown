@@ -40,7 +40,15 @@ pub(crate) struct CargoEnvironment {
     pub(crate) global_age: Option<String>,
     /// The raw `CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE`.
     pub(crate) incompatible: Option<String>,
+    /// The raw value of every `CARGO_REGISTRIES_<NAME>_MIN_PUBLISH_AGE`.
+    pub(crate) registry_ages: Vec<String>,
+    /// The raw `CARGO_NET_OFFLINE`.
+    pub(crate) offline: Option<String>,
 }
+
+/// The prefix and suffix of the environment variable cargo reads for
+/// `registries.<name>.min-publish-age`.
+const REGISTRY_AGE_ENV: (&str, &str) = ("CARGO_REGISTRIES_", "_MIN_PUBLISH_AGE");
 
 impl CargoEnvironment {
     /// Captures the environment of the running process.
@@ -53,11 +61,43 @@ impl CargoEnvironment {
             // user profile rather than `HOME`.
             .or_else(|| std::env::home_dir().map(|home| home.join(".cargo")))
             .and_then(|path| Utf8PathBuf::from_path_buf(path).ok());
+        let (prefix, suffix) = REGISTRY_AGE_ENV;
+        let registry_ages = std::env::vars_os()
+            .filter_map(|(name, value)| {
+                name.to_str()?.strip_prefix(prefix)?.strip_suffix(suffix)?;
+                // A value that is not Unicode is no age cargo parses either, and stays configured
+                // so that a caller treating it as unparsable fails safe.
+                Some(value.to_string_lossy().into_owned())
+            })
+            .collect();
         Self {
             cargo_home,
             global_age: std::env::var(GLOBAL_AGE_ENV).ok(),
             incompatible: std::env::var(INCOMPATIBLE_ENV).ok(),
+            registry_ages,
+            offline: std::env::var_os("CARGO_NET_OFFLINE")
+                .map(|value| value.to_string_lossy().into_owned()),
         }
+    }
+
+    /// The config files cargo merges for a command run in `dir`, nearest first.
+    ///
+    /// Cargo reads the active file of every ancestor's `.cargo/` directory, then the Cargo
+    /// home's, which always ranks last even when it is also an ancestor.
+    /// A directory's active file is `config` when that exists, and `config.toml` otherwise.
+    pub(crate) fn config_files(&self, dir: &Utf8Path) -> Vec<Utf8PathBuf> {
+        // A relative `CARGO_HOME` resolves against the directory cargo runs in.
+        let home = self.cargo_home.as_ref().map(|home| dir.join(home));
+        let mut config_dirs: Vec<Utf8PathBuf> = dir
+            .ancestors()
+            .map(|ancestor| ancestor.join(".cargo"))
+            .filter(|config_dir| Some(config_dir) != home.as_ref())
+            .collect();
+        config_dirs.extend(home);
+        config_dirs
+            .iter()
+            .filter_map(|config_dir| active_config_file(config_dir))
+            .collect()
     }
 }
 
@@ -109,20 +149,8 @@ impl PublishAgeSettings {
     /// A directory's active file is `config` when that exists, and `config.toml` otherwise.
     /// The environment then overrides the file value of the same key.
     pub(crate) fn discover(dir: &Utf8Path, env: &CargoEnvironment) -> Result<Self, CoreError> {
-        // A relative `CARGO_HOME` resolves against the directory cargo runs in.
-        let home = env.cargo_home.as_ref().map(|home| dir.join(home));
-        let mut config_dirs: Vec<Utf8PathBuf> = dir
-            .ancestors()
-            .map(|ancestor| ancestor.join(".cargo"))
-            .filter(|config_dir| Some(config_dir) != home.as_ref())
-            .collect();
-        config_dirs.extend(home);
-
         let mut settings = Self::default();
-        for config_dir in &config_dirs {
-            let Some(path) = active_config_file(config_dir) else {
-                continue;
-            };
+        for path in env.config_files(dir) {
             let content = std::fs::read_to_string(&path)
                 .map_err(|err| CoreError::Filesystem(format!("{path}: {err}")))?;
             let value: toml::Value = toml::from_str(&content)

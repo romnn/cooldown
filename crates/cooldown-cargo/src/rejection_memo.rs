@@ -14,6 +14,8 @@ pub(crate) enum MemoOperation {
     Landing,
     /// A `cargo metadata --locked` read, which keys the graph it returned.
     LockedRead,
+    /// A lock-resolving command, which keys its native outcome.
+    Command,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -26,6 +28,31 @@ struct CaptureContext {
     original_root: Utf8PathBuf,
     metadata_mode: MemoMetadataMode,
     environment: [u8; 32],
+    lock: LockSource,
+}
+
+/// Where a capture takes the project's `Cargo.lock` from.
+#[derive(Debug, Clone)]
+pub(crate) enum LockSource {
+    /// The file on disk.
+    Disk,
+    /// The given contents, `None` for an absent lock, in place of the file on disk.
+    Contents(Option<Vec<u8>>),
+}
+
+/// The native inputs of a command: their key, and the manifests among them.
+#[derive(Debug)]
+pub(crate) struct CommandInputs {
+    pub(crate) key: MemoKey,
+    pub(crate) manifests: Vec<CapturedManifest>,
+}
+
+/// A manifest the key captured, which Cargo may discover targets beside.
+#[derive(Debug)]
+pub(crate) struct CapturedManifest {
+    /// The directory holding the manifest.
+    pub(crate) directory: Utf8PathBuf,
+    pub(crate) document: Arc<toml::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -94,7 +121,25 @@ impl MemoKey {
         cache: &InputCache,
         context: CaptureContext,
     ) -> Result<Self, CoreError> {
-        let captured = capture_inputs(project, followers, cache, &context.original_root)?;
+        Self::capture_with_manifests(project, operation, changes, followers, cache, context)
+            .map(|captured| captured.key)
+    }
+
+    fn capture_with_manifests(
+        project: &Project,
+        operation: MemoOperation,
+        changes: &[&Change],
+        followers: &[MemberRef],
+        cache: &InputCache,
+        context: CaptureContext,
+    ) -> Result<CommandInputs, CoreError> {
+        let captured = capture_inputs(
+            project,
+            followers,
+            cache,
+            &context.original_root,
+            &context.lock,
+        )?;
         let mut identities = changes
             .iter()
             .map(|change| {
@@ -114,15 +159,18 @@ impl MemoKey {
         let mut followers: Vec<_> = followers.iter().map(MemberIdentity::from).collect();
         followers.sort();
         followers.dedup();
-        Ok(Self {
-            operation,
-            metadata_mode: context.metadata_mode,
-            original_root: context.original_root,
-            environment: context.environment,
-            cacheable: captured.cacheable,
-            changes: identities,
-            followers,
-            inputs: captured.digest,
+        Ok(CommandInputs {
+            key: Self {
+                operation,
+                metadata_mode: context.metadata_mode,
+                original_root: context.original_root,
+                environment: context.environment,
+                cacheable: captured.cacheable,
+                changes: identities,
+                followers,
+                inputs: captured.digest,
+            },
+            manifests: captured.manifests,
         })
     }
 }
@@ -215,6 +263,47 @@ impl RejectionMemo {
         followers: &[MemberRef],
         metadata_mode: MemoMetadataMode,
     ) -> Result<MemoKey, CoreError> {
+        let original_root = self.original_root(project)?;
+        MemoKey::capture_cached(
+            project,
+            operation,
+            changes,
+            followers,
+            &self.inputs,
+            CaptureContext {
+                original_root,
+                metadata_mode,
+                environment: environment_digest(std::env::vars_os()),
+                lock: LockSource::Disk,
+            },
+        )
+    }
+
+    /// The native inputs of a lock-resolving command run in `project`, reading the lock from
+    /// `lock`.
+    pub(crate) fn command_inputs(
+        &self,
+        project: &Project,
+        lock: LockSource,
+    ) -> Result<CommandInputs, CoreError> {
+        let original_root = self.original_root(project)?;
+        MemoKey::capture_with_manifests(
+            project,
+            MemoOperation::Command,
+            &[],
+            &[],
+            &self.inputs,
+            CaptureContext {
+                original_root,
+                metadata_mode: MemoMetadataMode::Resolve,
+                environment: environment_digest(std::env::vars_os()),
+                lock,
+            },
+        )
+    }
+
+    /// The root keys name `project` by: the original of a staged copy, else its own.
+    fn original_root(&self, project: &Project) -> Result<Utf8PathBuf, CoreError> {
         let original_root = match self
             .origins
             .lock()
@@ -229,18 +318,7 @@ impl RejectionMemo {
             }
             None => resolve_reference(&project.root)?,
         };
-        MemoKey::capture_cached(
-            project,
-            operation,
-            changes,
-            followers,
-            &self.inputs,
-            CaptureContext {
-                original_root,
-                metadata_mode,
-                environment: environment_digest(std::env::vars_os()),
-            },
-        )
+        Ok(original_root)
     }
 
     pub(crate) fn register_origin(
@@ -436,6 +514,7 @@ fn capture_files(
 struct CapturedDigest {
     digest: [u8; 32],
     cacheable: bool,
+    manifests: Vec<CapturedManifest>,
 }
 
 struct ConfigurationInputs {
@@ -584,9 +663,16 @@ fn capture_inputs(
     followers: &[MemberRef],
     cache: &InputCache,
     original_root: &Utf8Path,
+    lock: &LockSource,
 ) -> Result<CapturedDigest, CoreError> {
     let mut inputs = capture_configuration_inputs(project, followers, cache, original_root)?;
+    if let LockSource::Contents(contents) = lock {
+        inputs
+            .files
+            .insert(project.root.join("Cargo.lock"), contents.clone());
+    }
     inputs.cacheable &= !has_complex_member_globs(&inputs.files, cache);
+    let mut manifests = Vec::new();
     for (path, bytes) in &inputs.files {
         if path.file_name() != Some(crate::CARGO_MANIFEST) {
             continue;
@@ -597,6 +683,10 @@ fn capture_inputs(
         let Some(directory) = path.parent() else {
             continue;
         };
+        manifests.push(CapturedManifest {
+            directory: directory.to_owned(),
+            document: Arc::clone(&document),
+        });
         let mut tables = vec![document.as_ref()];
         while let Some(table) = tables.pop() {
             if let Some(table) = table.as_table() {
@@ -651,6 +741,7 @@ fn capture_inputs(
     Ok(CapturedDigest {
         digest: digest.finalize().into(),
         cacheable: inputs.cacheable,
+        manifests,
     })
 }
 
@@ -1689,6 +1780,7 @@ mod tests {
                 original_root: project.root.clone(),
                 metadata_mode: MemoMetadataMode::Skip,
                 environment: first,
+                lock: LockSource::Disk,
             },
         )?;
         let second_key = MemoKey::capture_cached(
@@ -1701,6 +1793,7 @@ mod tests {
                 original_root: project.root.clone(),
                 metadata_mode: MemoMetadataMode::Skip,
                 environment: second,
+                lock: LockSource::Disk,
             },
         )?;
         assert_ne!(first_key, second_key);

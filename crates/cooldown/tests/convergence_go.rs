@@ -688,3 +688,78 @@ fn a_module_only_the_graph_holds_is_neither_listed_nor_planned() {
         assert!(!names.contains(OBJX), "{command}: {names:?}");
     }
 }
+
+/// The cutoff for the requirer-follow test: `go.opentelemetry.io/otel/sdk/metric` v1.19.0 has
+/// matured, and with it `go.opentelemetry.io/otel/metric` v1.19.0, which it requires.
+const FREEZE_OTEL: &str = "2023-10-01T00:00:00Z";
+
+const OTEL_SDK_METRIC: &str = "go.opentelemetry.io/otel/sdk/metric";
+const OTEL_METRIC: &str = "go.opentelemetry.io/otel/metric";
+
+/// A `go 1.21` module on `otel/sdk/metric` v0.38.0, which requires `otel/metric` v0.38.0 as an
+/// indirect requirement.
+fn otel_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write(
+        "go.mod",
+        &indoc::formatdoc! {"
+            module example.com/cooldown-go-otel
+
+            go 1.21
+
+            require {OTEL_SDK_METRIC} v0.38.0
+        "},
+    );
+    fixture.write(
+        "main.go",
+        &indoc::formatdoc! {r#"
+            package main
+
+            import "{OTEL_SDK_METRIC}"
+
+            func main() {{ _ = metric.NewMeterProvider }}
+        "#},
+    );
+    fixture
+        .run_tool("go", &["mod", "tidy"], &[("GOFLAGS", "")])
+        .expect_success();
+    fixture
+}
+
+/// Under `--major`, `otel/sdk/metric` v1.19.0 requires `otel/metric` v1.19.0, while the plan
+/// advances the indirect `otel/metric` only within v0, to v0.38.1.
+/// The indirect module follows the requirer instead of holding it: the upgrade lands, and the
+/// module's real move is reported.
+#[test]
+fn an_indirect_module_follows_a_requirer_that_needs_it_newer() {
+    skip_if_missing!("go");
+    let fixture = otel_fixture();
+
+    let report = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE_OTEL]);
+
+    assert!(report.ok(), "{report:?}");
+    assert_eq!(report.summary_errors(), 0, "{report:?}");
+    let pins = go_mod_pins(&fixture.read_bytes("go.mod"));
+    assert_eq!(
+        pins.get(OTEL_SDK_METRIC).map(String::as_str),
+        Some("v1.19.0")
+    );
+    assert_eq!(pins.get(OTEL_METRIC).map(String::as_str), Some("v1.19.0"));
+    // The requirer is not held, and the indirect module's dropped v0 target is a conservative skip
+    // beside its real move.
+    assert!(
+        report.skipped_reasons_for(OTEL_SDK_METRIC).is_empty(),
+        "{report:?}"
+    );
+    assert_eq!(
+        report.skipped_reasons_for(OTEL_METRIC),
+        std::collections::BTreeSet::from(["not_eligible".to_string()])
+    );
+    assert!(
+        report
+            .changes_for(OTEL_METRIC)
+            .iter()
+            .any(|change| change.to == "v1.19.0"),
+        "{report:?}"
+    );
+}
