@@ -561,10 +561,14 @@ async fn a_replayed_pin_is_judged_against_the_plan_of_its_step() -> eyre::Result
         .tool
         .rejection_memo
         .register_origin(&fixture.project.root, &fixture.project.root)?;
+    // Staging registers the canonical directory of its copy, and a temporary directory is a
+    // symbolic link on macOS (`/var` is `/private/var`).
+    let tree = camino::Utf8PathBuf::from_path_buf(std::fs::canonicalize(&fixture.project.root)?)
+        .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
     fixture
         .tool
         .command_outcomes
-        .register_staged(&fixture.project.root, &fixture.project.root);
+        .register_staged(&fixture.project.root, &tree);
     let planned = change("pkg", "1.0.0", "1.2.0", false);
     let collateral = change("declared", "1.0.0", "0.9.0", true);
     let alone = [planned.clone()];
