@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Go upgrades let an indirect module follow the upgrades that need it newer.** When a planned
+  upgrade required a newer version of an `// indirect` module than the module's own planned
+  target, for example `otel/sdk/metric` v1.19.0 needing `otel/metric` v1.19.0 while
+  `otel/metric` was planned within v0, every joint resolve failed. Bisection then held whichever
+  candidates it happened to split off. The indirect module's target is now dropped, so it moves
+  to what its requirers need, and the upgrade lands. When `go` names a requirer that needs a
+  direct module newer than planned, or a version whose `go.mod` declares another module path, that
+  change alone is held with Go's explanation, and the rest is retried without bisecting.
+
 - **A uv upgrade held by the project's own constraint names that constraint.** A package held
   by `[tool.uv] constraint-dependencies` or `override-dependencies`, such as `onnxruntime==1.31.0`,
   was reported as conflicting with whichever package happened to pull it in, even when that
