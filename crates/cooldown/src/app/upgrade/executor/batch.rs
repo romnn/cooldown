@@ -65,7 +65,8 @@ pub(super) enum BatchOutcome {
     /// The post-apply graph was verified and retained.
     Committed {
         report: BatchReport,
-        state: CommittedBatch,
+        /// Boxed because its graph-sized sets would otherwise size every outcome.
+        state: Box<CommittedBatch>,
     },
     /// Independent drift prevented restoration, so no later mutation may run.
     RestoreConflict(BatchReport),
@@ -75,6 +76,10 @@ pub(super) enum BatchOutcome {
 pub(super) struct CommittedBatch {
     /// The graph's non-baselined violations after this batch (the next trial baseline).
     pub(super) violations_after: HashSet<BaselineViolation>,
+    /// The graph's versions above their configured `max-major` after this batch.
+    pub(super) crossings_after: HashSet<BaselineViolation>,
+    /// The versions outside a configured `max-major` this batch's planned changes authorize.
+    pub(super) admitted_crossings: HashSet<BaselineViolation>,
     /// Whether the batch floated up violations the reconcile pass should mature down.
     pub(super) reconcile_needed: bool,
 }
@@ -109,7 +114,7 @@ impl BatchOutcome {
 
     pub(super) fn committed_state(&self) -> Option<&CommittedBatch> {
         match self {
-            BatchOutcome::Committed { state, .. } => Some(state),
+            BatchOutcome::Committed { state, .. } => Some(state.as_ref()),
             BatchOutcome::Unchanged(_)
             | BatchOutcome::Restored(_)
             | BatchOutcome::RestoreConflict(_) => None,
@@ -123,7 +128,10 @@ impl BatchOutcome {
 
     pub(super) fn mark_committed(&mut self, state: CommittedBatch) {
         let report = self.take_report();
-        *self = BatchOutcome::Committed { report, state };
+        *self = BatchOutcome::Committed {
+            report,
+            state: Box::new(state),
+        };
     }
 
     pub(super) fn mark_restore_conflict(&mut self) {
@@ -211,6 +219,9 @@ pub(super) fn indeterminate_trial(outcomes: Vec<BatchOutcome>) -> BatchOutcome {
 /// The adapter evidence retained after graph verification accepts one batch.
 pub(super) struct VerifiedBatchReport {
     pub(super) applied: HashSet<ChangeTargetKey>,
+    /// The applied changes keyed with their source version, which tells a planned move that
+    /// landed apart from a collateral move onto the same target.
+    pub(super) applied_provenance: HashSet<ChangeProvenanceKey>,
     pub(super) collateral: Vec<cooldown_core::Change>,
     /// Lock edges the adapter's edge policy corrected or observed rebound.
     pub(super) edge_rebinds: Vec<EdgeRebind>,

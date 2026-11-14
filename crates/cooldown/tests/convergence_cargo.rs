@@ -2011,6 +2011,69 @@ fn upgrade_reruns_a_project_a_later_project_staled() {
     assert_run_absorbs_the_lock_it_staled(&fixture, "b", "a");
 }
 
+/// Caps the standalone project of a [`run_staled_fixture`] at `itoa` 0, runs `upgrade --major`,
+/// and asserts the refresh the workspace forces is reported as crossing that ceiling.
+/// The workspace has no ceiling of its own, so it adopts `itoa` 1.x and drags the standalone
+/// lock there; no rollback inside the standalone project can undo that.
+fn assert_refresh_crossing_fails_its_project(fixture: &Fixture, workspace: &str, standalone: &str) {
+    fixture.write(
+        &under(standalone, "cooldown.toml"),
+        indoc! {"
+            [tool.cargo.package.itoa]
+            max-major = 0
+        "},
+    );
+
+    let upgraded = fixture.cooldown_json(&["upgrade", "--major", "--freeze", FREEZE]);
+
+    assert!(
+        !upgraded.ok(),
+        "a refresh across a configured max-major must fail the run"
+    );
+    assert_eq!(
+        upgraded.error_projects(),
+        BTreeSet::from([standalone.to_string()]),
+        "{:?}",
+        upgraded.error_messages()
+    );
+    assert!(
+        upgraded
+            .error_messages()
+            .iter()
+            .any(|message| message.contains("itoa@1.") && message.contains("max-major")),
+        "the error must name the crossing, got {:?}",
+        upgraded.error_messages()
+    );
+    let workspace_itoa = toml_lock_pins(&fixture.read_bytes(&under(workspace, "Cargo.lock")))
+        .get("itoa")
+        .cloned();
+    assert!(
+        workspace_itoa
+            .as_deref()
+            .is_some_and(|version| version.starts_with("1.")),
+        "the uncapped workspace still adopts the 1.x line, got {workspace_itoa:?}"
+    );
+}
+
+/// The workspace stales the capped standalone lock before the standalone project's turn.
+#[test]
+fn upgrade_fails_a_project_whose_refresh_crosses_its_max_major() {
+    skip_if_missing!("cargo");
+    let fixture = run_staled_fixture("", "fuzz", "../member");
+
+    assert_refresh_crossing_fails_its_project(&fixture, "", "fuzz");
+}
+
+/// The workspace stales the capped standalone lock after the standalone project's turn, so the
+/// re-run's refresh is the one checked.
+#[test]
+fn upgrade_rerun_fails_a_project_whose_refresh_crosses_its_max_major() {
+    skip_if_missing!("cargo");
+    let fixture = run_staled_fixture("b", "a", "../b/member");
+
+    assert_refresh_crossing_fails_its_project(&fixture, "b", "a");
+}
+
 /// The instant the excluded-subtree scenarios were written.
 const EXCLUDED_SUBTREES_AS_OF: CargoAsOf = CargoAsOf {
     seed: "2026-09-03T00:17:22Z",
