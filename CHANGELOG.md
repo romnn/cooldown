@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Cargo reads of a project's own files are no longer reused.** A `cargo metadata --locked` read
+  was reused within a run while the manifests, lock and configuration stayed the same. In the
+  project itself, Cargo also reads target files that this check missed, such as a removed
+  `src/<name>.rs`, a deleted symlink target or a path dependency that gained a library, so a later
+  read could return a stale graph or stale-lock refusal. Reads and replayed commands are now reused
+  only in cooldown's private staged copies, and only while no Cargo configuration from outside the
+  copy applies. `check` runs one more `cargo metadata` per Cargo project.
+
 - **Cargo upgrades run fewer `cargo metadata` reads and stop reparsing the same lock.** After a
   whole-graph resolve that leaves `Cargo.lock` as it was, the locked reads of the same files that
   follow, such as edge-policy enforcement and the final checks, now reuse its output instead of

@@ -539,6 +539,37 @@ fn reject_staging_ancestor_overrides(scratch: &Utf8Path) -> Result<()> {
     reject_staging_ancestor_overrides_with_environment(scratch, &cargo_config_environment()?)
 }
 
+/// Whether Cargo run in the private `tree` of a staged copy reads only the configuration the
+/// native input key captures.
+///
+/// The key captures the configuration of the original project, which staging copied into the tree.
+/// Configuration in or above the copy's scratch directory, which staging refuses only while it
+/// prepares the copy, would apply as well.
+/// So would a Cargo home relative to the command's directory, which resolves elsewhere from the
+/// copy than from the original project.
+pub(crate) fn staged_configuration_captured(tree: &Utf8Path) -> bool {
+    let ancestors = tree
+        .ancestors()
+        .skip(1)
+        .map(Utf8Path::to_owned)
+        .collect::<BTreeSet<_>>();
+    cargo_config_environment()
+        .is_ok_and(|environment| staged_configuration_captured_in(&ancestors, &environment))
+}
+
+/// Whether Cargo reads only captured configuration in a staged copy whose tree lies below
+/// `ancestors`, the scratch directory included.
+fn staged_configuration_captured_in(
+    ancestors: &BTreeSet<Utf8PathBuf>,
+    environment: &CargoConfigEnvironment,
+) -> bool {
+    let relative_home = environment
+        .cargo_home
+        .as_ref()
+        .is_some_and(|(cargo_home, configured)| *configured && !cargo_home.is_absolute());
+    !relative_home && reject_ancestor_overrides(ancestors, environment).is_ok()
+}
+
 fn reject_staging_ancestor_overrides_with_environment(
     scratch: &Utf8Path,
     environment: &CargoConfigEnvironment,
@@ -1277,6 +1308,47 @@ mod tests {
             };
             reject_ancestor_overrides(&ancestors, &environment)?;
         }
+        Ok(())
+    }
+
+    /// A staged copy's configuration stays the captured one only while nothing above its tree
+    /// configures Cargo and the Cargo home does not follow the command's directory.
+    ///
+    /// Only the ancestors inside the temporary root are scanned, as in
+    /// `ambient_cargo_home_is_not_a_staging_divergence`.
+    #[test]
+    fn staged_configuration_is_captured_only_without_outside_sources() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = canonical_root(&directory)?;
+        let tree = root.join("scratch/tree");
+        std::fs::create_dir_all(&tree)?;
+        let ancestors = tree
+            .ancestors()
+            .skip(1)
+            .take_while(|ancestor| ancestor.starts_with(&root))
+            .map(Utf8Path::to_owned)
+            .collect::<BTreeSet<_>>();
+        let home = |cargo_home: Utf8PathBuf, configured| CargoConfigEnvironment {
+            cargo_home: Some((cargo_home, configured)),
+        };
+        let absolute = home(root.join("home"), true);
+
+        // An absolute or default Cargo home, nothing above the tree
+        assert!(staged_configuration_captured_in(&ancestors, &absolute));
+        assert!(staged_configuration_captured_in(
+            &ancestors,
+            &home(root.join("home"), false)
+        ));
+
+        // A Cargo home relative to the command's directory
+        assert!(!staged_configuration_captured_in(
+            &ancestors,
+            &home(Utf8PathBuf::from("../cargo-home"), true)
+        ));
+
+        // Configuration that appeared in the scratch directory after staging
+        write(&root.join("scratch/.cargo/config.toml"), "[net]\n")?;
+        assert!(!staged_configuration_captured_in(&ancestors, &absolute));
         Ok(())
     }
 
