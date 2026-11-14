@@ -372,12 +372,26 @@ impl CopyLanding {
     }
 
     /// Whether the edges explain a copy the resolve did not replace in more detail than an
-    /// ordinary hold: it advanced for only some dependents, the lock does not pair one of its
-    /// edges, or a copy at the target was added for other dependents.
+    /// ordinary hold: it advanced for only some dependents, its dependents settled at several
+    /// versions, the lock does not pair one of its edges, or a copy at the target was added for
+    /// other dependents.
     pub(super) fn explains_hold(&self) -> bool {
         self.recorded
             && !self.replaced()
-            && (!self.reached.is_empty() || !self.unpaired.is_empty() || !self.added_by.is_empty())
+            && (!self.reached.is_empty()
+                || (!self.behind.is_empty() && self.settled().is_none())
+                || !self.unpaired.is_empty()
+                || !self.added_by.is_empty())
+    }
+
+    /// The one version every edge left behind binds, `None` when no edge was left behind or they
+    /// bind several.
+    pub(super) fn settled(&self) -> Option<&str> {
+        let versions: BTreeSet<&str> = self.behind.values().flatten().map(String::as_str).collect();
+        match versions.into_iter().collect::<Vec<_>>().as_slice() {
+            [version] => Some(version),
+            _ => None,
+        }
     }
 
     /// The first package left behind, the requirer whose range kept the copy.
