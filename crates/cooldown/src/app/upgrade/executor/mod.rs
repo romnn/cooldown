@@ -499,6 +499,9 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     /// `Arc` so the per-round borrow of the planning loops is a refcount bump, not a deep copy
     /// of the advisory map.
     advisories: Option<std::sync::Arc<ProjectAdvisories>>,
+    /// The canonical shared files the project's write guard leases for the whole run, which
+    /// bound the shared files a source mutation may journal.
+    leased_shared_files: Vec<camino::Utf8PathBuf>,
 }
 
 impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
@@ -530,7 +533,17 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             top_up_declined: HashSet::new(),
             unproven_reported: HashSet::new(),
             advisories: None,
+            leased_shared_files: Vec::new(),
         }
+    }
+
+    fn record_leased_shared_files(
+        &mut self,
+        guard: Option<&crate::app::lock::ProjectAccessWriteGuard>,
+    ) {
+        self.leased_shared_files = guard
+            .map(|guard| guard.shared_files().map(ToOwned::to_owned).collect())
+            .unwrap_or_default();
     }
 
     pub(super) fn run(&mut self) -> impl std::future::Future<Output = ProjectRunStatus> {
@@ -546,6 +559,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return ProjectRunStatus::Terminated;
             }
         };
+        self.record_leased_shared_files(guard.as_ref());
         let recovery_result = match guard.as_ref() {
             Some(guard) => {
                 self.ctx
@@ -654,7 +668,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             evaluated_at: Some(self.ws.now()),
             ..Plan::default()
         };
-        let mutation = match self.ctx.prepare_mutation(&plan).await {
+        let mutation = match self
+            .ctx
+            .prepare_mutation(&plan, &self.leased_shared_files)
+            .await
+        {
             Ok(mutation) => mutation,
             Err(error) => {
                 self.record_project_error(&error, None);
@@ -710,6 +728,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return;
             }
         };
+        self.record_leased_shared_files(guard.as_ref());
         let recovery_result = match guard.as_ref() {
             Some(guard) => {
                 self.ctx
@@ -3012,7 +3031,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         plan: &Plan,
         rollback: Option<&mut TrialRollback>,
     ) -> cooldown_core::Result<cooldown_core::PreparedMutation> {
-        let prepared = self.ctx.prepare_mutation(plan).await?;
+        let prepared = self
+            .ctx
+            .prepare_mutation(plan, &self.leased_shared_files)
+            .await?;
         if let Some(rollback) = rollback {
             rollback.preserve(prepared.journal())?;
         }

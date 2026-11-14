@@ -517,8 +517,14 @@ const COMMIT_PIN_MAIN: &str = indoc::indoc! {r#"
 /// tidy keeps both requirements direct.
 fn commit_pin_fixture() -> Fixture {
     let fixture = Fixture::new();
+    write_commit_pin_module(&fixture, ".");
+    fixture
+}
+
+/// Writes the commit-pin module into `dir` and seeds its `go.sum`.
+fn write_commit_pin_module(fixture: &Fixture, dir: &str) {
     fixture.write(
-        "go.mod",
+        &format!("{dir}/go.mod"),
         &indoc::formatdoc! {"
             module example.com/cooldown-go-commit-pin
 
@@ -530,10 +536,23 @@ fn commit_pin_fixture() -> Fixture {
             )
         "},
     );
-    fixture.write("main.go", COMMIT_PIN_MAIN);
+    fixture.write(&format!("{dir}/main.go"), COMMIT_PIN_MAIN);
     fixture
-        .run_tool("go", &["mod", "tidy"], &[("GOFLAGS", "")])
+        .run_tool("go", &["-C", dir, "mod", "tidy"], &[("GOFLAGS", "")])
         .expect_success();
+}
+
+/// The workspace file of the workspace commit-pin fixture, on the Go its module declares.
+const COMMIT_PIN_GO_WORK: &str = "go 1.24.0\n\nuse ./app\n";
+
+/// The commit-pin module as the one module of a Go workspace, whose root `go.work` declares the
+/// module's own `go 1.24.0`.
+/// kustomize v0.21.2 declares `go 1.26.0`, so `go get` of either held candidate raises `go.work`
+/// with the module's `go.mod`.
+fn workspace_commit_pin_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write("go.work", COMMIT_PIN_GO_WORK);
+    write_commit_pin_module(&fixture, "app");
     fixture
 }
 
@@ -552,8 +571,14 @@ fn upgrade_kustomize(fixture: &Fixture, envs: &[(&str, &str)]) -> support::Envel
     )
 }
 
-/// Both kustomize candidates are held for the kube-openapi pin, and `go.mod` is unchanged.
-fn assert_commit_pin_held(fixture: &Fixture, report: &support::Envelope, go_mod_before: &[u8]) {
+/// Both kustomize candidates are held for the kube-openapi pin, and the module's `go.mod` (at
+/// `go_mod`) is unchanged.
+fn assert_commit_pin_held(
+    fixture: &Fixture,
+    report: &support::Envelope,
+    go_mod: &str,
+    go_mod_before: &[u8],
+) {
     assert!(report.ok(), "a held candidate is not a failure");
     assert_eq!(
         report
@@ -578,7 +603,7 @@ fn assert_commit_pin_held(fixture: &Fixture, report: &support::Envelope, go_mod_
     );
     assert_eq!(
         go_mod_before,
-        fixture.read_bytes("go.mod"),
+        fixture.read_bytes(go_mod),
         "go.mod keeps the pin and every other requirement"
     );
 }
@@ -604,7 +629,7 @@ fn upgrade_holds_a_candidate_that_would_move_a_direct_commit_pin() {
     // Scope the run to kustomize, so the only candidates are the two modules whose v0.21.2 raises
     // kube-openapi's minimum requirement.
     let report = upgrade_kustomize(&fixture, &[]);
-    assert_commit_pin_held(&fixture, &report, &go_mod_before);
+    assert_commit_pin_held(&fixture, &report, "go.mod", &go_mod_before);
 }
 
 /// A `GOFLAGS` saved with `go env -w` reaches every `go` command even when the environment does not
@@ -621,7 +646,7 @@ fn upgrade_holds_a_commit_pin_that_saved_goflags_would_hide() {
     let goenv = goenv.to_str().expect("UTF-8 fixture path");
 
     let report = upgrade_kustomize(&fixture, &[("GOENV", goenv)]);
-    assert_commit_pin_held(&fixture, &report, &go_mod_before);
+    assert_commit_pin_held(&fixture, &report, "go.mod", &go_mod_before);
 }
 
 /// The module only the testify fixture's module graph holds: testify's own `go.mod` requires it for
@@ -761,5 +786,47 @@ fn an_indirect_module_follows_a_requirer_that_needs_it_newer() {
             .iter()
             .any(|change| change.to == "v1.19.0"),
         "{report:?}"
+    );
+}
+
+/// A held upgrade of a workspace module leaves the workspace's `go.work` as it found it.
+/// The trial's `go get` raises `go.work` to the Go the candidates need before the commit-pin
+/// check refuses them, so the rollback must restore `go.work` along with the module's `go.mod`.
+#[test]
+fn a_held_upgrade_restores_the_workspace_go_work() {
+    skip_if_missing!("go");
+
+    // Control: the held targets' native `go get` does raise this workspace's `go` directive, so
+    // an unchanged `go.work` below proves a rollback rather than a trial that never touched it.
+    let control = workspace_commit_pin_fixture();
+    control
+        .run_tool(
+            "go",
+            &[
+                "-C",
+                "app",
+                "get",
+                "sigs.k8s.io/kustomize/api@v0.21.2",
+                "sigs.k8s.io/kustomize/kyaml@v0.21.2",
+            ],
+            &[("GOFLAGS", "")],
+        )
+        .expect_success();
+    assert_ne!(
+        control.read_bytes("go.work"),
+        COMMIT_PIN_GO_WORK.as_bytes(),
+        "native go get raises the workspace's go directive"
+    );
+
+    let fixture = workspace_commit_pin_fixture();
+    let go_mod_before = fixture.read_bytes("app/go.mod");
+
+    let report = upgrade_kustomize(&fixture, &[]);
+
+    assert_commit_pin_held(&fixture, &report, "app/go.mod", &go_mod_before);
+    assert_eq!(
+        String::from_utf8_lossy(&fixture.read_bytes("go.work")),
+        COMMIT_PIN_GO_WORK,
+        "the rolled-back trial leaves go.work unchanged"
     );
 }

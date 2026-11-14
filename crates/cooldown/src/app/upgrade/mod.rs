@@ -122,12 +122,14 @@ impl UpgradeCtx<'_> {
     ) -> cooldown_core::Result<Option<super::lock::ProjectAccessWriteGuard>> {
         match &self.access {
             ProjectExecution::Source => {
+                let shared_files = self.writer.shared_write_files(&self.pctx.project).await?;
                 let mut guard = super::lock::ProjectAccessWriteGuard::acquire_async(
                     self.repo_root,
                     &self.pctx.project.root,
                     &self.reader.lease_family(&self.pctx.project),
                     self.pctx.tool,
                     self.writer.sync_scope() == cooldown_core::SyncScope::Repo,
+                    shared_files,
                 )
                 .await?;
                 guard.observe(
@@ -141,18 +143,47 @@ impl UpgradeCtx<'_> {
         }
     }
 
+    /// Prepares `plan`'s mutation, refusing one whose journal reaches a shared file this
+    /// execution may not write.
+    ///
+    /// A source mutation may write only the shared files its write guard leases (`leased`).
+    /// A copy or isolated trial may write no file outside its own tree, since that file is the
+    /// real one and would outlive the trial.
     async fn prepare_mutation(
         &self,
         plan: &cooldown_core::Plan,
+        leased: &[camino::Utf8PathBuf],
     ) -> cooldown_core::Result<cooldown_core::PreparedMutation> {
-        match &self.access {
+        let prepared = match &self.access {
             ProjectExecution::Isolated(project) => {
-                cooldown_core::PreparedMutation::prepare_isolated(self.writer, project, plan).await
+                cooldown_core::PreparedMutation::prepare_isolated(self.writer, project, plan)
+                    .await?
             }
             ProjectExecution::Source | ProjectExecution::Copy => {
                 cooldown_core::PreparedMutation::prepare(self.writer, &self.pctx.project, plan)
-                    .await
+                    .await?
             }
+        };
+        let journal = prepared.journal();
+        let unleased = match &self.access {
+            ProjectExecution::Source => journal
+                .shared_files()
+                .find(|file| leased.iter().all(|leased| leased != file))
+                .map(ToOwned::to_owned),
+            ProjectExecution::Copy | ProjectExecution::Isolated(_) => journal
+                .files()
+                .iter()
+                .map(cooldown_core::ProjectMutationFile::path)
+                .find(|path| path.is_absolute())
+                .map(ToOwned::to_owned),
+        };
+        match unleased {
+            Some(file) => Err(cooldown_core::CoreError::LockConflict(format!(
+                "a {} mutation of {} would write shared file {file}, which this run does not hold",
+                self.tool_name(),
+                self.pctx.project.root
+            ))),
+            None => Ok(prepared),
         }
     }
 }
@@ -566,6 +597,7 @@ impl Workspace {
                 &self.lease_family(pctx),
                 pctx.tool,
                 writer.sync_scope() == cooldown_core::SyncScope::Repo,
+                Vec::new(),
             )
             .await?;
             let recovery = writer

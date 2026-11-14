@@ -34,7 +34,7 @@ pub use evaluate::{
 pub use model::*;
 pub use mutation::{
     AcceptedProjectState, BaselineFile, MutationBaseline, ProjectInputSnapshot,
-    ProjectMutationFile, ProjectMutationJournal, ProjectMutationState,
+    ProjectMutationFile, ProjectMutationJournal, ProjectMutationState, canonical_shared_file,
 };
 pub use policy::{
     ByKind, MaxMajorPick, NativeExemptions, Origin, PatternGlob, PolicyContext, PolicyLayer,

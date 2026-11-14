@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **A rolled-back Go upgrade restores the workspace's `go.work`.** In a `go.work` workspace,
+  `go get` raises the workspace's `go` directive when an upgrade needs a newer Go. When cooldown
+  then rejected the trial, for example because it would move a commit pin, it restored `go.mod`
+  and `go.sum` but left `go.work` raised. The workspace file `go env GOWORK` names, which may live
+  above the module or anywhere `GOWORK` points, is now journaled and restored with the module's
+  files. A run leases it for the whole project, so two cooldown runs on sibling modules never trial
+  it at once, and `go` is bound to that file during the apply. A dry run refuses to write a
+  workspace outside its throwaway copy. `go.work.sum` is not restored: every `go` command in
+  workspace mode, cooldown's own reads included, adds checksums to it, so a rolled-back trial may
+  leave verified checksums there.
+
 - **Go upgrades let an indirect module follow the upgrades that need it newer.** When a planned
   upgrade required a newer version of an `// indirect` module than the module's own planned
   target, for example `otel/sdk/metric` v1.19.0 needing `otel/metric` v1.19.0 while
