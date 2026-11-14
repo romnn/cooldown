@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **A resolver can no longer carry a package across its configured `max-major`.** Only planned
+  targets were checked against the ceiling, so a version the resolver chose on its own could
+  cross it as an ordinary collateral row. Examples are Go raising an indirect module from v0 to
+  v1 and Cargo or npm adding a copy on a higher major. `upgrade` and `fix` now roll such a change
+  back and hold the candidate that caused it as `max_major_held`, naming the capped package. A
+  lock refresh that another project in the run forces, and that would cross the ceiling, fails
+  its project instead. A version that was already above the ceiling before the run does not fail
+  it.
+
 - **Go reports and plans only modules that `go.mod` requires.** A module that sits in the module
   graph without a requirement in a `go 1.17`+ `go.mod` builds no code, and `go mod tidy` drops any
   requirement an upgrade adds for it. Such modules were still listed by `outdated` and `check` and

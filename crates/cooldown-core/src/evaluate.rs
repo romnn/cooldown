@@ -1008,6 +1008,21 @@ pub fn check_pin(
     check_pin_advised(dep, locked, None, layers, ctx, now)
 }
 
+/// Whether the locked release lies outside the package's configured `max-major`.
+///
+/// This is the gate-side mirror of the ceiling [`evaluate`] applies to candidates, so a release
+/// without a numeric major ordinal lies outside it too.
+#[must_use]
+pub fn exceeds_max_major(
+    dep: &Dependency,
+    locked: &Release,
+    layers: &[PolicyLayer],
+    ctx: &ResolveContext<'_>,
+) -> bool {
+    resolve_max_major(layers, &query(dep, ctx, ResolveKind::CurrentPin))
+        .is_some_and(|pick| !within_max_major(locked, Some(&pick)))
+}
+
 /// [`check_pin`] with an advisory feed: a locked version that is itself an advisory's fix
 /// version carries [`PinVerdict::security`], and under [`AdvisoryMode::Shorten`] resolves
 /// against the security window — so merging a security bump does not fail the next gate run.
@@ -1464,6 +1479,42 @@ mod tests {
             now,
         );
         assert_eq!(verdict.held_reason, Some(HeldReason::MaxMajor(5)));
+    }
+
+    /// The gate judges a locked release against the ceiling exactly as planning judges a
+    /// candidate: above the limit or without a numeric major is outside it.
+    #[test]
+    fn exceeds_max_major_mirrors_the_candidate_ceiling() {
+        let layers = [seven_day_layer(), max_major_layer(5)];
+        let dep = fix_dep("5.9.0");
+
+        // Within, above, and unclassifiable
+        assert!(!exceeds_max_major(
+            &dep,
+            &classified("5.9.0", 0, Some(5), None),
+            &layers,
+            &ctx()
+        ));
+        assert!(exceeds_max_major(
+            &dep,
+            &classified("6.0.0", 1, Some(6), None),
+            &layers,
+            &ctx()
+        ));
+        assert!(exceeds_max_major(
+            &dep,
+            &classified("next", 2, None, None),
+            &layers,
+            &ctx()
+        ));
+
+        // No configured ceiling bounds nothing.
+        assert!(!exceeds_max_major(
+            &dep,
+            &classified("6.0.0", 1, Some(6), None),
+            &[seven_day_layer()],
+            &ctx()
+        ));
     }
 
     #[test]

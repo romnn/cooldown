@@ -254,7 +254,8 @@ When `upgrade` holds a cross-major update back, it explains the required action:
 - `declared_bound_held` means pass `--rewrite` to cross and rewrite the manifest's explicit
   `<`/`<=` bound.
 - `max_major_held` means raise the package's `max-major` in `cooldown.toml`; no CLI flag overrides
-  this ceiling.
+  this ceiling. When the row names another package, adopting the candidate would lift that package
+  above its own ceiling.
 - `dist_tag_held` (npm family) means the target sits above the registry's current `latest`
   dist-tag, so it is not what a default `npm install` would resolve to today. Version-adopting
   commands (`upgrade`, `fix`) revalidate the package document against the registry so the mutable
