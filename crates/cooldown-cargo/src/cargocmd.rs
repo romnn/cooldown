@@ -1523,18 +1523,7 @@ impl Cargo {
     /// Returns [`CoreError::StaleLock`] when the lock must be updated, or the Cargo tool error
     /// for any other failure.
     pub(crate) async fn locked_metadata_output(&self, dir: &Utf8Path) -> Result<String, CoreError> {
-        let out = self
-            .output(
-                dir,
-                &[
-                    "metadata",
-                    "--all-features",
-                    "--locked",
-                    "--format-version",
-                    "1",
-                ],
-            )
-            .await?;
+        let out = self.output(dir, &LOCKED_METADATA_ARGS).await?;
         if out.status.success() {
             return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
         }
@@ -1941,6 +1930,15 @@ fn crates_io_spec(node: &PackageKey) -> String {
 
 /// The arguments of an unlocked resolve of the whole graph, which writes the lock it settles on.
 pub(crate) const RESOLVE_ARGS: [&str; 4] = ["metadata", "--all-features", "--format-version", "1"];
+
+/// The arguments of a read of the whole graph that refuses to write the lock.
+pub(crate) const LOCKED_METADATA_ARGS: [&str; 5] = [
+    "metadata",
+    "--all-features",
+    "--locked",
+    "--format-version",
+    "1",
+];
 
 /// The arguments of `cargo update` pinning the crates.io `name@from` node to exactly `to`, with
 /// each node of `unlocked` released for the same resolve.
