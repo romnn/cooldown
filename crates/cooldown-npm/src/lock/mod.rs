@@ -14,12 +14,14 @@
 //! each workspace.
 //! Formats without either fall back to the root manifest's declared dependency names.
 
+mod bindings;
 mod pnpm_frozen;
 mod yaml;
 mod yarn;
 mod yarn_berry;
 
 pub use crate::manifest::workspaces::{WorkspaceDialect, WorkspaceManifests};
+pub use bindings::{BindingContext, CopyBinding};
 pub use yarn::{UnattributedName, Unproven, UnprovenDeclaration, YarnBindings};
 
 pub(crate) use yarn_berry::{
@@ -177,6 +179,19 @@ pub trait NodeLock: Send + Sync + 'static {
     #[must_use]
     fn graph_dependents(_content: &str) -> HashMap<(String, String), Vec<String>> {
         HashMap::new()
+    }
+
+    /// Every requirement edge the lock records, one [`CopyBinding`] per importer entry or package
+    /// dependency, so a resolve's moves can be read per copy and incoming edge rather than per
+    /// name.
+    ///
+    /// Default: empty (only pnpm's lock records per-package edges in a form worth reading).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`] when the lock cannot be parsed.
+    fn copy_bindings(_content: &str) -> Result<Vec<CopyBinding>> {
+        Ok(Vec::new())
     }
 
     /// Every workspace member directory the lock records, whatever it declares — pnpm's
@@ -2143,6 +2158,10 @@ impl NodeLock for Pnpm {
 
     fn graph_dependents(content: &str) -> HashMap<(String, String), Vec<String>> {
         parse_pnpm_graph_dependents(content)
+    }
+
+    fn copy_bindings(content: &str) -> Result<Vec<CopyBinding>> {
+        bindings::parse_pnpm_copy_bindings(content)
     }
 
     fn relock_args(_before: Option<&str>) -> Vec<String> {

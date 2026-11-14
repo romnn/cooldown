@@ -56,6 +56,7 @@ recovery_options! {
         "log_level",
         "no_progress",
         "no_trace",
+        "full_trace",
         "trace_dir",
         "dir",
         "json",

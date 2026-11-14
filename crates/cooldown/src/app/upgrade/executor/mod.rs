@@ -4286,11 +4286,17 @@ fn advisory_id_list(ids: &[&cooldown_core::AdvisoryId]) -> String {
 /// Filtered by exact change identity ([`change_target_key`]), not by package: a held candidate's
 /// package is planned, but the row reporting its real off-target float is not, and a package-level
 /// filter would silently drop that movement behind the held skip.
+/// The source version is part of that identity here, though the target key leaves it out: another
+/// copy of a planned transitive moving to the same target is a move of its own, which the
+/// planned row does not report.
 fn collateral_rows(applied: &[Change], planned: &[Change]) -> Vec<Change> {
-    let planned: HashSet<ChangeTargetKey> = planned.iter().map(change_target_key).collect();
+    let planned: HashSet<(ChangeTargetKey, &str)> = planned
+        .iter()
+        .map(|change| (change_target_key(change), change.from.as_str()))
+        .collect();
     applied
         .iter()
-        .filter(|change| !planned.contains(&change_target_key(change)))
+        .filter(|change| !planned.contains(&(change_target_key(change), change.from.as_str())))
         .cloned()
         .collect()
 }
