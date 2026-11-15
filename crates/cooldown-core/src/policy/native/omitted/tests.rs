@@ -384,3 +384,28 @@ fn a_freeze_reason_joins_an_existing_entry() {
         Some(OmissionReason::FreezeUnderFloor { .. })
     );
 }
+
+/// One freeze written as the default under one floor and as a package window under a longer one
+/// drifts first in the default, so its single entry names the default's earlier end.
+#[test]
+fn a_freeze_drifting_in_several_windows_names_the_earliest_end() {
+    let layers = repo_layers(indoc! {r#"
+        freeze = "2026-01-10T00:00:00Z"
+        floor = "30d"
+
+        [package."numpy"]
+        floor = "60d"
+    "#});
+
+    let omitted = project_scope(&layers, ".", UV, true);
+
+    assert_eq!(keys(&omitted), ["repo:cooldown.toml default"]);
+    let freeze: Timestamp = "2026-01-10T00:00:00Z".parse().expect("timestamp");
+    assert_eq!(
+        omitted.first().and_then(|field| field.reason),
+        Some(OmissionReason::FreezeUnderFloor {
+            floor: SignedDuration::from_hours(24 * 30),
+            until: freeze + SignedDuration::from_hours(24 * 30),
+        })
+    );
+}

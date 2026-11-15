@@ -332,20 +332,28 @@ fn gating_fields(rule: &Rule) -> impl Iterator<Item = GatingField> + '_ {
 
 /// Adds `field` unless an entry for its origin, selector and field name exists, in which case
 /// only its reason is kept on that entry.
+///
+/// One freeze can drift in several written windows, such as the default and a package window
+/// under different floors, so the entry keeps the earliest drift: the first date a written value
+/// stops matching cooldown.
 fn record(omitted: &mut Vec<OmittedField>, field: OmittedField) {
     let existing = omitted.iter_mut().find(|existing| {
         existing.origin == field.origin
             && existing.selector == field.selector
             && existing.field.name() == field.field.name()
     });
-    match existing {
-        Some(existing) => {
-            if field.reason.is_some() {
-                existing.reason = field.reason;
-            }
-        }
-        None => omitted.push(field),
-    }
+    let Some(existing) = existing else {
+        omitted.push(field);
+        return;
+    };
+    existing.reason = match (existing.reason, field.reason) {
+        (
+            Some(OmissionReason::FreezeUnderFloor { until: kept, .. }),
+            Some(OmissionReason::FreezeUnderFloor { until: new, .. }),
+        ) if kept <= new => existing.reason,
+        (kept, None) => kept,
+        (_, new) => new,
+    };
 }
 
 /// The freezes a binding floor replaces in the written default or a written package window.
