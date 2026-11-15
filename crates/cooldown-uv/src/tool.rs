@@ -1051,6 +1051,10 @@ impl ToolWrite for UvTool {
         SyncScope::Repo
     }
 
+    fn native_package_windows(&self) -> bool {
+        true
+    }
+
     async fn write_repo_native(
         &self,
         repo_root: &Utf8Path,
@@ -1862,6 +1866,7 @@ mod tests {
         let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
         let tool = uv_tool();
         assert_eq!(tool.sync_scope(), SyncScope::Repo);
+        assert!(tool.native_package_windows());
 
         let policy = ResolvedPolicy {
             admitted_versions: Some(Vec::new()),

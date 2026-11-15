@@ -5,6 +5,8 @@
 //! project below it that does not set its own age.
 //! Cargo has a single age per registry, with no per-package exemption or window and no absolute
 //! cutoff, so whatever else the policy says is reported rather than written.
+//! The application reports the rules the age leaves out for every tool alike; this module reports
+//! only a default window it cannot write and settings that keep cargo from enforcing the age.
 
 use super::{
     CRATES_IO_AGE_KEY, CargoEnvironment, PublishAgeSettings, parse_age, render_age,
@@ -28,17 +30,6 @@ pub(crate) fn write_repo_native(
     let path = writable_config_file(&config_dir);
     let mut warnings = Vec::new();
 
-    if !policy.package_windows.is_empty() {
-        let names: Vec<&str> = policy.package_windows.keys().map(String::as_str).collect();
-        warnings.push(Diagnostic::new(
-            DiagnosticKind::StricterNative,
-            format!(
-                "cargo has no per-package publish age, so a bare cargo command applies the \
-                 default age to {} as well",
-                names.join(", ")
-            ),
-        ));
-    }
     if PublishAgeSettings::discover(repo_root, env)?.enforcement_disabled()? {
         warnings.push(Diagnostic::new(
             DiagnosticKind::Config,

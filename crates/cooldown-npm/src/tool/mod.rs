@@ -4611,6 +4611,17 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         let Some(minutes) = policy.default_window.as_ref().and_then(window_minutes) else {
             // pnpm's minimumReleaseAge is a rolling minute count; a freeze date or opt-out can't be
             // expressed, so the window is left as it is.
+            // A freeze still gates, so the user learns that a bare pnpm command does not apply it.
+            if let Some(cooldown_core::WindowSpec::Freeze(cutoff)) = &policy.default_window {
+                warnings.push(Diagnostic::new(
+                    DiagnosticKind::Config,
+                    format!(
+                        "the default window is a freeze at {cutoff}, which pnpm's rolling \
+                         minimumReleaseAge cannot express, so sync leaves minimumReleaseAge as it \
+                         is"
+                    ),
+                ));
+            }
             // The window may still be active, so a selector the policy no longer grants loses its
             // entry.
             // An existing key always survives as at least `[]`; only a withheld or omitted
@@ -5898,16 +5909,24 @@ packages:
         }
     }
 
-    /// The selectors a sync report's `StricterNative` warnings name, in report order.
-    fn omitted_selectors(report: &SyncReport) -> Vec<String> {
-        let warnings = match report {
+    /// The warnings a sync report carries, in report order.
+    fn sync_warnings(report: &SyncReport) -> &[Diagnostic] {
+        match report {
             SyncReport::Written { warnings, .. } | SyncReport::Unchanged { warnings, .. } => {
                 warnings.as_slice()
             }
             SyncReport::Deferred { .. } | SyncReport::Unsupported => &[],
-        };
-        warnings
+        }
+    }
+
+    /// The selectors a sync report's `StricterNative` warnings name, in report order.
+    ///
+    /// A `Config` warning about the default window is left out, and every other kind fails the
+    /// test.
+    fn omitted_selectors(report: &SyncReport) -> Vec<String> {
+        sync_warnings(report)
             .iter()
+            .filter(|warning| warning.kind != DiagnosticKind::Config)
             .inspect(|warning| assert_eq!(warning.kind, DiagnosticKind::StricterNative))
             .filter_map(|warning| {
                 let (_, rest) = warning.message.split_once('`')?;
@@ -6131,6 +6150,70 @@ packages:
             !written.contains("minimumReleaseAgeExclude"),
             "an absent key stays absent: {written}"
         );
+        Ok(())
+    }
+
+    /// pnpm's minute count rounds a partial minute up, so the native gate never undercuts the
+    /// window: 90 seconds is written as 2 minutes and 30 seconds as 1, without a warning.
+    #[tokio::test]
+    async fn write_native_rounds_a_partial_minute_up() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        let project = pnpm_sync_project(&root);
+        let (_cache, tool) = pnpm_sync_tool()?;
+        for (seconds, minutes) in [(90, 2), (30, 1)] {
+            std::fs::write(&path, "packages: []\n")?;
+            let mut policy = pnpm_sync_policy(&[], Some(&[]));
+            policy.default_window = Some(cooldown_core::WindowSpec::MinAge(
+                jiff::SignedDuration::from_secs(seconds),
+            ));
+
+            let report = tool.write_native(&project, &policy, false).await?;
+
+            std::assert_matches!(&report, SyncReport::Written { .. }, "{seconds}s");
+            assert_eq!(sync_warnings(&report), [], "{seconds}s");
+            assert_eq!(NativeAge::read(&path)?.minutes, Some(minutes), "{seconds}s");
+        }
+        Ok(())
+    }
+
+    /// A freeze still gates, so leaving `minimumReleaseAge` as it is comes with a `config`
+    /// warning, while an opt-out, which gates nothing, leaves it silently.
+    #[tokio::test]
+    async fn write_native_warns_when_a_freeze_leaves_the_window() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        let original = indoc! {"
+            packages: []
+            minimumReleaseAge: 10080
+        "};
+        std::fs::write(&path, original)?;
+        let project = pnpm_sync_project(&root);
+        let (_cache, tool) = pnpm_sync_tool()?;
+        let mut policy = pnpm_sync_policy(&[], Some(&[]));
+
+        policy.default_window = Some(cooldown_core::WindowSpec::Freeze(
+            "2026-10-31T00:00:00Z".parse()?,
+        ));
+        let frozen = tool.write_native(&project, &policy, false).await?;
+        std::assert_matches!(frozen, SyncReport::Unchanged { .. });
+        assert_eq!(
+            sync_warnings(&frozen),
+            [Diagnostic::new(
+                DiagnosticKind::Config,
+                "the default window is a freeze at 2026-10-31T00:00:00Z, which pnpm's rolling \
+                 minimumReleaseAge cannot express, so sync leaves minimumReleaseAge as it is",
+            )]
+        );
+
+        policy.default_window = Some(cooldown_core::WindowSpec::Latest);
+        let opted_out = tool.write_native(&project, &policy, false).await?;
+        assert_eq!(sync_warnings(&opted_out), []);
+        assert_eq!(std::fs::read_to_string(&path)?, original);
         Ok(())
     }
 

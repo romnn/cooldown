@@ -149,12 +149,28 @@ fn reports_policy_cargo_cannot_carry() -> eyre::Result<()> {
 
     let report = write_repo_native(&root, &with_package, &CargoEnvironment::default(), false)?;
 
-    // The age is still written, with one warning for the per-package window cargo drops and one
-    // for the resolver switch that keeps a bare cargo from enforcing it.
-    assert_eq!(
-        warning_kinds(&report),
-        [DiagnosticKind::StricterNative, DiagnosticKind::Config]
-    );
+    // The age is still written, with a warning for the resolver switch that keeps a bare cargo
+    // from enforcing it.
+    // The per-package window is left to the application's notice about policy the native config
+    // omits, so the adapter adds no warning of its own for it.
+    assert_eq!(warning_kinds(&report), [DiagnosticKind::Config]);
+    std::assert_matches!(report, SyncReport::Written { .. });
+    Ok(())
+}
+
+/// A package window is reported by the application's notice about policy the native config
+/// omits, so the adapter writes the age without a warning of its own.
+#[test]
+fn a_package_window_adds_no_adapter_warning() -> eyre::Result<()> {
+    let (_directory, root) = repo()?;
+    let mut with_package = policy(days(7));
+    with_package
+        .package_windows
+        .insert("serde".to_owned(), days(30));
+
+    let report = write_repo_native(&root, &with_package, &CargoEnvironment::default(), false)?;
+
+    assert_eq!(warning_kinds(&report), []);
     std::assert_matches!(report, SyncReport::Written { .. });
     Ok(())
 }

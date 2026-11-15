@@ -536,9 +536,8 @@ fn environment_warnings(environment: &SyncEnvironment, gate_written: bool) -> Ve
 ///
 /// Every Yarn from 4.10.0 reads a bare number as minutes: 4.10 with `parseInt`, which would read
 /// `"7d"` as 7, and later releases as a duration.
-/// cooldown evaluates the admissions it writes against whole minutes rounded down, so for a
-/// window that is no whole number of minutes, a release whose age falls in the last minute of
-/// the gate is gated without an entry for under a minute after the sync.
+/// cooldown evaluates the admissions it writes against the same rounded-up minutes, so a release
+/// whose age falls in the last partial minute of the gate still gets its entry.
 fn written_minutes(window: &WindowSpec) -> Option<u64> {
     let WindowSpec::MinAge(duration) = window else {
         return None;

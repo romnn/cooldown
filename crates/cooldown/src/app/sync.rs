@@ -8,8 +8,9 @@ use super::{Exit, RunOpts, Workspace, diag_from_error, recovery_diagnostics};
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::fs::ManifestFamily;
 use cooldown_core::{
-    Diagnostic, NativeExemptions, PolicyContext, ResolveKind, ResolveQuery, ResolvedPolicy,
-    SyncReport, SyncScope, ToolId, ToolWrite, WindowSpec, native_exemptions, resolve,
+    Diagnostic, DiagnosticKind, NativeEncoding, NativeExemptions, PolicyContext, ResolvedPolicy,
+    SyncReport, SyncScope, ToolId, ToolWrite, WindowSpec, native_default_resolution,
+    native_exemptions, omitted_native_fields,
 };
 
 enum SyncAccessGuard {
@@ -295,19 +296,26 @@ impl Workspace {
     ) -> SyncItem {
         let project = pctx.rel_path.to_string();
         let window = native_default_window(&pctx.policy.layers, tool, &pctx.rel_path, self.now());
+        let context = PolicyContext {
+            layers: &pctx.policy.layers,
+            project: &pctx.rel_path,
+        };
+        let notices = omitted_policy_notices(
+            &[context],
+            tool,
+            &NativeEncoding {
+                default_layers: &pctx.policy.layers,
+                default_project: &pctx.rel_path,
+                package_windows: writer.native_package_windows(),
+            },
+            self.now(),
+        );
         // Bake the `latest`/`allow` package selectors that exempt every release into the native
         // per-package exemption list alongside the default window, so a cooldown-exempt package is
         // exempt natively too.
         // A selector cooldown still gates in part is withheld; the young locked versions cooldown
         // admits reach the native list as exact admissions instead.
-        let NativeExemptions { exempt, withheld } = native_exemptions(
-            &[PolicyContext {
-                layers: &pctx.policy.layers,
-                project: &pctx.rel_path,
-            }],
-            tool,
-            self.now(),
-        );
+        let NativeExemptions { exempt, withheld } = native_exemptions(&[context], tool, self.now());
         let mut policy = ResolvedPolicy {
             admitted_versions: Some(Vec::new()),
             default_window: Some(window.clone()),
@@ -353,7 +361,7 @@ impl Workspace {
             Ok(report) => {
                 let SyncClassification { status, path } = classify(&report, &pctx.project.root);
                 summary.record(status);
-                warnings.extend(report_warnings(report, tool, &project));
+                warnings.extend(report_warnings(report, notices, tool, &project));
                 SyncItem {
                     tool: tool.as_str().to_string(),
                     project,
@@ -397,6 +405,25 @@ impl Workspace {
         // field can carry.
         let window =
             native_default_window(self.repo_layers(tool), tool, Utf8Path::new("."), self.now());
+        // Every project that reads the repo-level file is a consumer whose policy it must carry,
+        // including a project whose nearer `cooldown.toml` the repo-root default never saw.
+        let consumers: Vec<PolicyContext<'_>> = projects
+            .iter()
+            .map(|project| PolicyContext {
+                layers: &project.policy.layers,
+                project: &project.rel_path,
+            })
+            .collect();
+        let notices = omitted_policy_notices(
+            &consumers,
+            tool,
+            &NativeEncoding {
+                default_layers: self.repo_layers(tool),
+                default_project: Utf8Path::new("."),
+                package_windows: writer.native_package_windows(),
+            },
+            self.now(),
+        );
         let policy = ResolvedPolicy {
             admitted_versions: Some(Vec::new()),
             default_window: Some(window.clone()),
@@ -436,7 +463,7 @@ impl Workspace {
             Ok(report) => {
                 let SyncClassification { status, path } = classify(&report, self.repo_root());
                 summary.record(status);
-                warnings.extend(report_warnings(report, tool, &project));
+                warnings.extend(report_warnings(report, notices, tool, &project));
                 SyncItem {
                     tool: tool.as_str().to_string(),
                     project,
@@ -462,38 +489,32 @@ impl Workspace {
     }
 }
 
-/// The default window `sync` bakes into a tool's single native field for `project`.
+/// The default window `sync` bakes into a tool's single native field for `project`: the
+/// effective spec of [`native_default_resolution`], with any binding floor folded in.
 ///
-/// This is the window cooldown gates a locked pin of an unnamed package with, so a package rule
-/// that matches every name, such as `[package."*"]`, sets it just as the bare `min-age` does.
-/// When that window is an exemption, the project default `min-age`, which package rules do not
-/// change, is used instead: the native field still governs every package whose native exemption
-/// [`native_exemptions`] withholds, so a package rule's `latest` or `allow` must not lift it.
-/// The two windows are never compared by today's cutoffs, since a rolling age and an absolute
-/// freeze trade places as time passes while the persisted value stays.
-/// Per-kind and other per-package windows are not expressible in the single field.
+/// Per-kind windows and the windows of packages a rule names do not fit the single field;
+/// [`omitted_native_fields`] reports each one the native config does not carry otherwise.
 fn native_default_window(
     layers: &[cooldown_core::PolicyLayer],
     tool: ToolId,
     project: &Utf8Path,
     now: jiff::Timestamp,
 ) -> WindowSpec {
-    let window = |kind| {
-        let query = ResolveQuery {
-            tool,
-            package: "",
-            registry: None,
-            project,
-            kind,
-        };
-        resolve(layers, &query, now).window.effective_spec(now)
-    };
-    // The empty name stands for a package no rule names: only a glob matching the empty name,
-    // such as `*`, applies to it.
-    match window(ResolveKind::CurrentPin) {
-        WindowSpec::Latest => window(ResolveKind::EffectiveDefault),
-        unnamed => unnamed,
-    }
+    native_default_resolution(layers, tool, project, now).effective_spec(now)
+}
+
+/// One [`DiagnosticKind::Config`] notice per gating policy field in `contexts` that `tool`'s
+/// native config does not carry, so the user learns which rules a bare native command skips.
+fn omitted_policy_notices(
+    contexts: &[PolicyContext<'_>],
+    tool: ToolId,
+    encoding: &NativeEncoding<'_>,
+    now: jiff::Timestamp,
+) -> Vec<Diagnostic> {
+    omitted_native_fields(contexts, tool, encoding, now)
+        .iter()
+        .map(|field| Diagnostic::new(DiagnosticKind::Config, field.notice(tool)))
+        .collect()
 }
 
 /// Takes the project's lease of `family`, the tool's declared lease family, for one sync.
@@ -584,10 +605,21 @@ fn classify(report: &SyncReport, base: &Utf8Path) -> SyncClassification {
     SyncClassification { status, path }
 }
 
-/// The adapter's non-fatal diagnostics from `report`, attributed to the synced tool and project.
-fn report_warnings(report: SyncReport, tool: ToolId, project: &str) -> Vec<Diagnostic> {
+/// The adapter's non-fatal diagnostics from `report`, followed by `notices` about policy the
+/// native config does not represent, attributed to the synced tool and project.
+///
+/// The notices accompany only a report that has a native config, written or unchanged.
+fn report_warnings(
+    report: SyncReport,
+    notices: Vec<Diagnostic>,
+    tool: ToolId,
+    project: &str,
+) -> Vec<Diagnostic> {
     let warnings = match report {
-        SyncReport::Written { warnings, .. } | SyncReport::Unchanged { warnings, .. } => warnings,
+        SyncReport::Written { mut warnings, .. } | SyncReport::Unchanged { mut warnings, .. } => {
+            warnings.extend(notices);
+            warnings
+        }
         SyncReport::Deferred { .. } | SyncReport::Unsupported => Vec::new(),
     };
     warnings
@@ -661,6 +693,59 @@ mod tests {
         assert_eq!(out.items.len(), 1);
         assert_eq!(progress.finished_blocks(), 2);
         assert_eq!(progress.completed_tools(), 1);
+        Ok(())
+    }
+
+    /// A repo-level file carries the repo-root default only, so a nested project's own
+    /// `cooldown.toml` window is reported once against the repo-level item, while the repository's
+    /// own default, which every project shares, is not.
+    #[tokio::test]
+    async fn a_repo_scoped_sync_reports_a_consumer_only_window() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::create_dir(root.join("nested"))?;
+        let mut adapters = AdapterSet::new();
+        adapters.register_target_verified_mutator(Arc::new(TestAdapter {
+            write_id: CARGO,
+            refresh: false,
+            repo_sync: true,
+        }))?;
+        let repo_layers = vec![builtin_default_layer(), repo_config(r#"min-age = "7d""#)?];
+        let mut top = project_ctx(CARGO, root.as_str());
+        top.policy.layers.clone_from(&repo_layers);
+        let mut nested = project_ctx(CARGO, root.join("nested").as_str());
+        nested.rel_path = Utf8PathBuf::from("nested");
+        nested.policy.layers.clone_from(&repo_layers);
+        nested
+            .policy
+            .layers
+            .push(cooldown_core::config::parse_config(
+                r#"min-age = "30d""#,
+                cooldown_core::Origin::Repo("nested/cooldown.toml".into()),
+            )?);
+        let ws = Workspace::new(
+            adapters,
+            vec![top, nested],
+            "2026-06-17T00:00:00Z".parse()?,
+            Baseline::default(),
+            root.clone(),
+            repo_layers,
+        );
+
+        let out = ws.sync(&RunOpts::default()).await;
+
+        assert_eq!(out.summary.written, 1, "{:?}", out.items);
+        assert_eq!(
+            out.warnings,
+            [cooldown_core::Diagnostic::new(
+                cooldown_core::DiagnosticKind::Config,
+                "`min-age = \"30d\"` from `repo:nested/cooldown.toml` is not represented in \
+                 cargo's native config, so a bare cargo command does not apply it",
+            )
+            .with_tool(CARGO.as_str())
+            .with_project(".")]
+        );
         Ok(())
     }
 
@@ -985,14 +1070,22 @@ mod tests {
         Ok(())
     }
 
-    /// Only a written or unchanged report carries native warnings, and each is attributed.
+    /// Only a written or unchanged report carries native warnings and the omitted-policy notices
+    /// after them, and each is attributed.
     #[test]
     fn report_warnings_attribute_written_and_unchanged_reports() {
         let warning = cooldown_core::Diagnostic::new(
             cooldown_core::DiagnosticKind::StricterNative,
             "selector `a?` is left out",
         );
-        let expected = [warning.clone().with_tool("uv").with_project(".")];
+        let notice = cooldown_core::Diagnostic::new(
+            cooldown_core::DiagnosticKind::Config,
+            "`major = \"30d\"` is not represented",
+        );
+        let expected = [
+            warning.clone().with_tool("uv").with_project("."),
+            notice.clone().with_tool("uv").with_project("."),
+        ];
         let path = Utf8PathBuf::from("uv.toml");
         let written = cooldown_core::SyncReport::Written {
             path: path.clone(),
@@ -1002,13 +1095,22 @@ mod tests {
             path,
             warnings: vec![warning],
         };
-        assert_eq!(super::report_warnings(written, ToolId("uv"), "."), expected);
+        let notices = vec![notice];
         assert_eq!(
-            super::report_warnings(unchanged, ToolId("uv"), "."),
+            super::report_warnings(written, notices.clone(), ToolId("uv"), "."),
             expected
         );
         assert_eq!(
-            super::report_warnings(cooldown_core::SyncReport::Unsupported, ToolId("uv"), "."),
+            super::report_warnings(unchanged, notices.clone(), ToolId("uv"), "."),
+            expected
+        );
+        assert_eq!(
+            super::report_warnings(
+                cooldown_core::SyncReport::Unsupported,
+                notices,
+                ToolId("uv"),
+                "."
+            ),
             []
         );
     }
@@ -1313,6 +1415,50 @@ mod tests {
             fail_fetch: false,
             native_warnings: Vec::new(),
         })
+    }
+
+    /// A per-kind window the native config cannot carry reaches the outcome as a `config` notice
+    /// attributed to the synced tool and project, after the adapter's own warnings, in a dry run
+    /// as in a real one.
+    #[tokio::test]
+    async fn sync_reports_policy_the_native_config_omits() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let warning = cooldown_core::Diagnostic::new(
+            cooldown_core::DiagnosticKind::StricterNative,
+            "selector `a?` is left out",
+        );
+        let mut adapter = locked_adapter(Vec::new(), None)?;
+        adapter.native_warnings = vec![warning.clone()];
+        let ws = policy_workspace(
+            &root,
+            adapter,
+            Baseline::default(),
+            vec![repo_config(PER_KIND_WINDOW)?],
+        )?;
+        let notice = cooldown_core::Diagnostic::new(
+            cooldown_core::DiagnosticKind::Config,
+            "`major = \"30d\"` from `repo:cooldown.toml` is not represented in cargo's native \
+             config, so a bare cargo command does not apply it",
+        );
+        let expected = [
+            warning.with_tool(CARGO.as_str()).with_project("."),
+            notice.with_tool(CARGO.as_str()).with_project("."),
+        ];
+        for dry_run in [true, false] {
+            let opts = RunOpts {
+                dry_run,
+                ..RunOpts::default()
+            };
+
+            let outcome = ws.sync(&opts).await;
+
+            assert_eq!(outcome.summary.written, 1, "dry run: {dry_run}");
+            assert_eq!(outcome.warnings, expected, "dry run: {dry_run}");
+            assert_eq!(outcome.exit, Exit::Ok);
+        }
+        Ok(())
     }
 
     /// The `latest` glob of the issue's policy exempts every kind of `@corp/*` but majors, so
