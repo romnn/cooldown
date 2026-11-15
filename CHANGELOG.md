@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.30
+
 - **`sync` reports the policy a native config cannot carry.** `sync` writes one default window
   into each tool's native config, and for uv the windows of packages a rule names exactly. Per-kind
   windows such as `major = "30d"`, glob package rules such as `[package."internal-*"]`, and for
