@@ -2593,13 +2593,19 @@ fn sync_withholds_a_partially_exempt_latest_glob() {
     assert!(report.ok(), "sync should succeed: {report:?}");
     assert_eq!(
         report.warning_kinds(),
-        std::collections::BTreeSet::from(["stricter_native".to_string()]),
+        std::collections::BTreeSet::from(["config".to_string(), "stricter_native".to_string()]),
         "{report:?}"
     );
     assert!(
         report.warning_messages().iter().any(|message| message
             .contains("cannot prove that every release `@corp/*` matches is exempt")),
         "the warning names the withheld selector: {report:?}"
+    );
+    // pnpm's single minute count has no per-kind window, so the 30-day major window is reported.
+    assert!(
+        report.warning_messages().iter().any(|message| message
+            .contains("`major = \"30d\"` from `repo:cooldown.toml` is not represented")),
+        "the per-kind window the native config omits is reported: {report:?}"
     );
 
     let yaml = String::from_utf8(fixture.read_bytes("pnpm-workspace.yaml")).expect("utf8");
