@@ -128,6 +128,22 @@ fn check_scope(opts: &RunOpts) -> DepScope {
     }
 }
 
+/// The native window exact admissions are selected against: `window` in whole minutes, rounded
+/// up as pnpm and Yarn write it, or `None` when `window` is no positive rolling age.
+fn native_admission_window(
+    window: &cooldown_core::WindowSpec,
+) -> Option<cooldown_core::WindowSpec> {
+    let cooldown_core::WindowSpec::MinAge(duration) = window else {
+        return None;
+    };
+    let seconds = duration.as_secs() + i64::from(duration.subsec_nanos() > 0);
+    let seconds = u64::try_from(seconds).ok().filter(|seconds| *seconds > 0)?;
+    let rounded = i64::try_from(seconds.div_ceil(60).checked_mul(60)?).ok()?;
+    Some(cooldown_core::WindowSpec::MinAge(
+        jiff::SignedDuration::from_secs(rounded),
+    ))
+}
+
 impl Workspace {
     /// Gate the resolved graph: exit non-zero if anything is younger than its cooldown (the CI
     /// gate).
@@ -177,17 +193,10 @@ impl Workspace {
         let mut runner = CheckRunner::new(self, opts);
         // Native policy serves every locked registry version even when the command hides transitives.
         runner.scope = DepScope::Graph;
-        // pnpm represents its native rolling age in whole minutes, truncated toward zero.
-        // Select against that persisted window so subminute precision cannot add needless entries.
-        runner.admission_window = match window {
-            cooldown_core::WindowSpec::MinAge(duration) => {
-                let minutes = duration.as_secs() / 60;
-                (minutes > 0).then_some(cooldown_core::WindowSpec::MinAge(
-                    jiff::SignedDuration::from_secs(minutes * 60),
-                ))
-            }
-            cooldown_core::WindowSpec::Freeze(_) | cooldown_core::WindowSpec::Latest => None,
-        };
+        // pnpm and Yarn represent their native rolling age in whole minutes, rounded up.
+        // Select against that persisted window so a release the native gate still holds gets its
+        // entry, and subminute precision cannot add needless ones.
+        runner.admission_window = native_admission_window(window);
         if let Some(deps) = runner.read_dependencies(pctx, &read).await {
             runner.evaluate_dependencies(pctx, &read, deps).await;
         }
@@ -765,12 +774,28 @@ fn error_item(dep: &Dependency, project: &str, tool: &str, diag: Diagnostic) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{CheckAccum, error_item, finalize_check};
+    use super::{CheckAccum, error_item, finalize_check, native_admission_window};
     use crate::app::{RunOpts, RunScope};
     use camino::Utf8Path;
     use cooldown_core::{
         Dependency, Diagnostic, DiagnosticKind, PackageId, ReleaseQuality, ToolId, Version,
     };
+
+    /// Admissions are selected against the gate pnpm and Yarn hold, whole minutes rounded up, so
+    /// a release in the last partial minute of the window still gets its entry.
+    #[test]
+    fn the_admission_window_rounds_up_to_whole_minutes() {
+        let seconds =
+            |count| cooldown_core::WindowSpec::MinAge(jiff::SignedDuration::from_secs(count));
+        assert_eq!(native_admission_window(&seconds(90)), Some(seconds(120)));
+        assert_eq!(native_admission_window(&seconds(30)), Some(seconds(60)));
+        assert_eq!(native_admission_window(&seconds(600)), Some(seconds(600)));
+        assert_eq!(native_admission_window(&seconds(0)), None);
+        assert_eq!(
+            native_admission_window(&cooldown_core::WindowSpec::Latest),
+            None
+        );
+    }
 
     fn diagnostic(message: &str) -> Diagnostic {
         Diagnostic::new(DiagnosticKind::Config, message)

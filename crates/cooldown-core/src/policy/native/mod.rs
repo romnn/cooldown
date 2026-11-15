@@ -1,13 +1,23 @@
-//! Proofs that a `latest`/`allow` package selector may become a package-wide native exemption.
+//! What `sync` may write into a tool's native config, and what it leaves out.
 //!
 //! A native exemption list (pnpm's `minimumReleaseAgeExclude`) exempts every version of every
 //! package a selector names, so `sync` may write a selector there only when cooldown's own policy
 //! exempts all of those releases too.
 //! [`native_exemptions`] proves that per selector and withholds every selector it cannot prove.
+//!
+//! [`native_default_resolution`] resolves the single default window `sync` writes, and
+//! [`omitted_native_fields`] names every gating policy field that window and the native config's
+//! other entries do not carry.
+
+mod omitted;
+
+pub use omitted::{
+    GatingField, NativeEncoding, OmissionReason, OmittedField, WindowField, omitted_native_fields,
+};
 
 use super::model::{
-    ByKind, Origin, PatternGlob, PolicyLayer, ResolveKind, ResolveQuery, Rule, RuleRank, Selector,
-    WindowSpec,
+    ByKind, Origin, PatternGlob, PolicyLayer, ResolveKind, ResolveQuery, ResolvedWindow, Rule,
+    RuleRank, Selector, WindowSpec,
 };
 use super::resolve::resolve;
 use crate::model::{ToolId, UpdateKind};
@@ -136,6 +146,47 @@ pub fn native_exemptions(
         list.push(raw.to_string());
     }
     exemptions
+}
+
+/// Resolves the default window `sync` writes into `target`'s single native field for `project`.
+///
+/// This is the window cooldown gates a locked pin of an unnamed package with, so a package rule
+/// that matches every name, such as `[package."*"]`, sets it just as the bare `min-age` does.
+/// When that window is an exemption, the project default `min-age`, which package rules do not
+/// change, is used instead: the native field still governs every package whose native exemption
+/// [`native_exemptions`] withholds, so a package rule's `latest` or `allow` must not lift it.
+/// The two windows are never compared by today's cutoffs, since a rolling age and an absolute
+/// freeze trade places as time passes while the persisted value stays.
+///
+/// The written value is the returned window's [`ResolvedWindow::effective_spec`], which folds in
+/// a binding floor.
+/// Per-kind windows and windows of packages a rule names are not part of it;
+/// [`omitted_native_fields`] reports each one the native config does not carry otherwise.
+#[must_use]
+pub fn native_default_resolution(
+    layers: &[PolicyLayer],
+    target: ToolId,
+    project: &Utf8Path,
+    now: Timestamp,
+) -> ResolvedWindow {
+    let window = |kind| {
+        let query = ResolveQuery {
+            tool: target,
+            package: "",
+            registry: None,
+            project,
+            kind,
+        };
+        resolve(layers, &query, now).window
+    };
+    // The empty name stands for a package no rule names: only a glob matching the empty name,
+    // such as `*`, applies to it.
+    let unnamed = window(ResolveKind::CurrentPin);
+    if unnamed.effective_spec(now) == WindowSpec::Latest {
+        window(ResolveKind::EffectiveDefault)
+    } else {
+        unnamed
+    }
 }
 
 /// The package glob of `rule` when it is a `latest`/`allow` package rule that applies to `target`.

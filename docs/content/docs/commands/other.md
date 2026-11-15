@@ -114,12 +114,34 @@ The same behavior is available as a global `--sync` flag on any command, which s
 
 The default window `sync` writes is the one a package no rule names gets: the bare `min-age`, or a package rule that matches every name, such as `[package."*"]`, when it sets one. When that window is an exemption (`latest` or `allow` on such a package rule), `sync` writes the bare `min-age` instead, since the native window still applies to every package whose native exemption is withheld.
 
+A native config holds one default window, and for uv the windows of packages a rule names exactly, so most policies say more than it can carry. `sync` reports every rule field that can hold a release back and that the written config does not carry, as a `config` warning naming the field, the file and the rule it comes from:
+
+```toml
+# cooldown.toml
+[min-age]
+default = "7d"
+major = "30d" # reported: no native config has a window per update kind
+
+[package."internal-*"]
+min-age = "30d" # reported: a glob package rule has no native form
+```
+
+cooldown's own commands still enforce every one of these fields; the warning says only that a bare `pnpm install`, `uv lock` or `cargo update` does not. The report depends on where a field is declared, never on its value, so a per-kind window shorter than the default, such as `patch = "1d"`, is reported too. Reported are:
+
+- every `major`, `minor` and `patch` window;
+- the window and `floor` of a package rule whose pattern is anything but `*`, including a literal package for pnpm, Yarn and Cargo, which have no per-package window;
+- for uv and Cargo, whose one file serves every project in the repository, a project rule that does not match the repository root, and every field of a `cooldown.toml` below the root, which the root's default never sees;
+- a `freeze` whose `floor` still binds: `sync` writes the floor's rolling age, which stops matching cooldown on the date the warning names, once the floor reaches past the freeze date.
+
+`latest`, `allow` and `max-major` are not reported here: the exemptions are covered by the native exemption lists described below, and `max-major` is no window. Two boundaries stay outside the report. A `[registry."…"]` rule never reaches a native config, since cooldown tags every package with its tool's fixed registry. And a native config nearer to a project than the file `sync` writes, such as a nested uv project's own `[tool.uv]` table or a nearer `.cargo` configuration, shadows the written file for that project.
+
 ### pnpm
 
 For pnpm, `sync` writes the project's `pnpm-workspace.yaml`: the default window as
-`minimumReleaseAge` (in minutes), and every `latest` or `allow` package selector that exempts every
-release it matches as a `minimumReleaseAgeExclude` entry, followed by the exact versions of young
-locked packages cooldown admits.
+`minimumReleaseAge` (in whole minutes, rounded up so the gate is never shorter than the window), and
+every `latest` or `allow` package selector that exempts every release it matches as a
+`minimumReleaseAgeExclude` entry, followed by the exact versions of young locked packages cooldown
+admits.
 
 A `minimumReleaseAgeExclude` entry exempts every version of every package it names, so `sync`
 writes a selector there only when cooldown exempts all of them too: for the locked version and
@@ -161,10 +183,11 @@ inherited from user or global configuration. For the same reason `sync` never re
 stays absent.
 
 When the default window is a `freeze` or `latest`, which pnpm's minute count cannot express,
-`sync` leaves `minimumReleaseAge` as it is but still removes every `minimumReleaseAgeExclude` entry
-without versions that it would not write, keeping every version-qualified entry as written, so no
-package gains an exemption. A list it empties stays as `[]`, and when a selector was withheld or
-left out it writes `minimumReleaseAgeExclude: []` even where the key or the file was absent.
+`sync` leaves `minimumReleaseAge` as it is, reporting a freeze as a `config` warning, but still
+removes every `minimumReleaseAgeExclude` entry without versions that it would not write, keeping
+every version-qualified entry as written, so no package gains an exemption. A list it empties
+stays as `[]`, and when a selector was withheld or left out it writes
+`minimumReleaseAgeExclude: []` even where the key or the file was absent.
 
 ### Yarn Berry
 
@@ -253,7 +276,8 @@ overrides below into the table key by key, so an entry left in `uv.toml` for a r
 exists still applies until the next sync removes it.
 Only exact names in their normalized PyPI spelling (`types-pyyaml`, not `Types_PyYAML`) are
 written, since those are the names the gate matches against `uv.lock`; glob rules such as
-`[package."types-*"]` have no `exclude-newer-package` form and stay enforced by the gate alone.
+`[package."types-*"]` have no `exclude-newer-package` form, stay enforced by the gate alone, and are
+reported as a `config` warning, as are a package rule's per-kind windows.
 
 Every uv command cooldown runs (`uv lock --check` under `check`, the re-locks under `fix` and
 `upgrade`, and `uv sync` under `--build`) passes the project's resolved policy the same way, as
@@ -290,7 +314,7 @@ Cargo has one age per registry and nothing more, so `sync` cannot write everythi
 
 - A `freeze` or an opt-out leaves the existing age alone, with a warning.
 - A package rule has no Cargo equivalent, so a plain cargo command applies the default age to that
-  package too; `sync` names those packages in a warning.
+  package too; `sync` reports each such window or `floor` as a `config` warning.
 - Cargo enforces no age at all while `resolver.incompatible-publish-age` is `allow`; `sync` writes
   the age anyway and warns that Cargo will ignore it.
 

@@ -152,15 +152,18 @@ impl NativeAge {
     }
 }
 
-/// Converts a cooldown window into pnpm's rolling whole-minute representation.
+/// Converts a cooldown window into pnpm's rolling whole-minute representation, or `None` when the
+/// window is no positive rolling age.
+///
+/// A partial minute rounds up, as Yarn's gate does, so the written gate is never shorter than the
+/// window: a 90-second window becomes 2 minutes and a 30-second one 1 minute.
 pub(crate) fn window_minutes(spec: &WindowSpec) -> Option<i64> {
-    match spec {
-        WindowSpec::MinAge(duration) => {
-            let minutes = duration.as_secs() / 60;
-            (minutes > 0).then_some(minutes)
-        }
-        WindowSpec::Freeze(_) | WindowSpec::Latest => None,
-    }
+    let WindowSpec::MinAge(duration) = spec else {
+        return None;
+    };
+    let seconds = duration.as_secs() + i64::from(duration.subsec_nanos() > 0);
+    let seconds = u64::try_from(seconds).ok().filter(|seconds| *seconds > 0)?;
+    i64::try_from(seconds.div_ceil(60)).ok()
 }
 
 /// Sets one top-level YAML scalar while preserving comments and key order.

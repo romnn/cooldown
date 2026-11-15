@@ -25,5 +25,8 @@ pub use model::{
     ByKind, Origin, PatternGlob, PolicyLayer, PolicyStack, Resolution, ResolveKind, ResolveQuery,
     ResolvedWindow, Rule, Selector, TraceStep, WindowSpec, window_exclude_newer,
 };
-pub use native::{NativeExemptions, PolicyContext, native_exemptions};
+pub use native::{
+    GatingField, NativeEncoding, NativeExemptions, OmissionReason, OmittedField, PolicyContext,
+    WindowField, native_default_resolution, native_exemptions, omitted_native_fields,
+};
 pub use resolve::{MaxMajorPick, package_windows, resolve, resolve_max_major};

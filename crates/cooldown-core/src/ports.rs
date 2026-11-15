@@ -1307,6 +1307,17 @@ pub trait ToolWrite: Send + Sync {
         SyncScope::None
     }
 
+    /// Whether the native config `sync` writes carries [`ResolvedPolicy::package_windows`], the
+    /// window of each package a literal package selector names, as uv's `exclude-newer-package`
+    /// does.
+    ///
+    /// `sync` reports every package window of a tool that answers `false` as policy its native
+    /// config does not represent (see [`omitted_native_fields`](crate::omitted_native_fields)).
+    /// The default is `false`.
+    fn native_package_windows(&self) -> bool {
+        false
+    }
+
     /// Writes the resolved repo-wide policy into a single repo-level native config file (the `sync`
     /// operation for [`SyncScope::Repo`] adapters, e.g. uv's root `uv.toml`).
     ///
@@ -1627,7 +1638,8 @@ pub struct ResolvedPolicy {
     /// The effective window of every package a literal `package` selector names (see
     /// [`package_windows`](crate::package_windows)), to bake into a native per-package cutoff
     /// table (uv's `exclude-newer-package`).
-    /// Empty for tools without such a knob, which simply ignore it.
+    /// Tools without such a knob simply ignore it, and answer `false` to
+    /// [`ToolWrite::native_package_windows`], so `sync` reports these windows for them.
     pub package_windows: std::collections::BTreeMap<String, crate::WindowSpec>,
     /// Exact locked versions admitted by read-side evaluation while still younger than the
     /// native default window.

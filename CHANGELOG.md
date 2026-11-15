@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **`sync` reports the policy a native config cannot carry.** `sync` writes one default window
+  into each tool's native config, and for uv the windows of packages a rule names exactly. Per-kind
+  windows such as `major = "30d"`, glob package rules such as `[package."internal-*"]`, and for
+  uv and Cargo the rules of a nested `cooldown.toml` or of a project rule that misses the
+  repository root were dropped without a word, so a bare `pnpm install`, `uv lock` or
+  `cargo update` could adopt a release cooldown's own gate rejects. Each such field is now a
+  `config` warning naming the field, its file and its rule, as is a `freeze` whose binding `floor`
+  is written in its place, with the date the written value stops matching. pnpm also warns when
+  a freeze leaves `minimumReleaseAge` as it is, and rounds a partial minute up, so a 90-second
+  window is written as 2 minutes, not 1. Cargo's own warning naming the packages with a window of
+  their own is replaced by these warnings.
+
 - **A held copy no longer holds back its sibling's move to the same target.** When two copies of
   one package were planned onto the same version, for example `seroval` 1.6.12 under `solid-js`
   and 1.7.1 under `@tanstack/router-core`, both onto 1.7.2, cooldown identified the two moves by
