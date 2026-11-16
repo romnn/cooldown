@@ -67,6 +67,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod acceptance;
 mod landing;
 
+use crate::lockstep::{LockstepEdges, Released, Role};
 use acceptance::{ResolveBaseline, Violation};
 
 /// The line cargo-hakari writes above the dependency tables it generates. Read for one purpose
@@ -119,6 +120,9 @@ pub struct CargoTool {
     ///
     /// A plan without those crates may land the change, so its hold is not attested.
     refusal_constraints: std::sync::Mutex<HashMap<RefusalKey, BTreeSet<String>>>,
+    /// The exact-pin edges of every graph the run read, which decide the lockstep family a
+    /// refusal releases.
+    lockstep: LockstepEdges,
     /// The split completions of the current resolve per project root that did not land.
     ///
     /// A completion's outcome is a function of the project files it starts from, its coalition
@@ -147,6 +151,7 @@ impl CargoTool {
             memo: &self.rejection_memo,
             trees: &self.staged_trees,
             reads: &self.locked_reads,
+            lockstep: &self.lockstep,
         }
     }
 
@@ -159,6 +164,7 @@ impl CargoTool {
             outcomes: &self.command_outcomes,
             trees: &self.staged_trees,
             reads: &self.locked_reads,
+            lockstep: &self.lockstep,
             enabled: self.rejection_memo_enabled,
         }
     }
@@ -186,6 +192,7 @@ impl CargoTool {
             generated: tokio::sync::Mutex::new(HashMap::new()),
             refused_alone: std::sync::Mutex::new(HashSet::new()),
             refusal_constraints: std::sync::Mutex::new(HashMap::new()),
+            lockstep: LockstepEdges::default(),
             failed_completions: std::sync::Mutex::new(HashSet::new()),
             rejection_memo: RejectionMemo::default(),
             rejection_memo_enabled: true,
@@ -943,6 +950,11 @@ struct SeedGroup<'a> {
     changes: &'a [&'a Change],
     /// The whole plan, which the seeded resolve's [acceptance rule](acceptance) is judged against.
     plan: &'a [Change],
+    /// Whether a refusal naming a lockstep family member is retried with the family released.
+    ///
+    /// Only the final atomic attempt over the rejected changes retries: a bisecting worklist
+    /// splits a refused group anyway, and a retry per split would multiply its resolves.
+    release_lockstep: bool,
 }
 
 struct MemoAttempt<'a> {
@@ -1870,6 +1882,65 @@ fn pin_blockers(
         .collect()
 }
 
+/// Writes a seed: the `seeded` lock, with the generated projections following its `moves` as they
+/// follow a pin.
+fn write_seed(
+    project: &Project,
+    moves: &[PlannedNodeMove],
+    followers: &[MemberRef],
+    seeded: &str,
+    journal: &ProjectMutationJournal,
+) -> Result<()> {
+    journal.validate_project(&project.root)?;
+    for planned in moves {
+        manifest::follow_constraint_checked(
+            &project.root,
+            followers,
+            &planned.name,
+            &planned.from,
+            &planned.to,
+            || journal.validate_project(&project.root),
+        )?;
+    }
+    journal.validate_project(&project.root)?;
+    std::fs::write(project.root.join("Cargo.lock"), seeded)?;
+    Ok(())
+}
+
+/// The [`Role`] each lockstep family member plays in an attempt on `subjects`.
+///
+/// The attempt pins or seeds its subjects itself.
+/// It holds every crate an authored package declares, which never moves outside the plan; every
+/// planned target, which a released family member must not displace; and the original node of
+/// each planned change it `dropped`, whose failure it already established.
+fn attempt_roles<'a>(
+    baseline: &'a ResolveBaseline,
+    plan: &'a [Change],
+    subjects: &'a [&'a Change],
+    dropped: &'a [&'a Change],
+) -> impl Fn(&PackageKey) -> Role + 'a {
+    move |node| {
+        let names = |change: &Change, version: &str| {
+            change.package.name == node.name && version == node.version
+        };
+        if subjects
+            .iter()
+            .any(|change| names(change, change.from.as_str()))
+        {
+            Role::Subject
+        } else if baseline.declares_crates_io(&node.name, &node.version)
+            || dropped
+                .iter()
+                .any(|change| names(change, change.from.as_str()))
+            || plan.iter().any(|change| names(change, change.to.as_str()))
+        {
+            Role::Held
+        } else {
+            Role::Free
+        }
+    }
+}
+
 impl CargoTool {
     fn rejection_memo_key(&self, attempt: &MemoAttempt<'_>) -> Result<Option<MemoKey>> {
         attempt.validate()?;
@@ -1898,7 +1969,10 @@ impl CargoTool {
         let Some(key) = key else {
             return Ok(None);
         };
-        let mut rejection = self.rejection_memo.get(key);
+        let mut rejection = self
+            .rejection_memo
+            .get(key)
+            .filter(|recalled| recalled.lockstep_edges == self.lockstep.len());
         if let Some(recalled) = &rejection
             && !recalled.heals.is_empty()
         {
@@ -1928,6 +2002,10 @@ impl CargoTool {
         if let Some(before) = before
             && self.inputs_restored(attempt, &before)?
         {
+            let rejection = MemoRejection {
+                lockstep_edges: self.lockstep.len(),
+                ..rejection
+            };
             self.rejection_memo.insert(before, rejection);
         }
         Ok(())
@@ -2346,29 +2424,44 @@ impl CargoTool {
         // candidate (a `links` clash of its new `-sys` crate); the candidate then appears only
         // further up the explanation's chain.
         // A candidate dropped wrongly only falls back to its own attempt.
-        // Each retry drops at least one candidate, which bounds the loop by the group size.
+        // A refusal naming a locked lockstep family member is first retried with the family
+        // released beside the same candidates, since dropping a candidate cannot free a node a
+        // locked family member pins.
+        // Each retry drops at least one candidate or releases at least one more node, at most
+        // PIN_BLOCKER_ROUNDS times per subset, which bounds the loop.
+        let mut released = Released::default();
         let resolved = loop {
-            match self
-                .resolve_widened_group(&probe, &candidates, &[], culprit_drop)
+            let outcome = match self
+                .resolve_widened_group(&probe, &candidates, released.nodes(), culprit_drop)
                 .await?
             {
                 GroupResolve::Resolved(evidence) => break Some(*evidence),
                 GroupResolve::Discarded => break None,
-                outcome @ (GroupResolve::Refused { .. } | GroupResolve::Violated { .. }) => {
-                    let dropped = culprit_drop.dropped(outcome, &candidates);
-                    if dropped.is_empty() || dropped.len() == candidates.len() {
-                        break None;
-                    }
-                    restore_widen_checkpoint(probe.project, probe.journal, &checkpoint)?;
-                    candidates.retain(|change| !dropped.contains(change));
-                    stats.joint_retries += 1;
-                    tracing::debug!(
-                        dropped = ?dropped.iter().map(|change| change.package.name.as_str()).collect::<Vec<_>>(),
-                        remaining = candidates.len(),
-                        "retrying cargo joint widen without the refused candidates"
-                    );
-                }
+                outcome @ (GroupResolve::Refused { .. } | GroupResolve::Violated { .. }) => outcome,
+            };
+            restore_widen_checkpoint(probe.project, probe.journal, &checkpoint)?;
+            if let GroupResolve::Refused { parties, .. } = &outcome
+                && released.grow(self.group_lockstep_releases(&probe, &candidates, parties)?)
+            {
+                stats.joint_retries += 1;
+                tracing::debug!(
+                    released = ?released.nodes(),
+                    "retrying cargo joint widen with its lockstep family released"
+                );
+                continue;
             }
+            let dropped = culprit_drop.dropped(outcome, &candidates);
+            if dropped.is_empty() || dropped.len() == candidates.len() {
+                break None;
+            }
+            candidates.retain(|change| !dropped.contains(change));
+            released = Released::default();
+            stats.joint_retries += 1;
+            tracing::debug!(
+                dropped = ?dropped.iter().map(|change| change.package.name.as_str()).collect::<Vec<_>>(),
+                remaining = candidates.len(),
+                "retrying cargo joint widen without the refused candidates"
+            );
         };
         let reached: Vec<_> = resolved
             .as_ref()
@@ -2412,9 +2505,8 @@ impl CargoTool {
         // Evidence from the full probe cannot authorize A without the failed B's edits.
         // Rebuild the subset from the checkpoint and resolve exactly those edits again.
         let replayed = self
-            .resolve_widened_group(&probe, &reached, &[], culprit_drop)
-            .await?
-            .into_evidence();
+            .replay_reached(&probe, &candidates, &reached, &released, culprit_drop)
+            .await?;
         if let Some(replayed) = replayed
             && reached.iter().all(|change| replayed.reached(change))
             && probe
@@ -2428,6 +2520,60 @@ impl CargoTool {
         stats.partial_replays_discarded += 1;
         restore_widen_checkpoint(probe.project, probe.journal, &checkpoint)?;
         Ok(None)
+    }
+
+    /// Resolves the `reached` subset of a joint probe's `candidates` again from its checkpoint,
+    /// releasing the same family save the original nodes of the candidates that fell short.
+    async fn replay_reached(
+        &self,
+        probe: &WidenProbe<'_>,
+        candidates: &[&Change],
+        reached: &[&Change],
+        released: &Released,
+        culprit_drop: CulpritDrop,
+    ) -> Result<Option<WidenEvidence>> {
+        let lock = read_lock(probe.project)?;
+        let baseline = ResolveBaseline::capture(&lock, &probe.project.generated_members);
+        let short: Vec<_> = candidates
+            .iter()
+            .copied()
+            .filter(|change| !reached.contains(change))
+            .collect();
+        let role = attempt_roles(&baseline, probe.plan, reached, &short);
+        let replay_released: Vec<_> = released
+            .nodes()
+            .iter()
+            .filter(|node| role(node) == Role::Free)
+            .cloned()
+            .collect();
+        Ok(self
+            .resolve_widened_group(probe, reached, &replay_released, culprit_drop)
+            .await?
+            .into_evidence())
+    }
+
+    /// The lockstep family a joint probe of `candidates` releases after a refusal naming
+    /// `parties`, read from the restored checkpoint.
+    ///
+    /// The probe's other candidates were dropped, so their original nodes stay where they are.
+    fn group_lockstep_releases(
+        &self,
+        probe: &WidenProbe<'_>,
+        candidates: &[&Change],
+        parties: &[ConflictParty],
+    ) -> Result<Vec<PackageKey>> {
+        let lock = read_lock(probe.project)?;
+        let baseline = ResolveBaseline::capture(&lock, &probe.project.generated_members);
+        let dropped: Vec<_> = probe
+            .candidates
+            .iter()
+            .copied()
+            .filter(|change| !candidates.contains(change))
+            .collect();
+        let role = attempt_roles(&baseline, probe.plan, candidates, &dropped);
+        Ok(self
+            .lockstep
+            .releases(&lock, &locked_parties(&lock, parties), role))
     }
 
     /// Widens and seeds `candidates` together and resolves them in one step, also releasing the
@@ -2682,6 +2828,7 @@ impl CargoTool {
                     MemoRejection {
                         effects: pins.rejection_effects,
                         heals: pins.heals,
+                        ..MemoRejection::default()
                     },
                 )?;
             }
@@ -2727,7 +2874,7 @@ impl CargoTool {
         };
         MemoRejection {
             effects: vec![effect.clone()],
-            heals: Vec::new(),
+            ..MemoRejection::default()
         }
         .apply(rejections);
         stats.rejection_effects.push(effect);
@@ -2808,7 +2955,7 @@ impl CargoTool {
                         };
                         MemoRejection {
                             effects: vec![effect.clone()],
-                            heals: Vec::new(),
+                            ..MemoRejection::default()
                         }
                         .apply(rejections);
                         stats.rejection_effects.push(effect);
@@ -3052,6 +3199,7 @@ impl CargoTool {
                     moves: &moves,
                     changes: &obligations,
                     plan: &plan.changes,
+                    release_lockstep: true,
                 },
                 journal,
                 observer.zip(
@@ -3114,7 +3262,11 @@ impl CargoTool {
         let memo_attempt = MemoAttempt {
             project,
             plan: group.plan,
-            operation: MemoOperation::Seed,
+            operation: if group.release_lockstep {
+                MemoOperation::FamilySeed
+            } else {
+                MemoOperation::Seed
+            },
             metadata_mode: MemoMetadataMode::Resolve,
             changes: group.changes,
             followers: &followers,
@@ -3129,27 +3281,41 @@ impl CargoTool {
             return Ok(SeedOutcome::Refused);
         }
         let snapshot = widen_snapshot(&project.root, &[], &followers)?;
-        journal.validate_project(&project.root)?;
-        for planned in moves {
-            manifest::follow_constraint_checked(
-                &project.root,
-                &followers,
-                &planned.name,
-                &planned.from,
-                &planned.to,
-                || journal.validate_project(&project.root),
-            )?;
-        }
-        journal.validate_project(&project.root)?;
-        std::fs::write(&lock_path, &seeded)?;
-        stats.seeded += moves.len();
-        stats.resolves += 1;
-        if let Some((observer, change)) = notification {
-            observer.resolver_started(Some(change));
-        }
-        let resolved = self.commands().resolve(project).await;
-        // A coordination failure forbids restoring files that may now belong to another writer.
-        journal.validate_project(&project.root)?;
+        let role = attempt_roles(&baseline, group.plan, group.changes, &[]);
+        let mut released = Released::default();
+        let resolved = loop {
+            write_seed(project, moves, &followers, &seeded, journal)?;
+            stats.seeded += moves.len();
+            stats.resolves += 1;
+            if let Some((observer, change)) = notification {
+                observer.resolver_started(Some(change));
+            }
+            let resolved = self.resolve_releasing(project, released.nodes()).await;
+            // A coordination failure forbids restoring files that may now belong to another writer.
+            journal.validate_project(&project.root)?;
+            let Err(err) = resolved else {
+                break Ok(());
+            };
+            if !group.release_lockstep || !seed_resolver_rejection(&err) {
+                break Err(err);
+            }
+            let parties = rejection_parties(&err);
+            // Which family members may be released depends on the plan, which the memo key
+            // omits, so a refusal naming a family is not remembered.
+            if self.names_lockstep_family(&before, &parties) {
+                stats.memo_disqualified = true;
+            }
+            let refused = locked_parties(&before, &parties);
+            if !released.grow(self.lockstep.releases(&before, &refused, &role)) {
+                break Err(err);
+            }
+            tracing::debug!(
+                group = moves.len(),
+                released = ?released.nodes(),
+                "retrying a cargo seed with its lockstep family released"
+            );
+            restore_widen_snapshot(&project.root, &snapshot, journal)?;
+        };
         match resolved {
             Ok(()) => {
                 let after = read_lock(project)?;
@@ -3362,6 +3528,7 @@ impl CargoTool {
                         moves: &moves,
                         changes: &unlanded,
                         plan,
+                        release_lockstep: false,
                     },
                     journal,
                     notification,
@@ -3608,6 +3775,7 @@ impl CargoTool {
         let rejection = MemoRejection {
             effects,
             heals: unhealable.into_iter().collect(),
+            ..MemoRejection::default()
         };
         // Last rejection wins; a candidate a later pass still lands never reads its
         // stale entry (details are consulted only for unreached candidates).
@@ -3617,6 +3785,24 @@ impl CargoTool {
             self.remember_rejection(memo_attempt, key, rejection)?;
         }
         Ok(())
+    }
+
+    /// Resolves `project`'s graph, first releasing `released` by name, since a metadata resolve
+    /// keeps every locked version its requirements admit.
+    async fn resolve_releasing(&self, project: &Project, released: &[PackageKey]) -> Result<()> {
+        if !released.is_empty() {
+            self.commands().update_unlocking(project, released).await?;
+        }
+        self.commands().resolve(project).await
+    }
+
+    /// Whether a refusal naming `parties` names a member of a lockstep family in `lock`, whatever
+    /// the attempt would keep.
+    fn names_lockstep_family(&self, lock: &CargoLock, parties: &[ConflictParty]) -> bool {
+        !self
+            .lockstep
+            .releases(lock, &locked_parties(lock, parties), |_| Role::Free)
+            .is_empty()
     }
 
     /// Starts a resolve of `root` with no refusal constraints or failed split completions
@@ -3672,18 +3858,21 @@ impl CargoTool {
         let PinPass { scope, batch } = pass;
         let PinScope {
             project,
+            plan,
             journal,
             observer,
-            ..
         } = scope;
         let RefusedPin {
             change, current, ..
         } = *refused;
         let before_text = std::fs::read_to_string(project.root.join("Cargo.lock"))?;
         let before = CargoLock::parse(&before_text)?;
-        // Which conflict parties may be released depends on the batch, which the memo key omits,
-        // so a refusal naming any is not remembered even when this batch releases none of them.
-        if !conflicting_nodes(&before, change, &refused.parties).is_empty() {
+        // Which conflict parties and lockstep family members may be released depends on the
+        // batch, which the memo key omits, so a refusal naming any is not remembered even when
+        // this batch releases none of them.
+        if !conflicting_nodes(&before, change, &refused.parties).is_empty()
+            || self.names_lockstep_family(&before, &refused.parties)
+        {
             stats.memo_disqualified = true;
         }
         let baseline = ResolveBaseline::capture(&before, &project.generated_members);
@@ -3692,7 +3881,24 @@ impl CargoTool {
             change,
             withheld_planned(&before, change, batch, &refused.parties),
         );
-        let mut blockers = pin_blockers(&before, &baseline, change, batch, &refused.parties);
+        // A blocker that belongs to a lockstep family is released with its family, which may
+        // include a planned co-requirer the pin cannot land without; the acceptance rule judges
+        // where that one lands.
+        let subjects = [change];
+        let role = attempt_roles(&baseline, plan, &subjects, &[]);
+        let blockers_of = |parties: &[ConflictParty]| {
+            let mut blockers = pin_blockers(&before, &baseline, change, batch, parties);
+            for node in self
+                .lockstep
+                .releases(&before, &locked_parties(&before, parties), &role)
+            {
+                if !blockers.contains(&node) {
+                    blockers.push(node);
+                }
+            }
+            blockers
+        };
+        let mut blockers = blockers_of(&refused.parties);
         if blockers.is_empty() {
             return Ok(Unlocking::NothingToRelease);
         }
@@ -3738,7 +3944,7 @@ impl CargoTool {
                         change,
                         withheld_planned(&before, change, batch, &parties),
                     );
-                    blockers = pin_blockers(&before, &baseline, change, batch, &parties);
+                    blockers = blockers_of(&parties);
                 }
             }
         }
@@ -5027,6 +5233,9 @@ mod tests {
 
     #[cfg(unix)]
     mod unlocking_pins;
+
+    #[cfg(unix)]
+    mod lockstep_families;
 
     #[cfg(unix)]
     mod acceptance_steps;

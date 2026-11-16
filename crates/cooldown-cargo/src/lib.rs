@@ -10,6 +10,7 @@ mod edges;
 pub mod index;
 mod locked_reads;
 mod lockfile;
+mod lockstep;
 mod manifest;
 mod native;
 mod ownership;

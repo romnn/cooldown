@@ -32,6 +32,8 @@ enum Resolver {
     SnapshotFamily {
         pinned_child: bool,
         fresh_sibling: bool,
+        /// The parent is undeclared, so it moves only as collateral of the sibling that pins it.
+        undeclared_parent: bool,
     },
     PersistentParent {
         companions: u32,
@@ -365,10 +367,18 @@ impl ToolRead for FakeCargo {
         let mut dependencies = Vec::new();
         for (name, version) in &versions {
             let mut dep = dependency(name, version);
-            if let Resolver::SnapshotFamily { pinned_child, .. } = self.resolver {
+            if let Resolver::SnapshotFamily {
+                pinned_child,
+                undeclared_parent,
+                ..
+            } = self.resolver
+            {
                 if name == "child" {
                     dep.direct = true;
                     dep.pinned = pinned_child;
+                }
+                if name == "parent" {
+                    dep.direct = !undeclared_parent;
                 }
                 let requirer = match name.as_str() {
                     "child" => Some("parent"),
@@ -565,6 +575,15 @@ impl ToolWrite for FakeCargo {
                     Resolver::SnapshotFamily { .. } => {}
                 }
             }
+        }
+        // Cargo moves an undeclared parent along with the sibling that pins it exactly.
+        if let Resolver::SnapshotFamily {
+            undeclared_parent: true,
+            ..
+        } = self.resolver
+            && let Some(sibling) = versions.get("sibling").cloned()
+        {
+            versions.insert("parent".to_string(), sibling);
         }
         self.validate_resolve(&versions, plan)?;
         std::fs::write(
@@ -771,7 +790,12 @@ fn fixture_with_edges(
             parent = "1"
         "#},
     )?;
-    if let Resolver::SnapshotFamily { pinned_child, .. } = resolver {
+    if let Resolver::SnapshotFamily {
+        pinned_child,
+        undeclared_parent,
+        ..
+    } = resolver
+    {
         std::fs::write(
             root.join("Cargo.toml"),
             indoc::formatdoc! {r#"
@@ -779,10 +803,11 @@ fn fixture_with_edges(
             name = "app"
             version = "0.1.0"
             [dependencies]
-            parent = "1.0.0"
-            sibling = "1.0.0"
+            {}sibling = "1.0.0"
             child = "{}1.0.0"
-        "#, if pinned_child { "=" } else { "" }},
+        "#,
+            if undeclared_parent { "" } else { "parent = \"1.0.0\"\n" },
+            if pinned_child { "=" } else { "" }},
         )?;
     }
     let project = Project {
@@ -895,6 +920,7 @@ async fn coordinated_snapshot_family_advances_only_to_the_matured_release() -> e
         Resolver::SnapshotFamily {
             pinned_child: false,
             fresh_sibling: false,
+            undeclared_parent: false,
         },
         2,
         true,
@@ -943,6 +969,7 @@ fn upgrade_trials_fit_a_small_thread_stack() -> eyre::Result<()> {
                 Resolver::SnapshotFamily {
                     pinned_child: false,
                     fresh_sibling: false,
+                    undeclared_parent: false,
                 },
                 2,
                 true,
@@ -960,6 +987,40 @@ fn upgrade_trials_fit_a_small_thread_stack() -> eyre::Result<()> {
         .map_err(|_| eyre::eyre!("small-stack upgrade thread panicked"))?
 }
 
+/// A declared child whose exact requirer is undeclared, and so never planned itself, still moves
+/// with the family when that requirer is pinned in turn by a moving sibling: the requirer follows
+/// the sibling as collateral, so it does not keep the child's ceiling.
+#[tokio::test]
+async fn coordinated_snapshot_family_moves_through_an_undeclared_pinning_parent() -> eyre::Result<()>
+{
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(
+        Resolver::SnapshotFamily {
+            pinned_child: false,
+            fresh_sibling: false,
+            undeclared_parent: true,
+        },
+        2,
+        true,
+    )?;
+    let outcome = workspace.upgrade(&RunOpts::default()).await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    // The declared child and sibling are planned and land together; the parent follows.
+    assert!(lock(&project)?.values().all(|version| version == "1.1.0"));
+    let trials = std::fs::read_to_string(project.root.join("trials"))?;
+    assert!(
+        trials
+            .lines()
+            .any(|line| line.contains("child@1.1.0") && line.contains("sibling@1.1.0")),
+        "{trials}"
+    );
+    assert!(!trials.contains("parent@"), "{trials}");
+    Ok(())
+}
+
 #[tokio::test]
 async fn coordinated_snapshot_family_preserves_an_authored_exact_pin() -> eyre::Result<()> {
     let CargoFixture {
@@ -970,6 +1031,7 @@ async fn coordinated_snapshot_family_preserves_an_authored_exact_pin() -> eyre::
         Resolver::SnapshotFamily {
             pinned_child: true,
             fresh_sibling: false,
+            undeclared_parent: false,
         },
         2,
         true,
@@ -993,6 +1055,7 @@ async fn coordinated_snapshot_family_keeps_unselected_requirers_authoritative() 
         Resolver::SnapshotFamily {
             pinned_child: false,
             fresh_sibling: false,
+            undeclared_parent: false,
         },
         2,
         true,
@@ -1026,6 +1089,7 @@ async fn coordinated_snapshot_family_keeps_an_immature_requirer_authoritative() 
         Resolver::SnapshotFamily {
             pinned_child: false,
             fresh_sibling: true,
+            undeclared_parent: false,
         },
         2,
         true,
@@ -1869,6 +1933,7 @@ async fn fast_mode_commits_the_settled_companions() -> eyre::Result<()> {
         Resolver::SnapshotFamily {
             pinned_child: false,
             fresh_sibling: false,
+            undeclared_parent: false,
         },
         2,
         true,

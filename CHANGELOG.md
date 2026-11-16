@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Cargo upgrades a family of crates that pin each other exactly.** Crates such as
+  `wasm-bindgen`, `js-sys` and `web-sys`, or a snapshot-versioned framework like gpui and its
+  `gpui-pre-*` sub-crates, require each other with `=x.y.z` and can only move together. A pin or
+  joint resolve released only the crates Cargo's refusal named, so a locked member that still
+  pinned the old version refused every attempt, and the planner kept a declared crate held when
+  its exact requirers were undeclared crates that would follow the family anyway. A refusal that
+  names a family member now releases the members pinning it, transitively, and the members they
+  pin, but never a declared crate, a planned target or a dropped candidate. The planner counts an
+  undeclared crate as moving when every crate pinning it moves. Authored `=` pins still hold.
+  Closes #125.
+
 ## v0.0.30
 
 - **`sync` reports the policy a native config cannot carry.** `sync` writes one default window

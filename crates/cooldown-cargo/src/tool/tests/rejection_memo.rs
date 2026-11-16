@@ -126,7 +126,7 @@ impl MemoFixture {
             MemoOperation::Precise => {
                 self.precise(journal, stats).await?;
             }
-            MemoOperation::Seed => {
+            MemoOperation::Seed | MemoOperation::FamilySeed => {
                 let moves = [PlannedNodeMove {
                     name: self.change.package.name.clone(),
                     from: self.change.from.to_string(),
@@ -141,6 +141,7 @@ impl MemoFixture {
                                 moves: &moves,
                                 changes: &changes,
                                 plan: std::slice::from_ref(&self.change),
+                                release_lockstep: operation == MemoOperation::FamilySeed,
                             },
                             journal,
                             None,
@@ -293,6 +294,7 @@ async fn failed_seed_repeats_without_cargo_or_per_member_diagnostics() -> eyre::
                         moves: &moves,
                         changes: &changes,
                         plan: std::slice::from_ref(&fixture.change),
+                        release_lockstep: false,
                     },
                     &journal,
                     None,
@@ -618,7 +620,7 @@ async fn disabled_memo_repeats_every_native_attempt_and_preserves_details() -> e
                 MemoOperation::Precise => {
                     rejections = fixture.precise(&journal, &mut stats).await?;
                 }
-                MemoOperation::Seed => {
+                MemoOperation::Seed | MemoOperation::FamilySeed => {
                     fixture.attempt(operation, &journal, &mut stats).await?;
                     assert!(stats.rejection_effects.is_empty());
                 }

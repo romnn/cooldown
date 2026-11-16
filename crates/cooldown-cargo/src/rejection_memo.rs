@@ -10,6 +10,9 @@ pub(crate) enum MemoOperation {
     Widen,
     Precise,
     Seed,
+    /// A seed that retries a refusal with the lockstep family it names released, which may land
+    /// where a plain [`Seed`](Self::Seed) of the same group is refused.
+    FamilySeed,
     /// The start of a whole-graph resolve, which keys the landing it reaches.
     Landing,
     /// A `cargo metadata --locked` read, which keys the graph it returned.
@@ -195,6 +198,12 @@ pub(crate) struct MemoRejection {
     /// Such a refusal depends on the plan, which the key omits: it holds only while the plan
     /// carries no planned move that heals one of them.
     pub(crate) heals: Vec<SplitHeal>,
+    /// How many lockstep edges the run knew when the refusal was remembered.
+    ///
+    /// A family release decides whether the same attempt lands, and the edge log only grows, so
+    /// the refusal holds only while the log is unchanged: a new edge may name a family a release
+    /// would free.
+    pub(crate) lockstep_edges: usize,
 }
 
 /// The planned moves that would heal a split of a declared crate: the move of the split crate
@@ -1898,7 +1907,7 @@ mod tests {
         let mut rejections = BTreeMap::new();
         MemoRejection {
             effects,
-            heals: Vec::new(),
+            ..MemoRejection::default()
         }
         .apply(&mut rejections);
         assert_eq!(rejections.get(&key).map(String::as_str), Some("last"));

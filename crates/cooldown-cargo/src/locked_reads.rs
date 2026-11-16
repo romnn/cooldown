@@ -17,6 +17,7 @@ use cooldown_core::{CoreError, Project};
 
 use crate::cargocmd::{Cargo, LOCKED_METADATA_ARGS, ResolvedGraph};
 use crate::command_memo::{StagedInputs, StagedTrees};
+use crate::lockstep::LockstepEdges;
 use crate::rejection_memo::{LockSource, MemoOperation, RejectionMemo};
 
 /// The recent locked reads of the run, newest last.
@@ -85,6 +86,8 @@ pub(crate) struct LockedReader<'a> {
     /// The run's staged copies, the only places reads are reused in.
     pub(crate) trees: &'a StagedTrees,
     pub(crate) reads: &'a LockedReads,
+    /// The run's exact-pin edges, which every graph read adds to.
+    pub(crate) lockstep: &'a LockstepEdges,
 }
 
 impl LockedReader<'_> {
@@ -100,9 +103,7 @@ impl LockedReader<'_> {
             && let Some(outcome) = self.reads.get(&project.root, inputs)
         {
             return match outcome {
-                ReadOutcome::Graph(stdout) => {
-                    Cargo::parse_graph(&stdout, &project.generated_members)
-                }
+                ReadOutcome::Graph(stdout) => self.parse(project, &stdout),
                 ReadOutcome::Stale(detail) => Err(CoreError::StaleLock(detail)),
             };
         }
@@ -125,7 +126,13 @@ impl LockedReader<'_> {
                 });
             }
         }
-        Cargo::parse_graph(&read?, &project.generated_members)
+        self.parse(project, &read?)
+    }
+
+    fn parse(&self, project: &Project, stdout: &str) -> Result<ResolvedGraph, CoreError> {
+        let graph = Cargo::parse_graph(stdout, &project.generated_members)?;
+        self.lockstep.record(&graph);
+        Ok(graph)
     }
 
     /// Keeps `stdout` as the locked read of `project`'s current `inputs`, keyed for a
@@ -197,6 +204,7 @@ mod tests {
         memo: RejectionMemo,
         trees: StagedTrees,
         reads: LockedReads,
+        lockstep: LockstepEdges,
         #[expect(dead_code, reason = "dropping the guard deletes the fixture directory")]
         directory: tempfile::TempDir,
     }
@@ -237,6 +245,7 @@ mod tests {
                 memo: RejectionMemo::default(),
                 trees: StagedTrees::default(),
                 reads: LockedReads::default(),
+                lockstep: LockstepEdges::default(),
                 directory,
             })
         }
@@ -264,6 +273,7 @@ mod tests {
                 memo: &self.memo,
                 trees: &self.trees,
                 reads: &self.reads,
+                lockstep: &self.lockstep,
             }
         }
 

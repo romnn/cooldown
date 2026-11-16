@@ -2365,7 +2365,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .filter_map(|fetched| {
                 let dep = &fetched.dependency;
                 let releases = fetched.result.as_ref().ok()?;
-                let effective = released_dependency(dep, &potential);
+                // An undeclared node is never planned, but it moves as collateral of the requirers
+                // pinning it, so it counts as moving when they all move: otherwise a declared node
+                // it pins in turn could never be released.
+                let effective = upgrade_dependency(dep, &potential);
                 let advised = self
                     .advisories
                     .as_ref()
@@ -2384,7 +2387,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     .as_ref()
                     .filter(|target| verdict.status != Status::Held && **target != dep.current)?;
                 let node = (dep.package.name.clone(), dep.current.as_str().to_string());
-                if crosses_line(releases, &dep.current, target) {
+                // Only a node the plan carries leaves its line itself; a collateral one follows.
+                let planned = dep.direct || dep.graph_ceiling.is_none();
+                if planned && crosses_line(releases, &dep.current, target) {
                     crossing.insert(node.clone());
                 }
                 Some(node)
