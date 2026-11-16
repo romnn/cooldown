@@ -52,6 +52,7 @@ struct CommandFixture {
     outcomes: CommandOutcomes,
     trees: StagedTrees,
     reads: LockedReads,
+    lockstep: LockstepEdges,
     #[expect(dead_code, reason = "dropping the guard deletes the fixture directory")]
     directory: tempfile::TempDir,
 }
@@ -103,6 +104,7 @@ impl CommandFixture {
             outcomes: CommandOutcomes::default(),
             trees: StagedTrees::default(),
             reads: LockedReads::default(),
+            lockstep: LockstepEdges::default(),
             directory,
         })
     }
@@ -114,6 +116,7 @@ impl CommandFixture {
             outcomes: &self.outcomes,
             trees: &self.trees,
             reads: &self.reads,
+            lockstep: &self.lockstep,
             enabled: true,
         }
     }
@@ -124,6 +127,7 @@ impl CommandFixture {
             memo: &self.memo,
             trees: &self.trees,
             reads: &self.reads,
+            lockstep: &self.lockstep,
         }
     }
 

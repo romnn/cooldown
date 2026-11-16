@@ -39,6 +39,7 @@ use crate::cargocmd::{
     memoizable_resolver_rejection, update_precise_args, update_unlocking_args,
 };
 use crate::locked_reads::{LockedReader, LockedReads};
+use crate::lockstep::LockstepEdges;
 use crate::publish_age::{CargoEnvironment, parse_age};
 use crate::rejection_memo::{LockSource, MemoOperation, RejectionMemo};
 
@@ -203,6 +204,8 @@ pub(crate) struct MemoizedCargo<'a> {
     pub(crate) trees: &'a StagedTrees,
     /// The run's locked reads, which a resolve that left the lock as it was feeds.
     pub(crate) reads: &'a LockedReads,
+    /// The run's exact-pin edges, which every resolved graph adds to.
+    pub(crate) lockstep: &'a LockstepEdges,
     /// Whether outcomes are recorded and replayed at all, which the rejection memo's switch
     /// decides.
     pub(crate) enabled: bool,
@@ -326,7 +329,9 @@ impl MemoizedCargo<'_> {
 
     fn graph(&self, project: &Project, run: &Run) -> Result<ResolvedGraph, CoreError> {
         let stdout = self.cargo.stdout_of(&run.outcome.output)?;
-        Cargo::parse_graph(&stdout, &project.generated_members)
+        let graph = Cargo::parse_graph(&stdout, &project.generated_members)?;
+        self.lockstep.record(&graph);
+        Ok(graph)
     }
 
     /// Replays the outcome recorded for this command's inputs, or runs Cargo.
@@ -401,6 +406,7 @@ impl MemoizedCargo<'_> {
             memo: self.memo,
             trees: self.trees,
             reads: self.reads,
+            lockstep: self.lockstep,
         };
         reader.keep_settled(
             project,
