@@ -5,7 +5,7 @@ members = ["crates/*"]
 exclude = ["examples"]
 
 [workspace.package]
-version = "0.0.30"
+version = "0.0.31"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/romnn/cooldown"

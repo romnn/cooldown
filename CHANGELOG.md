@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.31
+
 - **Cargo upgrades a family of crates that pin each other exactly.** Crates such as
   `wasm-bindgen`, `js-sys` and `web-sys`, or a snapshot-versioned framework like gpui and its
   `gpui-pre-*` sub-crates, require each other with `=x.y.z` and can only move together. A pin or
