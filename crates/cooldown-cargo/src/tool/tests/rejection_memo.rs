@@ -220,6 +220,7 @@ async fn identical_precise_rejection_replays_the_exact_detail_without_cargo() ->
     assert!(
         first
             .values()
+            .map(|detail| &detail.text)
             .any(|detail| detail.contains("demo") && detail.contains("holder"))
     );
     let second = fixture.precise(&journal, &mut stats).await?;
@@ -314,6 +315,7 @@ async fn failed_seed_repeats_without_cargo_or_per_member_diagnostics() -> eyre::
     assert!(
         rejections
             .values()
+            .map(|detail| &detail.text)
             .all(|detail| detail.contains("holder") && !detail.contains("joint seed"))
     );
     Ok(())
@@ -375,7 +377,11 @@ async fn tentative_widen_hit_preserves_files_and_the_rejection_detail() -> eyre:
     }
     assert_eq!(fixture.calls()?, 1);
     assert_eq!(stats.hits, 1);
-    assert!(rejections.values().any(|detail| detail.contains("holder")));
+    assert!(
+        rejections
+            .values()
+            .any(|detail| detail.text.contains("holder"))
+    );
     Ok(())
 }
 
@@ -660,7 +666,7 @@ async fn disabled_memo_repeats_every_native_attempt_and_preserves_details() -> e
         assert_eq!(fixture.calls()?, 2, "{operation:?}");
         assert_eq!(stats.memo.hits, 0, "{operation:?}");
         if operation != MemoOperation::Seed {
-            assert!(first.values().any(|detail| detail.contains("holder")));
+            assert!(first.values().any(|detail| detail.text.contains("holder")));
         }
     }
     Ok(())

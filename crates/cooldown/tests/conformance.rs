@@ -19,7 +19,7 @@ use camino::Utf8PathBuf;
 use color_eyre::eyre;
 use cooldown::app::{
     AdapterSet, Baseline, CheckStatus, Exit, MemberExcludes, OutdatedStatus, ProjectCtx, RunOpts,
-    RunScope, Workspace,
+    RunScope, SkippedInfo, UpgradeItem, Workspace,
 };
 use cooldown_core::config::builtin_default_layer;
 use cooldown_core::*;
@@ -154,6 +154,41 @@ struct FakeEco {
 }
 
 impl FakeEco {
+    /// The skip the fake reports for `change` when a marker file under its root names it.
+    ///
+    /// The `hold-not-eligible` marker lists package names (one per line) the fake refuses to
+    /// move, reported as `NotEligible` skips — the catalog-managed / no-editable-requirement
+    /// shape the pnpm and npm adapters produce.
+    /// The `hold-pin` marker lists package names the fake reports as `PinHeld`: an exact pin the
+    /// lock does not show, beside another member's range, which npm's adapter finds only when it
+    /// lands the move.
+    fn marked_hold(&self, change: &Change) -> Option<Skipped> {
+        let marks = |marker: &str| {
+            std::fs::read_to_string(self.root.join(marker))
+                .is_ok_and(|names| names.lines().any(|name| name == change.package.name))
+        };
+        if marks("hold-pin") {
+            return Some(Skipped {
+                change: change.clone(),
+                reason: SkipReason::PinHeld,
+                offending: None,
+                detail: Some(format!(
+                    "the exact pin {} in devDependencies of package.json excludes {}",
+                    change.from, change.to
+                )),
+            });
+        }
+        marks("hold-not-eligible").then(|| Skipped {
+            change: change.clone(),
+            reason: SkipReason::NotEligible,
+            offending: Some(change.package.clone()),
+            detail: Some(format!(
+                "{} is catalog-managed; update the catalog entry to move it",
+                change.package.name
+            )),
+        })
+    }
+
     fn persist_native_exclusions(&self, project: &Project, plan: &Plan) -> Result<()> {
         if !project.root.join("persist-native-exclusions").exists() {
             return Ok(());
@@ -660,26 +695,11 @@ impl ToolWrite for FakeEco {
             state.fresh_transitive_present = true;
         }
         self.persist_native_exclusions(p, plan)?;
-        // The `hold-not-eligible` marker lists package names (one per line) the fake refuses to
-        // move, reported as `NotEligible` skips — the catalog-managed / no-editable-requirement
-        // shape the pnpm and npm adapters produce.
-        let held_not_eligible: Vec<String> =
-            std::fs::read_to_string(self.root.join("hold-not-eligible"))
-                .map(|contents| contents.lines().map(str::to_string).collect())
-                .unwrap_or_default();
         let mut applied = Vec::new();
         let mut skipped = Vec::new();
         for change in &plan.changes {
-            if held_not_eligible.contains(&change.package.name) {
-                skipped.push(Skipped {
-                    change: change.clone(),
-                    reason: SkipReason::NotEligible,
-                    offending: Some(change.package.clone()),
-                    detail: Some(format!(
-                        "{} is catalog-managed; update the catalog entry to move it",
-                        change.package.name
-                    )),
-                });
+            if let Some(held) = self.marked_hold(change) {
+                skipped.push(held);
                 continue;
             }
             state
@@ -3071,6 +3091,162 @@ async fn upgrade_applies_an_in_bound_update_and_reports_the_bound_held_major() {
                 .as_ref()
                 .is_some_and(|skip| skip.reason == SkipReason::DeclaredBoundHeld)
     }));
+}
+
+/// Package `name` locked at `v1.0.0` with a matured in-line `v1.1.0`, declared exactly by the
+/// members `app` and `cli`.
+fn exactly_pinned(name: &str) -> Dependency {
+    Dependency {
+        pinned: true,
+        members: vec![
+            MemberRef {
+                name: "app".to_string(),
+                path: ".".to_string(),
+            },
+            MemberRef {
+                name: "cli".to_string(),
+                path: "cli".to_string(),
+            },
+        ],
+        ..dep(name, "v1.0.0", true)
+    }
+}
+
+/// A fixture of direct dependencies locked at `v1.0.0`, each with a matured minor `v1.1.0`.
+fn matured_minor_fake(root: Utf8PathBuf, direct: Vec<Dependency>) -> FakeEco {
+    let mut releases = HashMap::new();
+    let mut locked = HashMap::new();
+    for dependency in &direct {
+        let name = dependency.package.name.clone();
+        releases.insert(
+            name.clone(),
+            vec![
+                rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None),
+                rel(
+                    "v1.1.0",
+                    1,
+                    Some("2026-01-15T00:00:00Z"),
+                    Some(UpdateKind::Minor),
+                ),
+            ],
+        );
+        locked.insert(name, rel("v1.0.0", 0, Some("2026-01-01T00:00:00Z"), None));
+    }
+    fake(root, direct, Vec::new(), releases, locked)
+}
+
+/// The skip rows among `items` that report `name`.
+fn skips_for<'a>(items: &'a [UpgradeItem], name: &str) -> Vec<&'a SkippedInfo> {
+    items
+        .iter()
+        .filter(|item| item.name == name)
+        .filter_map(|item| item.skipped.as_ref())
+        .collect()
+}
+
+/// A direct dependency its own exact pin holds below a matured target is listed, naming the pin,
+/// the members declaring it and the target, instead of vanishing from the report.
+/// Holding an authored pin is the author's choice, so a strict run still passes.
+#[tokio::test]
+async fn upgrade_reports_a_direct_dependency_its_exact_pin_holds() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let out = workspace(
+        matured_minor_fake(root, vec![exactly_pinned("a")]),
+        Baseline::default(),
+    )
+    .upgrade(&RunOpts {
+        strict: true,
+        ..opts()
+    })
+    .await;
+
+    assert_eq!(out.exit, Exit::Ok, "{:?}", out.errors);
+    assert_eq!(out.summary.applied, 0);
+    assert_eq!(out.summary.skipped, 1);
+    let [held] = out.items.as_slice() else {
+        panic!("one pin-held row: {:?}", out.items);
+    };
+    assert_eq!((held.from.as_str(), held.to.as_str()), ("v1.0.0", "v1.1.0"));
+    assert_eq!(
+        held.skipped,
+        Some(SkippedInfo {
+            reason: SkipReason::PinHeld,
+            message: "pinned to exactly v1.0.0 in app, cli; loosen the requirement to adopt v1.1.0"
+                .to_string(),
+            offending: None,
+        })
+    );
+}
+
+/// `--package` scopes the pin-held rows like every other row: an exact pin outside the selection
+/// is not reported.
+#[tokio::test]
+async fn upgrade_reports_only_the_selected_packages_exact_pins() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let out = workspace(
+        matured_minor_fake(root, vec![exactly_pinned("a"), exactly_pinned("b")]),
+        Baseline::default(),
+    )
+    .upgrade(&RunOpts {
+        package: vec![PatternGlob::new("a").expect("glob")],
+        ..opts()
+    })
+    .await;
+
+    assert_eq!(out.summary.skipped, 1, "{:?}", out.items);
+    assert_eq!(
+        skips_for(&out.items, "a")
+            .iter()
+            .map(|skip| skip.reason)
+            .collect::<Vec<_>>(),
+        [SkipReason::PinHeld]
+    );
+    assert!(skips_for(&out.items, "b").is_empty(), "{:?}", out.items);
+}
+
+/// A pin the lock does not show (npm's exact pin beside another member's range) leaves the
+/// dependency movable, so the planner plans it and only the adapter's own `pin_held` row reports
+/// it, once; beside it, a pin the lock shows gets the planner's row.
+#[tokio::test]
+async fn upgrade_reports_an_adapter_found_pin_once_beside_a_planner_found_one() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    std::fs::write(root.join("hold-pin"), "mixed\n").expect("write hold-pin marker");
+    let out = workspace(
+        matured_minor_fake(
+            root,
+            vec![dep("mixed", "v1.0.0", true), exactly_pinned("pinned")],
+        ),
+        Baseline::default(),
+    )
+    .upgrade(&RunOpts {
+        strict: true,
+        ..opts()
+    })
+    .await;
+
+    assert_eq!(out.exit, Exit::Ok, "{:?}", out.errors);
+    assert_eq!(out.summary.applied, 0);
+    let messages = |name: &str| {
+        skips_for(&out.items, name)
+            .iter()
+            .map(|skip| (skip.reason, skip.message.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        messages("mixed"),
+        [(
+            SkipReason::PinHeld,
+            "the exact pin v1.0.0 in devDependencies of package.json excludes v1.1.0".to_string()
+        )]
+    );
+    assert_eq!(
+        messages("pinned"),
+        [(
+            SkipReason::PinHeld,
+            "pinned to exactly v1.0.0 in app, cli; loosen the requirement to adopt v1.1.0"
+                .to_string()
+        )]
+    );
 }
 
 #[tokio::test]
@@ -6692,6 +6868,41 @@ async fn a_bound_held_security_fix_keeps_its_provenance() {
         })
         .expect("the bound-held row");
     assert_eq!(held.to, "v2.0.0");
+    let security = held.security.as_ref().expect("security provenance");
+    assert_eq!(security.fixes, vec!["GHSA-CONF".to_string()]);
+    assert!(security.applied, "matured only under the security window");
+}
+
+/// A direct dependency its exact pin holds keeps its security provenance the same way: the row
+/// says the target it could be loosened to fixes the advisory, matured only under the security
+/// window.
+#[tokio::test]
+async fn a_pin_held_security_fix_keeps_its_provenance() {
+    let TmpRoot { guard: _g, root } = tmp_root();
+    let mut fake = advisory_fake(root);
+    if let Some(dep) = fake.direct.first_mut() {
+        dep.pinned = true;
+    }
+    let out = workspace_with_layers(
+        fake,
+        Baseline::default(),
+        advisory_layers(Some(AdvisoryMode::Shorten)),
+    )
+    .with_advisory_source(advisory_feed())
+    .upgrade(&opts())
+    .await;
+
+    assert_eq!(out.summary.applied, 0);
+    let held = out
+        .items
+        .iter()
+        .find(|item| {
+            item.skipped
+                .as_ref()
+                .is_some_and(|skip| skip.reason == SkipReason::PinHeld)
+        })
+        .expect("the pin-held row");
+    assert_eq!(held.to, "v1.1.0");
     let security = held.security.as_ref().expect("security provenance");
     assert_eq!(security.fixes, vec!["GHSA-CONF".to_string()]);
     assert!(security.applied, "matured only under the security window");

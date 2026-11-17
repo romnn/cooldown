@@ -186,6 +186,17 @@ impl WidenFixture {
         culprit_drop: CulpritDrop,
         stats: &mut WholeGraphStats,
     ) -> Result<Option<WidenEvidence>> {
+        self.probe_recording(journal, culprit_drop, &mut PinRejections::new(), stats)
+            .await
+    }
+
+    async fn probe_recording(
+        &self,
+        journal: &ProjectMutationJournal,
+        culprit_drop: CulpritDrop,
+        rejections: &mut PinRejections,
+        stats: &mut WholeGraphStats,
+    ) -> Result<Option<WidenEvidence>> {
         let candidates: Vec<_> = self.changes.iter().collect();
         self.tool
             .joint_widen_probe(
@@ -200,6 +211,7 @@ impl WidenFixture {
                     observer: None,
                 },
                 culprit_drop,
+                rejections,
                 stats,
             )
             .await
@@ -331,6 +343,66 @@ async fn a_joint_probe_retries_without_the_candidate_its_refusal_chain_cites() -
     Ok(())
 }
 
+/// A probe whose every candidate splits a declared crate stops without a survivor, and still
+/// records each candidate's own split: their manifests may already admit the targets, so no
+/// later widen of their own runs to explain the hold.
+#[tokio::test]
+async fn a_probe_that_drops_every_candidate_still_blames_each_one() -> eyre::Result<()> {
+    for culprit_drop in [CulpritDrop::First, CulpritDrop::All] {
+        let fixture = WidenFixture::new(
+            2,
+            indoc! {r#"
+            widened=''
+            for name in pkg000 pkg001 pkg002; do
+              if grep -q "$name = \"2" Cargo.toml; then widened="${widened}1"; else widened="${widened}0"; fi
+            done
+            cp "lock-$widened" Cargo.lock
+        "#},
+        )?;
+        let root = &fixture.project.root;
+        std::fs::write(root.join("Cargo.lock"), splitting_lock([false; 3]))?;
+        for widened in 0..8_u8 {
+            let moved = [widened & 4 != 0, widened & 2 != 0, widened & 1 != 0];
+            let name = moved.map(|moved| if moved { '1' } else { '0' });
+            std::fs::write(
+                root.join(format!("lock-{}", name.iter().collect::<String>())),
+                splitting_lock(moved),
+            )?;
+        }
+        let journal = fixture.journal().await?;
+        let mut stats = WholeGraphStats::default();
+        let mut rejections = PinRejections::new();
+        let retained = fixture
+            .probe_recording(&journal, culprit_drop, &mut rejections, &mut stats)
+            .await?;
+
+        // Nothing survives the probe.
+        assert!(retained.is_none(), "{culprit_drop:?}");
+        // Each candidate is blamed with its own split as an acceptance-rule violation.
+        for (index, split) in [(0, "shared0"), (1, "shared1")] {
+            let planned = fixture
+                .changes
+                .get(index)
+                .ok_or_else(|| eyre::eyre!("missing planned change"))?;
+            let detail = rejections
+                .get(&rejection_key(planned))
+                .ok_or_else(|| eyre::eyre!("{culprit_drop:?}: no rejection for {planned:?}"))?;
+            assert_eq!(
+                detail.origin,
+                DiagnosticOrigin::Acceptance,
+                "{culprit_drop:?}"
+            );
+            assert!(
+                detail.text.contains(split),
+                "{culprit_drop:?}: {} blamed with {}",
+                planned.package.name,
+                detail.text
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The lock the fake `cargo` of [`a_fast_joint_probe_drops_every_culprit_of_one_resolve`]
 /// writes when `widened` names which of `pkg000`..`pkg002` moved to 2.0.0.
 ///
@@ -396,6 +468,8 @@ fn splitting_lock(widened: [bool; 3]) -> String {
 /// Under `upgrade --fast` a joint probe leaves out every culprit one resolve names at once: two
 /// candidates that each split a declared crate cost one retry instead of one each, and the
 /// candidate that splits nothing lands either way.
+/// Either way each dropped candidate keeps the violation of its own split, not the first one the
+/// resolve broke.
 #[tokio::test]
 async fn a_fast_joint_probe_drops_every_culprit_of_one_resolve() -> eyre::Result<()> {
     for (culprit_drop, resolves) in [(CulpritDrop::First, 3), (CulpritDrop::All, 2)] {
@@ -421,8 +495,9 @@ async fn a_fast_joint_probe_drops_every_culprit_of_one_resolve() -> eyre::Result
         }
         let journal = fixture.journal().await?;
         let mut stats = WholeGraphStats::default();
+        let mut rejections = PinRejections::new();
         let retained = fixture
-            .probe_dropping(&journal, culprit_drop, &mut stats)
+            .probe_recording(&journal, culprit_drop, &mut rejections, &mut stats)
             .await?;
 
         // The probe keeps the one widen that splits nothing.
@@ -442,6 +517,27 @@ async fn a_fast_joint_probe_drops_every_culprit_of_one_resolve() -> eyre::Result
         assert!(manifest.contains("pkg000 = \"1\""), "{manifest}");
         assert!(manifest.contains("pkg001 = \"1\""), "{manifest}");
         assert!(manifest.contains("pkg002 = \"2"), "{manifest}");
+
+        // Each splitting candidate is blamed with its own split as an acceptance-rule violation,
+        // and the candidate that landed records nothing.
+        for (planned, split) in [(pkg000, "shared0"), (pkg001, "shared1")] {
+            let planned = planned.ok_or_else(|| eyre::eyre!("missing planned change"))?;
+            let detail = rejections
+                .get(&rejection_key(planned))
+                .ok_or_else(|| eyre::eyre!("{culprit_drop:?}: no rejection for {planned:?}"))?;
+            assert_eq!(
+                detail.origin,
+                DiagnosticOrigin::Acceptance,
+                "{culprit_drop:?}"
+            );
+            assert!(
+                detail.text.contains(split),
+                "{culprit_drop:?}: {} blamed with {}",
+                planned.package.name,
+                detail.text
+            );
+        }
+        assert_eq!(rejections.len(), 2, "{culprit_drop:?}: {rejections:?}");
     }
     Ok(())
 }
@@ -669,6 +765,7 @@ async fn protected_member_reach_cannot_be_replaced_by_a_disconnected_target_copy
                     observer: None
                 },
                 CulpritDrop::First,
+                &mut PinRejections::new(),
                 &mut stats
             )
             .await?
@@ -792,6 +889,7 @@ async fn rejected_metadata_restores_removed_and_renamed_follower_entries_and_loc
                     observer: None
                 },
                 CulpritDrop::First,
+                &mut PinRejections::new(),
                 &mut stats
             )
             .await?
@@ -888,6 +986,7 @@ async fn whole_graph_keeps_forty_seven_landings_and_three_original_manifests_wit
             fixture.assert_held_manifest(planned)?;
             let detail = rejections
                 .get(&rejection_key(planned))
+                .map(|detail| &detail.text)
                 .expect("hopeless candidate detail");
             assert!(detail.contains(&planned.package.name), "{detail:?}");
         }

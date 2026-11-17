@@ -804,9 +804,26 @@ fn edge_group_status(group: &[&UpgradeItem]) -> MutationStatus {
         },
         _ => MutationStatus {
             status: "restored",
-            reason: format!("the re-resolve rebound {subject}; restored"),
+            reason: format!(
+                "kept {} for {} dependents ({list}); the re-resolve had rebound them to {}",
+                first.to,
+                labels.len(),
+                first.from
+            ),
             color: Color::Green,
         },
+    }
+}
+
+/// The From cell of a mutation row.
+///
+/// A restored edge row's `from` is the re-resolve's transient binding and its `to` the binding
+/// the lock kept, so the lock never left `to`: the row shows `to → to`, and its reason names the
+/// transient binding.
+fn from_cell(it: &UpgradeItem) -> &str {
+    match &it.edge {
+        Some(edge) if edge.action == cooldown_core::EdgeBindingAction::Restored => &it.to,
+        _ => &it.from,
     }
 }
 
@@ -827,14 +844,15 @@ fn edge_status(it: &UpgradeItem, edge: &UpgradeEdgeInfo) -> MutationStatus {
         .as_deref()
         .map(|source| format!(" ({})", abbreviated_source(source)))
         .unwrap_or_default();
-    let subject = format!(
-        "{} {}{source}'s {} edge binding",
-        edge.dependent, edge.dependent_version, it.name
-    );
+    let dependent = format!("{} {}{source}", edge.dependent, edge.dependent_version);
+    let subject = format!("{dependent}'s {} edge binding", it.name);
     match edge.action {
         cooldown_core::EdgeBindingAction::Restored => MutationStatus {
             status: "restored",
-            reason: format!("the re-resolve rebound {subject}; restored"),
+            reason: format!(
+                "kept {} for {dependent}; the re-resolve had rebound it to {}",
+                it.to, it.from
+            ),
             color: Color::Green,
         },
         cooldown_core::EdgeBindingAction::Canonicalized => MutationStatus {
@@ -1096,7 +1114,7 @@ fn render_mutation(
             if project {
                 row.push(Cell::new(path_label(&it.project)));
             }
-            row.push(Cell::new(&it.from));
+            row.push(Cell::new(from_cell(it)));
             row.push(Cell::new(&it.to));
             row.push(cell_colored(status, color, use_color));
             row.push(cell_colored(reason, color, use_color));
@@ -1479,9 +1497,9 @@ mod tests {
         let status = edge_group_status(group);
         assert_eq!(status.status, "restored");
         assert!(
-            status
-                .reason
-                .contains("4 dependents' windows-sys edge bindings")
+            status.reason.starts_with("kept 0.59.0 for 4 dependents ("),
+            "{}",
+            status.reason
         );
         assert!(status.reason.contains("fd-lock 1.0.0"));
         assert!(
@@ -1513,6 +1531,109 @@ mod tests {
             group_edge_corrections(&cross).len(),
             3,
             "cross-project and cross-registry corrections stay separate"
+        );
+    }
+
+    /// A restored edge row for `name`: the re-resolve bound `dependent`'s edge to `transient`,
+    /// and the lock kept `kept`, so the row's `from` is the transient binding.
+    fn restored_edge_item(name: &str, transient: &str, kept: &str, dependent: &str) -> UpgradeItem {
+        UpgradeItem {
+            applied: true,
+            skipped: None,
+            edge: Some(crate::UpgradeEdgeInfo {
+                dependent: dependent.to_string(),
+                dependent_version: "0.14.6".to_string(),
+                dependent_source: Some(
+                    "registry+https://github.com/rust-lang/crates.io-index".to_string(),
+                ),
+                action: cooldown_core::EdgeBindingAction::Restored,
+                detail: None,
+            }),
+            ..needs_major_item(name, transient, kept, UpdateKind::Minor, ".")
+        }
+    }
+
+    /// The whitespace-separated cells of the rendered table row that starts with `name`.
+    fn row_cells<'a>(out: &'a str, name: &str) -> Vec<&'a str> {
+        out.lines()
+            .map(str::split_whitespace)
+            .map(Iterator::collect::<Vec<_>>)
+            .find(|cells| cells.first() == Some(&name))
+            .unwrap_or_default()
+    }
+
+    /// A restored edge keeps the lock's binding, so its row shows the kept version in both From
+    /// and To instead of a move backwards from the re-resolve's transient binding, which the
+    /// reason names instead.
+    #[test]
+    fn a_restored_edge_row_shows_the_kept_binding_both_ways() {
+        let out = render_upgrade_of(&[restored_edge_item(
+            "itertools",
+            "0.14.0",
+            "0.11.0",
+            "prost-derive",
+        )]);
+
+        assert_eq!(
+            row_cells(&out, "itertools"),
+            [
+                "itertools",
+                "0.11.0",
+                "0.11.0",
+                "restored",
+                "kept",
+                "0.11.0",
+                "for",
+                "prost-derive",
+                "0.14.6",
+                "(crates.io);",
+                "the",
+                "re-resolve",
+                "had",
+                "rebound",
+                "it",
+                "to",
+                "0.14.0",
+            ],
+            "{out}"
+        );
+    }
+
+    /// A collapsed group of restorations reads the same way, naming every dependent it kept.
+    #[test]
+    fn a_restored_edge_group_row_shows_the_kept_binding_both_ways() {
+        let out = render_upgrade_of(&[
+            restored_edge_item("windows-sys", "0.59.0", "0.52.0", "fd-lock"),
+            restored_edge_item("windows-sys", "0.59.0", "0.52.0", "rustix"),
+        ]);
+
+        assert_eq!(
+            row_cells(&out, "windows-sys"),
+            [
+                "windows-sys",
+                "0.52.0",
+                "0.52.0",
+                "restored",
+                "kept",
+                "0.52.0",
+                "for",
+                "2",
+                "dependents",
+                "(fd-lock",
+                "0.14.6",
+                "(crates.io),",
+                "rustix",
+                "0.14.6",
+                "(crates.io));",
+                "the",
+                "re-resolve",
+                "had",
+                "rebound",
+                "them",
+                "to",
+                "0.59.0",
+            ],
+            "{out}"
         );
     }
 

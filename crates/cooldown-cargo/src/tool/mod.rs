@@ -41,8 +41,8 @@ use crate::manifest;
 use crate::native::native_policy_layer;
 use crate::publish_age::CargoEnvironment;
 use crate::rejection_memo::{
-    MemoKey, MemoMetadataMode, MemoOperation, MemoRejection, RejectionEffect, RejectionMemo,
-    SplitHeal,
+    DiagnosticOrigin, MemoKey, MemoMetadataMode, MemoOperation, MemoRejection, PinRejections,
+    RejectionDetail, RejectionEffect, RejectionMemo, SplitHeal,
 };
 use crate::version;
 use async_trait::async_trait;
@@ -892,11 +892,6 @@ impl DeclaredSides {
     }
 }
 
-/// Pin-rejection diagnostics keyed by planned-change identity. Keying by name alone would let
-/// coexisting-major plans for one crate (cargo forks distinct majors side by side) overwrite each
-/// other's diagnostics and attach one target's rejection to the other's held row.
-type PinRejections = BTreeMap<(String, String, String), String>;
-
 #[derive(Default)]
 struct MemoStats {
     hits: usize,
@@ -1215,15 +1210,20 @@ impl CulpritDrop {
     fn violated(self, mut violations: impl Iterator<Item = Violation>) -> Option<GroupResolve> {
         let violation = violations.next()?;
         tracing::debug!(%violation, "cargo joint widen broke the acceptance rule");
-        let mut culprits: BTreeSet<String> = violation
-            .culprits()
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        let mut culprits = BTreeMap::new();
+        let mut blame = |violation: &Violation| {
+            let detail = violation.to_string();
+            for culprit in violation.culprits() {
+                culprits
+                    .entry(culprit.to_string())
+                    .or_insert_with(|| detail.clone());
+            }
+        };
+        blame(&violation);
         // Only a probe that drops them all reads the rest, so only it pays for finding them.
         if self == Self::All {
             for further in violations {
-                culprits.extend(further.culprits().into_iter().map(str::to_string));
+                blame(&further);
             }
         }
         Some(GroupResolve::Violated {
@@ -1232,11 +1232,31 @@ impl CulpritDrop {
         })
     }
 
+    /// The `candidates` a probe retries without after `outcome` refused or violated the group,
+    /// or `None` when it drops none or all of them and the probe stops.
+    ///
+    /// Every candidate a violation names is recorded with that violation either way: a probe that
+    /// stops still decided the hold, and the candidate's own attempt may not run again to explain
+    /// it.
+    fn retry_without<'c>(
+        self,
+        outcome: &GroupResolve,
+        candidates: &[&'c Change],
+        rejections: &mut PinRejections,
+    ) -> Option<Vec<&'c Change>> {
+        outcome.blame(candidates, rejections);
+        let dropped = self.dropped(outcome, candidates);
+        if dropped.is_empty() || dropped.len() == candidates.len() {
+            return None;
+        }
+        Some(dropped)
+    }
+
     /// The `candidates` a probe retries without after `outcome` refused or violated the group.
-    fn dropped<'c>(self, outcome: GroupResolve, candidates: &[&'c Change]) -> Vec<&'c Change> {
+    fn dropped<'c>(self, outcome: &GroupResolve, candidates: &[&'c Change]) -> Vec<&'c Change> {
         match outcome {
             GroupResolve::Refused { parties, chain } => {
-                refused_candidates(candidates, &parties, &chain)
+                refused_candidates(candidates, parties, chain)
             }
             // A violation that names the planned crates whose own moves broke the rule retries
             // without them like a refusal naming them.
@@ -1251,7 +1271,7 @@ impl CulpritDrop {
                 Self::All => candidates
                     .iter()
                     .copied()
-                    .filter(|change| culprits.contains(&change.package.name))
+                    .filter(|change| culprits.contains_key(&change.package.name))
                     .collect(),
             },
             GroupResolve::Resolved(_) | GroupResolve::Discarded => Vec::new(),
@@ -1274,8 +1294,9 @@ enum GroupResolve {
         /// The first way it broke the rule.
         violation: Violation,
         /// The planned crates the violations the resolve's [`CulpritDrop`] selects name as
-        /// culprits: the first violation's, or every violation's.
-        culprits: BTreeSet<String>,
+        /// culprits, the first violation's or every violation's, each with the first violation
+        /// that names it.
+        culprits: BTreeMap<String, String>,
     },
     /// The resolve moved a seeded package to a version the plan does not name, or the seed could
     /// not be written.
@@ -1283,6 +1304,30 @@ enum GroupResolve {
 }
 
 impl GroupResolve {
+    /// Records each of the `dropped` candidates' rejection as the violation that names it.
+    ///
+    /// Under `--fast` one resolve drops the culprits of several violations, so each dropped
+    /// candidate is blamed with its own violation, not the resolve's first.
+    fn blame(&self, dropped: &[&Change], rejections: &mut PinRejections) {
+        let Self::Violated { culprits, .. } = self else {
+            return;
+        };
+        MemoRejection {
+            effects: dropped
+                .iter()
+                .filter_map(|change| {
+                    let violation = culprits.get(&change.package.name)?;
+                    Some(RejectionEffect {
+                        key: rejection_key(change),
+                        detail: RejectionDetail::violation(violation.clone()),
+                    })
+                })
+                .collect(),
+            ..MemoRejection::default()
+        }
+        .apply(rejections);
+    }
+
     fn into_evidence(self) -> Option<WidenEvidence> {
         match self {
             Self::Resolved(evidence) => Some(*evidence),
@@ -1368,7 +1413,9 @@ enum TentativeWiden {
 enum PrecisePinOutcome {
     Completed,
     Rejected {
-        detail: Option<String>,
+        /// What the held row reports: Cargo's refusal, or the acceptance-rule violation the
+        /// landed pin was restored for.
+        detail: Option<RejectionDetail>,
         resolver_rejection: bool,
         /// The packages Cargo's conflict set against the pin, when it reported one.
         parties: Vec<ConflictParty>,
@@ -1402,7 +1449,7 @@ struct RefusedPin<'a> {
     change: &'a Change,
     /// The locked version the pin addresses.
     current: &'a str,
-    detail: Option<String>,
+    detail: Option<RejectionDetail>,
     resolver_rejection: bool,
     parties: Vec<ConflictParty>,
     split: Option<SplitHeal>,
@@ -1414,8 +1461,13 @@ type RefusalKey = (Utf8PathBuf, (String, String, String));
 /// What releasing a refused pin's blockers achieved.
 enum Unlocking {
     Landed,
-    /// Every attempt was refused, the last one for the split it would cause when that is why.
-    Refused(Option<UnlockedSplit>),
+    /// Every attempt was refused.
+    Refused {
+        /// The split the last attempt would cause, when that is why it was refused.
+        split: Option<UnlockedSplit>,
+        /// The acceptance-rule violation the last attempt was restored for, when it resolved.
+        violation: Option<String>,
+    },
     /// The refusal named no blocker the batch may release, so no unlocking was attempted.
     NothingToRelease,
 }
@@ -1424,6 +1476,14 @@ enum Unlocking {
 struct UnlockedSplit {
     heal: SplitHeal,
     released: Vec<PackageKey>,
+}
+
+/// The split a refused pin's own landing caused, with no blocker released beside it.
+fn unreleased_split(heal: SplitHeal) -> UnlockedSplit {
+    UnlockedSplit {
+        heal,
+        released: Vec::new(),
+    }
 }
 
 /// What [`CargoTool::complete_split`] achieved.
@@ -1644,7 +1704,9 @@ fn classify_planned_changes(
                 .unwrap_or_else(|| change.package.name.clone());
             // Cargo's own rejection sentence (which requirement, declared by whom) beats
             // both the generic reason and the `=`-pin-only graph offender.
-            let detail = pin_rejections.get(&rejection_key(change)).cloned();
+            let detail = pin_rejections
+                .get(&rejection_key(change))
+                .map(|rejection| reported_rejection(rejection, graph));
             report.skipped.push(Skipped {
                 change: change.clone(),
                 // A pin cargo itself refused is the resolver's rejection, and its sentence says
@@ -1663,6 +1725,31 @@ fn classify_planned_changes(
                 detail,
             });
         }
+    }
+}
+
+/// The held row's text for a recorded `rejection`, naming the workspace member's exact pin when
+/// Cargo's refusal set the move against it.
+///
+/// Cargo's summary names the requirement it could not satisfy, which for a pinned node is the
+/// requirer that wanted it to move, not the authored pin that kept it.
+/// The pin is named only when a conflict party read from Cargo's raw stderr, at the version the
+/// diagnostic states, is a node `graph` shows a workspace member pinning exactly.
+fn reported_rejection(rejection: &RejectionDetail, graph: Option<&ResolvedGraph>) -> String {
+    let pin = graph.and_then(|graph| {
+        rejection.parties.iter().find_map(|party| {
+            let version = party.version.as_deref()?;
+            graph
+                .is_exact_pinned(&party.name, version)
+                .then_some((party.name.as_str(), version))
+        })
+    });
+    match pin {
+        Some((name, version)) if rejection.origin == DiagnosticOrigin::Resolver => format!(
+            "held by the exact pin of {name} = {version} in a workspace member; {}",
+            rejection.text
+        ),
+        _ => rejection.text.clone(),
     }
 }
 
@@ -2282,13 +2369,9 @@ impl CargoTool {
         // dep; every joint probe still resolves its seeded graph.
         // When a member graph is needed, fail closed: a lock-slot fallback is a false positive.
         let followers = self.pin_followers(project).await?;
+        let needs_graph = plan.changes.iter().any(needs_member_graph);
         let graph = self
-            .widen_round_graph(
-                project,
-                plan.changes.iter().any(needs_member_graph),
-                journal,
-                observer,
-            )
+            .widen_round_graph(project, needs_graph, journal, observer)
             .await?;
         let scope = WidenProbe {
             project,
@@ -2323,6 +2406,7 @@ impl CargoTool {
                         ..scope
                     },
                     culprit_drop,
+                    rejections,
                     stats,
                 )
                 .await?
@@ -2402,10 +2486,13 @@ impl CargoTool {
     }
 
     // A probe never routes through pin_batch: lone-refusal memory belongs to its old context.
+    // A candidate dropped for a violation keeps that violation as its rejection, which its own
+    // per-change attempt can still replace.
     async fn joint_widen_probe(
         &self,
         probe: WidenProbe<'_>,
         culprit_drop: CulpritDrop,
+        rejections: &mut PinRejections,
         stats: &mut WholeGraphStats,
     ) -> Result<Option<WidenEvidence>> {
         if probe.candidates.is_empty() {
@@ -2450,10 +2537,10 @@ impl CargoTool {
                 );
                 continue;
             }
-            let dropped = culprit_drop.dropped(outcome, &candidates);
-            if dropped.is_empty() || dropped.len() == candidates.len() {
+            let Some(dropped) = culprit_drop.retry_without(&outcome, &candidates, rejections)
+            else {
                 break None;
-            }
+            };
             candidates.retain(|change| !dropped.contains(change));
             released = Released::default();
             stats.joint_retries += 1;
@@ -2869,8 +2956,7 @@ impl CargoTool {
         );
         let effect = RejectionEffect {
             key: rejection_key(change),
-            detail: violation.to_string(),
-            overwrite: false,
+            detail: RejectionDetail::violation(violation.to_string()),
         };
         MemoRejection {
             effects: vec![effect.clone()],
@@ -2950,8 +3036,7 @@ impl CargoTool {
                     if let Some(summary) = summarize_pin_rejection(&err) {
                         let effect = RejectionEffect {
                             key: rejection_key(change),
-                            detail: summary,
-                            overwrite: false,
+                            detail: RejectionDetail::resolver(summary, rejection_parties(&err)),
                         };
                         MemoRejection {
                             effects: vec![effect.clone()],
@@ -3715,15 +3800,17 @@ impl CargoTool {
         stats: &mut PinBatchStats,
     ) -> Result<()> {
         let unlocking = self.pin_unlocking_blockers(pass, &refused, stats).await?;
-        let split = match unlocking {
+        let (split, violation) = match unlocking {
             Unlocking::Landed => return Ok(()),
-            Unlocking::Refused(Some(split)) => Some(split),
-            Unlocking::Refused(None) | Unlocking::NothingToRelease => {
-                refused.split.clone().map(|heal| UnlockedSplit {
-                    heal,
-                    released: Vec::new(),
-                })
-            }
+            Unlocking::Refused {
+                split: Some(split),
+                violation,
+            } => (Some(split), violation),
+            Unlocking::Refused {
+                split: None,
+                violation,
+            } => (refused.split.clone().map(unreleased_split), violation),
+            Unlocking::NothingToRelease => (refused.split.clone().map(unreleased_split), None),
         };
         let mut unhealable = None;
         if let Some(UnlockedSplit { heal, released }) = split {
@@ -3761,12 +3848,15 @@ impl CargoTool {
             resolver_rejection,
             ..
         } = refused;
-        let effects: Vec<_> = detail
+        // An unlocking retry that resolved but broke the acceptance rule names the hold that
+        // decided the pin, which Cargo's refusal of the plain pin does not.
+        let effects: Vec<_> = violation
+            .map(RejectionDetail::violation)
+            .or(detail)
             .into_iter()
             .map(|detail| RejectionEffect {
                 key: rejection_key(change),
                 detail,
-                overwrite: true,
             })
             .collect();
         // A split the pin's own landing caused refuses it under every plan, and only a planned
@@ -3777,8 +3867,9 @@ impl CargoTool {
             heals: unhealable.into_iter().collect(),
             ..MemoRejection::default()
         };
-        // Last rejection wins; a candidate a later pass still lands never reads its
-        // stale entry (details are consulted only for unreached candidates).
+        // The last rejection of the highest origin wins (see `MemoRejection::apply`); a candidate
+        // a later pass still lands never reads its stale entry (details are consulted only for
+        // unreached candidates).
         stats.record_effects(&rejection, rejections);
         stats.record_rejection(memoizable);
         if stats.memoizable_rejection() && memoizable {
@@ -3848,7 +3939,8 @@ impl CargoTool {
     /// [acceptance rule](acceptance); otherwise the lock is restored byte for byte.
     /// The released nodes may move anywhere their requirements admit: the apply reports them as
     /// collateral rows, and the executor's transitive gate matures any that floated too fresh.
-    /// Returns whether the pin landed, or that the refusal named nothing to release.
+    /// Returns whether the pin landed, with the violation a refused retry that resolved broke, or
+    /// that the refusal named nothing to release.
     async fn pin_unlocking_blockers(
         &self,
         pass: PinPass<'_>,
@@ -3953,11 +4045,16 @@ impl CargoTool {
             released = ?released,
             "cargo unlocking pin refused"
         );
-        Ok(Unlocking::Refused(None))
+        Ok(Unlocking::Refused {
+            split: None,
+            violation: None,
+        })
     }
 
     /// Keeps an unlocking pin that reached its target within the [acceptance rule](acceptance),
     /// and otherwise restores the lock it started from.
+    ///
+    /// A refusal carries the violation it was restored for, which the held row reports.
     fn judge_unlocked_pin(
         &self,
         scope: PinScope<'_>,
@@ -3998,15 +4095,16 @@ impl CargoTool {
         );
         journal.validate_project(&project.root)?;
         std::fs::write(project.root.join("Cargo.lock"), before_text)?;
-        Ok(Unlocking::Refused(
-            violation
+        Ok(Unlocking::Refused {
+            split: violation
                 .as_ref()
                 .and_then(Violation::heal)
                 .map(|heal| UnlockedSplit {
                     heal,
                     released: released.to_vec(),
                 }),
-        ))
+            violation: violation.as_ref().map(ToString::to_string),
+        })
     }
 
     /// Issues one tolerant precise pin, separating resolver rejection from local breakage.
@@ -4074,7 +4172,7 @@ impl CargoTool {
                 );
                 restore()?;
                 Ok(PrecisePinOutcome::Rejected {
-                    detail: Some(violation.to_string()),
+                    detail: Some(RejectionDetail::violation(violation.to_string())),
                     // The verdict depends on the plan, which the memo key omits: a split may land
                     // beside the planned moves that heal it.
                     resolver_rejection: false,
@@ -4086,10 +4184,12 @@ impl CargoTool {
             Err(err) => {
                 // A refused re-pin leaves the overshoot behind; a refused first pin left nothing.
                 restore()?;
+                let parties = rejection_parties(&err);
                 Ok(PrecisePinOutcome::Rejected {
                     resolver_rejection: memoizable_resolver_rejection(&err),
-                    detail: summarize_pin_rejection(&err),
-                    parties: rejection_parties(&err),
+                    detail: summarize_pin_rejection(&err)
+                        .map(|summary| RejectionDetail::resolver(summary, parties.clone())),
+                    parties,
                     split: None,
                 })
             }
@@ -6735,6 +6835,114 @@ mod tests {
         );
     }
 
+    /// The `cargo metadata` of a workspace whose member `app` declares `gpui-pre` (renamed `gpui`)
+    /// under `requirement`, beside the transitive `gpui-base` that requires it.
+    fn gpui_graph(requirement: &str) -> ResolvedGraph {
+        let metadata = serde_json::json!({
+            "packages": [
+                {"id": "app", "name": "app", "version": "0.1.0",
+                 "manifest_path": "/repo/app/Cargo.toml",
+                 "dependencies": [
+                    {"name": "gpui-pre", "rename": "gpui", "req": requirement},
+                    {"name": "gpui-base", "req": "^0.8"}
+                 ]},
+                {"id": "base", "name": "gpui-base", "version": "0.8.0",
+                 "source": crate::lockfile::CRATES_IO_SOURCE,
+                 "dependencies": [{"name": "gpui-pre", "req": "^0.3.9"}]},
+                {"id": "pre", "name": "gpui-pre", "version": "0.3.9",
+                 "source": crate::lockfile::CRATES_IO_SOURCE, "dependencies": []}
+            ],
+            "workspace_members": ["app"],
+            "workspace_root": "/repo",
+            "resolve": {"nodes": [
+                {"id": "app", "deps": [{"pkg": "pre"}, {"pkg": "base"}]},
+                {"id": "base", "deps": [{"pkg": "pre"}]},
+                {"id": "pre", "deps": []}
+            ]}
+        });
+        crate::cargocmd::Cargo::build_graph_from_json(&metadata.to_string())
+    }
+
+    /// A transitive move Cargo refuses over a node a workspace member pins exactly names that pin
+    /// before Cargo's summary, which names only the requirer that wanted the node to move.
+    /// The reason stays a resolver conflict, so a strict run's verdict does not change.
+    #[test]
+    fn a_refusal_over_a_member_exact_pin_names_the_pin() -> eyre::Result<()> {
+        // Cargo visits the new `gpui-pre` requirement of `gpui-base` 0.8.1 after the member's
+        // exact pin selected 0.3.9, so the pinned node is the previously selected party.
+        let error = cooldown_core::CoreError::Tool {
+            tool: "cargo".into(),
+            termination: cooldown_core::ToolTermination::ExitCode(101),
+            stderr: indoc! {r#"
+                error: failed to select a version for `gpui-pre`.
+                    ... required by package `gpui-base v0.8.1`
+                versions that meet the requirements `^0.3.11` are: 0.3.11
+
+                all possible versions conflict with previously selected packages
+
+                  previously selected package `gpui-pre v0.3.9`
+                    ... which satisfies dependency `gpui = "=0.3.9"` of package `app v0.1.0 (/repo/app)`
+
+                failed to select a version for `gpui-pre` which could resolve this conflict
+            "#}
+            .into(),
+        };
+        let summary = summarize_pin_rejection(&error)
+            .ok_or_else(|| eyre::eyre!("cargo's refusal has a summary"))?;
+        let rejection = RejectionDetail::resolver(summary.clone(), rejection_parties(&error));
+        let planned = Change {
+            direct: false,
+            ..change("gpui-base", "0.8.0", "0.8.1", false)
+        };
+        let plan = Plan {
+            changes: vec![planned.clone()],
+            ..Plan::default()
+        };
+        let after =
+            lock_with(&[("gpui-base", "0.8.0"), ("gpui-pre", "0.3.9")]).crates_io_locked_versions();
+        let rejections = PinRejections::from([(rejection_key(&planned), rejection.clone())]);
+
+        // The member's `=0.3.9` pin is the node Cargo set the move against.
+        let pinned = gpui_graph("=0.3.9");
+        let mut report = ApplyReport::default();
+        classify_planned_changes(&plan, &after, Some(&pinned), &rejections, &mut report);
+        let [skipped] = report.skipped.as_slice() else {
+            eyre::bail!("one held change: {:?}", report.skipped);
+        };
+        assert_eq!(skipped.reason, SkipReason::ResolverConflict);
+        assert_eq!(
+            skipped.detail.as_deref(),
+            Some(
+                format!(
+                    "held by the exact pin of gpui-pre = 0.3.9 in a workspace member; {summary}"
+                )
+                .as_str()
+            )
+        );
+
+        // Without a member pin on that node, without a graph, at a version the conflict does not
+        // state, or for a violation, nothing identifies a pin and Cargo's summary stands alone.
+        assert_eq!(
+            reported_rejection(&rejection, Some(&gpui_graph("^0.3.9"))),
+            summary
+        );
+        assert_eq!(reported_rejection(&rejection, None), summary);
+        let elsewhere = RejectionDetail::resolver(
+            summary.clone(),
+            vec![ConflictParty {
+                name: "gpui-pre".to_string(),
+                version: Some("0.3.8".to_string()),
+            }],
+        );
+        assert_eq!(reported_rejection(&elsewhere, Some(&pinned)), summary);
+        let violation = RejectionDetail {
+            parties: rejection.parties.clone(),
+            ..RejectionDetail::violation(summary.clone())
+        };
+        assert_eq!(reported_rejection(&violation, Some(&pinned)), summary);
+        Ok(())
+    }
+
     #[test]
     fn summarize_pin_rejection_names_the_requirement_and_requirer() {
         // Verbatim (trimmed) stderr shape from a live `cargo update -p regex --precise 1.13.1`
@@ -7371,7 +7579,12 @@ mod tests {
         let mut rejections: PinRejections = plan
             .changes
             .iter()
-            .map(|change| (rejection_key(change), "held".to_string()))
+            .map(|change| {
+                (
+                    rejection_key(change),
+                    RejectionDetail::resolver("held".to_string(), Vec::new()),
+                )
+            })
             .collect();
         tool.land_rejected_group_atomically(
             &project,
@@ -7415,7 +7628,7 @@ mod tests {
 
         let mut rejections = PinRejections::from([(
             rejection_key(&plan.changes[0]),
-            "the precise pin was rejected".to_string(),
+            RejectionDetail::resolver("the precise pin was rejected".to_string(), Vec::new()),
         )]);
         tool.land_rejected_group_atomically(
             &project,
@@ -7473,6 +7686,7 @@ mod tests {
         );
         let detail = rejections
             .get(&("dep".to_string(), "1.0.0".to_string(), "2.0.0".to_string()))
+            .map(|detail| &detail.text)
             .expect("the held candidate keeps its planned-change-keyed rejection");
         assert!(
             detail.contains("failed to select a version") && detail.contains("required by app"),
@@ -7515,11 +7729,103 @@ mod tests {
         // The held candidate names the split it would have caused.
         let detail = rejections
             .get(&("dep".to_string(), "1.0.0".to_string(), "2.0.0".to_string()))
+            .map(|detail| &detail.text)
             .ok_or_else(|| eyre::eyre!("the held candidate keeps its rejection"))?;
         assert!(
             detail.contains("would resolve direct dependency dep at another incompatible line"),
             "{detail}"
         );
+        Ok(())
+    }
+
+    /// The split a widened resolve would cause decides the held row, not Cargo's refusal of the
+    /// precise pin the widen tried first, which can never land a cross-line move.
+    /// A replay of the remembered refusal reports the same split.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_widen_split_outranks_the_refused_precise_pin_cold_and_replayed() -> eyre::Result<()>
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(dir.path()).ok_or_else(|| eyre::eyre!("non-UTF-8 root"))?;
+        let (project, tool) = widen_fixture(root, true)?;
+        // Cargo refuses every precise pin, and only the widened metadata resolve lands, forking
+        // dep 2.0.0 beside the 1.0.0 line `holder` retains.
+        let script = root.join("fake-cargo.sh");
+        std::fs::write(
+            &script,
+            indoc! {r#"
+                #!/bin/sh
+                printf '%s\n' "$*" >> invocations
+                if [ "$1" = metadata ] && ! grep -q 'dep = "1"' Cargo.toml; then
+                  cp Cargo.lock.forked Cargo.lock
+                  printf '%s\n' '{"packages": [], "workspace_members": [], "workspace_root": "", "resolve": null}'
+                  exit 0
+                fi
+                echo 'error: failed to select a version for the requirement `dep = "^1"`' >&2
+                echo 'required by package `holder v1.0.0`' >&2
+                exit 101
+            "#},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        // A declaring member makes the widen resolve the member graph.
+        let planned = Change {
+            members: vec![MemberRef {
+                name: "app".to_string(),
+                path: ".".to_string(),
+            }],
+            ..change("dep", "1.0.0", "2.0.0", false)
+        };
+        let plan = Plan {
+            changes: vec![planned.clone()],
+            rewrite: RewriteMode::Auto,
+            ..Plan::default()
+        };
+        let journal = tool.mutation_journal(&project, &plan).await?;
+        let candidates = [&planned];
+        let probe = WidenProbe {
+            project: &project,
+            plan: &plan.changes,
+            rewrite: RewriteMode::Auto,
+            candidates: &candidates,
+            protected: &[],
+            followers: &[],
+            journal: &journal,
+            observer: None,
+        };
+
+        // Cold: the precise pin is refused first, then the widened resolve splits dep.
+        let mut cold = PinRejections::new();
+        let mut cold_memo = MemoStats::default();
+        assert!(matches!(
+            tool.tentative_widen_logged(probe, &planned, &mut cold, &mut cold_memo)
+                .await?,
+            TentativeWiden::Rejected
+        ));
+        let invocations = std::fs::read_to_string(root.join("invocations"))?;
+        assert!(invocations.contains("--precise"), "{invocations}");
+        let detail = cold
+            .get(&rejection_key(&planned))
+            .ok_or_else(|| eyre::eyre!("the held candidate keeps its rejection: {cold:?}"))?;
+        assert_eq!(detail.origin, DiagnosticOrigin::Acceptance, "{detail:?}");
+        assert!(
+            detail
+                .text
+                .contains("would resolve direct dependency dep at another incompatible line"),
+            "{detail:?}"
+        );
+
+        // Replayed: the remembered refusal reports the same split without running Cargo.
+        let mut replayed = PinRejections::new();
+        let mut replay_memo = MemoStats::default();
+        assert!(matches!(
+            tool.tentative_widen_logged(probe, &planned, &mut replayed, &mut replay_memo)
+                .await?,
+            TentativeWiden::Rejected
+        ));
+        assert_eq!(replay_memo.hits, 1);
+        assert_eq!(replayed, cold);
         Ok(())
     }
 
