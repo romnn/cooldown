@@ -346,6 +346,7 @@ async fn one_incompatible_target_bisects_without_linear_precise_pins() -> eyre::
     assert_eq!(rejections.len(), 1);
     let rejection = rejections
         .values()
+        .map(|detail| &detail.text)
         .next()
         .expect("one per-crate explanation");
     assert!(
@@ -920,6 +921,7 @@ async fn a_leftover_pin_that_displaces_a_seeded_target_is_refused() -> eyre::Res
     // The refusal names the target the pin would have displaced.
     let detail = rejections
         .get(&("pkg001".to_owned(), "1.0.0".to_owned(), "1.1.0".to_owned()))
+        .map(|detail| &detail.text)
         .ok_or_else(|| eyre::eyre!("the refused leftover records why: {rejections:?}"))?;
     assert!(detail.contains("pkg000 off its target 1.1.0"), "{detail}");
     // The script displaces only once, so the fixed point's next pass lands the leftover cleanly.

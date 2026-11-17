@@ -1,9 +1,12 @@
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use cooldown_core::{Change, CoreError, MemberRef, Project};
 use sha2::{Digest as _, Sha256};
+
+use crate::cargocmd::ConflictParty;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum MemoOperation {
@@ -183,11 +186,62 @@ impl MemoKey {
     }
 }
 
+/// Where a planned change's recorded rejection comes from, in increasing precedence.
+///
+/// A resolve that landed but broke the [acceptance rule](crate::tool::acceptance) names the hold
+/// that decided the step.
+/// It outranks Cargo's refusal of another attempt at the same change, such as a precise pin
+/// across lines, which Cargo refuses whatever holds the change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DiagnosticOrigin {
+    /// Cargo refused the resolve.
+    Resolver,
+    /// The resolve landed but broke the acceptance rule and was restored.
+    Acceptance,
+}
+
+/// The rejection recorded for one planned change, which its held row reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RejectionDetail {
+    /// The report text.
+    pub(crate) text: String,
+    pub(crate) origin: DiagnosticOrigin,
+    /// The packages Cargo's refusal set against each other, read from its raw stderr; empty for
+    /// an acceptance-rule violation.
+    pub(crate) parties: Vec<ConflictParty>,
+}
+
+impl RejectionDetail {
+    /// Cargo's refusal, summarized as `text`, with the `parties` its stderr names.
+    pub(crate) fn resolver(text: String, parties: Vec<ConflictParty>) -> Self {
+        Self {
+            text,
+            origin: DiagnosticOrigin::Resolver,
+            parties,
+        }
+    }
+
+    /// An acceptance-rule violation, described by `text`.
+    pub(crate) fn violation(text: String) -> Self {
+        Self {
+            text,
+            origin: DiagnosticOrigin::Acceptance,
+            parties: Vec::new(),
+        }
+    }
+}
+
+/// Recorded rejections keyed by planned-change identity.
+///
+/// Keying by name alone would let coexisting-major plans for one crate (cargo forks distinct
+/// majors side by side) overwrite each other's diagnostics and attach one target's rejection to
+/// the other's held row.
+pub(crate) type PinRejections = BTreeMap<(String, String, String), RejectionDetail>;
+
 #[derive(Debug, Clone)]
 pub(crate) struct RejectionEffect {
     pub(crate) key: (String, String, String),
-    pub(crate) detail: String,
-    pub(crate) overwrite: bool,
+    pub(crate) detail: RejectionDetail,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -217,14 +271,22 @@ pub(crate) struct SplitHeal {
 }
 
 impl MemoRejection {
-    pub(crate) fn apply(&self, rejections: &mut BTreeMap<(String, String, String), String>) {
+    /// Records each effect in order, keeping per change the detail of the highest
+    /// [`DiagnosticOrigin`] and the latest of that origin.
+    ///
+    /// A cold attempt records through this too, so a replayed refusal reports what the attempt
+    /// it replays reported.
+    pub(crate) fn apply(&self, rejections: &mut PinRejections) {
         for effect in &self.effects {
-            if effect.overwrite {
-                rejections.insert(effect.key.clone(), effect.detail.clone());
-            } else {
-                rejections
-                    .entry(effect.key.clone())
-                    .or_insert_with(|| effect.detail.clone());
+            match rejections.entry(effect.key.clone()) {
+                Entry::Occupied(mut recorded) => {
+                    if effect.detail.origin >= recorded.get().origin {
+                        recorded.insert(effect.detail.clone());
+                    }
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(effect.detail.clone());
+                }
             }
         }
     }
@@ -1884,34 +1946,57 @@ mod tests {
         Ok(())
     }
 
+    /// Replay keeps the latest detail of the highest origin: a violation outranks every resolver
+    /// error before or after it, and a later violation replaces an earlier one.
     #[test]
-    fn replay_retains_effect_order_and_overwrite_policy() {
-        let key = ("dep".into(), "1".into(), "2".into());
-        let effects = vec![
-            RejectionEffect {
-                key: key.clone(),
-                detail: "first".into(),
-                overwrite: false,
-            },
-            RejectionEffect {
-                key: key.clone(),
-                detail: "ignored".into(),
-                overwrite: false,
-            },
-            RejectionEffect {
-                key: key.clone(),
-                detail: "last".into(),
-                overwrite: true,
-            },
-        ];
-        let mut rejections = BTreeMap::new();
-        MemoRejection {
-            effects,
-            ..MemoRejection::default()
-        }
-        .apply(&mut rejections);
-        assert_eq!(rejections.get(&key).map(String::as_str), Some("last"));
+    fn replay_keeps_the_latest_detail_of_the_highest_origin() {
+        let key: (String, String, String) = ("dep".into(), "1".into(), "2".into());
+        let effect = |detail: RejectionDetail| RejectionEffect {
+            key: key.clone(),
+            detail,
+        };
+        let replay = |effects: Vec<RejectionEffect>| {
+            let mut rejections = PinRejections::new();
+            MemoRejection {
+                effects,
+                ..MemoRejection::default()
+            }
+            .apply(&mut rejections);
+            rejections.get(&key).map(|detail| detail.text.clone())
+        };
+
+        // Within one origin the latest wins.
+        assert_eq!(
+            replay(vec![
+                effect(RejectionDetail::resolver("first".into(), Vec::new())),
+                effect(RejectionDetail::resolver("last".into(), Vec::new())),
+            ])
+            .as_deref(),
+            Some("last")
+        );
+
+        // A violation survives a later resolver error, and a later violation replaces it.
+        assert_eq!(
+            replay(vec![
+                effect(RejectionDetail::resolver("cargo".into(), Vec::new())),
+                effect(RejectionDetail::violation("guard".into())),
+                effect(RejectionDetail::resolver("trailing pin".into(), Vec::new())),
+            ])
+            .as_deref(),
+            Some("guard")
+        );
+        assert_eq!(
+            replay(vec![
+                effect(RejectionDetail::violation("first guard".into())),
+                effect(RejectionDetail::violation("last guard".into())),
+            ])
+            .as_deref(),
+            Some("last guard")
+        );
+
+        // An empty replay records nothing.
+        let mut rejections = PinRejections::new();
         MemoRejection::default().apply(&mut rejections);
-        assert_eq!(rejections.len(), 1);
+        assert!(rejections.is_empty());
     }
 }

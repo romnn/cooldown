@@ -161,6 +161,7 @@ async fn a_pin_that_moves_a_declared_crate_is_refused_and_held() -> eyre::Result
     );
     let detail = rejections
         .get(&rejection_key(&planned))
+        .map(|detail| &detail.text)
         .ok_or_else(|| eyre::eyre!("the refused pin records why: {rejections:?}"))?;
     assert_eq!(
         detail,
@@ -250,6 +251,7 @@ async fn a_joint_widen_that_moves_a_declared_crate_restores_its_manifest_edit() 
                 observer: None,
             },
             CulpritDrop::First,
+            &mut PinRejections::new(),
             &mut stats,
         )
         .await?;
@@ -291,6 +293,7 @@ async fn a_joint_widen_that_keeps_declared_crates_is_retained() -> eyre::Result<
                 observer: None,
             },
             CulpritDrop::First,
+            &mut PinRejections::new(),
             &mut stats,
         )
         .await?
@@ -400,6 +403,7 @@ async fn a_refused_repin_restores_the_lock_the_overshoot_replaced() -> eyre::Res
     );
     let detail = rejections
         .get(&rejection_key(&planned))
+        .map(|detail| &detail.text)
         .ok_or_else(|| eyre::eyre!("the refused re-pin records why: {rejections:?}"))?;
     assert!(detail.contains("failed to select a version"), "{detail}");
     Ok(())
@@ -465,6 +469,7 @@ async fn a_planned_line_does_not_move_another_members_declared_major() -> eyre::
     assert_eq!(fixture.read("Cargo.lock")?, original);
     let detail = rejections
         .get(&rejection_key(&planned))
+        .map(|detail| &detail.text)
         .ok_or_else(|| eyre::eyre!("the refused pin records why: {rejections:?}"))?;
     assert_eq!(detail, "would move directly declared foo 2.0.0 to 2.1.0");
     Ok(())
@@ -548,6 +553,7 @@ async fn a_reachable_path_crates_declared_dependency_still_holds() -> eyre::Resu
     assert_eq!(fixture.read("Cargo.lock")?, original);
     let detail = rejections
         .get(&rejection_key(&planned))
+        .map(|detail| &detail.text)
         .ok_or_else(|| eyre::eyre!("the refused pin records why: {rejections:?}"))?;
     assert_eq!(detail, "would move directly declared leaf 1.0.0 to 1.2.0");
     Ok(())
@@ -596,7 +602,7 @@ async fn a_replayed_pin_is_judged_against_the_plan_of_its_step() -> eyre::Result
     let refused = pin(&alone).await?;
     assert!(
         matches!(&refused, PrecisePinOutcome::Rejected { detail: Some(detail), .. }
-            if detail == "would move directly declared declared 1.0.0 to 0.9.0"),
+            if detail.text == "would move directly declared declared 1.0.0 to 0.9.0"),
         "{refused:?}"
     );
     assert_eq!(

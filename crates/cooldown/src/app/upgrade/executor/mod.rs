@@ -2478,6 +2478,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             // A held dep (exact pin or commit pin) carries an `adoptable_target` for the report — the
             // version a human could manually pin to — but `upgrade` must never move it on its own.
             if verdict.status == cooldown_core::Status::Held {
+                self.record_held_pin(&effective, &releases, &verdict);
                 continue;
             }
             let Some(target) = verdict.adoptable_target.clone() else {
@@ -2582,6 +2583,63 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             Some(SkippedInfo {
                 reason,
                 message: reason.message().to_string(),
+                offending: None,
+            }),
+        );
+    }
+
+    /// Records the matured target an authored exact pin on a direct dependency holds back.
+    ///
+    /// `upgrade` never rewrites such a pin, so without this row the dependency would vanish from
+    /// the report although `outdated` lists it as held.
+    /// The row names the pin and the members declaring it, so the reader knows which requirement
+    /// to loosen.
+    /// A dependency held only by a requirer's exact pin, a graph ceiling rather than its own
+    /// authored pin, gets no row: [`SkipReason::GraphCeilingHeld`] would fail `--strict`.
+    fn record_held_pin(
+        &mut self,
+        dep: &Dependency,
+        releases: &[Release],
+        verdict: &cooldown_core::Verdict,
+    ) {
+        if !dep.direct || !dep.pinned {
+            return;
+        }
+        let Some(target) = verdict
+            .adoptable_target
+            .as_ref()
+            .filter(|target| **target != dep.current)
+        else {
+            return;
+        };
+        let candidate = verdict
+            .candidates
+            .iter()
+            .find(|candidate| candidate.version == *target);
+        let kind = candidate.map_or(UpdateKind::Minor, |candidate| candidate.kind);
+        let security = candidate
+            .and_then(|candidate| candidate.security.as_ref())
+            .map(|relevance| crate::app::workspace::security_info(relevance, target));
+        let change = Change {
+            package: target_package_for(releases, dep, target),
+            from: dep.current.clone(),
+            to: target.clone(),
+            kind,
+            downgrade: false,
+            direct: dep.direct,
+            members: dep.members.clone(),
+        };
+        // Same provenance rule as the ceiling holds: a pinned-back security fix still says why
+        // loosening the pin matters.
+        if let Some(security) = security {
+            self.security_by_change
+                .insert(ChangeKey::of(&change), security);
+        }
+        self.record_change_skip(
+            &change,
+            Some(SkippedInfo {
+                reason: SkipReason::PinHeld,
+                message: pin_hold_message(dep, target),
                 offending: None,
             }),
         );
@@ -4247,6 +4305,24 @@ fn conservative_hold(reason: SkipReason, mode: PlanMode) -> bool {
     // leaves the matured older version in place; holding a `fix` downgrade leaves the violation,
     // and the run is incomplete until the pin is rewritten or edited.
     || (reason == SkipReason::PinHeld && matches!(mode, PlanMode::Upgrade { .. }))
+}
+
+/// The skip message for a direct dependency an authored exact pin holds below `target`: the pin,
+/// the members declaring it, and what adopting the target takes.
+fn pin_hold_message(dep: &Dependency, target: &Version) -> String {
+    let declared_in = if dep.members.is_empty() {
+        "its manifest".to_string()
+    } else {
+        dep.members
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "pinned to exactly {current} in {declared_in}; loosen the requirement to adopt {target}",
+        current = dep.current,
+    )
 }
 
 /// Whether `changes` holds `change` itself: the same target from the same version.

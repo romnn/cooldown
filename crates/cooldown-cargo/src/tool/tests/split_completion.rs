@@ -297,6 +297,7 @@ async fn a_split_no_planned_move_heals_is_held() -> eyre::Result<()> {
             "1.0.0".to_string(),
             "1.1.0".to_string(),
         ))
+        .map(|detail| &detail.text)
         .ok_or_else(|| eyre::eyre!("the held candidate keeps its rejection"))?;
     assert!(
         detail.contains("would resolve direct dependency dep at another incompatible line"),

@@ -200,7 +200,8 @@ async fn a_pin_a_locked_crate_blocks_lands_with_that_crate_released() -> eyre::R
 }
 
 /// A release that would drag another planned crate off its version is not kept: the lock is
-/// restored byte for byte, and the candidate is held with Cargo's own explanation.
+/// restored byte for byte, and the candidate is held with the acceptance-rule violation the
+/// retry was restored for, not the refusal of the plain pin before it.
 #[tokio::test]
 async fn an_unlocking_pin_that_displaces_a_planned_crate_is_restored() -> eyre::Result<()> {
     let fixture = UnlockFixture::new(SCRIPT)?;
@@ -216,10 +217,11 @@ async fn an_unlocking_pin_that_displaces_a_planned_crate_is_restored() -> eyre::
     assert_eq!(fixture.lock()?, lock("1.0.0", "1.0.0", "1.0.0"));
     let detail = rejections
         .get(&("pkg".to_owned(), "1.0.0".to_owned(), "1.2.0".to_owned()))
+        .map(|detail| &detail.text)
         .ok_or_else(|| eyre::eyre!("the held pin keeps its rejection: {rejections:?}"))?;
-    assert!(
-        detail.contains("failed to select a version for `blocker`"),
-        "{detail}"
+    assert_eq!(
+        detail,
+        "would move planned sibling 1.0.0 to 1.5.0 instead of its target 1.1.0"
     );
     Ok(())
 }

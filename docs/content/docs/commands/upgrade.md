@@ -200,9 +200,19 @@ which of two things happened, because the way forward differs:
   project depends on litellm==1.91.5, we can conclude that … your project's requirements are
   unsatisfiable.`), so the requirement that conflicts and who declares it are on the row. This
   usually means a constraint you own excludes the candidate: change it, or keep the hold.
+  On Cargo, a refusal over a node a workspace member pins exactly names that pin first (`held by
+  the exact pin of gpui-pre = 0.3.9 in a workspace member; failed to select a version for
+  gpui-pre …`). A move Cargo resolved but cooldown restored for breaking one of its own rules,
+  such as resolving a direct dependency at a second incompatible line, carries that rule's
+  explanation rather than a later Cargo refusal of the same move.
 
 Both fail a `--strict` run. `outdated` reports the same rows as `blocked`, with the same sentence
 in `blockedReason` and under `--why`.
+
+A direct dependency its own exact pin holds below a matured target is never moved, but it is
+listed as `pin_held`, naming the pin and the members declaring it (`pinned to exactly 0.3.9 in
+app; loosen the requirement to adopt 0.3.11`). Like every forward move a pin holds, it never fails
+`--strict`.
 
 ## Fast mode
 
@@ -265,7 +275,9 @@ and `cargo metadata --locked` accepts either binding. `--cargo-edge-policy` deci
 
 Every corrected, withheld, unaddressable, or surviving rebind is reported as its own row
 (`restored`, `canonicalized`, `held`, `unaddressable`, or `rebound`) naming the dependent whose
-edge moved. Observation excludes a dependent whose own lock identity changed, an unpaired entry
+edge moved. A `restored` row shows the binding the lock kept in both From and To, and its reason
+names the binding the re-resolve had chosen (`kept 0.11.0 for prost-derive 0.14.6 (crates.io); the
+re-resolve had rebound it to 0.14.0`); in JSON its `from` stays that transient binding. Observation excludes a dependent whose own lock identity changed, an unpaired entry
 that appeared or vanished, and an endpoint that did not coexist in both snapshots; those are
 package-set changes rather than attributable binding-only moves. The report is audited from the
 run-start and final locks, so a temporary held attempt

@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **The `upgrade` report says why a dependency did not move.** A direct dependency an authored
+  exact pin held, such as `gpui = { package = "gpui-pre", version = "=0.3.9" }`, vanished from
+  the report although `outdated` lists it as held. It is now a `pin_held` row naming the pin, the
+  members declaring it and the target (`pinned to exactly 0.3.9 in app; loosen the requirement to
+  adopt 0.3.11`), which never fails `--strict`. On Cargo, a transitive move refused over a node a
+  workspace member pins exactly names that pin before Cargo's sentence (`held by the exact pin of
+  gpui-pre = 0.3.9 in a workspace member; …`). A move Cargo resolved but that broke one of
+  cooldown's own rules, such as resolving a direct dependency at a second incompatible line, now
+  reports that rule's explanation instead of a later Cargo refusal of the same move, including
+  when releasing a blocker resolved it and under `--fast`, where each dropped candidate names its
+  own violation. A `restored` lock edge row shows the binding the lock kept in both From and To,
+  with a reason naming the re-resolve's transient binding, instead of reading as a downgrade; its
+  JSON is unchanged. Closes #126.
+
 ## v0.0.31
 
 - **Cargo upgrades a family of crates that pin each other exactly.** Crates such as
