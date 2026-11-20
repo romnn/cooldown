@@ -355,6 +355,54 @@ async fn only_packages_inside_the_staged_copy_replay() -> eyre::Result<()> {
     manifest("[lib]\npath = \"linked.rs\"")?;
     pin_twice().await?;
     assert_eq!(fixture.invocations()?, 7);
+
+    // A package staged only for the workspace's topology, a `[workspace.dependencies]` path entry
+    // no member uses, whose target sources the staged copy lacks: nothing creates target sources
+    // in the copy, so they stay missing
+    let topology = fixture.project.root.join("topology");
+    std::fs::create_dir_all(&topology)?;
+    std::fs::write(
+        topology.join("Cargo.toml"),
+        indoc! {r#"
+            [package]
+            name = "topology"
+            version = "0.1.0"
+            build = "build.rs"
+
+            [[bin]]
+            name = "tool"
+            path = "src/bin/missing/../tool.rs"
+        "#},
+    )?;
+    manifest("[workspace.dependencies]\ntopology = { path = \"topology\" }")?;
+    pin_twice().await?;
+    assert_eq!(fixture.invocations()?, 8);
+
+    // A missing target source that would lie outside the staged copy
+    let path = toml::Value::String(outside.join("missing/lib.rs").to_string());
+    manifest(&format!("[lib]\npath = {path}"))?;
+    pin_twice().await?;
+    assert_eq!(fixture.invocations()?, 10);
+
+    // A missing target source that climbs out of the staged copy
+    manifest("[lib]\npath = \"missing/../../../../../../../../../../outside.rs\"")?;
+    pin_twice().await?;
+    assert_eq!(fixture.invocations()?, 12);
+
+    // A `..` past a missing directory onto a symbolic link out of the staged copy
+    std::os::unix::fs::symlink(&outside, fixture.project.root.join("away"))?;
+    manifest("[lib]\npath = \"missing/../away/absent.rs\"")?;
+    pin_twice().await?;
+    assert_eq!(fixture.invocations()?, 14);
+
+    // A dangling symbolic link in the staged copy to a path outside it
+    std::os::unix::fs::symlink(
+        outside.join("later.rs"),
+        fixture.project.root.join("dangling.rs"),
+    )?;
+    manifest("[lib]\npath = \"dangling.rs\"")?;
+    pin_twice().await?;
+    assert_eq!(fixture.invocations()?, 16);
     Ok(())
 }
 

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Cargo reuses command outcomes in nested workspaces again.** A nested project that
+  path-depends on its parent workspace stages the manifests of the parent's
+  `[workspace.dependencies]` packages only for the workspace's topology, without their target
+  files. Every outcome reuse check then saw a target such a manifest names, like
+  `[[bin]] path = "src/bin/…"` or `build = "build.rs"`, missing from the staged copy and treated it
+  as lying outside, so a large nested workspace reran every Cargo command. A target the copy lacks
+  now counts by where it would lie: nothing creates target sources in the copy, so it stays
+  missing and the outcome stays reusable, while a missing target that would lie outside the copy
+  still disqualifies reuse. The debug event names the path that failed the check. Closes #131.
 - **A failed fallback trial no longer discards the upgrades already verified.** When a trial of
   older or in-line fallback targets failed, for example because Cargo printed a resolver conflict
   and then crashed, `upgrade` dropped every change the project had verified, reported each one as
