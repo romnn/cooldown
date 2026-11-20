@@ -212,6 +212,363 @@ fn assert_shorter_package_window_persists_exact_native_exclusion(
     Ok(())
 }
 
+/// The release train behind the young-transitive tests: every `@sentry/utils` release pins the
+/// `@sentry/types` published with it exactly, as Next.js pins `@next/env`.
+/// The seed holds 5.22.3 (2020-08); the shorter package window admits 5.30.0 (2021-01), whose
+/// `@sentry/types@5.30.0` is as young under the native window as the pin itself.
+/// `extra_dependencies` adds root dependencies beside the train, and `native` is written to
+/// pnpm-workspace.yaml once the lock is seeded, with `{native_minutes}` replaced by the native
+/// window.
+struct ReleaseTrain<'a> {
+    package_rules: &'a str,
+    extra_dependencies: &'a str,
+    native: &'a str,
+}
+
+const UTILS_RULE: &str = indoc::indoc! {r#"
+    [package."@sentry/utils"]
+    min-age = "{package_minutes}m"
+"#};
+
+const TRAIN_RULE: &str = indoc::indoc! {r#"
+    [package."@sentry/*"]
+    min-age = "{package_minutes}m"
+"#};
+
+fn release_train_fixture(train: &ReleaseTrain<'_>) -> (Fixture, i64) {
+    let fixture = Fixture::pnpm().tag_independent();
+    let extra = train.extra_dependencies;
+    fixture.write(
+        "package.json",
+        &indoc::formatdoc! {r#"
+            {{
+              "name": "cooldown-pnpm-release-train-fixture",
+              "version": "0.1.0",
+              "private": true,
+              "dependencies": {{ "@sentry/utils": "^5.22.0"{extra} }}
+            }}
+        "#},
+    );
+    fixture.write("pnpm-workspace.yaml", "packages: []\n");
+    seed_lock(&fixture, "2020-09-01T00:00:00Z");
+    let pins = pnpm_lock_pins(&fixture.read_bytes("pnpm-lock.yaml"));
+    assert_eq!(
+        pins.get("@sentry/utils").map(String::as_str),
+        Some("5.22.3")
+    );
+    assert_eq!(
+        pins.get("@sentry/types").map(String::as_str),
+        Some("5.22.3")
+    );
+
+    let native_minutes = minimum_release_age_minutes("2020-09-01T00:00:00Z");
+    let package_minutes = minimum_release_age_minutes("2021-03-01T00:00:00Z");
+    fixture.write(
+        "pnpm-workspace.yaml",
+        &train
+            .native
+            .replace("{native_minutes}", &native_minutes.to_string()),
+    );
+    let rules = train
+        .package_rules
+        .replace("{package_minutes}", &package_minutes.to_string());
+    fixture.write(
+        "cooldown.toml",
+        &indoc::formatdoc! {r#"
+            min-age = "{native_minutes}m"
+
+            {rules}
+        "#},
+    );
+    (fixture, native_minutes)
+}
+
+/// The native settings `upgrade --sync` starts from before it writes the window.
+const NO_NATIVE_WINDOW: &str = "packages: []\n";
+
+/// A persisted native window, as an earlier `sync` or the user left it.
+const NATIVE_WINDOW: &str = indoc::indoc! {"
+    packages: []
+    minimumReleaseAge: {native_minutes}
+"};
+
+/// pnpm's frozen verification of the lock with no cooldown argument and a fresh cache, so no
+/// verification pnpm recorded earlier stands in for it.
+fn assert_bare_pnpm_accepts_the_lock(fixture: &Fixture, phase: &str) -> eyre::Result<()> {
+    let cache = tempfile::tempdir()?;
+    let cache_dir = format!("--config.cache-dir={}", cache.path().display());
+    let lock = fixture.read_bytes("pnpm-lock.yaml");
+    fixture
+        .run_tool_traced(
+            phase,
+            "pnpm",
+            &[
+                "install",
+                "--frozen-lockfile",
+                "--lockfile-only",
+                &cache_dir,
+            ],
+            &[],
+        )?
+        .require_success()?;
+    assert_eq!(lock, fixture.read_bytes("pnpm-lock.yaml"));
+    Ok(())
+}
+
+/// A genuine `pnpm install --frozen-lockfile` of the project, `node_modules` included, with no
+/// cooldown argument and a fresh cache and store, so no verification or package pnpm kept from
+/// earlier stands in for it; it must neither fail nor change the lock or the settings.
+fn assert_bare_pnpm_installs(fixture: &Fixture, phase: &str) -> eyre::Result<()> {
+    let cache = tempfile::tempdir()?;
+    let store = tempfile::tempdir()?;
+    let cache_dir = format!("--config.cache-dir={}", cache.path().display());
+    let store_dir = format!("--config.store-dir={}", store.path().display());
+    let lock = fixture.read_bytes("pnpm-lock.yaml");
+    let settings = fixture.read_bytes("pnpm-workspace.yaml");
+    fixture
+        .run_tool_traced(
+            phase,
+            "pnpm",
+            &["install", "--frozen-lockfile", &cache_dir, &store_dir],
+            &[],
+        )?
+        .require_success()?;
+    assert_eq!(lock, fixture.read_bytes("pnpm-lock.yaml"));
+    assert_eq!(settings, fixture.read_bytes("pnpm-workspace.yaml"));
+    Ok(())
+}
+
+/// A shorter package window lands a pin that drags in an equally young exact-pinned sibling when
+/// another package rule admits the sibling too, under pnpm's default `minimumReleaseAgeStrict`.
+/// The upgrade itself records both young versions exactly, so a bare pnpm accepts the lock before
+/// any later `sync`, and every later `sync` and `upgrade` leaves the result as it is.
+#[test]
+fn upgrade_sync_lands_a_pin_whose_young_transitive_another_rule_admits() -> eyre::Result<()> {
+    skip_if_missing!("pnpm", Ok(()));
+    let (fixture, native_minutes) = release_train_fixture(&ReleaseTrain {
+        package_rules: TRAIN_RULE,
+        extra_dependencies: "",
+        native: NO_NATIVE_WINDOW,
+    });
+    // Scoped to the parent, so the sibling can only land as the pin's collateral.
+    assert_release_train_lands(
+        &fixture,
+        native_minutes,
+        &["upgrade", "--sync", "--package", "@sentry/utils"],
+    )
+}
+
+/// The same landing under a window the workspace already persists, without `--sync`.
+#[test]
+fn upgrade_lands_a_pin_whose_young_transitive_another_rule_admits_under_a_persisted_window()
+-> eyre::Result<()> {
+    skip_if_missing!("pnpm", Ok(()));
+    let (fixture, native_minutes) = release_train_fixture(&ReleaseTrain {
+        package_rules: TRAIN_RULE,
+        extra_dependencies: "",
+        native: NATIVE_WINDOW,
+    });
+    assert_release_train_lands(
+        &fixture,
+        native_minutes,
+        &["upgrade", "--package", "@sentry/utils"],
+    )
+}
+
+fn assert_release_train_lands(
+    fixture: &Fixture,
+    native_minutes: i64,
+    upgrade: &[&str],
+) -> eyre::Result<()> {
+    let upgraded = fixture
+        .cooldown_json_traced("adopt the release train inside the native window", upgrade)?;
+    assert!(upgraded.ok(), "upgrade must succeed: {upgraded:#?}");
+    assert!(
+        upgraded.applied_names().contains("@sentry/utils"),
+        "{upgraded:#?}"
+    );
+    assert_pnpm_lock_current(&upgraded);
+    let lock_after_upgrade = fixture.read_bytes("pnpm-lock.yaml");
+    let pins = pnpm_lock_pins(&lock_after_upgrade);
+    assert_eq!(
+        pins.get("@sentry/utils").map(String::as_str),
+        Some("5.30.0")
+    );
+    assert_eq!(
+        pins.get("@sentry/types").map(String::as_str),
+        Some("5.30.0")
+    );
+
+    // Both young versions are exempted exactly, and nothing package-wide.
+    let native = String::from_utf8(fixture.read_bytes("pnpm-workspace.yaml"))?;
+    assert!(native.contains(&format!("minimumReleaseAge: {native_minutes}")));
+    assert!(native.contains("\"@sentry/utils@5.30.0\""), "{native}");
+    assert!(native.contains("\"@sentry/types@5.30.0\""), "{native}");
+    assert!(
+        !native.contains("\"@sentry/*\""),
+        "only exact versions are exempted: {native}"
+    );
+
+    // pnpm itself accepts the adopted lock before any later `sync` could have helped.
+    assert_bare_pnpm_accepts_the_lock(fixture, "verify native policy accepts the adopted lock")?;
+
+    // `sync` keeps every exemption, whether it selects the whole project or only the parent.
+    for args in [&["sync"][..], &["sync", "--package", "@sentry/utils"][..]] {
+        let resynced = fixture.cooldown_json_traced("retain the adopted permissions", args)?;
+        assert!(
+            resynced.ok(),
+            "sync must retain the admissions: {resynced:#?}"
+        );
+        assert_eq!(
+            native.as_bytes(),
+            fixture.read_bytes("pnpm-workspace.yaml"),
+            "{args:?}"
+        );
+    }
+
+    // A second upgrade finds nothing left to do.
+    let again = fixture.cooldown_json_traced("upgrade the adopted train again", upgrade)?;
+    assert!(again.ok(), "the second upgrade must succeed: {again:#?}");
+    assert_eq!(again.summary_applied(), 0, "{again:#?}");
+    assert_eq!(lock_after_upgrade, fixture.read_bytes("pnpm-lock.yaml"));
+    assert_eq!(native.as_bytes(), fixture.read_bytes("pnpm-workspace.yaml"));
+
+    // The final project installs with a bare pnpm, `node_modules` and all.
+    assert_bare_pnpm_installs(fixture, "install the final project with a bare pnpm")
+}
+
+/// Asserts that `upgraded` holds `@sentry/utils` at its 5.30.0 target as `transitive_in_cooldown`,
+/// naming the young `@sentry/types` sibling.
+fn assert_held_by_the_young_sibling(upgraded: &support::Envelope) {
+    let held = upgraded
+        .items()
+        .iter()
+        .find(|item| {
+            item.get("name").and_then(serde_json::Value::as_str) == Some("@sentry/utils")
+                && item.get("to").and_then(serde_json::Value::as_str) == Some("5.30.0")
+        })
+        .and_then(|item| item.get("skipped"))
+        .expect("the held pin explains itself");
+    assert_eq!(
+        held.get("reason").and_then(serde_json::Value::as_str),
+        Some("transitive_in_cooldown"),
+        "{held:#?}"
+    );
+    assert_eq!(
+        held.get("offending").and_then(serde_json::Value::as_str),
+        Some("@sentry/types"),
+        "{held:#?}"
+    );
+}
+
+/// When no rule admits the young sibling the pin drags in, the pin is held with cooldown's own
+/// verdict naming the sibling rather than pnpm's raw strictness error, and nothing is written.
+#[test]
+fn upgrade_holds_a_pin_whose_young_transitive_no_rule_admits() -> eyre::Result<()> {
+    skip_if_missing!("pnpm", Ok(()));
+    let (fixture, _) = release_train_fixture(&ReleaseTrain {
+        package_rules: UTILS_RULE,
+        extra_dependencies: "",
+        native: NO_NATIVE_WINDOW,
+    });
+    // The window `upgrade --sync` writes first, so the comparison below sees only the upgrade.
+    fixture
+        .cooldown_traced("persist the native window", &["sync"])?
+        .require_success()?;
+    let lock_before = fixture.read_bytes("pnpm-lock.yaml");
+    let native_before = fixture.read_bytes("pnpm-workspace.yaml");
+
+    let upgraded = fixture.cooldown_json_traced(
+        "hold the pin behind its young sibling",
+        &["upgrade", "--sync"],
+    )?;
+    assert!(upgraded.ok(), "upgrade must succeed: {upgraded:#?}");
+    assert_eq!(upgraded.summary_applied(), 0, "{upgraded:#?}");
+    assert_held_by_the_young_sibling(&upgraded);
+    assert_eq!(lock_before, fixture.read_bytes("pnpm-lock.yaml"));
+    assert_eq!(native_before, fixture.read_bytes("pnpm-workspace.yaml"));
+    let native_after = String::from_utf8(fixture.read_bytes("pnpm-workspace.yaml"))?;
+    assert!(
+        !native_after.contains("@sentry/"),
+        "no young version is exempted: {native_after}"
+    );
+    Ok(())
+}
+
+/// Holding the pin isolates it: an unrelated candidate of the same run, admitted by its own
+/// shorter window, still lands with its exact exemption, and the lock stays installable.
+#[test]
+fn upgrade_lands_an_unrelated_candidate_beside_a_pin_held_by_its_young_transitive()
+-> eyre::Result<()> {
+    skip_if_missing!("pnpm", Ok(()));
+    let rules = format!(
+        "{UTILS_RULE}\n{}",
+        UTILS_RULE.replace("\"@sentry/utils\"", "lodash")
+    );
+    let (fixture, _) = release_train_fixture(&ReleaseTrain {
+        package_rules: &rules,
+        extra_dependencies: r#", "lodash": "^4.17.19""#,
+        native: NATIVE_WINDOW,
+    });
+    assert_eq!(
+        pnpm_lock_pins(&fixture.read_bytes("pnpm-lock.yaml"))
+            .get("lodash")
+            .map(String::as_str),
+        Some("4.17.20")
+    );
+
+    let upgraded =
+        fixture.cooldown_json_traced("land lodash beside the held release train", &["upgrade"])?;
+    assert!(upgraded.ok(), "upgrade must succeed: {upgraded:#?}");
+    assert_held_by_the_young_sibling(&upgraded);
+    assert_pnpm_lock_current(&upgraded);
+    let pins = pnpm_lock_pins(&fixture.read_bytes("pnpm-lock.yaml"));
+    assert_eq!(pins.get("lodash").map(String::as_str), Some("4.17.21"));
+    assert_eq!(
+        pins.get("@sentry/utils").map(String::as_str),
+        Some("5.22.3")
+    );
+    assert_eq!(
+        pins.get("@sentry/types").map(String::as_str),
+        Some("5.22.3")
+    );
+    let native = String::from_utf8(fixture.read_bytes("pnpm-workspace.yaml"))?;
+    assert!(native.contains("\"lodash@4.17.21\""), "{native}");
+    assert!(!native.contains("@sentry/"), "{native}");
+    assert_bare_pnpm_accepts_the_lock(&fixture, "verify native policy accepts the partial upgrade")
+}
+
+/// `--transitive allow` leaves a young transitive in place only where pnpm's own gate accepts it,
+/// so under a persisted window the pin is still held, by the sibling pnpm would refuse.
+#[test]
+fn upgrade_transitive_allow_holds_a_pin_whose_young_transitive_pnpm_refuses() -> eyre::Result<()> {
+    skip_if_missing!("pnpm", Ok(()));
+    let (fixture, _) = release_train_fixture(&ReleaseTrain {
+        package_rules: UTILS_RULE,
+        extra_dependencies: "",
+        native: NATIVE_WINDOW,
+    });
+    let lock_before = fixture.read_bytes("pnpm-lock.yaml");
+    let native_before = fixture.read_bytes("pnpm-workspace.yaml");
+
+    let upgraded = fixture.cooldown_json_traced(
+        "hold the pin behind a sibling pnpm refuses",
+        &[
+            "upgrade",
+            "--transitive",
+            "allow",
+            "--package",
+            "@sentry/utils",
+        ],
+    )?;
+    assert!(upgraded.ok(), "upgrade must succeed: {upgraded:#?}");
+    assert_eq!(upgraded.summary_applied(), 0, "{upgraded:#?}");
+    assert_held_by_the_young_sibling(&upgraded);
+    assert_eq!(lock_before, fixture.read_bytes("pnpm-lock.yaml"));
+    assert_eq!(native_before, fixture.read_bytes("pnpm-workspace.yaml"));
+    Ok(())
+}
+
 /// Persisting an admitted young pin keeps a hand-ordered native exclusion list in pnpm's order:
 /// the pin joins its package's first rule in place, the stale version it held is pruned, and the
 /// rules after it keep their places, so no other package's exemption changes.

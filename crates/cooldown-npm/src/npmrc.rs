@@ -75,6 +75,25 @@ impl LayerOverrides {
         }
     }
 
+    /// Records pnpm's `registries` map, whose `default` key is the registry and whose `@scope`
+    /// keys route a scope, without letting it override the layer's own `registry` keys: either
+    /// one naming another registry routes away, since a reroute can only withhold.
+    /// A map this cannot read is unknown routing for every package.
+    fn assign_registries(&mut self, registries: &serde_json::Value) {
+        let Some(registries) = registries.as_object() else {
+            self.global = Some(true);
+            return;
+        };
+        for (key, url) in registries {
+            let custom = url.as_str().is_none_or(|url| !is_npmjs_registry(url));
+            if key == "default" {
+                self.global = Some(self.global.unwrap_or(false) || custom);
+            } else if key.starts_with('@') {
+                *self.scopes.entry(key.clone()).or_insert(false) |= custom;
+            }
+        }
+    }
+
     /// The layer a present-but-unreadable config file yields: unknown routing vetoes everything.
     fn opaque() -> Self {
         LayerOverrides {
@@ -174,6 +193,9 @@ pub(crate) fn overrides_from_effective_config(
             None => layer.assign(key, UNREADABLE_ROUTING),
         }
     }
+    if let Some(registries) = object.get(REGISTRIES_KEY) {
+        layer.assign_registries(registries);
+    }
     match query {
         EffectiveRegistryQuery::Unavailable => return None,
         EffectiveRegistryQuery::Vetoes => {}
@@ -185,6 +207,10 @@ pub(crate) fn overrides_from_effective_config(
     }
     Some(RegistryOverrides::merge([layer]))
 }
+
+/// pnpm's map of registries by scope, `default` naming the registry itself, which pnpm reads from
+/// pnpm-workspace.yaml and reports as one object in its effective configuration.
+const REGISTRIES_KEY: &str = "registries";
 
 /// A registry-routing configuration key: the default `registry` or a scoped `@scope:registry`.
 fn is_routing_key(key: &str) -> bool {
@@ -245,7 +271,7 @@ fn settings_yaml_file_layer(path: &std::path::Path) -> LayerOverrides {
 }
 
 /// Parses the routing keys out of a YAML settings document: a top-level `registry` or
-/// `"@scope:registry"` mapping entry.
+/// `"@scope:registry"` mapping entry, or pnpm's `registries` map.
 /// A document that is not a mapping of readable scalars where it matters is unknown routing and
 /// vetoes everything.
 fn settings_yaml_layer(content: &str) -> LayerOverrides {
@@ -264,6 +290,9 @@ fn settings_yaml_layer(content: &str) -> LayerOverrides {
             Some(value) => layer.assign(key, value),
             None => layer.assign(key, UNREADABLE_ROUTING),
         }
+    }
+    if let Some(registries) = document.get(REGISTRIES_KEY) {
+        layer.assign_registries(registries);
     }
     layer
 }
@@ -523,6 +552,47 @@ mod tests {
             RegistryOverrides::merge([settings_yaml_layer("- just\n- a list\n")])
                 .reroutes("lodash"),
             "a document that is not a mapping is unknown routing"
+        );
+    }
+
+    /// pnpm's `registries` map routes like the keys it stands for, in pnpm-workspace.yaml and in
+    /// pnpm's effective configuration, and never cancels a reroute the layer's `registry` key
+    /// makes.
+    #[test]
+    fn a_registries_map_routes_its_scopes() {
+        let yaml = RegistryOverrides::merge([settings_yaml_layer(indoc::indoc! {"
+            packages: []
+            registries:
+              default: https://registry.npmjs.org/
+              '@corp': https://npm.mirror.example/
+        "})]);
+        assert!(yaml.reroutes("@corp/api"));
+        assert!(!yaml.reroutes("lodash"));
+
+        let mirrored_default = RegistryOverrides::merge([settings_yaml_layer(indoc::indoc! {"
+            registry: https://registry.npmjs.org/
+            registries:
+              default: https://npm.mirror.example/
+        "})]);
+        assert!(mirrored_default.reroutes("lodash"));
+
+        let effective = overrides_from_effective_config(
+            r#"{"registry":"https://registry.npmjs.org/","registries":{"default":"https://registry.npmjs.org/","@jsr":"https://npm.jsr.io/","@corp":"https://npm.mirror.example/"}}"#,
+            EffectiveRegistryQuery::Proves,
+        )
+        .expect("parsed");
+        assert!(effective.reroutes("@corp/api"));
+        assert!(effective.reroutes("@jsr/std"));
+        assert!(!effective.reroutes("lodash"));
+
+        let unreadable = overrides_from_effective_config(
+            r#"{"registry":"https://registry.npmjs.org/","registries":["not", "a", "map"]}"#,
+            EffectiveRegistryQuery::Proves,
+        )
+        .expect("parsed");
+        assert!(
+            unreadable.reroutes("lodash"),
+            "a map this cannot read is unknown routing"
         );
     }
 

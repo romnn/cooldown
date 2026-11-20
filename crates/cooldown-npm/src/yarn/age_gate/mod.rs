@@ -146,7 +146,7 @@ fn write_supported(
     };
     if let Some(minutes) = policy.default_window.as_ref().and_then(written_minutes) {
         edit.set_gate(minutes)?;
-        edit.set_preapproved(&writable_entries(&selectors, policy, &settings))?;
+        edit.set_preapproved(&writable_entries(&selectors, policy, &settings, minutes))?;
         if support.scope_gates_apply {
             warnings.extend(edit.set_scope_gates(
                 root,
@@ -248,9 +248,9 @@ impl Selectors {
     }
 }
 
-/// The `npmPreapprovedPackages` entries a sync writing the gate writes: the written selectors,
-/// then one `name@version` per admitted young locked version no written selector already
-/// approves.
+/// The `npmPreapprovedPackages` entries a sync writing a gate of `minutes` writes: the written
+/// selectors, then one `name@version` per admitted locked version younger than the gate that no
+/// written selector already approves.
 ///
 /// Without an evaluation the existing exact entries are kept verbatim instead, so the current
 /// lock still resolves afresh.
@@ -258,11 +258,15 @@ fn writable_entries(
     selectors: &Selectors,
     policy: &ResolvedPolicy,
     settings: &Map<String, Value>,
+    minutes: u64,
 ) -> Vec<String> {
     let mut entries = selectors.written.clone();
     if let Some(admitted) = &policy.admitted_versions {
+        // A release in the gate's last partial minute is still young under the written minutes.
+        let gate = i64::try_from(minutes.saturating_mul(60)).unwrap_or(i64::MAX);
         let exact: BTreeSet<String> = admitted
             .iter()
+            .filter(|admission| admission.age.as_secs() < gate)
             .filter(|admission| {
                 !selectors
                     .written

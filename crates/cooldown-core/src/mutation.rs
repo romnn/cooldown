@@ -73,6 +73,55 @@ impl ProjectMutationState {
         Ok(())
     }
 
+    /// Refuses `journal` unless its preimage of every path this state also carries is exactly what
+    /// this state expects there: the same contents, or the same absence, and the same
+    /// permissions.
+    ///
+    /// A journal captured after this state was published continues it only while nothing else
+    /// touched the files they share.
+    /// Adopting a preimage that changed in between would let a later restore of the earlier
+    /// preimage overwrite that change.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] when the journal belongs to another project or a shared
+    /// path's preimage differs from what this state expects.
+    pub fn ensure_continued_by(&self, journal: &ProjectMutationJournal) -> Result<()> {
+        self.ensure_same_project(&journal.project)?;
+        for captured in &journal.files {
+            if let Some(expected) = self.files.iter().find(|file| file.path == captured.path)
+                && !expected.matches(captured)
+            {
+                return Err(CoreError::LockConflict(format!(
+                    "{} changed independently between cooldown's batches; left it untouched",
+                    self.project.path().join(&captured.path)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Expects the bytes the write-set file at `path` holds now, as a step cooldown owns leaves
+    /// it, while every other file keeps its expectation, so a later restore still refuses to
+    /// write over a change made to one of those.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] when `path` is not in this state or the project
+    /// changed identity, and a filesystem error when the file cannot be captured safely.
+    pub fn adopt_live(&mut self, path: &Utf8Path) -> Result<()> {
+        self.project.validate_live()?;
+        let root = self.project.path().to_owned();
+        let Some(entry) = self.files.iter_mut().find(|file| file.path == path) else {
+            return Err(CoreError::LockConflict(format!(
+                "{} is not in the mutation write set",
+                root.join(path)
+            )));
+        };
+        *entry = ProjectMutationFile::capture(&root, path)?;
+        Ok(())
+    }
+
     /// Replaces expected contents for every path carried by `other`.
     ///
     /// # Errors
@@ -92,6 +141,82 @@ impl ProjectMutationState {
             }
         }
         Ok(())
+    }
+
+    /// Writes `contents` to the write-set file at `path` while it still holds the bytes this state
+    /// expects there, then expects the written bytes instead.
+    ///
+    /// A later [`ProjectMutationJournal::restore_if_unchanged`] against this state therefore takes
+    /// the write back as cooldown's own, while a change someone else made is never claimed: every
+    /// file of this state is compared with the disk before the write, and the written file again
+    /// just before the replacement is renamed into place, as a checked restore does.
+    /// Writing the bytes the file already holds leaves it untouched.
+    /// The replacement keeps the file's permissions, and a file the write creates keeps the
+    /// permissions it was created with.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] when `path` is not in this state, the project changed
+    /// identity, or a live file no longer holds the bytes this state expects.
+    /// Returns a filesystem error when the file cannot be read or replaced.
+    /// The expectation follows the disk: it is advanced whenever the replacement landed, including
+    /// when only the durability of its directory entry is uncertain.
+    pub fn write_owned(&mut self, path: &Utf8Path, contents: &[u8]) -> Result<()> {
+        self.project.validate_live()?;
+        let root = self.project.path().to_owned();
+        let drift = |changed: &Utf8Path| {
+            CoreError::LockConflict(format!(
+                "{} changed independently while cooldown was mutating the project; left {} \
+                 untouched",
+                root.join(changed),
+                root.join(path)
+            ))
+        };
+        for expected in &self.files {
+            if !ProjectMutationFile::capture(&root, &expected.path)?.matches(expected) {
+                return Err(drift(&expected.path));
+            }
+        }
+        let Some(entry) = self.files.iter_mut().find(|file| file.path == path) else {
+            return Err(CoreError::LockConflict(format!(
+                "{} is not in the mutation write set; left it untouched",
+                root.join(path)
+            )));
+        };
+        validate_mutation_ancestors(&root, path)?;
+        let live = ProjectMutationFile::capture(&root, path)?;
+        if !live.matches(entry) {
+            return Err(drift(path));
+        }
+        if live.contents.as_deref() == Some(contents) {
+            return Ok(());
+        }
+        let target = root.join(path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let written = crate::fs::atomic_write_durable_with_permissions_checked(
+            target.as_std_path(),
+            contents,
+            live.permissions.as_ref(),
+            || {
+                let current = ProjectMutationFile::capture(&root, path)?;
+                if current.matches(&live) {
+                    Ok(())
+                } else {
+                    Err(drift(path))
+                }
+            },
+        );
+        if !matches!(written, Err(crate::fs::DurableWriteError::NotCommitted(_))) {
+            let permissions = match live.permissions {
+                Some(permissions) => permissions,
+                None => std::fs::metadata(&target)?.permissions(),
+            };
+            entry.contents = Some(contents.to_vec());
+            entry.permissions = Some(permissions);
+        }
+        written.map_err(|error| error.into_core_error(target.as_std_path()))
     }
 
     /// Projects this observed state onto a journal's ordered write set.
@@ -884,6 +1009,34 @@ impl ProjectMutationJournal {
         Ok(())
     }
 
+    /// Puts the write-set file at `path` back to the preimage this journal captured, when a step
+    /// cooldown ran since changed it, leaving every other file as it is.
+    ///
+    /// The file is compared with the disk again just before the replacement, so a change made
+    /// meanwhile stops the restore.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockConflict`] when `path` is not in the write set, the project
+    /// changed identity, or the file changed again during the restore, and a filesystem error
+    /// when it cannot be read or replaced.
+    pub fn restore_file(&self, path: &Utf8Path) -> Result<()> {
+        self.project.validate_live()?;
+        self.validate_shared()?;
+        let root = self.project.path();
+        let Some(preimage) = self.files.iter().find(|file| file.path == path) else {
+            return Err(CoreError::LockConflict(format!(
+                "{} is not in the mutation write set",
+                root.join(path)
+            )));
+        };
+        let live = Self::capture_file(root, path)?;
+        if live.matches(preimage) {
+            return Ok(());
+        }
+        preimage.restore_if_unchanged(root, &live)
+    }
+
     /// Restores every captured file entry in this journal's project.
     ///
     /// Entries whose captured contents are `None` are removed if they now exist.
@@ -1523,6 +1676,213 @@ mod mutation_journal_tests {
 
         assert_eq!(shared.recorded("adapter/members"), Some(r#"["a"]"#));
         assert_eq!(shared.recorded("adapter/other"), None);
+        Ok(())
+    }
+
+    /// An owned write advances the expectation by exactly the bytes it wrote, so the rollback
+    /// takes the write back, while an unrelated edit to another write-set file stays the user's.
+    #[test]
+    fn an_owned_write_is_rolled_back_as_cooldowns_own() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = root(&directory)?;
+        let native = Utf8Path::new("pnpm-workspace.yaml");
+        let lock = Utf8Path::new("pnpm-lock.yaml");
+        std::fs::write(root.join(native), "minimumReleaseAge: 10\n")?;
+        std::fs::write(root.join(lock), "lock\n")?;
+        let journal = ProjectMutationJournal::capture(&root, [native, lock])?;
+        let mut expected = journal.capture_state()?;
+
+        let granted = "minimumReleaseAge: 10\nminimumReleaseAgeExclude:\n  - \"a@1.0.0\"\n";
+        expected.write_owned(native, granted.as_bytes())?;
+        assert_eq!(std::fs::read_to_string(root.join(native))?, granted);
+
+        // The rollback removes the grant because the expectation names it.
+        journal.restore_if_unchanged(&expected)?;
+        assert_eq!(
+            std::fs::read_to_string(root.join(native))?,
+            "minimumReleaseAge: 10\n"
+        );
+
+        // An edit the expectation does not name refuses the rollback instead of being claimed.
+        let mut expected = journal.capture_state()?;
+        expected.write_owned(native, granted.as_bytes())?;
+        std::fs::write(root.join(lock), "edited by the user\n")?;
+        std::assert_matches!(
+            journal.restore_if_unchanged(&expected),
+            Err(CoreError::LockConflict(_))
+        );
+        assert_eq!(std::fs::read_to_string(root.join(native))?, granted);
+
+        // The same edit made before the write refuses the write, which never touches the file.
+        std::fs::write(root.join(native), "minimumReleaseAge: 10\n")?;
+        std::fs::write(root.join(lock), "lock\n")?;
+        let mut expected = journal.capture_state()?;
+        std::fs::write(root.join(lock), "edited by the user\n")?;
+        std::assert_matches!(
+            expected.write_owned(native, granted.as_bytes()),
+            Err(CoreError::LockConflict(_))
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(native))?,
+            "minimumReleaseAge: 10\n"
+        );
+        Ok(())
+    }
+
+    /// An owned write refuses a file that changed since the expectation was taken, and a path
+    /// outside the write set, leaving both the disk and the expectation as they were.
+    #[test]
+    fn an_owned_write_refuses_drift_and_foreign_paths() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = root(&directory)?;
+        let native = Utf8Path::new("pnpm-workspace.yaml");
+        std::fs::write(root.join(native), "original\n")?;
+        let journal = ProjectMutationJournal::capture(&root, [native])?;
+        let mut expected = journal.capture_state()?;
+        std::fs::write(root.join(native), "external\n")?;
+
+        std::assert_matches!(
+            expected.write_owned(native, b"cooldown\n"),
+            Err(CoreError::LockConflict(_))
+        );
+        assert_eq!(std::fs::read_to_string(root.join(native))?, "external\n");
+        std::assert_matches!(
+            expected.write_owned(Utf8Path::new("package.json"), b"{}"),
+            Err(CoreError::LockConflict(_))
+        );
+
+        // The expectation still names the original bytes, so restoring over the drift is refused.
+        std::assert_matches!(
+            journal.restore_if_unchanged(&expected),
+            Err(CoreError::LockConflict(_))
+        );
+        Ok(())
+    }
+
+    /// A later journal continues a state only while its preimage of every shared path matches
+    /// the state's expectation in contents, absence, and permissions; a path only the journal
+    /// carries is not compared.
+    #[test]
+    fn a_journal_continues_a_state_only_over_unchanged_shared_files() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = root(&directory)?;
+        let lock = Utf8Path::new("pnpm-lock.yaml");
+        let native = Utf8Path::new("pnpm-workspace.yaml");
+        let manifest = Utf8Path::new("package.json");
+        std::fs::write(root.join(lock), "lock\n")?;
+        let expected = ProjectMutationJournal::capture(&root, [lock, native])?.capture_state()?;
+        std::fs::write(root.join(manifest), "{}\n")?;
+        let continues = |paths: &[&Utf8Path]| -> eyre::Result<Result<()>> {
+            let journal = ProjectMutationJournal::capture(&root, paths.iter().copied())?;
+            Ok(expected.ensure_continued_by(&journal))
+        };
+
+        assert!(continues(&[lock, native, manifest])?.is_ok());
+
+        std::fs::write(root.join(native), "packages: []\n")?;
+        std::assert_matches!(continues(&[native])?, Err(CoreError::LockConflict(_)));
+        std::fs::remove_file(root.join(native))?;
+
+        std::fs::write(root.join(lock), "edited\n")?;
+        std::assert_matches!(continues(&[lock])?, Err(CoreError::LockConflict(_)));
+        std::fs::write(root.join(lock), "lock\n")?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let original = std::fs::metadata(root.join(lock))?.permissions();
+            let changed = if original.mode() & 0o777 == 0o600 {
+                0o640
+            } else {
+                0o600
+            };
+            std::fs::set_permissions(root.join(lock), std::fs::Permissions::from_mode(changed))?;
+            std::assert_matches!(continues(&[lock])?, Err(CoreError::LockConflict(_)));
+            std::fs::set_permissions(root.join(lock), original)?;
+        }
+        assert!(continues(&[lock, native])?.is_ok());
+        Ok(())
+    }
+
+    /// Adopting one file's live bytes leaves every other expectation as it was, so a restore takes
+    /// the adopted file back and still refuses a change made to another.
+    #[test]
+    fn adopting_one_file_keeps_the_others_expectations() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = root(&directory)?;
+        let lock = Utf8Path::new("pnpm-lock.yaml");
+        let manifest = Utf8Path::new("package.json");
+        std::fs::write(root.join(lock), "lock\n")?;
+        std::fs::write(root.join(manifest), "{}\n")?;
+        let journal = ProjectMutationJournal::capture(&root, [lock, manifest])?;
+        let mut expected = journal.capture_state()?;
+
+        std::fs::write(root.join(lock), "rewritten\n")?;
+        expected.adopt_live(lock)?;
+        journal.restore_if_unchanged(&expected)?;
+        assert_eq!(std::fs::read_to_string(root.join(lock))?, "lock\n");
+
+        std::fs::write(root.join(lock), "rewritten\n")?;
+        std::fs::write(root.join(manifest), "{\"edited\": true}\n")?;
+        let mut expected = journal.capture_state()?;
+        std::fs::write(root.join(manifest), "{\"edited\": \"again\"}\n")?;
+        expected.adopt_live(lock)?;
+        std::assert_matches!(
+            journal.restore_if_unchanged(&expected),
+            Err(CoreError::LockConflict(_))
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(manifest))?,
+            "{\"edited\": \"again\"}\n"
+        );
+        std::assert_matches!(
+            expected.adopt_live(Utf8Path::new("other.yaml")),
+            Err(CoreError::LockConflict(_))
+        );
+        Ok(())
+    }
+
+    /// Restoring one file brings back its preimage and leaves the others as they are, and a file
+    /// still holding its preimage is not written at all.
+    #[test]
+    fn restoring_one_file_leaves_the_others() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = root(&directory)?;
+        let lock = Utf8Path::new("pnpm-lock.yaml");
+        let manifest = Utf8Path::new("package.json");
+        std::fs::write(root.join(lock), "# kept\nlock\n")?;
+        std::fs::write(root.join(manifest), "{}\n")?;
+        let journal = ProjectMutationJournal::capture(&root, [lock, manifest])?;
+
+        std::fs::write(root.join(lock), "lock\n")?;
+        std::fs::write(root.join(manifest), "{\"edited\": true}\n")?;
+        journal.restore_file(lock)?;
+        assert_eq!(std::fs::read_to_string(root.join(lock))?, "# kept\nlock\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join(manifest))?,
+            "{\"edited\": true}\n"
+        );
+        journal.restore_file(lock)?;
+        std::assert_matches!(
+            journal.restore_file(Utf8Path::new("other.yaml")),
+            Err(CoreError::LockConflict(_))
+        );
+        Ok(())
+    }
+
+    /// An owned write creates a file the write set records as absent, and the rollback removes it.
+    #[test]
+    fn an_owned_write_creates_and_rolls_back_an_absent_file() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = root(&directory)?;
+        let native = Utf8Path::new("pnpm-workspace.yaml");
+        let journal = ProjectMutationJournal::capture(&root, [native])?;
+        let mut expected = journal.capture_state()?;
+
+        expected.write_owned(native, b"minimumReleaseAge: 10\n")?;
+        assert!(root.join(native).exists());
+        journal.restore_if_unchanged(&expected)?;
+        assert!(!root.join(native).exists());
         Ok(())
     }
 

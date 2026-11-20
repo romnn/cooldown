@@ -115,7 +115,9 @@ struct CheckRunner<'a> {
     opts: &'a RunOpts,
     scope: DepScope,
     acc: CheckAccum,
-    admission_window: Option<cooldown_core::WindowSpec>,
+    /// Whether this run collects the exact versions cooldown admits, as `sync` does: every one,
+    /// with its age, since the adapter decides which of them its native gate needs.
+    collect_admissions: bool,
 }
 
 /// `check --transitive hide` skips evaluating transitive deps; every other mode (including
@@ -128,20 +130,21 @@ fn check_scope(opts: &RunOpts) -> DepScope {
     }
 }
 
-/// The native window exact admissions are selected against: `window` in whole minutes, rounded
-/// up as pnpm and Yarn write it, or `None` when `window` is no positive rolling age.
-fn native_admission_window(
-    window: &cooldown_core::WindowSpec,
-) -> Option<cooldown_core::WindowSpec> {
-    let cooldown_core::WindowSpec::MinAge(duration) = window else {
-        return None;
-    };
-    let seconds = duration.as_secs() + i64::from(duration.subsec_nanos() > 0);
-    let seconds = u64::try_from(seconds).ok().filter(|seconds| *seconds > 0)?;
-    let rounded = i64::try_from(seconds.div_ceil(60).checked_mul(60)?).ok()?;
-    Some(cooldown_core::WindowSpec::MinAge(
-        jiff::SignedDuration::from_secs(rounded),
-    ))
+/// Whether cooldown admits a locked version exactly, so a native exemption list may exempt that
+/// version: its verdict passes or exempts it, or a baseline entry acknowledges it (`acknowledged`),
+/// its publish time is known, and it is a registry release.
+///
+/// `sync` and the upgrade gate both decide native exemptions through this one predicate, so a
+/// version an upgrade records natively is one the next `sync` keeps.
+/// A pseudo-version is exempt as well, but it is never an exact registry admission.
+pub(crate) fn admits_exactly(
+    verdict: &cooldown_core::PinVerdict,
+    locked: &cooldown_core::Release,
+    acknowledged: bool,
+) -> bool {
+    (matches!(verdict.status, Status::UpToDate | Status::Exempt) || acknowledged)
+        && verdict.published_at.is_some()
+        && locked.quality != cooldown_core::ReleaseQuality::Pseudo
 }
 
 impl Workspace {
@@ -172,6 +175,8 @@ impl Workspace {
 
     /// Evaluate native exact-version admissions while the caller holds the sync lease.
     ///
+    /// Every admitted locked version is returned with its age, mature ones included: the adapter
+    /// knows which window its native gate applies, so it decides which need an entry.
     /// Reuses the check gate without refreshing the lock or acquiring another lease, which would
     /// deadlock against the caller's exclusive access.
     /// A frozen resolver probe would reject the very pins whose exact native admissions are missing,
@@ -180,7 +185,6 @@ impl Workspace {
         &self,
         pctx: &super::ProjectCtx,
         opts: &RunOpts,
-        window: &cooldown_core::WindowSpec,
         warnings: &mut Vec<Diagnostic>,
     ) -> Result<Vec<cooldown_core::AdmittedVersion>, Box<Diagnostic>> {
         let progress = opts.progress.project(pctx.tool, pctx.rel_path.as_str());
@@ -193,11 +197,8 @@ impl Workspace {
         let mut runner = CheckRunner::new(self, opts);
         // Native policy serves every locked registry version even when the command hides transitives.
         runner.scope = DepScope::Graph;
-        // pnpm and Yarn represent their native rolling age in whole minutes, rounded up.
-        // Select against that persisted window so a release the native gate still holds gets its
-        // entry, and subminute precision cannot add needless ones.
-        runner.admission_window = native_admission_window(window);
-        if let Some(deps) = runner.read_dependencies(pctx, &read).await {
+        runner.collect_admissions = true;
+        if let Some(deps) = runner.read_whole_lock(pctx, &read).await {
             runner.evaluate_dependencies(pctx, &read, deps).await;
         }
         // A fail-open advisory read cannot safely revoke a permission that relied on that feed.
@@ -236,7 +237,7 @@ impl<'a> CheckRunner<'a> {
             opts,
             scope: check_scope(opts),
             acc: CheckAccum::default(),
-            admission_window: None,
+            collect_admissions: false,
         }
     }
 
@@ -319,6 +320,34 @@ impl<'a> CheckRunner<'a> {
                     diag_from_error(&err, pctx.tool, &read.project_label, None)
                         .with_path(pctx.manifest_report_path()),
                 );
+                None
+            }
+        }
+    }
+
+    /// Every locked dependency of the project, whatever `--package` and the member scope select.
+    ///
+    /// The native exemption list `sync` rebuilds is project-wide and the native gate verifies every
+    /// locked entry, so a selection that judged fewer pins would revoke the exemptions of the pins
+    /// it left out.
+    async fn read_whole_lock(
+        &mut self,
+        pctx: &super::ProjectCtx,
+        read: &ReadProjectCtx<'_>,
+    ) -> Option<Vec<Dependency>> {
+        match read
+            .adapter
+            .dependencies(&pctx.project, DepScope::Graph)
+            .await
+        {
+            Ok(deps) => Some(deps),
+            Err(error) => {
+                self.acc.errors.push(diag_from_error(
+                    &error,
+                    pctx.tool,
+                    &read.project_label,
+                    None,
+                ));
                 None
             }
         }
@@ -572,12 +601,10 @@ impl<'a> CheckRunner<'a> {
         let allowed_transitive = self.opts.transitive_mode == TransitiveGate::Allow && !dep.direct;
         // An `allow`-exempt pin needs its own exact admission too, because `sync` writes its
         // selector package-wide only when cooldown exempts every release the selector matches.
-        // A pseudo-version is exempt as well, but it is never an exact registry admission.
-        let admitted = matches!(pv.status, Status::UpToDate | Status::Exempt) || baseline_acked;
         self.record_native_admission(
             dep,
             pv.published_at,
-            admitted && locked.quality != cooldown_core::ReleaseQuality::Pseudo,
+            admits_exactly(&pv, &locked, baseline_acked),
         );
         if pv.status == Status::Exempt {
             self.acc.exempt += 1;
@@ -629,15 +656,15 @@ impl<'a> CheckRunner<'a> {
         admitted: bool,
     ) {
         if admitted
-            && let Some(window) = &self.admission_window
+            && self.collect_admissions
             && let Some(published_at) = published_at
-            && published_at > window.base_cutoff(self.ws.now())
         {
             self.acc
                 .admitted_versions
                 .push(cooldown_core::AdmittedVersion {
                     name: dep.package.name.clone(),
                     version: dep.current.clone(),
+                    age: self.ws.now().duration_since(published_at),
                 });
         }
     }
@@ -774,27 +801,89 @@ fn error_item(dep: &Dependency, project: &str, tool: &str, diag: Diagnostic) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{CheckAccum, error_item, finalize_check, native_admission_window};
+    use super::{CheckAccum, admits_exactly, error_item, finalize_check};
     use crate::app::{RunOpts, RunScope};
     use camino::Utf8Path;
     use cooldown_core::{
         Dependency, Diagnostic, DiagnosticKind, PackageId, ReleaseQuality, ToolId, Version,
     };
 
-    /// Admissions are selected against the gate pnpm and Yarn hold, whole minutes rounded up, so
-    /// a release in the last partial minute of the window still gets its entry.
+    /// A verdict of `status` over a release published at a known instant when `published`.
+    fn verdict(status: cooldown_core::Status, published: bool) -> cooldown_core::PinVerdict {
+        cooldown_core::PinVerdict {
+            status,
+            window: cooldown_core::ResolvedWindow {
+                spec: cooldown_core::WindowSpec::MinAge(jiff::SignedDuration::from_hours(24 * 14)),
+                decided_by: cooldown_core::Origin::Default,
+                decided_selector: cooldown_core::Selector::Default,
+                floor: None,
+                floor_origin: None,
+                exempt: false,
+                exempt_origin: None,
+                shortened_by: None,
+                advisory_floor: None,
+                advisory_floor_origin: None,
+            },
+            graph_held: false,
+            graph_floor: None,
+            published_at: published.then_some(jiff::Timestamp::UNIX_EPOCH),
+            security: None,
+        }
+    }
+
+    fn release(quality: ReleaseQuality) -> cooldown_core::Release {
+        cooldown_core::Release {
+            version: Version::new("1.0.0"),
+            order: cooldown_core::ReleaseOrder(Vec::new()),
+            major: cooldown_core::MajorKey("1".to_string()),
+            major_number: Some(1),
+            kind_from_current: None,
+            beyond_declared_bound: false,
+            beyond_latest_tag: false,
+            published_at: None,
+            yanked: false,
+            quality,
+        }
+    }
+
+    /// A version is admitted exactly when its verdict passes, exempts it, or a baseline entry
+    /// acknowledges it, and only with a known publish time on a registry release: a pin still in
+    /// cooldown, one of unknown age, and a pseudo-version earn no native exemption.
     #[test]
-    fn the_admission_window_rounds_up_to_whole_minutes() {
-        let seconds =
-            |count| cooldown_core::WindowSpec::MinAge(jiff::SignedDuration::from_secs(count));
-        assert_eq!(native_admission_window(&seconds(90)), Some(seconds(120)));
-        assert_eq!(native_admission_window(&seconds(30)), Some(seconds(60)));
-        assert_eq!(native_admission_window(&seconds(600)), Some(seconds(600)));
-        assert_eq!(native_admission_window(&seconds(0)), None);
-        assert_eq!(
-            native_admission_window(&cooldown_core::WindowSpec::Latest),
-            None
-        );
+    fn exact_admission_needs_a_passing_verdict_a_known_age_and_a_registry_release() {
+        use cooldown_core::Status;
+        let stable = release(ReleaseQuality::Stable);
+        assert!(admits_exactly(
+            &verdict(Status::UpToDate, true),
+            &stable,
+            false
+        ));
+        assert!(admits_exactly(
+            &verdict(Status::Exempt, true),
+            &stable,
+            false
+        ));
+        assert!(admits_exactly(
+            &verdict(Status::CurrentInCooldown, true),
+            &stable,
+            true
+        ));
+
+        assert!(!admits_exactly(
+            &verdict(Status::CurrentInCooldown, true),
+            &stable,
+            false
+        ));
+        assert!(!admits_exactly(
+            &verdict(Status::UpToDate, false),
+            &stable,
+            false
+        ));
+        assert!(!admits_exactly(
+            &verdict(Status::UpToDate, true),
+            &release(ReleaseQuality::Pseudo),
+            false
+        ));
     }
 
     fn diagnostic(message: &str) -> Diagnostic {

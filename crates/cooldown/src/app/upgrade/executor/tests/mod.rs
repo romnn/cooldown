@@ -5,7 +5,7 @@ use super::planning::{
 };
 use super::{
     AttestedHolds, BatchOutcome, CommittedBatch, PlanMode, TrialRollback, admitted_crossings,
-    candidate_scope, collapse_applied_legs, collateral_rows, combine_lock_status,
+    candidate_scope, collapse_applied_legs, collateral_rows, combine_lock_status, compact_duration,
     conflict_skip_message, conservative_hold, followed_manifest_warning, indeterminate_trial,
     insert_graph_violation, is_downgrade, landed_upgrade_changes, newly_introduced_violations,
     package_label, planned_changes_landed, preserve_rollback_entries, sort_planned_changes,
@@ -24,6 +24,19 @@ use std::collections::HashSet;
 
 mod cargo_trials;
 mod node_trials;
+
+/// A residual hold names its offender's age and window in the largest whole unit, so a window
+/// under a day still reads as more than zero.
+#[test]
+fn compact_durations_keep_their_unit_under_a_day() {
+    let duration = jiff::SignedDuration::from_secs;
+    assert_eq!(compact_duration(duration(10 * 24 * 60 * 60 + 5)), "10d");
+    assert_eq!(compact_duration(duration(5 * 60 * 60 + 59)), "5h");
+    assert_eq!(compact_duration(duration(12 * 60)), "12m");
+    assert_eq!(compact_duration(duration(30)), "30s");
+    assert_eq!(compact_duration(duration(0)), "0s");
+    assert_eq!(compact_duration(duration(-5)), "0s");
+}
 
 /// A forward move an exact manifest pin holds stays a deliberate, strict-clean choice, while a
 /// downgrade it holds leaves the cooldown violation, so a strict `fix` is incomplete.
@@ -150,6 +163,85 @@ fn trial_rollback_refuses_to_overwrite_external_drift() -> eyre::Result<()> {
         .ok_or_else(|| eyre::eyre!("independent drift unexpectedly allowed trial rollback"))?;
     std::assert_matches!(error, cooldown_core::CoreError::LockConflict(_));
     assert_eq!(std::fs::read(path)?, b"external edit");
+    Ok(())
+}
+
+/// A later batch whose journal captured a shared file edited since the forward batch is refused
+/// before it changes anything, so no trial restore can write the trial's preimage over the edit.
+#[test]
+fn trial_rollback_refuses_a_batch_that_captured_an_edit_made_between_batches() -> eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = camino::Utf8PathBuf::from_path_buf(directory.path().to_owned())
+        .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+    let lock = root.join("pnpm-lock.yaml");
+    let native = root.join("pnpm-workspace.yaml");
+    std::fs::write(&lock, b"baseline lock")?;
+    std::fs::write(&native, b"packages: []\n")?;
+    let write_set = [
+        camino::Utf8Path::new("pnpm-lock.yaml"),
+        camino::Utf8Path::new("pnpm-workspace.yaml"),
+    ];
+
+    let forward = ProjectMutationJournal::capture(&root, write_set)?;
+    let mut rollback = TrialRollback::default();
+    rollback.preserve(&forward)?;
+    std::fs::write(&lock, b"forward lock")?;
+    rollback.accept(forward.capture_state()?)?;
+
+    let edited = b"# kept by hand\npackages: []\n";
+    std::fs::write(&native, edited)?;
+    let second = ProjectMutationJournal::capture(&root, write_set)?;
+    let error = rollback
+        .preserve(&second)
+        .err()
+        .ok_or_else(|| eyre::eyre!("a batch adopted an edit made between batches"))?;
+    std::assert_matches!(error, cooldown_core::CoreError::LockConflict(_));
+    assert_eq!(std::fs::read(&native)?, edited);
+
+    // The trial cannot be restored over the edit either.
+    std::assert_matches!(
+        rollback.restore(),
+        Err(cooldown_core::CoreError::LockConflict(_))
+    );
+    assert_eq!(std::fs::read(&native)?, edited);
+    assert_eq!(std::fs::read(&lock)?, b"forward lock");
+    Ok(())
+}
+
+/// A later batch whose journal captured only what the earlier batch left continues the trial,
+/// and a file only it writes joins the trial's rollback.
+#[test]
+fn trial_rollback_continues_with_a_batch_that_captured_the_accepted_state() -> eyre::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = camino::Utf8PathBuf::from_path_buf(directory.path().to_owned())
+        .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+    let lock = root.join("pnpm-lock.yaml");
+    let manifest = root.join("package.json");
+    std::fs::write(&lock, b"baseline lock")?;
+    std::fs::write(&manifest, b"baseline manifest")?;
+
+    let forward =
+        ProjectMutationJournal::capture(&root, [camino::Utf8Path::new("pnpm-lock.yaml")])?;
+    let mut rollback = TrialRollback::default();
+    rollback.preserve(&forward)?;
+    std::fs::write(&lock, b"forward lock")?;
+    rollback.accept(forward.capture_state()?)?;
+
+    let second = ProjectMutationJournal::capture(
+        &root,
+        [
+            camino::Utf8Path::new("pnpm-lock.yaml"),
+            camino::Utf8Path::new("package.json"),
+        ],
+    )?;
+    rollback.preserve(&second)?;
+    std::fs::write(&lock, b"second lock")?;
+    std::fs::write(&manifest, b"second manifest")?;
+    rollback.accept(second.capture_state()?)?;
+    rollback.restore()?;
+
+    assert_eq!(std::fs::read(lock)?, b"baseline lock");
+    assert_eq!(std::fs::read(manifest)?, b"baseline manifest");
     Ok(())
 }
 
@@ -1096,6 +1188,7 @@ fn restore_conflict_does_not_claim_rows_from_an_earlier_committed_batch() {
         crossings_after: HashSet::new(),
         admitted_crossings: HashSet::new(),
         reconcile_needed: false,
+        native_edit: None,
     });
     let mut failed = BatchOutcome::default();
     failed.errors.push(Diagnostic::new(
@@ -1735,6 +1828,7 @@ fn landed_targets_require_committed_evidence_for_each_original_copy() {
         crossings_after: HashSet::new(),
         admitted_crossings: HashSet::new(),
         reconcile_needed: false,
+        native_edit: None,
     });
     let landed = landed_upgrade_changes(&[held, accepted], &[outcome], &graph);
     assert_eq!(landed.len(), 1);
@@ -1759,6 +1853,7 @@ fn restored_applied_rows_are_not_landed_evidence() {
         crossings_after: HashSet::new(),
         admitted_crossings: HashSet::new(),
         reconcile_needed: false,
+        native_edit: None,
     });
     assert_eq!(
         landed_upgrade_changes(

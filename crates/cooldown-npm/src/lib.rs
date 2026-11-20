@@ -8,6 +8,7 @@
 //!
 //! [`ToolId`]: cooldown_core::ToolId
 
+mod admissions;
 mod apply;
 pub mod deno;
 mod exclusions;

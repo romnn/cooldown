@@ -9,7 +9,7 @@
 //! A union member is compared by its node-semver identity ([`version_identity`]).
 
 use crate::native::ConfigStringList;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One `minimumReleaseAgeExclude` entry split the way pnpm's version-policy parser splits it.
 struct Rule<'a> {
@@ -43,6 +43,25 @@ impl<'a> Rule<'a> {
     fn is_literal(&self) -> bool {
         !self.name.contains('*') && !self.name.starts_with('!')
     }
+}
+
+/// The package name and version members of `entry` when pnpm reads it as an exact rule
+/// (`parseVersionPolicyRule`): a literal name, then a `||` union whose every member node-semver
+/// reads as a valid version ([`version_identity`]), such as `foo@1.2.3||v2.0.0`.
+///
+/// A rule without versions, a name pattern, and a union pnpm rejects, such as a range, yield
+/// `None`.
+pub(crate) fn exact_exclusion(entry: &str) -> Option<(&str, Vec<&str>)> {
+    let rule = Rule::parse(entry);
+    let versions = rule.versions?;
+    if rule.name.is_empty() || !rule.is_literal() {
+        return None;
+    }
+    let members: Vec<&str> = versions.split("||").collect();
+    members
+        .iter()
+        .all(|member| version_identity(member).is_some())
+        .then_some((rule.name, members))
 }
 
 /// Matches a package name against a pnpm name pattern.
@@ -272,21 +291,55 @@ pub(crate) fn grant_pins(pins: &[(String, String)], configured: Vec<String>) -> 
     exclusions
 }
 
-/// Drops the versions of literal exact rules that the lock no longer resolves, removing stale
+/// How the pnpm reading a `minimumReleaseAgeExclude` list decides a package among its rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MatchSemantics {
+    /// The first rule matching the package decides alone (`evaluateVersionPolicy`), as pnpm reads
+    /// the list from 10.19.0 up to 11.9.0 ([`crate::admissions::match_semantics`]).
+    FirstMatch,
+    /// Not known to be first-match, so a rule behind an earlier match for its package may still
+    /// count: releases before 10.19.0 fold every rule into one name matcher, where a later rule
+    /// re-includes a package an earlier negation excluded, and 11.9.0 on joins the versions of
+    /// every matching exact rule.
+    Unverified,
+}
+
+/// Whether some literal rule of `exclusions` is one a first-match reader never reads
+/// ([`drop_shadowed_rules`]), the only lists whose pruning depends on [`MatchSemantics`].
+pub(crate) fn has_shadowed_rule(exclusions: &[String]) -> bool {
+    drop_shadowed_rules(exclusions).len() < exclusions.len()
+}
+
+/// Drops the versions of literal exact rules that `drops` lets go, given the package name and
+/// the version's identity, such as the ones the lock no longer resolves, removing stale
 /// exemptions without widening any.
 ///
-/// Removing members from a rule that keeps at least one cannot expose a later rule, because pnpm
-/// stops at the first rule whose name matches.
-/// A rule left with none is deleted only when that changes nothing a package is exempt from: it is
-/// shadowed by an earlier rule for its package, or no later rule matches its package.
-/// The last remaining rule is never deleted either, so the setting never empties; an emptied list
-/// would only stay masking the exclusions pnpm inherits because it is written as `[]`.
+/// A first-match reader ([`MatchSemantics::FirstMatch`]) reads only the first rule matching a
+/// package, so every literal rule for a package an earlier rule already matches is removed first
+/// ([`drop_shadowed_rules`]), which changes nothing it exempts, and no rule left can then be
+/// activated by a removal before it.
+/// Under other semantics no rule is removed for being shadowed, since a later rule may still
+/// count there.
+/// Removing members from a rule that keeps at least one cannot expose a later rule either.
+/// A rule left with none is deleted unless a later rule matches its package, since deleting it
+/// could let that rule exempt every version of the package: a first-match pnpm would read the
+/// later rule instead, and one joining the matching exact rules stops at the first rule without
+/// versions only when no exact rule came before it.
+/// A pnpm before 10.19.0 reads no exact rule as matching any package, so pruning one changes
+/// nothing there.
+/// An emptied list is the caller's to write as `[]`, which keeps masking the exclusions pnpm
+/// inherits.
 /// Negated, wildcard and versionless rules, and members pnpm would reject, are kept verbatim, and
 /// surviving members keep their raw spelling.
-pub(crate) fn prune_unlocked(
+pub(crate) fn prune_exact_members(
     exclusions: &[String],
-    locked: &HashMap<String, BTreeSet<String>>,
+    semantics: MatchSemantics,
+    drops: impl Fn(&str, &str) -> bool,
 ) -> Vec<String> {
+    let exclusions = match semantics {
+        MatchSemantics::FirstMatch => drop_shadowed_rules(exclusions),
+        MatchSemantics::Unverified => exclusions.to_vec(),
+    };
     let mut kept: Vec<String> = Vec::with_capacity(exclusions.len());
     for (index, entry) in exclusions.iter().enumerate() {
         let rule = Rule::parse(entry);
@@ -294,37 +347,44 @@ pub(crate) fn prune_unlocked(
             kept.push(entry.clone());
             continue;
         };
-        let locked_identities: BTreeSet<String> = locked
-            .get(rule.name)
-            .into_iter()
-            .flatten()
-            .filter_map(|version| version_identity(version))
-            .collect();
         let members: Vec<&str> = versions.split("||").collect();
         let surviving: Vec<&str> = members
             .iter()
             .copied()
             .filter(|member| {
-                version_identity(member)
-                    .is_none_or(|identity| locked_identities.contains(&identity))
+                version_identity(member).is_none_or(|identity| !drops(rule.name, &identity))
             })
             .collect();
         if surviving.len() == members.len() {
             kept.push(entry.clone());
         } else if !surviving.is_empty() {
             kept.push(format!("{}@{}", rule.name, join(surviving.into_iter())));
-        } else {
-            let shadowed = kept
+        } else if exclusions
+            .iter()
+            .skip(index + 1)
+            .any(|later| name_matches(Rule::parse(later).name, rule.name))
+        {
+            kept.push(entry.clone());
+        }
+    }
+    kept
+}
+
+/// Removes every literal rule pnpm never reads: one whose package an earlier rule already
+/// matches, whether by its exact name, a name pattern or a negation, since pnpm decides each
+/// package by the first rule matching it (`evaluateVersionPolicy`).
+///
+/// A name pattern or negation matches packages no single earlier rule accounts for, so it is
+/// kept.
+fn drop_shadowed_rules(exclusions: &[String]) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::with_capacity(exclusions.len());
+    for entry in exclusions {
+        let rule = Rule::parse(entry);
+        let shadowed = rule.is_literal()
+            && kept
                 .iter()
                 .any(|earlier| name_matches(Rule::parse(earlier).name, rule.name));
-            let exposes_later = exclusions
-                .iter()
-                .skip(index + 1)
-                .any(|later| name_matches(Rule::parse(later).name, rule.name));
-            let last = kept.is_empty() && index + 1 == exclusions.len();
-            if (shadowed || !exposes_later) && !last {
-                continue;
-            }
+        if !shadowed {
             kept.push(entry.clone());
         }
     }
@@ -353,7 +413,7 @@ pub(crate) fn drop_versionless_rules(rules: &[String], keep: &[String]) -> Vec<S
 pub(crate) enum Persisted {
     /// The setting stays as written.
     Unchanged,
-    /// The setting becomes these rules, which are never empty.
+    /// The setting becomes these rules, written as `[]` when there are none.
     Rules(Vec<String>),
     /// The setting is a scalar and versions must be granted.
     /// pnpm may expand `${VAR}` in a scalar before reading it one pattern per character, which no
@@ -361,18 +421,22 @@ pub(crate) enum Persisted {
     ScalarSetting,
 }
 
-/// Grants the `granted` versions in the native rules, then prunes unlocked versions
-/// ([`set_exact_permission`], [`prune_unlocked`]), keeping the rules in pnpm's order.
+/// Grants the `granted` versions in the native rules, then prunes the version members `drops`
+/// lets go ([`set_exact_permission`], [`prune_exact_members`]), keeping the rules in pnpm's order.
 ///
-/// Granting comes first, so a version admitted now is never pruned as unlocked.
-/// An empty result leaves the setting as written, so an explicit empty list keeps masking the
-/// exclusions pnpm inherits; pruning never empties a non-empty list.
+/// Granting comes first, so a version admitted now is never pruned.
+/// An empty list with nothing to grant stays as written; a list pruning empties becomes `[]`, and
+/// either keeps masking the exclusions pnpm inherits.
 pub(crate) fn persisted_rules(
     native: ConfigStringList,
     granted: &BTreeMap<String, BTreeSet<String>>,
-    locked: &HashMap<String, BTreeSet<String>>,
+    semantics: MatchSemantics,
+    drops: impl Fn(&str, &str) -> bool,
 ) -> Persisted {
     let mut rules = match native {
+        ConfigStringList::Many(rules) if rules.is_empty() && granted.is_empty() => {
+            return Persisted::Unchanged;
+        }
         ConfigStringList::Many(rules) => rules,
         ConfigStringList::One(_) if granted.is_empty() => return Persisted::Unchanged,
         ConfigStringList::One(_) => return Persisted::ScalarSetting,
@@ -380,16 +444,10 @@ pub(crate) fn persisted_rules(
     for (name, versions) in granted {
         set_exact_permission(&mut rules, name, &BTreeSet::new(), versions);
     }
-    let rules = prune_unlocked(&rules, locked);
-    if rules.is_empty() {
-        Persisted::Unchanged
-    } else {
-        Persisted::Rules(rules)
-    }
+    Persisted::Rules(prune_exact_members(&rules, semantics, drops))
 }
 
 /// Whether `version` of `name` is exempt under `exclusions`, evaluated the way pnpm does.
-#[cfg(test)]
 pub(crate) fn exempts(exclusions: &[String], name: &str, version: &str) -> bool {
     let Some(rule) = exclusions
         .iter()
@@ -408,6 +466,7 @@ pub(crate) fn exempts(exclusions: &[String], name: &str, version: &str) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn strings(entries: &[&str]) -> Vec<String> {
         entries.iter().map(ToString::to_string).collect()
@@ -558,17 +617,16 @@ mod tests {
             (&["foo@1.0.0||2.0.0", "*"], &["foo@2.0.0", "*"]),
             // Deleting the emptied rule would let the wildcard exempt every `foo`.
             (&["foo@1.0.0", "*"], &["foo@1.0.0", "*"]),
-            // Deleting the first rule would activate the shadowed second one.
-            (&["foo@1.0.0", "foo@3.0.0"], &["foo@1.0.0"]),
+            // pnpm never reads the shadowed second rule, so it goes before the stale first one,
+            // which deleting then cannot activate.
+            (&["foo@1.0.0", "foo@3.0.0"], &[]),
             // An emptied rule nothing follows for its package is deleted.
             (&["foo@1.0.0", "bar@1.0.0"], &["bar@1.0.0"]),
-            // Deleting the last rule would remove the setting and expose inherited exclusions.
-            (&["foo@1.0.0"], &["foo@1.0.0"]),
-            // A negated rule names no single package and is never pruned.
-            (
-                &["!other@1.0.0", "bar@1.0.0"],
-                &["!other@1.0.0", "bar@1.0.0"],
-            ),
+            // So is the last one, the emptied list being written as `[]`.
+            (&["foo@1.0.0"], &[]),
+            // A negated rule names no single package and is never pruned, while it shadows the
+            // rule for every other package after it.
+            (&["!other@1.0.0", "bar@1.0.0"], &["!other@1.0.0"]),
             // A member pnpm would reject is not this function's to remove.
             (
                 &["foo@not-a-version||1.0.0", "bar@1.0.0"],
@@ -576,7 +634,11 @@ mod tests {
             ),
         ];
         for (configured, expected) in cases {
-            let pruned = prune_unlocked(&strings(configured), &locked);
+            let pruned = prune_exact_members(
+                &strings(configured),
+                MatchSemantics::FirstMatch,
+                unlocked(&locked),
+            );
             assert_eq!(pruned, strings(expected), "{configured:?}");
             for (name, version) in [
                 ("foo", "2.0.0"),
@@ -663,8 +725,112 @@ mod tests {
 
             let locked: HashMap<String, BTreeSet<String>> =
                 [("bar".to_string(), versions(&["1.0.0"]))].into();
-            let pruned = prune_unlocked(&[configured.clone(), "bar@1.0.0".to_string()], &locked);
+            let pruned = prune_exact_members(
+                &[configured.clone(), "bar@1.0.0".to_string()],
+                MatchSemantics::FirstMatch,
+                unlocked(&locked),
+            );
             assert_eq!(pruned[0], invalid);
+        }
+    }
+
+    /// An exact rule is one pnpm reads as such: a literal name and a union of versions node-semver
+    /// reads as valid, a `v` prefix, padding and build metadata included, while `=` and ranges
+    /// are not versions to it.
+    #[test]
+    fn exact_exclusion_claims_the_unions_pnpm_reads_as_exact() {
+        assert_eq!(
+            exact_exclusion("@scope/a@1.2.2||2.0.1"),
+            Some(("@scope/a", vec!["1.2.2", "2.0.1"]))
+        );
+        assert_eq!(exact_exclusion("foo@v1.2.3"), Some(("foo", vec!["v1.2.3"])));
+        assert_eq!(
+            exact_exclusion("foo@ 1.2.3 ||1.2.4+build"),
+            Some(("foo", vec![" 1.2.3 ", "1.2.4+build"]))
+        );
+        for entry in [
+            "a",
+            "@scope/*",
+            "a@^1.2.2",
+            "a@1.2.2||*",
+            "a@=1.2.2",
+            "a@",
+            "@1.2.2",
+            "f*@1.0.0",
+            "!a@1.0.0",
+        ] {
+            assert_eq!(exact_exclusion(entry), None, "{entry}");
+        }
+    }
+
+    /// A rule for a package an earlier rule already matches, by name, pattern or negation, is one
+    /// pnpm never reads, so it goes before anything is pruned, and nothing pnpm exempts changes.
+    #[test]
+    fn shadowed_rules_go_first() {
+        let locked: HashMap<String, BTreeSet<String>> =
+            [("foo".to_string(), versions(&["2.0.0"]))].into();
+        let cases: [(&[&str], &[&str]); 4] = [
+            (&["foo@1.0.0", "foo@2.0.0"], &[]),
+            (&["f*", "foo@2.0.0"], &["f*"]),
+            (&["foo", "foo@2.0.0"], &["foo"]),
+            // A later pattern is kept, and keeps the emptied rule it would otherwise expose.
+            (&["foo@1.0.0", "f*"], &["foo@1.0.0", "f*"]),
+        ];
+        for (configured, expected) in cases {
+            let configured = strings(configured);
+            let pruned =
+                prune_exact_members(&configured, MatchSemantics::FirstMatch, unlocked(&locked));
+            assert_eq!(pruned, strings(expected), "{configured:?}");
+            for version in ["1.0.0", "2.0.0", "3.0.0"] {
+                assert!(
+                    !exempts(&pruned, "foo", version) || exempts(&configured, "foo", version),
+                    "pruning {configured:?} widened foo@{version}"
+                );
+            }
+        }
+    }
+
+    /// Only a first-match reader never reads a rule behind an earlier match for its package: an
+    /// earlier pnpm lets `@team/safe-legacy` re-include the package `!*-legacy` excluded, so
+    /// without first-match semantics the rule stays, and pruning still never touches a
+    /// versionless rule.
+    #[test]
+    fn shadowed_rules_go_only_under_first_match() {
+        let rules = strings(&["@team/*", "!*-legacy", "@team/safe-legacy"]);
+        let nothing_locked = HashMap::new();
+        assert!(has_shadowed_rule(&rules));
+        assert_eq!(
+            prune_exact_members(
+                &rules,
+                MatchSemantics::FirstMatch,
+                unlocked(&nothing_locked)
+            ),
+            strings(&["@team/*", "!*-legacy"])
+        );
+        assert_eq!(
+            prune_exact_members(
+                &rules,
+                MatchSemantics::Unverified,
+                unlocked(&nothing_locked)
+            ),
+            rules
+        );
+        // A stale exact member still goes, and an emptied rule a later one matches stays.
+        let stale = strings(&["foo@1.0.0||2.0.0", "bar@1.0.0", "b*"]);
+        let locked: HashMap<String, BTreeSet<String>> =
+            [("foo".to_string(), versions(&["2.0.0"]))].into();
+        assert_eq!(
+            prune_exact_members(&stale, MatchSemantics::Unverified, unlocked(&locked)),
+            strings(&["foo@2.0.0", "bar@1.0.0", "b*"])
+        );
+    }
+
+    /// Lets go of every version member the lock no longer holds.
+    fn unlocked(locked: &HashMap<String, BTreeSet<String>>) -> impl Fn(&str, &str) -> bool + '_ {
+        |name, identity| {
+            !locked
+                .get(name)
+                .is_some_and(|versions| versions.contains(identity))
         }
     }
 
@@ -677,21 +843,41 @@ mod tests {
         let nothing = BTreeMap::new();
         // An explicit empty list masks inherited exclusions and stays as written.
         assert_eq!(
-            persisted_rules(ConfigStringList::Many(Vec::new()), &nothing, &locked),
+            persisted_rules(
+                ConfigStringList::Many(Vec::new()),
+                &nothing,
+                MatchSemantics::FirstMatch,
+                unlocked(&locked)
+            ),
             Persisted::Unchanged
         );
         assert_eq!(
-            persisted_rules(ConfigStringList::Many(Vec::new()), &granted, &locked),
+            persisted_rules(
+                ConfigStringList::Many(Vec::new()),
+                &granted,
+                MatchSemantics::FirstMatch,
+                unlocked(&locked)
+            ),
             Persisted::Rules(strings(&["foo@2.0.0"]))
         );
         // A scalar is left alone unless something must be granted, which it cannot record.
         for scalar in ["", "${COOLDOWN_EXCLUDES}"] {
             assert_eq!(
-                persisted_rules(ConfigStringList::One(scalar.to_string()), &nothing, &locked),
+                persisted_rules(
+                    ConfigStringList::One(scalar.to_string()),
+                    &nothing,
+                    MatchSemantics::FirstMatch,
+                    unlocked(&locked)
+                ),
                 Persisted::Unchanged
             );
             assert_eq!(
-                persisted_rules(ConfigStringList::One(scalar.to_string()), &granted, &locked),
+                persisted_rules(
+                    ConfigStringList::One(scalar.to_string()),
+                    &granted,
+                    MatchSemantics::FirstMatch,
+                    unlocked(&locked)
+                ),
                 Persisted::ScalarSetting
             );
         }
@@ -700,7 +886,8 @@ mod tests {
             persisted_rules(
                 ConfigStringList::Many(strings(&["foo@1.0.0", "*"])),
                 &granted,
-                &locked
+                MatchSemantics::FirstMatch,
+                unlocked(&locked)
             ),
             Persisted::Rules(strings(&["foo@2.0.0", "*"]))
         );

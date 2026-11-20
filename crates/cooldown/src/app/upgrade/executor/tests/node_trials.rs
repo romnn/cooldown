@@ -3,7 +3,9 @@
 //! replay the lower-line fallback uses.
 
 use crate::app::upgrade::PreviewEvidence;
-use crate::app::{AdapterSet, Baseline, Exit, ProjectCtx, ProjectProgress, RunOpts, Workspace};
+use crate::app::{
+    AdapterSet, Baseline, Exit, ProjectCtx, ProjectProgress, RunOpts, TransitiveGate, Workspace,
+};
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use color_eyre::eyre;
@@ -11,11 +13,12 @@ use cooldown_core::config::builtin_default_layer;
 use cooldown_core::{
     AdvisoryFetch, AdvisoryPolicy, AdvisorySource, AdvisorySourceId, ApplyReport, CandidateScope,
     Capabilities, Change, CoreError, DepScope, Dependency, FetchContext, GeneratedMembers,
-    GraphHoldEdge, GraphHoldKind, LockStatus, LockVerifyReport, MajorKey, MemberRef,
-    NativePolicyLayer, PackageAdvisories, PackageId, Plan, PolicyLayer, PolicyStack,
-    PreparedMutation, Project, ProjectMarker, ProjectMutationJournal, RawAdvisory, Release,
-    ReleaseFetcher, ReleaseOrder, ReleaseQuality, SkipReason, Skipped, TargetFallback, ToolId,
-    ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    GraphHoldEdge, GraphHoldKind, JudgedPin, LockStatus, LockVerifyReport, LockedVersion, MajorKey,
+    MemberRef, NativeAdmissionQuery, NativeAssessment, NativeEdit, NativeGateQuery,
+    NativeGateRefusal, NativePolicyLayer, PackageAdvisories, PackageId, Plan, PolicyLayer,
+    PolicyStack, PreparedMutation, Project, ProjectMarker, ProjectMutationJournal, RawAdvisory,
+    Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs, SkipReason, Skipped,
+    TargetFallback, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -167,6 +170,47 @@ struct Script {
     straggler: Option<Straggler>,
 }
 
+/// A native exemption list the fake keeps beside its lock, the way pnpm keeps
+/// `minimumReleaseAgeExclude` in pnpm-workspace.yaml.
+#[derive(Default)]
+struct NativeList {
+    /// The admitted packages whose locked version an assessment grants.
+    grant: &'static [&'static str],
+    /// The packages whose origin an assessment cannot prove, so it grants their admitted versions
+    /// nothing, while a version the native gate refused in the starting lock needs no such proof.
+    unproven: &'static [&'static str],
+    /// Whether the assessed edit names a file the journal does not hold, so writing it fails.
+    write_fails: bool,
+    /// The `name@version` the native backstop refuses while the lock holds it and the list does
+    /// not exempt it, if any.
+    backstop_refuses: Option<&'static str>,
+    /// Whether the native backstop and the final lock check refuse even a version the list
+    /// exempts, as pnpm does when a setting above the file overrides the list.
+    backstop_ignores_list: bool,
+    /// Whether the verification of the starting lock fails, as one whose refusals pnpm cannot
+    /// all name does.
+    starting_probe_fails: bool,
+    /// Whether the verification of the starting lock rewrites it with the same entries spelled
+    /// otherwise, as pnpm's frozen lockfile-only run can.
+    starting_probe_reformats_lock: bool,
+    /// The `name@version` the final lock check requires the list to exempt, as a bare pnpm
+    /// refuses a lock holding that young version otherwise, and every time under
+    /// [`backstop_ignores_list`](Self::backstop_ignores_list).
+    finalize_requires: Option<&'static str>,
+    /// Whether the native backstop rewrites the lock with the same entries spelled otherwise
+    /// before its verdict, as a pnpmfile hook can during a verification.
+    backstop_reformats_lock: bool,
+    /// Whether the manifest is edited while the native backstop runs, as someone else's edit
+    /// would be, which no verification writes.
+    backstop_edits_manifest: bool,
+}
+
+/// The manifest someone else writes while the native backstop runs.
+const EDITED_MANIFEST: &str = r#"{"name":"app","edited":true}"#;
+
+/// The fake's native exemption list file.
+const NATIVE: &str = "native.yaml";
+
 struct FakeNode {
     fallback: TargetFallback,
     /// Whether the fake can pin an undeclared package, so `upgrade` plans transitive copies too.
@@ -178,6 +222,20 @@ struct FakeNode {
     /// preview runs in a throwaway copy.
     trials: Mutex<Vec<Vec<String>>>,
     shared: Option<SharedFile>,
+    native: Option<NativeList>,
+    /// The order of the applies and native calls, as `apply`, `assess`, and `backstop`.
+    events: Mutex<Vec<&'static str>>,
+    /// What the last native backstop saw.
+    backstop_saw: Mutex<Option<BackstopView>>,
+    /// The lock bytes each apply found.
+    apply_saw_lock: Mutex<Vec<Vec<u8>>>,
+}
+
+/// The project a native backstop judged, and the native list it held.
+#[derive(Clone)]
+struct BackstopView {
+    root: Utf8PathBuf,
+    list: Option<String>,
 }
 
 /// A file outside the project that every apply rewrites, the way `go get` rewrites the `go.work`
@@ -198,7 +256,32 @@ impl FakeNode {
             advisory_ecosystem: None,
             trials: Mutex::new(Vec::new()),
             shared: None,
+            native: None,
+            events: Mutex::new(Vec::new()),
+            backstop_saw: Mutex::new(None),
+            apply_saw_lock: Mutex::new(Vec::new()),
         }
+    }
+
+    fn apply_saw_lock(&self) -> Vec<Vec<u8>> {
+        self.apply_saw_lock.lock().expect("apply log").clone()
+    }
+
+    fn backstop_saw(&self) -> Option<BackstopView> {
+        self.backstop_saw.lock().expect("backstop view").clone()
+    }
+
+    fn with_native(mut self, native: NativeList) -> Self {
+        self.native = Some(native);
+        self
+    }
+
+    fn events(&self) -> Vec<&'static str> {
+        self.events.lock().expect("event log").clone()
+    }
+
+    fn record(&self, event: &'static str) {
+        self.events.lock().expect("event log").push(event);
     }
 
     fn with_transitive_advance(mut self) -> Self {
@@ -394,8 +477,25 @@ impl ToolRead for FakeNode {
 
     async fn verify_lock_current(
         &self,
-        _project: &Project,
+        project: &Project,
     ) -> cooldown_core::Result<LockVerifyReport> {
+        let required = self
+            .native
+            .as_ref()
+            .and_then(|native| native.finalize_requires);
+        if let Some(required) = required {
+            let listed = std::fs::read_to_string(project.root.join(NATIVE)).unwrap_or_default();
+            let ignores_list = self
+                .native
+                .as_ref()
+                .is_some_and(|native| native.backstop_ignores_list);
+            if ignores_list || !listed.lines().any(|entry| entry == required) {
+                return Ok(LockVerifyReport {
+                    status: LockStatus::Stale,
+                    detail: format!("{required} was published within the minimumReleaseAge cutoff"),
+                });
+            }
+        }
         Ok(LockVerifyReport {
             status: LockStatus::Current,
             detail: "consistent fake Node resolve".to_string(),
@@ -454,11 +554,134 @@ impl ToolWrite for FakeNode {
         project: &Project,
         _plan: &Plan,
     ) -> cooldown_core::Result<ProjectMutationJournal> {
+        let native = self.native.as_ref().map(|_| Utf8Path::new(NATIVE));
         ProjectMutationJournal::capture_with_external(
             &project.root,
-            [Utf8Path::new(LOCKFILE), Utf8Path::new(MANIFEST)],
+            [Utf8Path::new(LOCKFILE), Utf8Path::new(MANIFEST)]
+                .into_iter()
+                .chain(native),
             self.shared.iter().map(|shared| &shared.path),
         )
+    }
+
+    fn accepts_native_admissions(&self, _project: &Project) -> bool {
+        self.native.is_some()
+    }
+
+    async fn assess_native_admissions(
+        &self,
+        query: NativeAdmissionQuery<'_>,
+    ) -> cooldown_core::Result<NativeAssessment> {
+        let Some(native) = &self.native else {
+            return Ok(NativeAssessment::default());
+        };
+        self.record("assess");
+        let locked = |pin: &&JudgedPin| LockedVersion {
+            name: pin.name.clone(),
+            version: pin.version.clone(),
+        };
+        let grants: Vec<LockedVersion> = query
+            .pins
+            .iter()
+            .filter(|pin| {
+                let name = pin.name.as_str();
+                (pin.admitted && native.grant.contains(&name) && !native.unproven.contains(&name))
+                    || query.refused_at_start.contains(&locked(pin))
+            })
+            .map(|pin| locked(&pin))
+            .collect();
+        let list: Vec<String> = grants
+            .iter()
+            .map(|grant| format!("{}@{}", grant.name, grant.version))
+            .collect();
+        // A failing write is one into a file the journal does not hold.
+        let path = if native.write_fails {
+            "outside.yaml"
+        } else {
+            NATIVE
+        };
+        Ok(NativeAssessment {
+            edit: (!grants.is_empty()).then(|| NativeEdit {
+                path: Utf8PathBuf::from(path),
+                contents: list.join("\n").into_bytes(),
+            }),
+            grants,
+        })
+    }
+
+    fn resolve_inputs(&self) -> ResolveInputs {
+        ResolveInputs {
+            filenames: &[LOCKFILE, MANIFEST, NATIVE],
+            path_prefixes: &[],
+            source_extensions: &[],
+        }
+    }
+
+    fn native_gate_writes(&self, _project: &Project) -> Vec<Utf8PathBuf> {
+        if self.native.is_some() {
+            vec![Utf8PathBuf::from(LOCKFILE)]
+        } else {
+            Vec::new()
+        }
+    }
+
+    async fn native_gate_refusal(
+        &self,
+        query: NativeGateQuery<'_>,
+    ) -> cooldown_core::Result<Option<NativeGateRefusal>> {
+        let Some(native) = &self.native else {
+            return Ok(None);
+        };
+        let project = query.project;
+        // The run first asks about the lock it starts from; only a later verification follows an
+        // apply, and only that one rewrites or edits anything.
+        let after_apply = self.events().contains(&"apply");
+        self.record("backstop");
+        *self.backstop_saw.lock().expect("backstop view") = Some(BackstopView {
+            root: project.root.clone(),
+            list: std::fs::read_to_string(project.root.join(NATIVE)).ok(),
+        });
+        if !after_apply && native.starting_probe_fails {
+            return Err(CoreError::System(
+                "pnpm refused only versions its command-line minimumReleaseAgeExclude already \
+                 exempts"
+                    .to_string(),
+            ));
+        }
+        if !after_apply && native.starting_probe_reformats_lock {
+            std::fs::write(
+                project.root.join(LOCKFILE),
+                serde_json::to_vec_pretty(&lock(project)?)
+                    .map_err(|error| CoreError::Serialization(error.to_string()))?,
+            )?;
+        }
+        if after_apply && native.backstop_edits_manifest {
+            std::fs::write(project.root.join(MANIFEST), EDITED_MANIFEST)?;
+        }
+        if after_apply && native.backstop_reformats_lock {
+            std::fs::write(
+                project.root.join(LOCKFILE),
+                serde_json::to_vec_pretty(&lock(project)?)
+                    .map_err(|error| CoreError::Serialization(error.to_string()))?,
+            )?;
+        }
+        let held = lock(project)?;
+        let listed = std::fs::read_to_string(project.root.join(NATIVE)).unwrap_or_default();
+        Ok(native.backstop_refuses.and_then(|refused| {
+            let (name, version) = refused.split_once('@')?;
+            let locked = held
+                .iter()
+                .any(|(key, held)| copy_name(key) == name && held == version);
+            let exempt =
+                !native.backstop_ignores_list && listed.lines().any(|entry| entry == refused);
+            (locked && !exempt).then(|| NativeGateRefusal {
+                versions: vec![LockedVersion {
+                    name: name.to_string(),
+                    version: Version::new(version),
+                }],
+                detail: format!("{refused} was published within the minimumReleaseAge cutoff"),
+            })
+        }))
     }
 
     async fn shared_write_files(
@@ -474,7 +697,12 @@ impl ToolWrite for FakeNode {
     }
 
     async fn apply(&self, mutation: &PreparedMutation) -> cooldown_core::Result<ApplyReport> {
+        self.record("apply");
         let (project, plan, _) = mutation.parts_for(self)?;
+        self.apply_saw_lock
+            .lock()
+            .expect("apply log")
+            .push(std::fs::read(project.root.join(LOCKFILE))?);
         let mut versions = lock(project)?;
         let targets: Vec<String> = plan
             .changes
@@ -1776,6 +2004,499 @@ async fn a_held_copy_keeps_its_hold_when_reconciliation_moves_it_partly() -> eyr
     assert!(
         !rows.contains(&applied("dom", "1.0.0", "2.0.0")),
         "{rows:?}"
+    );
+    Ok(())
+}
+
+/// `safe` moves to its matured `1.1.0` under a fake that keeps a native exemption list.
+fn native_safe(native: NativeList, float: Option<Float>) -> eyre::Result<NodeFixture> {
+    let fake = FakeNode::new(
+        TargetFallback::None,
+        Script {
+            float,
+            ..Script::default()
+        },
+    )
+    .with_releases("safe", &[("1.0.0", false), ("1.1.0", false)])
+    .with_releases("child", &[("1.0.0", false), ("1.1.0", true)])
+    .with_native(native);
+    let fixture = fixture(fake, &[("child", "1.0.0"), ("safe", "1.0.0")])?;
+    std::fs::write(fixture.project.root.join(NATIVE), "before")?;
+    Ok(fixture)
+}
+
+/// `safe`'s landing floats the transitive `child` onto its cooling `1.1.0`.
+fn fresh_child_float() -> Float {
+    Float {
+        trigger: "safe",
+        floated: "child",
+        from: "1.0.0",
+        to: "1.1.0",
+    }
+}
+
+/// A committed batch is assessed after its apply, and its assessed list is written before the
+/// native gate judges the settled project itself, so the gate's refusal rolls the written list
+/// back with the lock, as cooldown's own write rather than a conflict, while the candidate is
+/// held by the version the gate refused, as a cooldown violation would hold it.
+#[tokio::test]
+async fn a_native_backstop_refusal_rolls_the_written_list_back_and_holds_the_candidate()
+-> eyre::Result<()> {
+    let fixture = native_safe(
+        NativeList {
+            grant: &["safe"],
+            backstop_refuses: Some("safe@1.1.0"),
+            backstop_ignores_list: true,
+            ..NativeList::default()
+        },
+        None,
+    )?;
+    let lock_before = std::fs::read(fixture.project.root.join(LOCKFILE))?;
+
+    let outcome = fixture.workspace.upgrade(&RunOpts::default()).await;
+
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!(
+        fixture.fake.events(),
+        ["backstop", "apply", "assess", "backstop"]
+    );
+    // The backstop judged the project itself, which already held the written list.
+    let seen = fixture.fake.backstop_saw().expect("the backstop ran");
+    assert_eq!(seen.root, fixture.project.root);
+    assert_eq!(seen.list.as_deref(), Some("safe@1.1.0"));
+    assert_eq!(
+        std::fs::read(fixture.project.root.join(LOCKFILE))?,
+        lock_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.project.root.join(NATIVE))?,
+        "before"
+    );
+    let [held] = outcome.items.as_slice() else {
+        panic!("one held row: {:?}", outcome.items);
+    };
+    let skipped = held.skipped.as_ref().expect("the candidate is held");
+    assert_eq!(skipped.reason, SkipReason::TransitiveInCooldown);
+    assert_eq!(skipped.offending.as_deref(), Some("safe"));
+    Ok(())
+}
+
+/// The backstop is cooldown's own step, like the resolve: a verification that rewrites the lock
+/// and accepts it lands the trial with the verification's bytes, while one that rewrites it and
+/// refuses restores the lock from before the trial and holds the candidate.
+#[tokio::test]
+async fn a_backstop_that_rewrites_the_lock_owns_its_bytes() -> eyre::Result<()> {
+    for refuses in [None, Some("safe@1.1.0")] {
+        let fixture = native_safe(
+            NativeList {
+                grant: &["safe"],
+                backstop_refuses: refuses,
+                backstop_ignores_list: true,
+                backstop_reformats_lock: true,
+                ..NativeList::default()
+            },
+            None,
+        )?;
+        let lock_before = std::fs::read(fixture.project.root.join(LOCKFILE))?;
+
+        let outcome = fixture.workspace.upgrade(&RunOpts::default()).await;
+
+        assert!(
+            outcome.errors.is_empty(),
+            "{refuses:?}: {:?}",
+            outcome.errors
+        );
+        assert_eq!(
+            fixture.fake.events(),
+            ["backstop", "apply", "assess", "backstop"]
+        );
+        let lock_after = std::fs::read(fixture.project.root.join(LOCKFILE))?;
+        let [row] = outcome.items.as_slice() else {
+            panic!("one row: {:?}", outcome.items);
+        };
+        if refuses.is_some() {
+            assert_eq!(lock_after, lock_before);
+            let held = row.skipped.as_ref().expect("the candidate is held");
+            assert_eq!(held.reason, SkipReason::TransitiveInCooldown);
+        } else {
+            assert!(row.applied, "{row:?}");
+            assert_eq!(locked(&fixture, "safe")?.as_deref(), Some("1.1.0"));
+            // The verification's spelling of the lock is what landed.
+            let reformatted = serde_json::to_vec_pretty(&lock(&fixture.project)?)?;
+            assert_eq!(lock_after, reformatted);
+        }
+    }
+    Ok(())
+}
+
+/// Only the lock is the backstop's to adopt: a manifest edited while it runs is someone else's
+/// change, so the refused trial's restore stops at it, reports the conflict, and leaves the edit
+/// in place rather than restoring over it.
+#[tokio::test]
+async fn a_backstop_restore_never_writes_over_an_edit_made_during_it() -> eyre::Result<()> {
+    let fixture = native_safe(
+        NativeList {
+            grant: &["safe"],
+            backstop_refuses: Some("safe@1.1.0"),
+            backstop_ignores_list: true,
+            backstop_edits_manifest: true,
+            ..NativeList::default()
+        },
+        None,
+    )?;
+
+    let outcome = fixture.workspace.upgrade(&RunOpts::default()).await;
+
+    assert_eq!(
+        fixture.fake.events(),
+        ["backstop", "apply", "assess", "backstop"]
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.project.root.join(MANIFEST))?,
+        EDITED_MANIFEST
+    );
+    assert!(
+        outcome
+            .errors
+            .iter()
+            .chain(outcome.items.iter().filter_map(|item| item.error.as_ref()))
+            .any(|error| error.message.contains("changed independently")),
+        "{:?}",
+        outcome.errors
+    );
+    Ok(())
+}
+
+/// `fix` has no trial isolation, so the native gate judges each round before it is accepted: a
+/// `--transitive allow` round whose young transitive the gate refuses is restored and held by
+/// that transitive, quoting the tool, and the warning that the graph gate left the transitive in
+/// place goes with it.
+#[tokio::test]
+async fn a_restored_fix_round_drops_its_left_in_place_warning() -> eyre::Result<()> {
+    let fake = FakeNode::new(
+        TargetFallback::None,
+        Script {
+            float: Some(fresh_child_float()),
+            ..Script::default()
+        },
+    )
+    .with_releases("safe", &[("1.0.0", false), ("1.1.0", true)])
+    .with_releases("child", &[("1.0.0", false), ("1.1.0", true)])
+    .with_native(NativeList {
+        backstop_refuses: Some("child@1.1.0"),
+        ..NativeList::default()
+    });
+    let fixture = fixture(fake, &[("child", "1.0.0"), ("safe", "1.1.0")])?;
+    let allow = RunOpts {
+        transitive_mode: TransitiveGate::Allow,
+        ..RunOpts::default()
+    };
+
+    let outcome = fixture.workspace.fix(&allow).await;
+
+    assert_eq!(locked(&fixture, "safe")?.as_deref(), Some("1.1.0"));
+    assert_eq!(locked(&fixture, "child")?.as_deref(), Some("1.0.0"));
+    assert!(
+        !outcome
+            .warnings
+            .iter()
+            .any(|warning| warning.message.contains("left in place")),
+        "{:?}",
+        outcome.warnings
+    );
+    let held = outcome
+        .items
+        .iter()
+        .find_map(|item| item.skipped.as_ref())
+        .expect("the downgrade is held");
+    assert_eq!(held.reason, SkipReason::TransitiveInCooldown);
+    assert_eq!(held.offending.as_deref(), Some("child"));
+    assert!(
+        held.message
+            .contains("child@1.1.0 was published within the minimumReleaseAge cutoff"),
+        "{}",
+        held.message
+    );
+    Ok(())
+}
+
+/// An accepted backstop commits the list the batch wrote with its lock.
+#[tokio::test]
+async fn an_accepted_batch_keeps_its_native_list() -> eyre::Result<()> {
+    let fixture = native_safe(
+        NativeList {
+            grant: &["safe"],
+            ..NativeList::default()
+        },
+        None,
+    )?;
+
+    let outcome = fixture.workspace.upgrade(&RunOpts::default()).await;
+
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!(locked(&fixture, "safe")?.as_deref(), Some("1.1.0"));
+    assert_eq!(
+        std::fs::read_to_string(fixture.project.root.join(NATIVE))?,
+        "safe@1.1.0"
+    );
+    Ok(())
+}
+
+/// A native write that fails restores the batch and reports the failure as the error it is,
+/// never as a hold.
+#[tokio::test]
+async fn a_failed_native_write_restores_the_batch_as_an_error() -> eyre::Result<()> {
+    let fixture = native_safe(
+        NativeList {
+            grant: &["safe"],
+            write_fails: true,
+            ..NativeList::default()
+        },
+        None,
+    )?;
+    let lock_before = std::fs::read(fixture.project.root.join(LOCKFILE))?;
+
+    let outcome = fixture.workspace.upgrade(&RunOpts::default()).await;
+
+    assert_eq!(fixture.fake.events(), ["backstop", "apply", "assess"]);
+    assert_eq!(
+        std::fs::read(fixture.project.root.join(LOCKFILE))?,
+        lock_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.project.root.join(NATIVE))?,
+        "before"
+    );
+    let failed = outcome
+        .items
+        .iter()
+        .find_map(|item| item.error.as_ref())
+        .expect("the candidate reports the write failure");
+    assert!(failed.message.contains("outside.yaml"), "{failed:?}");
+    assert!(outcome.items.iter().all(|item| !item.applied));
+    assert!(
+        !outcome
+            .errors
+            .iter()
+            .chain(outcome.items.iter().filter_map(|item| item.error.as_ref()))
+            .any(|error| error.message.contains("changed independently")),
+        "the rollback takes back cooldown's own write: {:?}",
+        outcome.errors
+    );
+    Ok(())
+}
+
+/// `--transitive allow` leaves a floated-up young transitive in place only while the native gate
+/// accepts it: one the native gate refuses holds the candidate that drags it in.
+#[tokio::test]
+async fn transitive_allow_holds_a_candidate_whose_young_transitive_the_native_gate_refuses()
+-> eyre::Result<()> {
+    let allow = RunOpts {
+        transitive_mode: TransitiveGate::Allow,
+        ..RunOpts::default()
+    };
+    let tolerated = native_safe(NativeList::default(), Some(fresh_child_float()))?;
+    let outcome = tolerated.workspace.upgrade(&allow).await;
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!(locked(&tolerated, "safe")?.as_deref(), Some("1.1.0"));
+    assert_eq!(locked(&tolerated, "child")?.as_deref(), Some("1.1.0"));
+
+    let refused = native_safe(
+        NativeList {
+            backstop_refuses: Some("child@1.1.0"),
+            ..NativeList::default()
+        },
+        Some(fresh_child_float()),
+    )?;
+    let outcome = refused.workspace.upgrade(&allow).await;
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!(locked(&refused, "safe")?.as_deref(), Some("1.0.0"));
+    assert_eq!(locked(&refused, "child")?.as_deref(), Some("1.0.0"));
+    let held = outcome
+        .items
+        .iter()
+        .find(|item| item.name == "safe")
+        .and_then(|item| item.skipped.as_ref())
+        .expect("the candidate is held");
+    assert_eq!(held.reason, SkipReason::TransitiveInCooldown);
+    assert_eq!(held.offending.as_deref(), Some("child"));
+    Ok(())
+}
+
+/// A version the native gate already refuses in the lock the run starts from was introduced by
+/// no trial, so even one its exemption cannot help, the list being overridden by a setting above
+/// it, holds no candidate, as a run-start cooldown violation holds none; the final lock check
+/// still reports the refusal the run started with.
+#[tokio::test]
+async fn a_refusal_the_starting_lock_already_had_holds_no_candidate() -> eyre::Result<()> {
+    let fake = FakeNode::new(TargetFallback::None, Script::default())
+        .with_releases("safe", &[("1.0.0", false), ("1.1.0", false)])
+        .with_releases("child", &[("1.0.0", false), ("1.1.0", true)])
+        .with_native(NativeList {
+            backstop_refuses: Some("child@1.1.0"),
+            backstop_ignores_list: true,
+            finalize_requires: Some("child@1.1.0"),
+            ..NativeList::default()
+        });
+    let fixture = fixture(fake, &[("child", "1.1.0"), ("safe", "1.0.0")])?;
+
+    let outcome = fixture.workspace.upgrade(&RunOpts::default()).await;
+
+    assert_eq!(locked(&fixture, "safe")?.as_deref(), Some("1.1.0"));
+    assert!(
+        outcome
+            .items
+            .iter()
+            .any(|item| item.name == "safe" && item.applied && item.skipped.is_none()),
+        "{:?}",
+        outcome.items
+    );
+    let messages: Vec<&str> = outcome
+        .errors
+        .iter()
+        .map(|error| error.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        ["child@1.1.0 was published within the minimumReleaseAge cutoff"]
+    );
+    Ok(())
+}
+
+/// A starting verdict that cannot be read in full is no baseline: the pin the gate refuses earns
+/// no exemption on it, and the refusal holds the candidate whose trial meets it.
+#[tokio::test]
+async fn an_incomplete_starting_verdict_grants_and_excuses_nothing() -> eyre::Result<()> {
+    let fake = FakeNode::new(TargetFallback::None, Script::default())
+        .with_releases("safe", &[("1.0.0", false), ("1.1.0", false)])
+        .with_releases("child", &[("1.0.0", false), ("1.1.0", true)])
+        .with_native(NativeList {
+            backstop_refuses: Some("child@1.1.0"),
+            starting_probe_fails: true,
+            ..NativeList::default()
+        });
+    let fixture = fixture(fake, &[("child", "1.1.0"), ("safe", "1.0.0")])?;
+    std::fs::write(fixture.project.root.join(NATIVE), "before")?;
+
+    let outcome = fixture.workspace.upgrade(&RunOpts::default()).await;
+
+    assert_eq!(locked(&fixture, "safe")?.as_deref(), Some("1.0.0"));
+    assert_eq!(
+        std::fs::read_to_string(fixture.project.root.join(NATIVE))?,
+        "before"
+    );
+    let held = outcome
+        .items
+        .iter()
+        .find(|item| item.name == "safe")
+        .and_then(|item| item.skipped.as_ref())
+        .expect("the candidate is held");
+    assert_eq!(held.offending.as_deref(), Some("child"));
+    Ok(())
+}
+
+/// A young pin the native gate refused in the starting lock, as once a native window is
+/// switched on, earns an exact exemption while the lock still holds it, so an unrelated upgrade
+/// lands and the final lock check passes.
+#[tokio::test]
+async fn a_pin_the_native_gate_refused_at_the_start_earns_its_exemption() -> eyre::Result<()> {
+    let fake = FakeNode::new(TargetFallback::None, Script::default())
+        .with_releases("safe", &[("1.0.0", false), ("1.1.0", false)])
+        .with_releases("child", &[("1.0.0", false), ("1.1.0", true)])
+        .with_native(NativeList {
+            backstop_refuses: Some("child@1.1.0"),
+            finalize_requires: Some("child@1.1.0"),
+            ..NativeList::default()
+        });
+    let fixture = fixture(fake, &[("child", "1.1.0"), ("safe", "1.0.0")])?;
+
+    let outcome = fixture.workspace.upgrade(&RunOpts::default()).await;
+
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!(locked(&fixture, "safe")?.as_deref(), Some("1.1.0"));
+    assert_eq!(
+        std::fs::read_to_string(fixture.project.root.join(NATIVE))?,
+        "child@1.1.0"
+    );
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    Ok(())
+}
+
+/// The verification of the starting lock runs once the first batch's journal is captured, and
+/// whatever it rewrites is put back from that journal, so the apply finds the starting lock byte
+/// for byte as it was.
+#[tokio::test]
+async fn the_starting_verification_leaves_the_lock_byte_identical() -> eyre::Result<()> {
+    let fixture = native_safe(
+        NativeList {
+            grant: &["safe"],
+            starting_probe_reformats_lock: true,
+            ..NativeList::default()
+        },
+        None,
+    )?;
+    let lock_before = std::fs::read(fixture.project.root.join(LOCKFILE))?;
+
+    let outcome = fixture.workspace.upgrade(&RunOpts::default()).await;
+
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!(
+        fixture.fake.events(),
+        ["backstop", "apply", "assess", "backstop"]
+    );
+    assert_eq!(fixture.fake.apply_saw_lock().first(), Some(&lock_before));
+    assert_eq!(locked(&fixture, "safe")?.as_deref(), Some("1.1.0"));
+    Ok(())
+}
+
+/// The native gate's refusal is a trial verdict like a cooldown violation, so candidate
+/// isolation finds the candidate whose young child the gate refuses and still lands the other.
+#[tokio::test]
+async fn a_native_refusal_isolates_the_candidate_that_caused_it() -> eyre::Result<()> {
+    let allow = RunOpts {
+        transitive_mode: TransitiveGate::Allow,
+        ..RunOpts::default()
+    };
+    let fake = FakeNode::new(
+        TargetFallback::None,
+        Script {
+            float: Some(fresh_child_float()),
+            ..Script::default()
+        },
+    )
+    .with_releases("safe", &[("1.0.0", false), ("1.1.0", false)])
+    .with_releases("child", &[("1.0.0", false), ("1.1.0", true)])
+    .with_releases("other", &[("1.0.0", false), ("1.1.0", false)])
+    .with_native(NativeList {
+        backstop_refuses: Some("child@1.1.0"),
+        ..NativeList::default()
+    });
+    let fixture = fixture(
+        fake,
+        &[("child", "1.0.0"), ("other", "1.0.0"), ("safe", "1.0.0")],
+    )?;
+
+    let outcome = fixture.workspace.upgrade(&allow).await;
+
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!(locked(&fixture, "other")?.as_deref(), Some("1.1.0"));
+    assert_eq!(locked(&fixture, "safe")?.as_deref(), Some("1.0.0"));
+    assert_eq!(locked(&fixture, "child")?.as_deref(), Some("1.0.0"));
+    let held = outcome
+        .items
+        .iter()
+        .find(|item| item.name == "safe")
+        .and_then(|item| item.skipped.as_ref())
+        .expect("the candidate that floats the refused child is held");
+    assert_eq!(held.reason, SkipReason::TransitiveInCooldown);
+    assert_eq!(held.offending.as_deref(), Some("child"));
+    assert!(
+        outcome
+            .items
+            .iter()
+            .any(|item| item.name == "other" && item.applied),
+        "{:?}",
+        outcome.items
     );
     Ok(())
 }
