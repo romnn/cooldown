@@ -1,12 +1,15 @@
-//! Tells pnpm's own refusal of a stale lock apart from every other way its frozen verification can
-//! fail.
+//! Tells pnpm's own refusals of a lock apart from every other way its frozen verification can fail.
 //!
 //! `pnpm install --lockfile-only --frozen-lockfile` exits non-zero for a lock that no longer
 //! matches its inputs, but equally for a registry, authentication, configuration, CLI, or store
 //! failure.
 //! Only the first is staleness, which `--allow-stale-lock` may waive, so the verdict is read from
 //! the error codes pnpm prints rather than from the exit status.
+//! pnpm 11 also verifies every locked entry against its supply-chain policies, and a refusal of
+//! entries younger than its `minimumReleaseAge` names each of them.
 
+use super::MinimumAgeRefusal;
+use cooldown_core::{LockedVersion, Version};
 use std::borrow::Cow;
 
 /// The codes pnpm's frozen install raises for a lock that its inputs no longer match, or that is
@@ -26,6 +29,10 @@ const STALE_CODES: [&str; 4] = [
     "FROZEN_LOCKFILE_WITH_OUTDATED_LOCKFILE",
 ];
 
+/// The code pnpm 11's lockfile verification raises when every entry it refuses is younger than
+/// `minimumReleaseAge`; refusals of several kinds share `LOCKFILE_RESOLUTION_VERIFICATION`.
+const MINIMUM_AGE_CODE: &str = "MINIMUM_RELEASE_AGE_VIOLATION";
+
 /// What one error header pnpm's reporter printed says about the lock.
 #[derive(Debug, PartialEq, Eq)]
 enum Header {
@@ -34,6 +41,15 @@ enum Header {
     /// Any other `ERR_PNPM_<code>`, or an uncoded `ERROR` (an unknown option, unparsable
     /// configuration).
     Other,
+}
+
+/// One error header pnpm's reporter printed.
+#[derive(Debug, PartialEq, Eq)]
+enum ErrorHeader<'a> {
+    /// `ERR_PNPM_<code>`, holding the code.
+    Coded(&'a str),
+    /// An uncoded `ERROR`.
+    Uncoded,
 }
 
 /// Whether `output`, from a failed frozen verification, is pnpm refusing a stale or absent lock.
@@ -60,12 +76,105 @@ pub(crate) fn frozen_refusal_is_stale(output: &str) -> bool {
     headers.peek().is_some() && headers.all(|header| header == Header::Stale)
 }
 
+/// The versions a failed frozen verification refused as younger than pnpm's `minimumReleaseAge`,
+/// when that refusal is all `output` reports.
+///
+/// The one error header must carry the minimum-age code, and every refused entry pnpm lists must
+/// be one it found published within the window.
+/// An entry pnpm could not check, such as one whose publish time the registry did not serve, is a
+/// registry failure rather than a refusal, and so is any other header, so either yields `None`.
+/// pnpm raises that failure under the same code and lists at most 20 entries, closing a longer
+/// list with `…and <n> more`, so the refusal also counts the entries it left out, which may
+/// include such a failure; a list that accounts for fewer entries than the header counts yields
+/// `None`.
+pub(crate) fn minimum_age_refusals(output: &str) -> Option<MinimumAgeRefusal> {
+    let lines: Vec<Cow<'_, str>> = output.lines().map(strip_ansi).collect();
+    let headers: Vec<&str> = lines
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|line| error_header(line).is_some())
+        .collect();
+    let [header] = headers.as_slice() else {
+        return None;
+    };
+    if error_header(header) != Some(ErrorHeader::Coded(MINIMUM_AGE_CODE)) {
+        return None;
+    }
+    let counted = refused_count(header)?;
+    let mut refused = Vec::new();
+    let mut omitted = None;
+    for line in &lines {
+        // An entry is indented by exactly two spaces: `  <name>@<version> <reason>`.
+        let Some(entry) = line
+            .strip_prefix("  ")
+            .filter(|entry| !entry.starts_with(' '))
+        else {
+            continue;
+        };
+        if let Some(count) = omitted_count(entry) {
+            if omitted.replace(count).is_some() {
+                return None;
+            }
+            continue;
+        }
+        let Some((spec, reason)) = entry.split_once(' ') else {
+            continue;
+        };
+        // A scope's leading `@` belongs to the name, so the version follows the last `@`.
+        let Some((name, version)) = spec
+            .rsplit_once('@')
+            .filter(|(name, version)| !name.is_empty() && !version.is_empty())
+        else {
+            continue;
+        };
+        if !reason.starts_with("was published at ") {
+            return None;
+        }
+        refused.push(LockedVersion {
+            name: name.to_string(),
+            version: Version::new(version),
+        });
+    }
+    let omitted = omitted.unwrap_or(0);
+    (!refused.is_empty() && refused.len().checked_add(omitted) == Some(counted)).then_some(
+        MinimumAgeRefusal {
+            listed: refused,
+            omitted,
+        },
+    )
+}
+
+/// The number of entries the tail line pnpm closes a truncated list with, `…and <n> more`,
+/// leaves out.
+fn omitted_count(entry: &str) -> Option<usize> {
+    entry
+        .strip_prefix("\u{2026}and ")?
+        .strip_suffix(" more")?
+        .parse()
+        .ok()
+}
+
+/// The number of entries a verification error `header` says failed:
+/// `[ERR_PNPM_<code>] <count> lockfile entries failed verification:`.
+fn refused_count(header: &str) -> Option<usize> {
+    let (before, _) = header.split_once(" lockfile entries failed verification")?;
+    before.rsplit(char::is_whitespace).next()?.parse().ok()
+}
+
+/// The error header `line` opens with, if any, as the stale-lock verdict reads it.
+fn header(line: &str) -> Option<Header> {
+    error_header(line).map(|header| match header {
+        ErrorHeader::Coded(code) if STALE_CODES.contains(&code) => Header::Stale,
+        ErrorHeader::Coded(_) | ErrorHeader::Uncoded => Header::Other,
+    })
+}
+
 /// The error header `line` opens with, if any.
 ///
 /// pnpm 11 brackets the header (`[ERR_PNPM_OUTDATED_LOCKFILE] …`, `[ERROR] …`).
 /// pnpm 9 and 10 pad it with thin spaces instead (`\u{2009}ERR_PNPM_OUTDATED_LOCKFILE\u{2009} …`),
 /// which [`str::trim_start`] and [`char::is_whitespace`] both treat as whitespace.
-fn header(line: &str) -> Option<Header> {
+fn error_header(line: &str) -> Option<ErrorHeader<'_>> {
     let line = line.trim_start();
     let (body, bracketed) = match line.strip_prefix('[') {
         Some(body) => (body, true),
@@ -86,15 +195,11 @@ fn header(line: &str) -> Option<Header> {
         if code.is_empty() || !closes(rest) {
             return None;
         }
-        return Some(if STALE_CODES.contains(&code) {
-            Header::Stale
-        } else {
-            Header::Other
-        });
+        return Some(ErrorHeader::Coded(code));
     }
     body.strip_prefix("ERROR")
         .is_some_and(closes)
-        .then_some(Header::Other)
+        .then_some(ErrorHeader::Uncoded)
 }
 
 /// `line` without its ANSI control sequences (`ESC [` parameters, then one final byte).
@@ -122,8 +227,124 @@ fn strip_ansi(line: &str) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
-    use super::frozen_refusal_is_stale;
+    use super::{MinimumAgeRefusal, frozen_refusal_is_stale, minimum_age_refusals};
+    use cooldown_core::{LockedVersion, Version};
     use indoc::indoc;
+
+    /// pnpm 11.8.0's refusal of a lock holding an entry younger than `minimumReleaseAge`, as it
+    /// prints it with `--reporter=append-only --loglevel=error`.
+    const PNPM_11_TOO_YOUNG: &str = indoc! {r#"
+        [ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] 2 lockfile entries failed verification:
+          @sentry/types@5.30.0 was published at 2021-01-13T11:40:12.849Z, within the minimumReleaseAge cutoff (2020-09-01T00:00:38.279Z)
+          is-number@7.0.0 was published at 2018-07-04T15:08:58.238Z, within the minimumReleaseAge cutoff (1836-10-02T17:00:19.949Z)
+
+        The lockfile contains entries that the active policies reject. This can mean the lockfile is stale, or that someone committed a lockfile that bypassed the policy locally — inspect recent changes to pnpm-lock.yaml before trusting it. If the changes look expected, run "pnpm clean --lockfile" and then "pnpm install" to rebuild from a fresh resolution. Alternatively, relax the policy that flagged them.
+    "#};
+
+    fn locked(name: &str, version: &str) -> LockedVersion {
+        LockedVersion {
+            name: name.to_string(),
+            version: Version::new(version),
+        }
+    }
+
+    /// A minimum-age refusal names every listed entry, a scoped name included, even when colored.
+    #[test]
+    fn a_minimum_age_refusal_names_its_entries() {
+        let expected = vec![
+            locked("@sentry/types", "5.30.0"),
+            locked("is-number", "7.0.0"),
+        ];
+        let complete = |listed: Vec<LockedVersion>| MinimumAgeRefusal { listed, omitted: 0 };
+        assert_eq!(
+            minimum_age_refusals(PNPM_11_TOO_YOUNG),
+            Some(complete(expected.clone()))
+        );
+        let colored = PNPM_11_TOO_YOUNG.replacen(
+            "[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION]",
+            "\u{1b}[41m\u{1b}[30m[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION]\u{1b}[39m\u{1b}[49m",
+            1,
+        );
+        assert_eq!(minimum_age_refusals(&colored), Some(complete(expected)));
+        // A minimum-age refusal is no stale lock that `--allow-stale-lock` could waive.
+        assert!(!frozen_refusal_is_stale(PNPM_11_TOO_YOUNG));
+    }
+
+    /// pnpm lists at most 20 refused entries and counts the rest in a tail line, which the
+    /// refusal reports as omitted; a list that accounts for fewer entries than its header counts,
+    /// or counts them in two tails, is inconclusive.
+    #[test]
+    fn a_truncated_refusal_counts_what_it_left_out() {
+        let entry = |index: usize| {
+            format!(
+                "  pkg-{index:02}@1.0.0 was published at 2026-11-19T00:00:00.000Z, within the minimumReleaseAge cutoff (2026-11-06T00:00:00.000Z)"
+            )
+        };
+        let listed: Vec<String> = (0..20).map(entry).collect();
+        let report = |counted: usize, tails: &str| {
+            format!(
+                "[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] {counted} lockfile entries failed verification:\n{}\n{tails}",
+                listed.join("\n")
+            )
+        };
+
+        let truncated = minimum_age_refusals(&report(22, "  \u{2026}and 2 more\n"));
+        assert_eq!(
+            truncated.map(|refusal| (refusal.listed.len(), refusal.omitted)),
+            Some((20, 2))
+        );
+        assert_eq!(
+            minimum_age_refusals(&report(20, ""))
+                .map(|refusal| (refusal.listed.len(), refusal.omitted)),
+            Some((20, 0))
+        );
+        for inconclusive in [
+            report(22, ""),
+            report(23, "  \u{2026}and 2 more\n"),
+            report(24, "  \u{2026}and 2 more\n  \u{2026}and 2 more\n"),
+        ] {
+            assert_eq!(minimum_age_refusals(&inconclusive), None, "{inconclusive}");
+        }
+    }
+
+    /// Anything beside a plain minimum-age refusal is no refusal of young versions: an entry pnpm
+    /// could not check, a refusal of several kinds, another failure next to it, or no entry at all.
+    #[test]
+    fn other_verification_failures_name_no_young_versions() {
+        let cases = [
+            // An entry whose publish time the registry did not serve
+            indoc! {"
+                [ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] 1 lockfile entries failed verification:
+                  left-pad@1.3.0 could not be checked against minimumReleaseAge (version not present in registry manifest)
+            "},
+            // A young entry beside one pnpm could not check
+            indoc! {"
+                [ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] 2 lockfile entries failed verification:
+                  is-number@7.0.0 was published at 2018-07-04T15:08:58.238Z, within the minimumReleaseAge cutoff (1836-10-02T17:00:19.949Z)
+                  left-pad@1.3.0 could not be checked against minimumReleaseAge (fetch failed)
+            "},
+            // Refusals of several kinds
+            indoc! {"
+                [ERR_PNPM_LOCKFILE_RESOLUTION_VERIFICATION] 2 lockfile entries failed verification:
+                  is-number@7.0.0 [MINIMUM_RELEASE_AGE_VIOLATION] was published at 2018-07-04T15:08:58.238Z, within the minimumReleaseAge cutoff (1836-10-02T17:00:19.949Z)
+                  left-pad@1.3.0 [TRUST_DOWNGRADE] was published without provenance
+            "},
+            // Another failure beside the refusal
+            indoc! {"
+                [ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] 1 lockfile entries failed verification:
+                  is-number@7.0.0 was published at 2018-07-04T15:08:58.238Z, within the minimumReleaseAge cutoff (1836-10-02T17:00:19.949Z)
+                [ERR_PNPM_META_FETCH_FAIL] GET https://registry.npmjs.org/left-pad failed
+            "},
+            // A stale lock
+            "[ERR_PNPM_OUTDATED_LOCKFILE] Cannot install with \"frozen-lockfile\"",
+            // The header without any entry
+            "[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] 0 lockfile entries failed verification:",
+            "",
+        ];
+        for output in cases {
+            assert_eq!(minimum_age_refusals(output), None, "{output}");
+        }
+    }
 
     /// pnpm 11.8.0's refusal of a lock that misses a newly declared dependency, as it prints it
     /// with `--reporter=append-only --loglevel=error`.

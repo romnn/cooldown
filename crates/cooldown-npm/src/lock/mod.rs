@@ -35,6 +35,19 @@ use serde::de::{Deserializer, IgnoredAny, Visitor};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use yaml::{YamlEntries, parse_lock_yaml};
 
+/// A manager's refusal of locked versions younger than its native release-age window, as one
+/// failed [`NodeLock::verify_current_args`] run reported it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MinimumAgeRefusal {
+    /// The refused versions the manager listed.
+    pub listed: Vec<cooldown_core::LockedVersion>,
+    /// How many more entries it refused without listing them, past the most one report lists.
+    ///
+    /// They may have failed for another reason, such as a publish time the registry did not
+    /// serve, so only a refusal that omits none names everything the run refused.
+    pub omitted: usize,
+}
+
 /// The per-package-manager knobs the generic adapter needs: identity, the lockfile/driver it reads
 /// and shells out to, how to parse its lock, and how to refresh the lock after a manifest edit.
 pub trait NodeLock: Send + Sync + 'static {
@@ -319,6 +332,16 @@ pub trait NodeLock: Send + Sync + 'static {
     #[must_use]
     fn verify_refusal_is_stale(_output: &str) -> bool {
         false
+    }
+
+    /// The versions a failed [`verify_current_args`](Self::verify_current_args) run refused as
+    /// younger than the manager's native release-age window, when that is all its `output`
+    /// reports.
+    ///
+    /// The default recognizes no such refusal, so the failure stays the tool error it is.
+    #[must_use]
+    fn minimum_age_refusals(_output: &str) -> Option<MinimumAgeRefusal> {
+        None
     }
 
     /// The mutating driver args that refresh the lock before a read-only command evaluates it.
@@ -1240,6 +1263,21 @@ impl PnpmResolution {
             && self.kind.is_none()
             && self.other.is_empty()
     }
+
+    /// The tarball URL of a registry entry pnpm recorded with its URL: the integrity hash and an
+    /// HTTP(S) `tarball` and nothing else, as `lockfileIncludeTarballUrl` writes every entry and
+    /// pnpm writes an entry it could not derive from the default registry.
+    /// The URL names the registry that served the artifact.
+    fn tarball(&self) -> Option<&str> {
+        let tarball = self.other.get("tarball")?.as_str()?;
+        let http = tarball.starts_with("https://") || tarball.starts_with("http://");
+        (self.integrity.is_some()
+            && self.directory.is_none()
+            && self.kind.is_none()
+            && self.other.len() == 1
+            && http)
+            .then_some(tarball)
+    }
 }
 
 /// Parses `pnpm-lock.yaml` once into the typed document, failing closed on a document cooldown
@@ -1909,8 +1947,9 @@ pub enum LockOrigin {
     /// bundled entry, an injected workspace copy, a git or tarball resolution).
     /// Nothing is proven, so no identity is granted.
     Unrecorded,
-    /// The URL the artifact was fetched from — npm's and yarn classic's `resolved`, which name the
-    /// registry per entry (the integrity hash pins the artifact to what that registry served).
+    /// The URL the artifact was fetched from — npm's and yarn classic's `resolved`, and pnpm's
+    /// registry `tarball`, which name the registry per entry (the integrity hash pins the artifact
+    /// to what that registry served).
     Url(String),
     /// A registry entry whose registry the lock does not name: pnpm's `resolution: {integrity: …}`
     /// shape, written only for an artifact fetched from the *configured* registry by package name
@@ -2187,6 +2226,10 @@ impl NodeLock for Pnpm {
         pnpm_frozen::frozen_refusal_is_stale(output)
     }
 
+    fn minimum_age_refusals(output: &str) -> Option<MinimumAgeRefusal> {
+        pnpm_frozen::minimum_age_refusals(output)
+    }
+
     fn refresh_lock_args(window_minutes: Option<i64>) -> Option<Vec<String>> {
         let mut args = vec!["install".into(), "--lockfile-only".into()];
         if let Some(minutes) = window_minutes {
@@ -2220,8 +2263,11 @@ impl NodeLock for Pnpm {
         // Filters restrict the command to the importers known to declare at least one planned pin. The
         // recursive fallback is reserved for graph-only changes with no declaring-member attribution.
         // A positive `minimumReleaseAge` stays as the transitive floor.
-        // The exclusions exempt pins the native gate would refuse: with pnpm's default strictness,
-        // a refused version needs an approval that `--no-save` cannot record.
+        // The exclusions exempt pins the native gate would refuse.
+        // Strictness is off because cooldown, not pnpm, judges the young versions a pin drags in:
+        // strict pnpm refuses an exact-pinned young sibling outright, since the approval it wants
+        // cannot be recorded under `--no-save`, while relaxed pnpm still prefers a mature version
+        // wherever one satisfies the request.
         if pins.is_empty() {
             return None;
         }
@@ -2244,6 +2290,7 @@ impl NodeLock for Pnpm {
         }
         args.push("--lockfile-only".to_string());
         args.push("--no-save".to_string());
+        args.push(RELAXED_MINIMUM_AGE.to_string());
         if let Some(minutes) = window_minutes {
             args.push(format!("--config.minimumReleaseAge={minutes}"));
         }
@@ -2261,6 +2308,10 @@ impl NodeLock for Pnpm {
             args.push("--resolution-only".to_string());
         }
         args.push("--trust-lockfile".to_string());
+        // Relaxed pnpm records every young pick in pnpm-workspace.yaml unless saving is off, and
+        // cooldown persists only the versions it admitted.
+        args.push("--no-save".to_string());
+        args.push(RELAXED_MINIMUM_AGE.to_string());
         if let Some(minutes) = window_minutes {
             args.push(format!("--config.minimumReleaseAge={minutes}"));
         }
@@ -2277,12 +2328,20 @@ impl NodeLock for Pnpm {
     }
 }
 
+/// Turns off pnpm's `minimumReleaseAgeStrict` for one command.
+///
+/// pnpm turns strictness on whenever `minimumReleaseAge` is set, and strict pnpm refuses every
+/// young pick no exclusion covers.
+/// Relaxed, it picks a young version only where no mature one satisfies the request, which leaves
+/// cooldown to judge that version against its own per-package window.
+const RELAXED_MINIMUM_AGE: &str = "--config.minimumReleaseAgeStrict=false";
+
 /// Appends pnpm's release-age exclusion list as repeated `--config` flags.
 ///
 /// pnpm builds a list only from a repeated `--config.<key>=` flag.
 /// A lone flag becomes a plain string, which pnpm reads as one pattern per character, so a single
 /// entry is passed twice.
-fn push_minimum_age_excludes(args: &mut Vec<String>, excludes: &[String]) {
+pub(crate) fn push_minimum_age_excludes(args: &mut Vec<String>, excludes: &[String]) {
     let repeat = usize::from(excludes.len() == 1);
     for exclusion in excludes.iter().chain(excludes.iter().take(repeat)) {
         args.push(format!("--config.minimumReleaseAgeExclude={exclusion}"));
@@ -2622,7 +2681,8 @@ fn lock_entry_origin(val: &serde_json::Value) -> LockOrigin {
 /// Parses `pnpm-lock.yaml` (v9, enforced by [`parse_pnpm_document_strict`]): the top-level
 /// `packages:` section keys every resolved package by its `name@version(...peers)` identity, and
 /// each entry's `resolution:` record says whether the configured registry served it
-/// ([`LockOrigin::ConfiguredRegistry`]) or something else did.
+/// ([`LockOrigin::ConfiguredRegistry`]), a registry tarball URL names its source
+/// ([`LockOrigin::Url`]), or something else did.
 /// An entry whose shape the model does not recognize proves nothing and reads as unrecorded.
 fn parse_pnpm(content: &str) -> Result<Vec<NameVersion>> {
     let doc = parse_pnpm_document_strict(content)?;
@@ -2634,12 +2694,13 @@ fn parse_pnpm(content: &str) -> Result<Vec<NameVersion>> {
             // balanced trailing-group strip, since an injected key's `file:` path may itself
             // contain parenthesized directory segments.
             let mut entry = split_name_version(strip_pnpm_peer_suffixes(key))?;
-            let registry = package
+            let resolution = package
                 .known()
-                .and_then(|package| package.resolution.as_ref())
-                .is_some_and(PnpmResolution::is_registry);
-            if registry {
+                .and_then(|package| package.resolution.as_ref());
+            if resolution.is_some_and(PnpmResolution::is_registry) {
                 entry.origin = LockOrigin::ConfiguredRegistry;
+            } else if let Some(tarball) = resolution.and_then(PnpmResolution::tarball) {
+                entry.origin = LockOrigin::Url(tarball.to_string());
             }
             Some(entry)
         })
@@ -4509,10 +4570,10 @@ mod tests {
 
     /// pnpm names no registry per entry, but the *shape* of `resolution:` says whether the
     /// configured registry served the artifact by name — only its integrity hash — or something
-    /// else did: a tarball URL (a custom registry, or a plain URL dependency), a git repo and
-    /// commit, an injected directory.
-    /// Only the former is origin evidence; every other shape, an unmodeled key included, reads as
-    /// unrecorded.
+    /// else did: a tarball URL (a registry pnpm could not derive from the default one, or every
+    /// entry under `lockfileIncludeTarballUrl`), a git repo and commit, an injected directory.
+    /// The first is origin evidence through the configured registry, and a registry tarball URL
+    /// names its own source; every other shape, an unmodeled key included, reads as unrecorded.
     #[test]
     fn pnpm_origin_is_the_configured_registry_only_for_an_integrity_only_resolution() {
         let lock = indoc! {"
@@ -4550,8 +4611,8 @@ mod tests {
         assert_eq!(origin_of("lodash"), LockOrigin::ConfiguredRegistry);
         assert_eq!(
             origin_of("private-api"),
-            LockOrigin::Unrecorded,
-            "a tarball URL names another source"
+            LockOrigin::Url("https://npm.corp.example/private-api/-/private-api-1.0.0.tgz".into()),
+            "a registry tarball URL names its own source"
         );
         assert_eq!(origin_of("pinned-git"), LockOrigin::Unrecorded);
         assert_eq!(origin_of("local-shim"), LockOrigin::Unrecorded);

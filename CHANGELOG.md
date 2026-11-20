@@ -15,6 +15,42 @@
   own violation. A `restored` lock edge row shows the binding the lock kept in both From and To,
   with a reason naming the re-resolve's transient binding, instead of reading as a downgrade; its
   JSON is unchanged. Closes #126.
+- **pnpm adopts a version a shorter package window admits, young transitives included.** With a
+  14-day `min-age` and a 7-day rule for `next` and `@next/*`, `next@16.4.6` (10 days old) pins
+  `@next/env@16.4.6` exactly, and the trial resolve failed with
+  `ERR_PNPM_STRICT_MIN_RELEASE_AGE_REQUIRES_SAVE` because pnpm 11 turns `minimumReleaseAgeStrict`
+  on with any `minimumReleaseAge`. Trial resolves now run with strictness off, cooldown's own gate
+  judges every version the resolve picks, and each committed batch records an exact
+  `minimumReleaseAgeExclude` entry in pnpm-workspace.yaml for every young version cooldown admits,
+  transitives included, so a bare `pnpm install --frozen-lockfile` accepts the lock without a
+  later `sync`. Only versions whose publish time comes from the registry the lock resolved them
+  from are exempted, honoring pnpm's `registries` routing, against the window bare pnpm applies
+  (its effective `minimumReleaseAge`, else pnpm 11's built-in day); `sync` exempts exact versions
+  by the same rule against the window it writes, or a longer one pnpm applies on this machine,
+  warns about each young one it cannot, keeps an existing exact exemption it cannot prove unneeded
+  while the lock holds its version, and names any admitted version a setting above
+  pnpm-workspace.yaml, such as an environment variable, still makes a bare pnpm refuse. A young
+  transitive no rule admits holds the change as `transitive_in_cooldown`, naming it with its age
+  and window. Before an upgrade trial or a `fix` round commits, while the lock holds a version
+  that may be younger than pnpm's window, or a pnpmfile may set a window of its own, pnpm's own
+  frozen verification judges the settled lock in the project under the persisted settings as part
+  of that trial, so a lock it rewrites lands or rolls back with it. A version it refuses that the
+  starting lock did not already have refused holds the change as `transitive_in_cooldown` in any
+  transitive mode, the way a cooldown violation does, so the other candidates of an upgrade still
+  land. A young pin pnpm already refuses in the starting lock, as once `sync` switches its window
+  on, keeps an exact exemption while the lock holds it on pnpm's verdict alone, even from a mirror
+  and past the 20 refusals pnpm lists at once, so the run still ends with a lock pnpm accepts. A
+  scoped `sync --package` keeps the exemptions of the pins it did not select, and keeps every
+  exact exemption as written when pnpm's registry configuration or window cannot be read; it
+  writes a linked pnpm-workspace.yaml through the link. Under a pnpm that reads the list by first
+  match (10.19 to 11.8), a rule it never reads, behind an earlier rule for the same package, is
+  removed before stale exemptions are pruned, so pruning never activates it; any other pnpm keeps
+  every rule that is not stale. A `minimumReleaseAgeExclude` list written as an indentless YAML
+  sequence is rewritten without corrupting the keys after it, a list that already reads right is
+  left alone, and a form cooldown cannot rewrite safely, such as a quoted key, is reported instead
+  of corrupted, with the file left exactly as it was. An upgrade that finds a file edited between
+  two of its batches stops with a lock conflict instead of later rolling back over the edit.
+  Closes #129.
 
 ## v0.0.31
 

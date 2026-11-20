@@ -94,6 +94,7 @@ fn policy(
                 .map(|(name, version)| AdmittedVersion {
                     name: (*name).to_string(),
                     version: Version::new(*version),
+                    age: jiff::SignedDuration::from_hours(24),
                 })
                 .collect()
         }),

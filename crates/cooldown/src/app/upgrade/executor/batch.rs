@@ -3,7 +3,7 @@
 use super::super::UpgradeAccum;
 use crate::app::UpgradeItem;
 use crate::app::change_key::ChangeKey;
-use cooldown_core::{ApplyReport, BaselineViolation, Change, Diagnostic, EdgeRebind};
+use cooldown_core::{ApplyReport, BaselineViolation, Change, Diagnostic, EdgeRebind, NativeEdit};
 use std::collections::HashSet;
 
 /// The report produced by one native resolver batch.
@@ -77,6 +77,11 @@ pub(super) struct CommittedBatch {
     pub(super) admitted_crossings: HashSet<BaselineViolation>,
     /// Whether the batch floated up violations the reconcile pass should mature down.
     pub(super) reconcile_needed: bool,
+    /// The writer's native settings with this batch's exact exemptions written, applied unchanged
+    /// when the batch commits (see [`NativeAssessment::edit`]).
+    ///
+    /// [`NativeAssessment::edit`]: cooldown_core::NativeAssessment::edit
+    pub(super) native_edit: Option<NativeEdit>,
 }
 
 impl Default for BatchOutcome {

@@ -1276,6 +1276,96 @@ pub trait ToolWrite: Send + Sync {
         false
     }
 
+    /// Whether a mutation of `project` records the young versions cooldown admits in a native
+    /// exemption list (see [`assess_native_admissions`](ToolWrite::assess_native_admissions)).
+    ///
+    /// The application collects the [`JudgedPin`]s only for an adapter that answers `true`, so a
+    /// tool without such a list never pays for them.
+    fn accepts_native_admissions(&self, _project: &Project) -> bool {
+        false
+    }
+
+    /// Assesses which young versions of a settled graph need an exact native exemption, without
+    /// writing anything.
+    ///
+    /// The tool's native gate keeps applying its own window after cooldown accepts a graph, so a
+    /// lock holding a version that only a shorter cooldown rule admits stays installable only
+    /// with an exact exemption for that version.
+    /// A version is young when it was published within the window the bare tool applies.
+    /// The adapter ages each admitted version from the gate's publish time and grants none whose
+    /// time it cannot attribute to the registry the lock resolved it from, while a version the
+    /// tool itself refused at the start ([`NativeAdmissionQuery::refused_at_start`]) needs only
+    /// to be locked still.
+    /// It reads the lock and its native settings from [`NativeAdmissionQuery::snapshot`] alone,
+    /// and returns the complete edit those grants make, which the application writes unchanged.
+    /// Whether the tool then accepts the lock is the tool's own verdict
+    /// ([`native_gate_refusal`](ToolWrite::native_gate_refusal)), never predicted here.
+    /// The default grants and edits nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`] when the native configuration or the lock cannot be read, the
+    /// native window cannot be determined, or the native list cannot record an exact version.
+    async fn assess_native_admissions(
+        &self,
+        _query: NativeAdmissionQuery<'_>,
+    ) -> Result<NativeAssessment> {
+        Ok(NativeAssessment::default())
+    }
+
+    /// Runs the tool's own lock verification under the persisted native settings, with no trial
+    /// override, and returns its refusal of versions too young for its native window.
+    ///
+    /// The verification runs in the project itself, which holds the settled graph, and may write
+    /// the files [`native_gate_writes`](ToolWrite::native_gate_writes) names there; the
+    /// application adopts their bytes afterwards as its own, and no other file's.
+    /// The application asks it of every trial that would commit, once the trial's own exemptions
+    /// are written, and treats a refusal as that trial's policy verdict.
+    /// Nothing runs when the gate is known to have nothing to refuse, such as when the tool
+    /// applies no window or every locked version is older than it by
+    /// [`NativeGateQuery::published`], and nothing the tool loads can set a window of its own.
+    /// The default runs nothing and refuses nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`] when the verification fails for any other reason, such as a stale
+    /// lock, a registry or configuration failure, or an interruption.
+    async fn native_gate_refusal(
+        &self,
+        _query: NativeGateQuery<'_>,
+    ) -> Result<Option<NativeGateRefusal>> {
+        Ok(None)
+    }
+
+    /// Like [`native_gate_refusal`](ToolWrite::native_gate_refusal), for the lock the run starts
+    /// from, and naming every version the gate refuses there, where the tool's report names only
+    /// some of them, as pnpm's lists at most 20.
+    ///
+    /// The application asks it once per run, before any trial, and puts back the files
+    /// [`native_gate_writes`](ToolWrite::native_gate_writes) names afterwards.
+    /// The default asks [`native_gate_refusal`](ToolWrite::native_gate_refusal), for a tool whose
+    /// report names every version it refuses.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`] when the verification fails for another reason, or when the
+    /// refused versions cannot all be named.
+    async fn native_gate_baseline(
+        &self,
+        query: NativeGateQuery<'_>,
+    ) -> Result<Option<NativeGateRefusal>> {
+        self.native_gate_refusal(query).await
+    }
+
+    /// The project files, relative to its root, that
+    /// [`native_gate_refusal`](ToolWrite::native_gate_refusal) and
+    /// [`native_gate_baseline`](ToolWrite::native_gate_baseline) may write, such as the lock a
+    /// frozen verification rewrites.
+    /// The default names none.
+    fn native_gate_writes(&self, _project: &Project) -> Vec<camino::Utf8PathBuf> {
+        Vec::new()
+    }
+
     /// Writes the resolved policy down into native config (the `sync` operation; opt-in, post-MVP).
     ///
     /// The default implementation returns [`SyncReport::Unsupported`]; adapters that can sync
@@ -1403,6 +1493,7 @@ impl ResolveInputs {
         "pnpm-workspace.yaml",
         ".npmrc",
         ".pnpmfile.cjs",
+        ".pnpmfile.mjs",
         "yarn.lock",
         ".yarnrc",
         ".yarnrc.yml",
@@ -1609,6 +1700,103 @@ pub struct AdmittedVersion {
     pub name: String,
     /// Exact locked registry version; never a range or package-wide exemption.
     pub version: Version,
+    /// How long before the evaluation instant the version was published, by the publish time the
+    /// verdict read, which an adapter ages against the window its native gate applies.
+    pub age: SignedDuration,
+}
+
+/// One locked registry version with the cooldown gate's verdict on it, the evidence a native
+/// exemption list is derived from (see [`ToolWrite::assess_native_admissions`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JudgedPin {
+    /// Registry package name, including its scope when present.
+    pub name: String,
+    /// Exact locked registry version.
+    pub version: Version,
+    /// The publish time the verdict read, or `None` when the registry reported none.
+    pub published_at: Option<Timestamp>,
+    /// Whether cooldown admits this exact version, as `sync` decides it: its verdict passes or
+    /// is exempt, or a baseline entry acknowledges it, its publish time is known, and it is a
+    /// registry release rather than a pseudo-version.
+    pub admitted: bool,
+}
+
+/// An exact version of a package, as a lock holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LockedVersion {
+    /// Registry package name, including its scope when present.
+    pub name: String,
+    /// Exact registry version.
+    pub version: Version,
+}
+
+/// The settled graph handed to [`ToolWrite::assess_native_admissions`].
+#[derive(Debug, Clone, Copy)]
+pub struct NativeAdmissionQuery<'a> {
+    /// The project whose native configuration is assessed.
+    pub project: &'a Project,
+    /// Every locked registry version of the project's graph, as the gate judged it.
+    pub pins: &'a [JudgedPin],
+    /// The versions the tool's own verification refused in the lock the run started from, empty
+    /// when that verdict could not be read in full.
+    ///
+    /// The tool judged each against the window and the registry it actually applies, so one the
+    /// lock still holds at that version earns an exact exemption on that verdict alone, which
+    /// only keeps a pin the project already had, while cooldown's broader idea of a tolerated
+    /// violation earns none.
+    pub refused_at_start: &'a std::collections::HashSet<LockedVersion>,
+    /// The evaluation instant the verdicts were reached at, which ages the publish times.
+    pub evaluated_at: Timestamp,
+    /// The state the mutation journal expects of its write set: the lock the gate judged and the
+    /// native settings beside it, the one snapshot the assessment reads them from.
+    pub snapshot: &'a ProjectMutationState,
+}
+
+/// What a settled graph needs from a native exemption list, as
+/// [`ToolWrite::assess_native_admissions`] reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NativeAssessment {
+    /// The locked versions to exempt exactly: each young one cooldown admits whose publish time
+    /// came from the registry the lock resolved it from, and each one the tool refused in the
+    /// lock the run started from ([`NativeAdmissionQuery::refused_at_start`]).
+    pub grants: Vec<LockedVersion>,
+    /// The native settings file with the grants written, or `None` when it already reads that
+    /// way.
+    pub edit: Option<NativeEdit>,
+}
+
+/// The complete new contents of one native settings file in the mutation's write set.
+///
+/// The application writes it through [`ProjectMutationState::write_owned`], so a rollback of the
+/// journal takes the edit back without claiming a change someone else made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeEdit {
+    /// The file, relative to the project root.
+    pub path: Utf8PathBuf,
+    /// The file's new bytes.
+    pub contents: Vec<u8>,
+}
+
+/// The settled project handed to [`ToolWrite::native_gate_refusal`].
+#[derive(Debug, Clone, Copy)]
+pub struct NativeGateQuery<'a> {
+    /// The project whose settled lock the tool verifies.
+    pub project: &'a Project,
+    /// The publish time of every locked registry version the gate judged, from any of its
+    /// passes, since a version's publish time never changes.
+    pub published: &'a std::collections::HashMap<LockedVersion, Timestamp>,
+    /// The evaluation instant the gate judged at, which ages the publish times.
+    pub evaluated_at: Timestamp,
+}
+
+/// The native gate's own refusal of a settled lock, as
+/// [`ToolWrite::native_gate_refusal`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeGateRefusal {
+    /// The versions the gate named as too young.
+    pub versions: Vec<LockedVersion>,
+    /// The tool's own explanation, unredacted.
+    pub detail: String,
 }
 
 /// The resolved policy handed to [`ToolWrite::write_native`] for `sync`.

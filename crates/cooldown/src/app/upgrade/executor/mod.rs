@@ -24,15 +24,17 @@ use crate::app::advisories::{
     AdvisoryPackages, ClassifiedAdvisories, ProjectAdvisories, advisory_fetch_policy,
 };
 use crate::app::change_key::ChangeKey;
+use crate::app::check::admits_exactly;
 use crate::app::{
     FetchedRelease, SkippedInfo, TransitiveGate, UpgradeItem, Workspace, diag_from_error,
     recovery_diagnostics, stale_evaluation_skipped,
 };
 use cooldown_core::{
     ApplyReport, BaselineViolation, CeilingReason, Change, DepScope, Dependency, Diagnostic,
-    DiagnosticKind, FixVerdict, LockStatus, MemberRef, PackageId, Plan, ProjectMutationJournal,
-    ProjectMutationState, Release, ResolveContext, RewriteMode, SkipReason, Skipped, Status,
-    TargetFallback, UpdateKind, Version, check_pin_advised, evaluate_advised,
+    DiagnosticKind, FixVerdict, JudgedPin, LockStatus, LockedVersion, MemberRef,
+    NativeAdmissionQuery, NativeAssessment, NativeGateQuery, NativeGateRefusal, PackageId, Plan,
+    ProjectMutationJournal, ProjectMutationState, Release, ResolveContext, RewriteMode, SkipReason,
+    Skipped, Status, TargetFallback, UpdateKind, Version, check_pin_advised, evaluate_advised,
     evaluate_ceiling_hold_advised, evaluate_fix_advised, exceeds_max_major,
 };
 use std::collections::{HashMap, HashSet};
@@ -368,6 +370,17 @@ struct GraphGate {
     violations: HashMap<BaselineViolation, bool>,
     /// Every locked version outside its package's configured `max-major`.
     ceiling_crossings: HashSet<BaselineViolation>,
+    /// Every locked registry version with the gate's verdict on it, collected only for a writer
+    /// that records native admissions (see [`accepts_native_admissions`]).
+    ///
+    /// [`accepts_native_admissions`]: cooldown_core::ToolWrite::accepts_native_admissions
+    pins: Vec<JudgedPin>,
+}
+
+/// A residual-gate pass and the writer's native assessment of the graph it judged.
+struct JudgedGraph {
+    gate: GraphGate,
+    native: NativeAssessment,
 }
 
 /// The evolving per-project state during upgrade trials.
@@ -407,6 +420,9 @@ impl TrialRollback {
                 journal: rollback,
                 expected,
             } => {
+                // A file an earlier batch of the trial left must still read as it left it, or a
+                // trial restore would write the trial's preimage over the change made since.
+                expected.ensure_continued_by(journal)?;
                 preserve_rollback_entries(rollback, journal)?;
                 expected.extend_missing(state)?;
             }
@@ -427,6 +443,18 @@ impl TrialRollback {
             ));
         };
         expected.replace(state)
+    }
+
+    /// Takes the bytes the `written` files hold now as the trial's own, as a step cooldown owns
+    /// leaves them: an acceptance commits them and a rollback takes them back, while every other
+    /// file keeps its expectation, so a change made to one still stops a restore.
+    fn adopt_live(&mut self, written: &[camino::Utf8PathBuf]) -> cooldown_core::Result<()> {
+        match self {
+            TrialRollback::Empty => Ok(()),
+            TrialRollback::Captured { expected, .. } => written
+                .iter()
+                .try_for_each(|path| expected.adopt_live(path)),
+        }
     }
 
     fn restore(&mut self) -> cooldown_core::Result<()> {
@@ -540,6 +568,51 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     /// The canonical shared files the project's write guard leases for the whole run, which
     /// bound the shared files a source mutation may journal.
     leased_shared_files: Vec<camino::Utf8PathBuf>,
+    /// How young each violation the residual gate met was against its window, as
+    /// `<age>/<window>` in [`compact_duration`]'s units, such as `3d/7d` or `5h/12h`.
+    ///
+    /// A residual hold names its offender with this detail; like
+    /// [`pin_security`](Self::pin_security), entries for versions no longer locked are never
+    /// looked up again and are not pruned.
+    violation_ages: HashMap<BaselineViolation, String>,
+    /// The publish time of every locked registry version a gate pass judged, collected only for
+    /// a writer that records native admissions, which lets the native gate skip a lock it has
+    /// nothing to refuse in (see [`NativeGateQuery::published`]).
+    ///
+    /// A version's publish time never changes, so entries from earlier passes stay valid.
+    published_times: HashMap<LockedVersion, jiff::Timestamp>,
+    /// What the writer's native gate makes of the lock the run starts from, asked once, with the
+    /// first batch (see [`judge_starting_lock`](Self::judge_starting_lock)).
+    starting_verdict: StartingVerdict,
+}
+
+/// The writer's native gate's verdict on the lock a run starts from.
+#[derive(Debug)]
+enum StartingVerdict {
+    /// Not asked yet, or never, for a writer without a native gate.
+    Unasked,
+    /// Every version the gate refuses there, none when it accepts the lock.
+    ///
+    /// The tool's own window made them unacceptable, so each earns an exact exemption while the
+    /// lock still holds it.
+    /// No trial introduced them, so a trial's native verdict counts only the others, as the
+    /// residual gate counts only the violations a trial introduced; a version a trial makes the
+    /// gate refuse anew, such as one whose inherited exemption a newly written list masks, still
+    /// counts.
+    Refused(HashSet<LockedVersion>),
+    /// The verdict could not be read in full, so no version is known to have been refused before
+    /// the run: none earns an exemption on that verdict, and every refusal a trial meets counts.
+    Incomplete,
+}
+
+impl StartingVerdict {
+    /// The versions the gate refuses in the starting lock, when its verdict was read in full.
+    fn refused(&self) -> Option<&HashSet<LockedVersion>> {
+        match self {
+            StartingVerdict::Refused(versions) => Some(versions),
+            StartingVerdict::Unasked | StartingVerdict::Incomplete => None,
+        }
+    }
 }
 
 impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
@@ -572,6 +645,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             unproven_reported: HashSet::new(),
             advisories: None,
             leased_shared_files: Vec::new(),
+            violation_ages: HashMap::new(),
+            published_times: HashMap::new(),
+            starting_verdict: StartingVerdict::Unasked,
         }
     }
 
@@ -964,13 +1040,85 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 return None;
             }
         };
-
         Some(TrialState {
             baseline_violations: gate.violations.into_keys().collect(),
             allowed_crossings: gate.ceiling_crossings.clone(),
             ceiling_crossings: gate.ceiling_crossings,
             reconcile_needed: false,
         })
+    }
+
+    /// Puts the lock the run starts from to the writer's native gate, once, as the first batch's
+    /// `journal` is captured, recording its verdict as
+    /// [`starting_verdict`](Self::starting_verdict).
+    ///
+    /// The journal has validated the write set by then, so a project it refuses never reaches the
+    /// verification, and the files the verification writes are put back from the journal's
+    /// preimage, so the starting lock stays byte for byte as it was.
+    /// A verification that fails proves nothing about the starting lock, so its verdict is
+    /// [`StartingVerdict::Incomplete`]; the final frozen check still judges the lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`](cooldown_core::CoreError) when a written file cannot be put back,
+    /// such as one someone else changed meanwhile.
+    async fn judge_starting_lock(
+        &mut self,
+        journal: &ProjectMutationJournal,
+    ) -> cooldown_core::Result<()> {
+        let project = &self.ctx.pctx.project;
+        if !matches!(self.starting_verdict, StartingVerdict::Unasked)
+            || !self.ctx.writer.accepts_native_admissions(project)
+        {
+            return Ok(());
+        }
+        self.ctx
+            .progress
+            .phase("verifying the starting lock against the native release-age policy");
+        let verdict = self
+            .ctx
+            .writer
+            .native_gate_baseline(NativeGateQuery {
+                project,
+                published: &self.published_times,
+                evaluated_at: self.ws.now(),
+            })
+            .await;
+        self.starting_verdict = match verdict {
+            Ok(refusal) => StartingVerdict::Refused(
+                refusal
+                    .map(|refusal| refusal.versions.into_iter().collect())
+                    .unwrap_or_default(),
+            ),
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    project = %self.ctx.pctx.rel_path,
+                    "the native gate's verdict on the starting lock is incomplete"
+                );
+                StartingVerdict::Incomplete
+            }
+        };
+        for path in self.ctx.writer.native_gate_writes(project) {
+            journal.restore_file(&path)?;
+        }
+        Ok(())
+    }
+
+    /// The versions in a native gate's `refusal` that the starting lock did not already have
+    /// refused, or `None` when it refuses nothing new.
+    ///
+    /// Without a complete verdict on the starting lock, every version it names counts.
+    fn new_native_refusal(&self, refusal: Option<NativeGateRefusal>) -> Option<NativeGateRefusal> {
+        let NativeGateRefusal { versions, detail } = refusal?;
+        let versions: Vec<LockedVersion> = match self.starting_verdict.refused() {
+            Some(refused) => versions
+                .into_iter()
+                .filter(|version| !refused.contains(version))
+                .collect(),
+            None => versions,
+        };
+        (!versions.is_empty()).then_some(NativeGateRefusal { versions, detail })
     }
 
     /// Apply the forward moves, then (under the default transitive mode) reconcile the graph the
@@ -1932,10 +2080,88 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             // A configured `max-major` is absolute, so it holds in every transitive mode.
             max_major: unauthorized_crossings(&state.ceiling_crossings, &state.allowed_crossings),
         };
-        if residual.is_empty() {
-            return UpgradeTrialResult::Settled(pending);
+        if !residual.is_empty() {
+            return UpgradeTrialResult::PolicyBlocked(residual);
         }
-        UpgradeTrialResult::PolicyBlocked(residual)
+        // The writer's native gate judges the trial's settled bytes as part of its verdict, so a
+        // version it refuses holds candidates exactly as a cooldown violation does, and isolation
+        // and fallback can still land the others.
+        match self.native_trial_verdict(rollback).await {
+            Ok(None) => UpgradeTrialResult::Settled(pending),
+            Ok(Some(refused)) => UpgradeTrialResult::PolicyBlocked(PolicyResidual {
+                cooldown: refused,
+                max_major: Vec::new(),
+            }),
+            Err(error) => {
+                let mut outcome = BatchOutcome::default();
+                outcome.errors.push(self.project_diag(&error, None));
+                outcome.strict_incomplete = true;
+                pending.push(outcome);
+                UpgradeTrialResult::Aborted(pending)
+            }
+        }
+    }
+
+    /// The writer's native gate's own verdict on a trial that would commit, reached on its
+    /// settled bytes, once its exemptions are written: the versions the gate refuses, as
+    /// cooldown violations, or `None` when it accepts the lock.
+    ///
+    /// The verification runs in the project itself, since only the real tree carries every input
+    /// the tool reads, such as a pnpmfile's own imports.
+    /// It is cooldown's own step, like the resolve: the files it writes, such as a lock a
+    /// pnpmfile hook rewrote, become the trial's state, so an acceptance commits them and a
+    /// restore takes them back, while a change to any other file still stops the restore.
+    /// A verification that passes cannot change a resolution, so the gate's verdict on the graph
+    /// still holds.
+    async fn native_trial_verdict(
+        &mut self,
+        rollback: &mut TrialRollback,
+    ) -> cooldown_core::Result<Option<Vec<BaselineViolation>>> {
+        let project = &self.ctx.pctx.project;
+        if !self.ctx.writer.accepts_native_admissions(project) {
+            return Ok(None);
+        }
+        self.ctx
+            .progress
+            .phase("verifying the lock against the native release-age policy");
+        let verdict = self
+            .ctx
+            .writer
+            .native_gate_refusal(NativeGateQuery {
+                project,
+                published: &self.published_times,
+                evaluated_at: self.ws.now(),
+            })
+            .await;
+        let written = self.ctx.writer.native_gate_writes(project);
+        let refusal = self.new_native_refusal(rollback.adopt_live(&written).and(verdict)?);
+        Ok(refusal.map(|refusal| self.refused_violations(&refusal)))
+    }
+
+    /// The versions the native gate's `refusal` names, as violations of the graph the last gate
+    /// pass read.
+    fn refused_violations(&self, refusal: &NativeGateRefusal) -> Vec<BaselineViolation> {
+        let tool = self.ctx.pctx.tool;
+        refusal
+            .versions
+            .iter()
+            .map(|refused| {
+                let named = |dep: &&Dependency| dep.package.name == refused.name;
+                let package = self
+                    .last_gate_graph
+                    .iter()
+                    .find(|dep| named(dep) && dep.current == refused.version)
+                    .or_else(|| self.last_gate_graph.iter().find(named))
+                    .map_or_else(
+                        || PackageId::new(tool, refused.name.clone(), None),
+                        |dep| dep.package.clone(),
+                    );
+                BaselineViolation {
+                    package,
+                    version: refused.version.clone(),
+                }
+            })
+            .collect()
     }
 
     async fn upgrade_fallbacks(&mut self, change: &Change) -> cooldown_core::Result<Vec<Change>> {
@@ -2181,8 +2407,19 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         // Name one offender (sorted for a stable report).
         let offender = violations
             .iter()
-            .map(|violation| package_label(&violation.package))
-            .min();
+            .map(|violation| (package_label(&violation.package), violation))
+            .min_by(|(left, _), (right, _)| left.cmp(right));
+        // A young offender's message says how young it is against its window.
+        let described =
+            offender.as_ref().map(
+                |(label, violation)| match self.violation_ages.get(*violation) {
+                    Some(age) if reason == SkipReason::TransitiveInCooldown => {
+                        format!("{label}: {age}")
+                    }
+                    _ => label.clone(),
+                },
+            );
+        let offender = offender.map(|(label, _)| label);
         for change in changes {
             self.record_change_skip(
                 change,
@@ -2190,7 +2427,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     reason,
                     message: conflict_skip_message(
                         reason,
-                        offender.as_deref(),
+                        described.as_deref(),
                         &change.package.name,
                     ),
                     offending: offender.clone(),
@@ -3162,29 +3399,15 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             }
         };
 
-        // Resilient apply: if the joint resolve is unsatisfiable as a whole because of one unfetchable
-        // or conflicting candidate, isolate it and apply the rest rather than holding every candidate.
-        let mutation = match super::super::resilient_apply::apply_resilient_with_observer(
-            self.ctx.writer,
-            &prepared,
-            self.ctx.progress,
-            self.ctx.source_root,
-        )
-        .await
-        {
-            Ok(mutation) => mutation,
-            Err(super::super::resilient_apply::ApplyFailure::Failed(error)) => {
-                self.add_change_errors(&mut outcome, &error, &changes);
-                return outcome;
-            }
-            Err(super::super::resilient_apply::ApplyFailure::RestoreConflict(error)) => {
-                outcome.mark_restore_conflict();
-                self.add_change_errors(&mut outcome, &error, &changes);
-                return outcome;
-            }
+        // The apply and the native settlement below are heap-pinned, so their futures do not
+        // deepen the batch's own, which every trial nests on a possibly small thread stack.
+        let Some(mutation) =
+            Box::pin(self.apply_prepared_batch(&prepared, &mut outcome, &changes)).await
+        else {
+            return outcome;
         };
         let journal = prepared.journal();
-        let expected = mutation.expected;
+        let mut expected = mutation.expected;
         let report = mutation.report;
         outcome.attestation = Some(Box::new(HoldAttestation::of(&report, &changes)));
         // Candidates recovery dropped for a non-resolver failure (verification, stale lock — e.g.
@@ -3219,13 +3442,33 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             return outcome;
         }
 
+        // The graph gate's warnings describe the lock this batch settles on, so a batch restored
+        // after it drops them.
+        let settled_warnings = outcome.warnings.len();
         let verified = self
-            .verify_batch_graph(&mut outcome, &changes, &report, state)
+            .verify_batch_graph(&mut outcome, &changes, &report, state, &expected)
             .await;
         let Some(committed) = verified.filter(|_| !self.record_interruption(&mut outcome)) else {
             self.restore_journal_into_outcome(journal, &expected, &mut outcome);
             return outcome;
         };
+        let settlement = BatchSettlement {
+            journal,
+            changes: &changes,
+            report: &report,
+        };
+        if !Box::pin(self.settle_native_batch(
+            &mut outcome,
+            &settlement,
+            &mut expected,
+            committed.native_edit.as_ref(),
+            rollback.is_none(),
+        ))
+        .await
+        {
+            outcome.warnings.truncate(settled_warnings);
+            return outcome;
+        }
 
         self.capture_reintroduction_evidence(&changes, &report)
             .await;
@@ -3239,8 +3482,166 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         outcome
     }
 
-    async fn prepare_batch_journal(
+    /// Applies a prepared batch, reporting a failure on its `changes` in `outcome`.
+    ///
+    /// The apply is resilient: when the joint resolve is unsatisfiable as a whole because of one
+    /// unfetchable or conflicting candidate, it isolates that one and applies the rest rather than
+    /// holding every candidate.
+    async fn apply_prepared_batch(
         &self,
+        prepared: &cooldown_core::PreparedMutation,
+        outcome: &mut BatchOutcome,
+        changes: &[Change],
+    ) -> Option<super::super::resilient_apply::AppliedMutation> {
+        match super::super::resilient_apply::apply_resilient_with_observer(
+            self.ctx.writer,
+            prepared,
+            self.ctx.progress,
+            self.ctx.source_root,
+        )
+        .await
+        {
+            Ok(mutation) => Some(mutation),
+            Err(super::super::resilient_apply::ApplyFailure::Failed(error)) => {
+                self.add_change_errors(outcome, &error, changes);
+                None
+            }
+            Err(super::super::resilient_apply::ApplyFailure::RestoreConflict(error)) => {
+                outcome.mark_restore_conflict();
+                self.add_change_errors(outcome, &error, changes);
+                None
+            }
+        }
+    }
+
+    /// Settles the native side of a verified batch while its journal can still restore it, and
+    /// returns whether the batch may commit; otherwise `outcome` holds the restored batch.
+    ///
+    /// The assessed `edit` is written exactly as assessed and only into `expected`, the state the
+    /// journal expects, so a restore takes it back with the lock.
+    /// A trial's verdict includes the writer's native gate once all its batches settle (see
+    /// [`native_trial_verdict`](Self::native_trial_verdict)); a `standalone` batch, such as a
+    /// `fix` round, commits on its own with no isolation to fall back on, so the native gate
+    /// judges it here and a refusal holds every change it applied.
+    async fn settle_native_batch(
+        &mut self,
+        outcome: &mut BatchOutcome,
+        settlement: &BatchSettlement<'_>,
+        expected: &mut ProjectMutationState,
+        edit: Option<&cooldown_core::NativeEdit>,
+        standalone: bool,
+    ) -> bool {
+        let BatchSettlement {
+            journal,
+            changes,
+            report,
+        } = *settlement;
+        if let Some(edit) = edit
+            && let Err(error) = expected.write_owned(&edit.path, &edit.contents)
+        {
+            self.restore_failed_batch(outcome, journal, expected, &error, changes, report);
+            return false;
+        }
+        if !standalone {
+            return true;
+        }
+        self.native_batch_backstop(outcome, settlement, expected)
+            .await
+    }
+
+    /// Runs the writer's native backstop on a verified batch that commits on its own, and
+    /// returns whether the batch may commit.
+    ///
+    /// The verification is cooldown's own step, like the resolve, so `expected` takes the bytes
+    /// of the files it writes, and only theirs.
+    /// A refusal of a version the starting lock did not already have refused restores the batch
+    /// and holds each change it applied by that version; any other failure restores it and
+    /// reports the error, never a hold.
+    async fn native_batch_backstop(
+        &mut self,
+        outcome: &mut BatchOutcome,
+        settlement: &BatchSettlement<'_>,
+        expected: &mut ProjectMutationState,
+    ) -> bool {
+        let BatchSettlement {
+            journal,
+            changes,
+            report,
+        } = *settlement;
+        let project = &self.ctx.pctx.project;
+        if !self.ctx.writer.accepts_native_admissions(project) {
+            return true;
+        }
+        self.ctx
+            .progress
+            .phase("verifying the lock against the native release-age policy");
+        let verdict = self
+            .ctx
+            .writer
+            .native_gate_refusal(NativeGateQuery {
+                project,
+                published: &self.published_times,
+                evaluated_at: self.ws.now(),
+            })
+            .await;
+        let owned = self
+            .ctx
+            .writer
+            .native_gate_writes(project)
+            .iter()
+            .try_for_each(|path| expected.adopt_live(path));
+        match owned
+            .and(verdict)
+            .map(|refusal| self.new_native_refusal(refusal))
+        {
+            Ok(None) => true,
+            Ok(Some(refusal)) => {
+                self.restore_journal_into_outcome(journal, expected, outcome);
+                outcome.strict_incomplete |=
+                    !conservative_hold(SkipReason::TransitiveInCooldown, self.mode);
+                for change in changes
+                    .iter()
+                    .filter(|change| report.applied.contains(&ChangeKey::of(change)))
+                {
+                    outcome.items.push(
+                        self.change_skip_item(change, Some(native_refusal_skip(change, &refusal))),
+                    );
+                }
+                false
+            }
+            Err(error) => {
+                self.restore_failed_batch(outcome, journal, expected, &error, changes, report);
+                false
+            }
+        }
+    }
+
+    /// Restores a verified batch whose commit failed with `error`, reporting the failure on each
+    /// change the batch applied.
+    fn restore_failed_batch(
+        &self,
+        outcome: &mut BatchOutcome,
+        journal: &ProjectMutationJournal,
+        expected: &ProjectMutationState,
+        error: &cooldown_core::CoreError,
+        changes: &[Change],
+        report: &VerifiedBatchReport,
+    ) {
+        self.restore_journal_into_outcome(journal, expected, outcome);
+        self.add_change_errors(
+            outcome,
+            error,
+            changes
+                .iter()
+                .filter(|change| report.applied.contains(&ChangeKey::of(change))),
+        );
+    }
+
+    /// Captures the journal of the batch `plan` describes, preserves it into `rollback`, and puts
+    /// the starting lock to the native gate with the run's first batch (see
+    /// [`judge_starting_lock`](Self::judge_starting_lock)).
+    async fn prepare_batch_journal(
+        &mut self,
         plan: &Plan,
         withheld: &[Change],
         rollback: Option<&mut TrialRollback>,
@@ -3253,6 +3654,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         if let Some(rollback) = rollback {
             rollback.preserve(prepared.journal())?;
         }
+        Box::pin(self.judge_starting_lock(prepared.journal())).await?;
         Ok(prepared)
     }
 
@@ -3317,16 +3719,26 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         changes: &[Change],
         report: &VerifiedBatchReport,
         baseline: &TrialState,
+        snapshot: &ProjectMutationState,
     ) -> Option<CommittedBatch> {
         let applied = &report.applied;
         self.ctx
             .progress
             .phase("checking resolved graph cooldown after apply");
-        let GraphGate {
-            violations: after,
-            ceiling_crossings,
-        } = match self.graph_violations().await {
-            Ok(gate) => gate,
+        let JudgedGraph {
+            gate:
+                GraphGate {
+                    violations: after,
+                    ceiling_crossings,
+                    pins: _,
+                },
+            native:
+                NativeAssessment {
+                    grants: _,
+                    edit: native_edit,
+                },
+        } = match self.judge_graph(snapshot).await {
+            Ok(judged) => judged,
             Err(error) => {
                 self.add_change_errors(
                     outcome,
@@ -3380,6 +3792,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 crossings_after: ceiling_crossings,
                 admitted_crossings: admitted,
                 reconcile_needed,
+                native_edit,
             }),
         }
     }
@@ -3989,6 +4402,41 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         self.acc.lock_status = Some(combine_lock_status(self.acc.lock_status, status));
     }
 
+    /// The residual gate's pass over the locked graph, with the writer's native assessment of the
+    /// same graph, read from `snapshot`, the state the batch's journal expects.
+    async fn judge_graph(
+        &mut self,
+        snapshot: &ProjectMutationState,
+    ) -> cooldown_core::Result<JudgedGraph> {
+        let gate = self.graph_violations().await?;
+        let native = self.assess_native_admissions(&gate.pins, snapshot).await?;
+        Ok(JudgedGraph { gate, native })
+    }
+
+    /// What the writer's native exemption list needs for the graph whose `pins` the gate just
+    /// judged, or nothing for a writer without one.
+    async fn assess_native_admissions(
+        &self,
+        pins: &[JudgedPin],
+        snapshot: &ProjectMutationState,
+    ) -> cooldown_core::Result<NativeAssessment> {
+        let project = &self.ctx.pctx.project;
+        if !self.ctx.writer.accepts_native_admissions(project) {
+            return Ok(NativeAssessment::default());
+        }
+        let unknown = HashSet::new();
+        self.ctx
+            .writer
+            .assess_native_admissions(NativeAdmissionQuery {
+                project,
+                pins,
+                refused_at_start: self.starting_verdict.refused().unwrap_or(&unknown),
+                evaluated_at: self.ws.now(),
+                snapshot,
+            })
+            .await
+    }
+
     /// The graph's too-fresh, non-baselined violations, each mapped to whether a conservative `fix`
     /// gate can prove it is reducible: the graph floor sits below the locked version, so a downgrade
     /// can try to roll it back without violating known lower bounds. `upgrade` uses this same set for
@@ -4034,6 +4482,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let mut violations = HashMap::new();
         let mut ceiling_crossings = HashSet::new();
         let mut graph = Vec::new();
+        let collect_pins = self
+            .ctx
+            .writer
+            .accepts_native_admissions(&self.ctx.pctx.project);
+        let mut pins = Vec::new();
+        // A handle of its own, so recording a pin's evidence can borrow the executor mutably.
+        let advisories = self.advisories.clone();
         for FetchedRelease {
             dependency: dep,
             result,
@@ -4044,7 +4499,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             // freshly adopted security fix is itself a young pin, and an unadvised gate here
             // would count it as a new violation and roll back the very change the planner just
             // made.
-            let advised = self.advisories.as_ref().and_then(|project| {
+            let advised = advisories.as_ref().and_then(|project| {
                 project.classify(self.ctx.reader, &dep, std::slice::from_ref(&locked))
             });
             let advisory_ctx = advised.as_ref().map(ClassifiedAdvisories::context);
@@ -4056,35 +4511,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 &rctx,
                 self.ws.now(),
             );
-            // Remember what the feed says about this pin: a later committed change for exactly
-            // this (package, version) may have no planned provenance and reports from this
-            // evidence.
-            if let Some(security) = &pin.security {
-                self.pin_security.insert(
-                    pin_security_key(&dep.package, &dep.current),
-                    security.clone(),
-                );
-            }
-            // The other half of the fix-loss evidence: advisories that positively affect this
-            // locked version. With only the locked release fetched here, range boundaries are
-            // rarely orderable, so this pass contributes the enumerated-affected matches;
-            // range-only reintroductions are completed at commit time against a full release
-            // list (see capture_reintroduction_evidence).
-            if let Some(ctx) = &advisory_ctx {
-                let affected: Vec<cooldown_core::AdvisoryId> = ctx
-                    .advisories
-                    .iter()
-                    .filter(|advisory| {
-                        !advisory.withdrawn
-                            && advisory.affects(&locked.version, Some(&locked.order))
-                    })
-                    .map(|advisory| advisory.id.clone())
-                    .collect();
-                if !affected.is_empty() {
-                    self.pin_affected
-                        .insert(pin_security_key(&dep.package, &dep.current), affected);
-                }
-            }
+            self.record_advisory_evidence(&dep, &locked, &pin, advisory_ctx.as_ref());
             // The ceiling is policy, not age: no exemption, baseline entry, or transitive mode
             // relaxes it.
             if exceeds_max_major(&dep, &locked, &self.ctx.pctx.policy.layers, &rctx) {
@@ -4093,8 +4520,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     version: dep.current.clone(),
                 });
             }
-            if pin.status == Status::CurrentInCooldown {
-                let acknowledged = self.ws.baseline.is_acknowledged(
+            let acknowledged = pin.status == Status::CurrentInCooldown
+                && self.ws.baseline.is_acknowledged(
                     self.ctx.tool_name(),
                     self.project_label(),
                     &dep.package.name,
@@ -4102,9 +4529,26 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     dep.package.registry.as_deref(),
                     self.ws.now(),
                 );
-                if !acknowledged {
-                    insert_graph_violation(&mut violations, &dep);
+            if pin.status == Status::CurrentInCooldown && !acknowledged {
+                insert_graph_violation(&mut violations, &dep);
+                self.record_violation_age(&dep, &pin);
+            }
+            if collect_pins {
+                if let Some(published_at) = pin.published_at {
+                    self.published_times.insert(
+                        LockedVersion {
+                            name: dep.package.name.clone(),
+                            version: dep.current.clone(),
+                        },
+                        published_at,
+                    );
                 }
+                pins.push(JudgedPin {
+                    name: dep.package.name.clone(),
+                    version: dep.current.clone(),
+                    published_at: pin.published_at,
+                    admitted: admits_exactly(&pin, &locked, acknowledged),
+                });
             }
             graph.push(dep);
         }
@@ -4112,7 +4556,67 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         Ok(GraphGate {
             violations,
             ceiling_crossings,
+            pins,
         })
+    }
+
+    /// Remembers what the advisory feed says about one locked pin, the evidence a committed
+    /// change without planned provenance reports from.
+    fn record_advisory_evidence(
+        &mut self,
+        dep: &Dependency,
+        locked: &Release,
+        pin: &cooldown_core::PinVerdict,
+        advisory_ctx: Option<&cooldown_core::AdvisoryContext<'_>>,
+    ) {
+        // Remember what the feed says about this pin: a later committed change for exactly
+        // this (package, version) may have no planned provenance and reports from this
+        // evidence.
+        if let Some(security) = &pin.security {
+            self.pin_security.insert(
+                pin_security_key(&dep.package, &dep.current),
+                security.clone(),
+            );
+        }
+        // The other half of the fix-loss evidence: advisories that positively affect this
+        // locked version. With only the locked release fetched here, range boundaries are
+        // rarely orderable, so this pass contributes the enumerated-affected matches;
+        // range-only reintroductions are completed at commit time against a full release
+        // list (see capture_reintroduction_evidence).
+        if let Some(ctx) = advisory_ctx {
+            let affected: Vec<cooldown_core::AdvisoryId> = ctx
+                .advisories
+                .iter()
+                .filter(|advisory| {
+                    !advisory.withdrawn && advisory.affects(&locked.version, Some(&locked.order))
+                })
+                .map(|advisory| advisory.id.clone())
+                .collect();
+            if !affected.is_empty() {
+                self.pin_affected
+                    .insert(pin_security_key(&dep.package, &dep.current), affected);
+            }
+        }
+    }
+
+    /// Remembers how young the violating pin `dep` is against its window (see
+    /// [`violation_ages`](Self::violation_ages)).
+    fn record_violation_age(&mut self, dep: &Dependency, pin: &cooldown_core::PinVerdict) {
+        let Some(published_at) = pin.published_at else {
+            return;
+        };
+        let now = self.ws.now();
+        self.violation_ages.insert(
+            BaselineViolation {
+                package: dep.package.clone(),
+                version: dep.current.clone(),
+            },
+            format!(
+                "{}/{}",
+                compact_duration(cooldown_core::duration::since(now, published_at)),
+                compact_duration(cooldown_core::duration::since(now, pin.window.cutoff(now)))
+            ),
+        );
     }
 
     fn project_label(&self) -> &str {
@@ -4525,6 +5029,47 @@ fn planned_changes_landed(changes: &[Change], applied: &HashSet<ChangeKey>) -> b
 /// different registries — which the collateral differ deliberately keeps apart — cannot borrow
 /// each other's relevance.
 type PinSecurityKey = (String, String, Option<String>);
+
+/// A verified batch about to settle: the journal that can still restore it, its planned changes,
+/// and the report of the ones it applied.
+#[derive(Clone, Copy)]
+struct BatchSettlement<'a> {
+    journal: &'a ProjectMutationJournal,
+    changes: &'a [Change],
+    report: &'a VerifiedBatchReport,
+}
+
+/// The hold of `change` by the native gate's `refusal` of the lock it landed, naming the refused
+/// version and quoting the tool's redacted explanation.
+fn native_refusal_skip(change: &Change, refusal: &NativeGateRefusal) -> SkippedInfo {
+    let reason = SkipReason::TransitiveInCooldown;
+    let offender = refusal
+        .versions
+        .iter()
+        .map(|version| version.name.clone())
+        .min();
+    let detail = cooldown_core::redact::url_secrets(refusal.detail.trim());
+    let held = conflict_skip_message(reason, offender.as_deref(), &change.package.name);
+    SkippedInfo {
+        reason,
+        message: format!("{held}; the native gate refused the lock: {detail}"),
+        offending: offender,
+    }
+}
+
+/// `duration` in its largest whole unit, from days down to seconds, so an age or window under a
+/// day still reads as more than zero: `10d`, `5h`, `12m`, `30s`.
+fn compact_duration(duration: jiff::SignedDuration) -> String {
+    const UNITS: [(&str, i64); 4] = [("d", 24 * 60 * 60), ("h", 60 * 60), ("m", 60), ("s", 1)];
+    let seconds = duration.as_secs().max(0);
+    UNITS
+        .iter()
+        .find(|(_, per_unit)| seconds >= *per_unit)
+        .map_or_else(
+            || "0s".to_string(),
+            |(unit, per_unit)| format!("{}{unit}", seconds / per_unit),
+        )
+}
 
 fn pin_security_key(package: &cooldown_core::PackageId, version: &Version) -> PinSecurityKey {
     (

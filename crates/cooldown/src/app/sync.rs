@@ -336,18 +336,16 @@ impl Workspace {
                 )
             });
             if writer.requires_sync_admission_evaluation(&pctx.project) {
-                policy.admitted_versions = match self
-                    .sync_admitted_versions(pctx, opts, &window, warnings)
-                    .await
-                {
-                    Ok(admitted) => Some(admitted),
-                    Err(warning) => {
-                        if !warnings.contains(&warning) {
-                            warnings.push(*warning);
+                policy.admitted_versions =
+                    match self.sync_admitted_versions(pctx, opts, warnings).await {
+                        Ok(admitted) => Some(admitted),
+                        Err(warning) => {
+                            if !warnings.contains(&warning) {
+                                warnings.push(*warning);
+                            }
+                            None
                         }
-                        None
-                    }
-                };
+                    };
             }
             cooldown_core::interrupt::ensure_not_requested("writing native config")
                 .map_err(|err| diag_from_error(&err, tool, &project, None))?;
@@ -895,8 +893,14 @@ mod tests {
         ) -> cooldown_core::Result<cooldown_core::SyncReport> {
             let path = project.root.join("native-exclusions");
             let exclusions = if let Some(admitted) = &policy.admitted_versions {
+                // Like a real adapter, exempt only what is young under the window it writes.
+                let window = match &policy.default_window {
+                    Some(cooldown_core::WindowSpec::MinAge(window)) => Some(*window),
+                    _ => None,
+                };
                 admitted
                     .iter()
+                    .filter(|admission| window.is_some_and(|window| admission.age < window))
                     .map(|admission| format!("{}@{}", admission.name, admission.version))
                     .collect::<Vec<_>>()
                     .join(",")
@@ -980,7 +984,8 @@ mod tests {
     }
 
     /// Native admissions are recomputed from the locked graph: retained and newly acknowledged
-    /// pins survive, removed pins disappear, and every exact admission disappears after maturity.
+    /// pins survive, removed pins disappear, and every exact admission disappears after maturity,
+    /// once the adapter sees its age past the window it writes.
     #[tokio::test]
     async fn sync_recomputes_exact_admissions_and_prunes_mature_versions() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
@@ -1588,7 +1593,7 @@ mod tests {
 
     /// An exempt pin earns an exact admission only as a registry version of known age that is
     /// still younger than the native window: a pseudo-version, an unknown-age pin and a mature
-    /// pin get none.
+    /// pin get none, the last because the adapter sees its age past the window it writes.
     #[tokio::test]
     async fn sync_admits_only_young_known_age_exempt_registry_pins() -> eyre::Result<()> {
         let mut pseudo = admission_dependency("@corp/pseudo", true);

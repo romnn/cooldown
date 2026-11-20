@@ -11,17 +11,17 @@ use crate::apply::landing::{
     candidate_landing, holds_exact_pins, restore_after_owned_step, target_in_declared_range,
     window_minutes_from_cutoff,
 };
+use crate::exclusions::{MatchSemantics, exact_exclusion};
 use crate::lock::{
     AliasOnlyVersions, EffectiveRegistryQuery, FixedBinding, FixedOwner, MemberAttribution,
-    MemberIndex, MemberResolution, NameVersion, NodeLock, SplitHold, SplitVerdict,
-    UnattributedName, Unproven, UnprovenDeclaration, WorkspaceDialect, WorkspaceManifests,
-    YarnBindings,
+    MemberIndex, MemberResolution, MinimumAgeRefusal, NameVersion, NodeLock, SplitHold,
+    SplitVerdict, UnattributedName, Unproven, UnprovenDeclaration, WorkspaceDialect,
+    WorkspaceManifests, YarnBindings,
 };
 use crate::manifest;
 use crate::native::{
-    ConfigStringList, EmptyList, NativeAge, NativeSelectors, exact_exclusion,
-    minimum_age_exclusions, prune_exclusions, set_yaml_block_list, set_yaml_scalar,
-    set_yaml_string_map, window_minutes,
+    ConfigStringList, EmptyList, NativeAge, NativeSelectors, prune_exclusions,
+    render_yaml_block_list, render_yaml_scalar, set_yaml_string_map, window_minutes,
 };
 use crate::nodecmd::NodeCmd;
 use crate::peers::{
@@ -41,11 +41,12 @@ use cooldown_adapter_util::{
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, CoreError, Declaration, DepScope,
     Dependency, Diagnostic, DiagnosticKind, FetchContext, LockStatus, LockVerifyReport, MemberRef,
-    MutationBaseline, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
-    Project, ProjectMarker, ProjectMutationJournal, ProjectMutationState, RawRelease, Release,
-    ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolvedPolicy, Result, RewriteMode,
-    SingleCopyPolicy, SkipReason, Skipped, SyncReport, SyncScope, TargetFallback, ToolId, ToolRead,
-    ToolWrite, UpdateKind, VerifyReport, Version, redact,
+    MutationBaseline, NativeAdmissionQuery, NativeAssessment, NativeGateQuery, NativeGateRefusal,
+    NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation, Project, ProjectMarker,
+    ProjectMutationJournal, ProjectMutationState, RawRelease, Release, ReleaseFetcher,
+    ReleaseOrder, ReleaseQuality, ResolvedPolicy, Result, RewriteMode, SingleCopyPolicy,
+    SkipReason, Skipped, SyncReport, SyncScope, TargetFallback, ToolId, ToolRead, ToolWrite,
+    UpdateKind, VerifyReport, Version, redact,
 };
 use cooldown_registry::SharedHttp;
 use serde::de::DeserializeOwned;
@@ -239,15 +240,21 @@ fn pnpm_location_filter(path: &str) -> String {
 pub struct NpmTool<L> {
     registry: NpmRegistry,
     cmd: NodeCmd,
-    /// The effective registry routing per project root, queried from the manager binary once
-    /// per run when advisory identities need confirming (`None` cached for a failed query, so
-    /// a broken binary is asked once, not once per gate pass).
-    effective_registry: tokio::sync::Mutex<
-        std::collections::HashMap<Utf8PathBuf, Option<crate::npmrc::RegistryOverrides>>,
-    >,
-    /// Publish times already trusted during planning, reused by native exemption persistence.
-    publish_times:
-        tokio::sync::Mutex<HashMap<PackageId, HashMap<Version, Option<jiff::Timestamp>>>>,
+    /// The effective configuration listing per project root, queried from the manager binary
+    /// once per run when advisory identities need confirming or a native gate may be skipped
+    /// (`None` cached for a failed query, so a broken binary is asked once, not once per gate
+    /// pass).
+    effective_config: tokio::sync::Mutex<HashMap<Utf8PathBuf, Option<String>>>,
+    /// The manager's version per project root, queried once for the release-age window it applies
+    /// when nothing configures one.
+    manager_version: tokio::sync::Mutex<HashMap<Utf8PathBuf, String>>,
+    /// The cache directory the native backstop verifies under, one per canonical project root,
+    /// created on first use and kept for the run, so the registry metadata a project's probes
+    /// fetch stays warm across its trials and never serves a project with other credentials.
+    ///
+    /// A project's probes run one after another, so no probe's verification record outlives the
+    /// removal that precedes the next one there (see [`clear_verification_records`]).
+    verification_caches: tokio::sync::Mutex<HashMap<Utf8PathBuf, tempfile::TempDir>>,
     _lock: PhantomData<fn() -> L>,
 }
 
@@ -258,8 +265,9 @@ impl<L: NodeLock> NpmTool<L> {
         NpmTool {
             registry,
             cmd: NodeCmd::new(L::BIN),
-            effective_registry: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-            publish_times: tokio::sync::Mutex::new(HashMap::new()),
+            effective_config: tokio::sync::Mutex::new(HashMap::new()),
+            manager_version: tokio::sync::Mutex::new(HashMap::new()),
+            verification_caches: tokio::sync::Mutex::new(HashMap::new()),
             _lock: PhantomData,
         }
     }
@@ -282,7 +290,14 @@ impl<L: NodeLock> NpmTool<L> {
         if L::EFFECTIVE_REGISTRY == EffectiveRegistryQuery::Unavailable {
             return None;
         }
-        let mut cache = self.effective_registry.lock().await;
+        let listing = self.effective_config(root).await?;
+        crate::npmrc::overrides_from_effective_config(&listing, L::EFFECTIVE_REGISTRY)
+    }
+
+    /// The manager's effective configuration for `root` as `config list --json` prints it, asked
+    /// of the binary once and memoized, a failed query as `None`.
+    async fn effective_config(&self, root: &Utf8Path) -> Option<String> {
+        let mut cache = self.effective_config.lock().await;
         if let Some(cached) = cache.get(root) {
             return cached.clone();
         }
@@ -290,12 +305,7 @@ impl<L: NodeLock> NpmTool<L> {
             .iter()
             .map(ToString::to_string)
             .collect();
-        let queried = match self.cmd.stdout(root, &args).await {
-            Ok(stdout) => {
-                crate::npmrc::overrides_from_effective_config(&stdout, L::EFFECTIVE_REGISTRY)
-            }
-            Err(_) => None,
-        };
+        let queried = self.cmd.stdout(root, &args).await.ok();
         cache.insert(root.to_owned(), queried.clone());
         queried
     }
@@ -907,17 +917,6 @@ impl<L: NodeLock> ReleaseFetcher for NpmTool<L> {
         _candidates: CandidateScope,
     ) -> Result<Vec<Release>> {
         let packument = self.registry.packument(&dep.package).await?;
-        self.publish_times
-            .lock()
-            .await
-            .entry(dep.package.clone())
-            .or_default()
-            .extend(
-                packument
-                    .releases
-                    .iter()
-                    .map(|release| (release.version.clone(), release.published_at)),
-            );
         Ok(build_releases(
             dep.current.as_str(),
             packument.releases,
@@ -939,12 +938,6 @@ impl<L: NodeLock> ReleaseFetcher for NpmTool<L> {
             .registry
             .published_at(&dep.package, &dep.current, &[])
             .await?;
-        self.publish_times
-            .lock()
-            .await
-            .entry(dep.package.clone())
-            .or_default()
-            .insert(dep.current.clone(), time);
         Ok(Release {
             version: dep.current.clone(),
             order: ReleaseOrder(Vec::new()),
@@ -2990,15 +2983,6 @@ impl<L: NodeLock> NpmTool<L> {
         if !transitive.is_empty() {
             self.resolve_with_temporary_overrides(project, plan, transitive, window_minutes)
                 .await?;
-        } else if !inputs.exact_pins.is_empty() {
-            // An exact direct update can land below the native age floor without taking the
-            // repair leg; its plain frozen install still needs the same persisted permission.
-            self.persist_minimum_age_exclusions(
-                project,
-                &minimum_age_repair_versions(plan),
-                plan.evaluated_at,
-            )
-            .await?;
         }
         Ok(inputs.authorized)
     }
@@ -3179,7 +3163,6 @@ impl<L: NodeLock> NpmTool<L> {
         let native_rel = Utf8PathBuf::from(native);
         let native_snapshot = ProjectMutationJournal::capture(&project.root, [&native_rel])?;
         let configured_exclusions = self.effective_minimum_age_exclusions(project).await?;
-        let exact_versions = minimum_age_repair_versions(plan);
         let exclusions = minimum_age_repair_exclusions(plan, configured_exclusions);
         let mut overrides = self
             .configured_value::<BTreeMap<String, String>>(project, "overrides")
@@ -3218,92 +3201,442 @@ impl<L: NodeLock> NpmTool<L> {
         self.cmd
             .run(&project.root, &args)
             .await
-            .map_err(propagate_repeated_minimum_age_rejection)?;
-        // This file is in the outer mutation journal, so a failed graph gate or isolated
-        // candidate restores these permissions together with the settled lock.
-        self.persist_minimum_age_exclusions(project, &exact_versions, plan.evaluated_at)
-            .await
+            .map_err(propagate_repeated_minimum_age_rejection)
     }
 
-    async fn persist_minimum_age_exclusions(
+    /// The release-age window the bare manager applies to `project`: its effective
+    /// `minimumReleaseAge`, which it computes from the environment, the command line and
+    /// pnpm-workspace.yaml in its own precedence, else its built-in default.
+    ///
+    /// Returns `None` when that window is not positive, so the manager applies no age gate.
+    async fn native_floor(
         &self,
         project: &Project,
-        permitted_versions: &BTreeMap<String, BTreeSet<String>>,
-        evaluated_at: Option<jiff::Timestamp>,
-    ) -> Result<()> {
-        let Some(native) = L::NATIVE_MIN_AGE_FILE else {
-            return Ok(());
+    ) -> Result<Option<crate::admissions::NativeFloor>> {
+        let minutes = match self
+            .configured_value::<Option<i64>>(project, "minimumReleaseAge")
+            .await?
+        {
+            Some(minutes) => minutes,
+            None => crate::admissions::builtin_minimum_release_age(
+                &self.manager_version(&project.root).await?,
+            ),
         };
-        let path = project.root.join(native);
-        let native_age = NativeAge::read(&path)?;
-        let minutes = match native_age.minutes {
-            Some(minutes) => Some(minutes),
-            None => {
-                self.configured_value::<Option<i64>>(project, "minimumReleaseAge")
-                    .await?
+        Ok(crate::admissions::NativeFloor::new(minutes))
+    }
+
+    /// What `sync` judges the exact exemptions by: the `admitted` versions it exempts exactly,
+    /// the ones an upgrade grants too, young under the stricter of the `minutes` sync writes and
+    /// pnpm's effective window here, and resolved from the registry their publish time came
+    /// from, and the evidence that lets an `existing` exact entry go
+    /// ([`crate::admissions::ExemptionEvidence`]).
+    ///
+    /// The written window keeps the committed file right on its own wherever it is installed,
+    /// and a longer effective window, such as an environment variable sets, keeps the grants bare
+    /// pnpm here still needs: an extra exact entry for an admitted version is harmless, while a
+    /// dropped one breaks the install.
+    /// pnpm's window is asked before the write, so a file whose window sync lowers keeps grants
+    /// under the old one until the next sync prunes them.
+    /// A setting above the file that still refuses an admitted version is reported after the
+    /// write ([`Self::overridden_admission_warning`]).
+    /// Each young admitted version whose origin is not proven earns a warning in `warnings`
+    /// instead, since bare pnpm keeps refusing it.
+    ///
+    /// Returns `None` when pnpm's window or routing could not be read, so the evidence is
+    /// incomplete and no exact entry can be judged, which a warning in `warnings` says.
+    async fn sync_exemptions<'a>(
+        &self,
+        project: &Project,
+        minutes: i64,
+        admitted: &'a [cooldown_core::AdmittedVersion],
+        existing: &[String],
+        warnings: &mut Vec<Diagnostic>,
+    ) -> Result<Option<SyncExemptions<'a>>> {
+        let written = crate::admissions::NativeFloor::new(minutes);
+        let mut exemptions = SyncExemptions {
+            admitted,
+            grants: Vec::new(),
+            locked: crate::admissions::VersionLines::new(),
+            proven: crate::admissions::VersionLines::new(),
+            floor: written,
+        };
+        if admitted.is_empty() && existing.is_empty() {
+            return Ok(Some(exemptions));
+        }
+        // Only an admitted version's youth needs pnpm's window.
+        if !admitted.is_empty() {
+            let Ok(effective) = self.native_floor(project).await else {
+                warnings.push(Diagnostic::new(
+                    DiagnosticKind::ToolFailed,
+                    "pnpm's effective minimumReleaseAge could not be read, so sync keeps the exact \
+                     minimumReleaseAgeExclude entries as written and adds none",
+                ));
+                return Ok(None);
+            };
+            exemptions.floor = crate::admissions::NativeFloor::stricter(written, effective);
+        }
+        let young = exemptions
+            .floor
+            .is_some_and(|floor| admitted.iter().any(|version| floor.holds(version.age)));
+        if !young && existing.is_empty() {
+            return Ok(Some(exemptions));
+        }
+        let entries = L::parse(&read_lock::<L>(project)?)?;
+        exemptions.locked = registry_version_lines(&entries);
+        // An exact entry only for versions the lock no longer holds goes without any proof.
+        let lock_only = crate::admissions::ExemptionEvidence {
+            locked: &exemptions.locked,
+            mirrored: None,
+        };
+        let judged = existing.iter().any(|entry| {
+            exact_exclusion(entry).is_some_and(|(name, members)| {
+                members.iter().any(|member| {
+                    crate::exclusions::version_identity(member)
+                        .is_some_and(|identity| !lock_only.drops(name, &identity))
+                })
+            })
+        });
+        if !young && !judged {
+            return Ok(Some(exemptions));
+        }
+        let Some(proven) = self.origin_proven_versions(project, &entries).await else {
+            warnings.push(Diagnostic::new(
+                DiagnosticKind::ToolFailed,
+                "pnpm's registry configuration could not be read, so sync keeps the exact \
+                 minimumReleaseAgeExclude entries as written and adds none",
+            ));
+            return Ok(None);
+        };
+        exemptions.proven = proven;
+        let Some(floor) = exemptions.floor else {
+            return Ok(Some(exemptions));
+        };
+        let evidence = crate::admissions::GrantEvidence {
+            floor,
+            proven: &exemptions.proven,
+        };
+        let mut grants = Vec::new();
+        for version in admitted {
+            if evidence.young(&version.name, version.version.as_str(), version.age) {
+                grants.push(version);
+            } else if floor.holds(version.age) {
+                warnings.push(Diagnostic::new(
+                    DiagnosticKind::StricterNative,
+                    format!(
+                        "cooldown admits `{}@{}`, but cannot prove pnpm resolves it from the \
+                         registry its publish time came from, so it is not exempted natively",
+                        version.name, version.version
+                    ),
+                ));
             }
-        };
-        let locked = resolved_version_lines::<L>(&read_lock::<L>(project)?)?;
-        let mut exact_versions = BTreeMap::<String, BTreeSet<String>>::new();
-        if let Some(minutes) = minutes.filter(|minutes| *minutes > 0) {
-            for (name, versions) in permitted_versions {
-                for version in versions.iter().filter(|version| {
-                    locked
-                        .get(name)
-                        .is_some_and(|present| present.contains(*version))
-                }) {
-                    let now = evaluated_at.ok_or_else(|| {
-                        CoreError::System(
-                            "pnpm native age admissions require the plan's evaluation clock"
-                                .to_string(),
+        }
+        exemptions.grants = grants;
+        Ok(Some(exemptions))
+    }
+
+    /// The warning for the `admitted` versions that the settings file at `path` admits on its own
+    /// but bare pnpm on this machine still refuses, because a setting above the file overrides
+    /// its window or its exclusions.
+    ///
+    /// pnpm is asked for its effective window and exclusions in the project itself.
+    /// A query that fails is incomplete evidence, so it yields no warning and no failure.
+    async fn overridden_admission_warning(
+        &self,
+        project: &Project,
+        path: &Utf8Path,
+        admitted: &[cooldown_core::AdmittedVersion],
+    ) -> Option<Diagnostic> {
+        if admitted.is_empty() {
+            return None;
+        }
+        // The two gates are judged by first match ([`crate::exclusions::exempts`]), which only a
+        // pnpm known to read the list that way confirms.
+        let version = self.manager_version(&project.root).await.ok()?;
+        if crate::admissions::match_semantics(&version) != MatchSemantics::FirstMatch {
+            return None;
+        }
+        let written = NativeAge::read(path).ok()?;
+        let written_rules = crate::exclusions::configured_rules(written.exclusions);
+        let effective_floor = self.native_floor(project).await.ok()?;
+        let effective_rules = self.effective_minimum_age_exclusions(project).await.ok()?;
+        let overridden = crate::admissions::overridden_admissions(
+            admitted,
+            crate::admissions::NativeGate {
+                floor: written
+                    .minutes
+                    .and_then(crate::admissions::NativeFloor::new),
+                rules: &written_rules,
+            },
+            crate::admissions::NativeGate {
+                floor: effective_floor,
+                rules: &effective_rules,
+            },
+        );
+        (!overridden.is_empty()).then(|| {
+            Diagnostic::new(
+                DiagnosticKind::StricterNative,
+                format!(
+                    "pnpm-workspace.yaml admits {}, but a higher-precedence setting, such as an \
+                     environment variable, a CLI flag or a pnpmfile, overrides \
+                     pnpm-workspace.yaml here, so a bare pnpm install may refuse them",
+                    overridden.join(", ")
+                ),
+            )
+        })
+    }
+
+    /// The directory `project`'s native backstop verifies under, created on its first probe.
+    async fn verification_cache(&self, project: &Project) -> Result<Utf8PathBuf> {
+        let root = std::fs::canonicalize(&project.root)
+            .map_err(|error| CoreError::Filesystem(format!("{}: {error}", project.root)))?;
+        let root = Utf8PathBuf::from_path_buf(root).map_err(|path| {
+            CoreError::PathEncoding(format!(
+                "project root is not valid UTF-8: {}",
+                path.display()
+            ))
+        })?;
+        let mut caches = self.verification_caches.lock().await;
+        if let Some(dir) = caches.get(&root) {
+            return utf8_dir(dir);
+        }
+        let dir = tempfile::tempdir()
+            .map_err(|error| CoreError::Filesystem(format!("verification cache: {error}")))?;
+        let path = utf8_dir(&dir)?;
+        caches.insert(root, dir);
+        Ok(path)
+    }
+
+    /// Whether pnpm's frozen verification of the lock `query` names may refuse a version as too
+    /// young, so it has to run.
+    ///
+    /// The age gate has nothing to refuse without a window, or when every locked version is known
+    /// to be older than it by a publish time of proven origin, and the final frozen check still
+    /// judges the lock's currency.
+    /// A window or routing that cannot be read leaves it something all the same, and so does a
+    /// pnpmfile that may be loaded ([`Self::pnpmfile_may_load`]), since its `updateConfig` hook can
+    /// set a window that pnpm's configuration queries do not report.
+    async fn native_gate_may_refuse(&self, query: NativeGateQuery<'_>) -> Result<bool> {
+        if L::NATIVE_MIN_AGE_FILE.is_none() || L::verify_current_args().is_none() {
+            return Ok(false);
+        }
+        let NativeGateQuery {
+            project,
+            published,
+            evaluated_at,
+        } = query;
+        let nothing_to_refuse = match self.native_floor(project).await {
+            Ok(None) => true,
+            Ok(Some(floor)) => {
+                let entries = L::parse(&read_lock::<L>(project)?)?;
+                let locked = registry_version_lines(&entries);
+                self.origin_proven_versions(project, &entries)
+                    .await
+                    .is_some_and(|proven| {
+                        crate::admissions::all_mature(
+                            floor,
+                            &locked,
+                            &proven,
+                            published,
+                            evaluated_at,
                         )
-                    })?;
-                    let package = PackageId::new(L::ID, name, Some(NPM.to_string()));
-                    let version_id = Version::new(version);
-                    let cached = self
-                        .publish_times
-                        .lock()
-                        .await
-                        .get(&package)
-                        .and_then(|times| times.get(&version_id).copied());
-                    let published_at = match cached {
-                        Some(time) => time,
-                        None => {
-                            self.registry
-                                .published_at(&package, &version_id, &[])
-                                .await?
-                        }
-                    };
-                    if published_at
-                        .is_some_and(|time| now.duration_since(time).as_secs() / 60 < minutes)
-                    {
-                        exact_versions
-                            .entry(name.clone())
-                            .or_default()
-                            .insert(version.clone());
-                    }
-                }
+                    })
             }
+            Err(_) => false,
+        };
+        Ok(!nothing_to_refuse || self.pnpmfile_may_load(project).await)
+    }
+
+    /// Whether pnpm may load a pnpmfile in `project`, as its hook loading discovers one: the
+    /// default `.pnpmfile.mjs` or `.pnpmfile.cjs` beside the lock, or one its effective
+    /// configuration names ([`crate::admissions::configures_pnpmfile`]).
+    ///
+    /// It errs towards yes: a default file that exists but cannot be read, or a configuration that
+    /// cannot be read, may be one, and `ignorePnpmfile` is not trusted to rule any out.
+    async fn pnpmfile_may_load(&self, project: &Project) -> bool {
+        let present = |name: &str| {
+            !matches!(
+                std::fs::symlink_metadata(project.root.join(name)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        };
+        if present(".pnpmfile.mjs") || present(".pnpmfile.cjs") {
+            return true;
         }
-        match crate::exclusions::persisted_rules(native_age.exclusions, &exact_versions, &locked) {
-            crate::exclusions::Persisted::Unchanged => {}
-            crate::exclusions::Persisted::Rules(exclusions) => {
-                set_yaml_block_list(
-                    &path,
-                    "minimumReleaseAgeExclude",
-                    &exclusions,
-                    EmptyList::IfPresent,
-                    false,
-                )?;
+        self.effective_config(&project.root)
+            .await
+            .is_none_or(|listing| crate::admissions::configures_pnpmfile(&listing))
+    }
+
+    /// Runs pnpm's frozen verification of `project`'s lock and returns its refusal of young
+    /// versions, or `None` when it accepts the lock.
+    ///
+    /// A non-empty `excludes` replaces pnpm's effective `minimumReleaseAgeExclude` for the run.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CoreError`] when the verification fails for any other reason, such as a stale
+    /// lock, a registry or configuration failure, or an interruption.
+    async fn verify_native_gate(
+        &self,
+        project: &Project,
+        excludes: &[String],
+    ) -> Result<Option<NativeAgeReport>> {
+        let Some(mut args) = L::verify_current_args() else {
+            return Ok(None);
+        };
+        // pnpm skips a verification it recorded before for the same lock, and a lockfile-only
+        // resolve, a trial's included, records the lock it writes as verified.
+        // The record's key also leaves out settings that change the verdict, such as
+        // `minimumReleaseAgeIgnoreMissingTime` and the registry routing.
+        // The probe therefore runs under cooldown's own cache, whose records it removes first,
+        // while the registry metadata in that cache stays warm for the run.
+        let cache_dir = self.verification_cache(project).await?;
+        clear_verification_records(&cache_dir)?;
+        args.push(format!("--config.cache-dir={cache_dir}"));
+        // pnpm skips the verification of a lock it believes it installed unchanged before.
+        args.push("--config.optimistic-repeat-install=false".to_string());
+        // Without it a frozen install may still save settings, such as the catalogs
+        // `cleanupUnusedCatalogs` prunes from pnpm-workspace.yaml.
+        args.push("--no-save".to_string());
+        crate::lock::push_minimum_age_excludes(&mut args, excludes);
+        let report = self
+            .cmd
+            .lock_report(
+                &project.root,
+                &args,
+                L::LOCKFILE,
+                L::verify_refusal_is_stale,
+            )
+            .await;
+        match report {
+            Ok(LockVerifyReport {
+                status: LockStatus::Current,
+                ..
+            }) => {
+                self.ensure_verification_recorded(project, &cache_dir)
+                    .await?;
+                Ok(None)
             }
-            crate::exclusions::Persisted::ScalarSetting => {
-                return Err(CoreError::Config(format!(
-                    "{path}: minimumReleaseAgeExclude is a single string; make it a list so \
-                     cooldown can record the release-age exemptions it admitted"
-                )));
-            }
+            Ok(LockVerifyReport { detail, .. }) => Err(CoreError::StaleLock(detail)),
+            Err(CoreError::Tool {
+                tool,
+                termination,
+                stderr,
+            }) => match L::minimum_age_refusals(&stderr) {
+                Some(refusal) if !termination.is_abnormal() => Ok(Some(NativeAgeReport {
+                    refusal,
+                    detail: stderr.clone(),
+                    failure: CoreError::Tool {
+                        tool,
+                        termination,
+                        stderr,
+                    },
+                })),
+                _ => Err(CoreError::Tool {
+                    tool,
+                    termination,
+                    stderr,
+                }),
+            },
+            Err(error) => Err(error),
         }
-        Ok(())
+    }
+
+    /// Accepts a passing verification only when pnpm recorded it under `cache_dir`, the cache
+    /// cooldown gave it, so a pnpmfile that moves the cache cannot pass off a verdict reached
+    /// with records cooldown never cleared.
+    ///
+    /// A pnpm that keeps such records ([`crate::admissions::records_verifications`]) records
+    /// every verification it runs, so only a lock it trusts without verifying leaves no record,
+    /// and then it refuses no entry either.
+    /// An earlier pnpm, or one whose version cannot be read, is taken at its word.
+    async fn ensure_verification_recorded(
+        &self,
+        project: &Project,
+        cache_dir: &Utf8Path,
+    ) -> Result<()> {
+        if cache_dir.join(VERIFICATION_RECORDS).is_file() {
+            return Ok(());
+        }
+        let records = self
+            .manager_version(&project.root)
+            .await
+            .is_ok_and(|version| crate::admissions::records_verifications(&version));
+        if !records || self.trusts_lockfile(project).await? {
+            return Ok(());
+        }
+        Err(CoreError::System(
+            "pnpm did not use the verification cache cooldown provided, so its verdict cannot \
+             be trusted"
+                .to_string(),
+        ))
+    }
+
+    /// Whether the bare manager trusts `project`'s lock without verifying its entries
+    /// (`trust-lockfile`), so its release-age gate refuses none of them.
+    async fn trusts_lockfile(&self, project: &Project) -> Result<bool> {
+        Ok(self
+            .configured_value::<Option<bool>>(project, "trustLockfile")
+            .await?
+            .unwrap_or(false))
+    }
+
+    /// The versions among the lock `entries` whose publish time cooldown's registry client can
+    /// vouch for, or `None` when pnpm's routing could not be read (see
+    /// [`crate::admissions::origin_proven_versions`]).
+    ///
+    /// Where a pnpmfile may be loaded ([`Self::pnpmfile_may_load`]), only an entry's recorded
+    /// tarball URL proves its origin.
+    async fn origin_proven_versions(
+        &self,
+        project: &Project,
+        entries: &[NameVersion],
+    ) -> Option<crate::admissions::VersionLines> {
+        let file_overrides = if L::NPMRC_ROUTING {
+            crate::npmrc::RegistryOverrides::read(&project.root, L::NATIVE_MIN_AGE_FILE)
+        } else {
+            crate::npmrc::RegistryOverrides::none()
+        };
+        let effective_routing = self.effective_overrides(&project.root).await;
+        let routing = if self.pnpmfile_may_load(project).await {
+            crate::admissions::ReportedRouting::MayBeOverridden
+        } else {
+            crate::admissions::ReportedRouting::Complete
+        };
+        crate::admissions::origin_proven_versions(
+            entries,
+            &file_overrides,
+            effective_routing.as_ref(),
+            routing,
+        )
+    }
+
+    /// How the pnpm in `project` reads its exclusion list `rules`, by its cached version
+    /// ([`crate::admissions::match_semantics`]).
+    ///
+    /// Only a list with a rule a first-match reader never reads prunes differently under the two
+    /// semantics, so the version is asked only for one ([`crate::exclusions::has_shadowed_rule`]),
+    /// and any other list reads as [`MatchSemantics::Unverified`], which prunes it the same.
+    async fn match_semantics(&self, project: &Project, rules: &[String]) -> MatchSemantics {
+        if !crate::exclusions::has_shadowed_rule(rules) {
+            return MatchSemantics::Unverified;
+        }
+        self.manager_version(&project.root)
+            .await
+            .map_or(MatchSemantics::Unverified, |version| {
+                crate::admissions::match_semantics(&version)
+            })
+    }
+
+    /// The manager's `--version` for `root`, asked once per root.
+    async fn manager_version(&self, root: &Utf8Path) -> Result<String> {
+        let mut cache = self.manager_version.lock().await;
+        if let Some(version) = cache.get(root) {
+            return Ok(version.clone());
+        }
+        let version = self.cmd.stdout(root, &["--version".to_string()]).await?;
+        cache.insert(root.to_owned(), version.clone());
+        Ok(version)
     }
 
     async fn configured_value<T>(&self, project: &Project, key: &str) -> Result<T>
@@ -4137,14 +4470,116 @@ fn graph_ceiling_hold<L: NodeLock>(
 /// default would silently judge every name single-line, letting an advance verdict pass on a
 /// corrupted lock (see [`locked_versions`] for the same fail-closed contract).
 fn resolved_version_lines<L: NodeLock>(content: &str) -> Result<HashMap<String, BTreeSet<String>>> {
+    Ok(registry_version_lines(&L::parse(content)?))
+}
+
+/// The name of the file pnpm records its lockfile verifications in, inside its cache directory.
+const VERIFICATION_RECORDS: &str = "lockfile-verified.jsonl";
+
+/// What `sync` judges the exact exemptions by ([`NpmTool::sync_exemptions`]).
+struct SyncExemptions<'a> {
+    /// Every locked version cooldown admits, with its age.
+    admitted: &'a [cooldown_core::AdmittedVersion],
+    /// The admitted versions to exempt exactly.
+    grants: Vec<&'a cooldown_core::AdmittedVersion>,
+    /// Every version the lock holds, read once an exact entry or a grant needs it.
+    locked: crate::admissions::VersionLines,
+    /// The locked versions of proven origin, read once a locked exact entry or a grant needs
+    /// them.
+    proven: crate::admissions::VersionLines,
+    /// The window the bare manager applies.
+    floor: Option<crate::admissions::NativeFloor>,
+}
+
+impl SyncExemptions<'_> {
+    /// The grants, by package name.
+    fn granted(&self) -> BTreeMap<String, BTreeSet<String>> {
+        let mut granted = BTreeMap::<String, BTreeSet<String>>::new();
+        for version in &self.grants {
+            granted
+                .entry(version.name.clone())
+                .or_default()
+                .insert(version.version.to_string());
+        }
+        granted
+    }
+
+    /// The evidence that lets an existing exact entry go, mirroring cooldown's verdicts.
+    fn evidence(&self) -> crate::admissions::ExemptionEvidence<'_> {
+        crate::admissions::ExemptionEvidence {
+            locked: &self.locked,
+            mirrored: Some(crate::admissions::MirroredVerdicts {
+                proven: &self.proven,
+                admitted: self.admitted,
+                floor: self.floor,
+            }),
+        }
+    }
+}
+
+/// A refusal of young versions one frozen verification reported.
+struct NativeAgeReport {
+    /// The versions it names.
+    refusal: MinimumAgeRefusal,
+    /// pnpm's own report, unredacted.
+    detail: String,
+    /// The failed run itself, which stands as the verdict when the report omits entries.
+    failure: CoreError,
+}
+
+/// Removes pnpm's lockfile verification records from `cache_dir`, so the next verification there
+/// trusts none of them; a directory without records is left as it is.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Filesystem`] when the records exist but cannot be removed.
+fn clear_verification_records(cache_dir: &Utf8Path) -> Result<()> {
+    let records = cache_dir.join(VERIFICATION_RECORDS);
+    match std::fs::remove_file(&records) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CoreError::Filesystem(format!("{records}: {error}"))),
+    }
+}
+
+/// The UTF-8 path of the temporary directory `dir`.
+fn utf8_dir(dir: &tempfile::TempDir) -> Result<Utf8PathBuf> {
+    Utf8PathBuf::from_path_buf(dir.path().to_owned()).map_err(|path| {
+        CoreError::PathEncoding(format!(
+            "verification cache is not valid UTF-8: {}",
+            path.display()
+        ))
+    })
+}
+
+/// The text of the write-set file at `path` as `snapshot` holds it, or `None` when it was absent.
+fn snapshot_text(snapshot: &ProjectMutationState, path: &Utf8Path) -> Result<Option<String>> {
+    let file = snapshot
+        .files()
+        .iter()
+        .find(|file| file.path() == path)
+        .ok_or_else(|| CoreError::System(format!("the mutation journal does not hold {path}")))?;
+    file.contents()
+        .map(|contents| {
+            String::from_utf8(contents.to_vec())
+                .map_err(|error| CoreError::Parse(format!("{path}: {error}")))
+        })
+        .transpose()
+}
+
+/// Every registry-resolved version line per name among parsed lock `entries`.
+fn registry_version_lines(entries: &[NameVersion]) -> HashMap<String, BTreeSet<String>> {
     let mut lines: HashMap<String, BTreeSet<String>> = HashMap::new();
-    for NameVersion { name, version, .. } in L::parse(content)? {
+    for NameVersion { name, version, .. } in entries {
         if version.contains(':') {
             continue;
         }
-        lines.entry(name).or_default().insert(version);
+        lines
+            .entry(name.clone())
+            .or_default()
+            .insert(version.clone());
     }
-    Ok(lines)
+    lines
 }
 
 /// The plan's direct exact pins re-keyed for the override engine: each name gains its target's
@@ -4592,6 +5027,161 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         L::NATIVE_MIN_AGE_FILE.is_some()
     }
 
+    fn accepts_native_admissions(&self, _project: &Project) -> bool {
+        L::NATIVE_MIN_AGE_FILE.is_some()
+    }
+
+    async fn assess_native_admissions(
+        &self,
+        query: NativeAdmissionQuery<'_>,
+    ) -> Result<NativeAssessment> {
+        let Some(native) = L::NATIVE_MIN_AGE_FILE else {
+            return Ok(NativeAssessment::default());
+        };
+        let NativeAdmissionQuery {
+            project,
+            pins,
+            refused_at_start,
+            evaluated_at,
+            snapshot,
+        } = query;
+        let Some(floor) = self.native_floor(project).await? else {
+            return Ok(NativeAssessment::default());
+        };
+        let native = Utf8Path::new(native);
+        let native_text = snapshot_text(snapshot, native)?.unwrap_or_default();
+        let lock = snapshot_text(snapshot, Utf8Path::new(L::LOCKFILE))?.ok_or_else(|| {
+            CoreError::System(format!(
+                "the settled graph has no {} to assess",
+                L::LOCKFILE
+            ))
+        })?;
+        let entries = L::parse(&lock)?;
+        let locked = registry_version_lines(&entries);
+        // Without pnpm's routing no origin is proven, so no admitted version is granted; a
+        // version pnpm itself refused at the start needs no such proof.
+        let proven = self
+            .origin_proven_versions(project, &entries)
+            .await
+            .unwrap_or_default();
+        let configured = NativeAge::parse(&native_text, native)?
+            .exclusions
+            .into_vec();
+        let semantics = self.match_semantics(project, &configured).await;
+        crate::admissions::assess(crate::admissions::AssessmentInput {
+            pins,
+            refused_at_start,
+            now: evaluated_at,
+            evidence: crate::admissions::GrantEvidence {
+                floor,
+                proven: &proven,
+            },
+            locked: &locked,
+            semantics,
+            native: crate::admissions::NativeFile {
+                path: native,
+                text: &native_text,
+            },
+        })
+    }
+
+    fn native_gate_writes(&self, _project: &Project) -> Vec<Utf8PathBuf> {
+        // A frozen lockfile-only verification writes the lock and nothing else.
+        if L::NATIVE_MIN_AGE_FILE.is_some() && L::verify_current_args().is_some() {
+            vec![Utf8PathBuf::from(L::LOCKFILE)]
+        } else {
+            Vec::new()
+        }
+    }
+
+    async fn native_gate_refusal(
+        &self,
+        query: NativeGateQuery<'_>,
+    ) -> Result<Option<NativeGateRefusal>> {
+        if !self.native_gate_may_refuse(query).await? {
+            return Ok(None);
+        }
+        match self.verify_native_gate(query.project, &[]).await? {
+            None => Ok(None),
+            Some(NativeAgeReport {
+                refusal: MinimumAgeRefusal { listed, omitted: 0 },
+                detail,
+                ..
+            }) => Ok(Some(NativeGateRefusal {
+                versions: listed,
+                detail,
+            })),
+            // The entries a report leaves out may have failed for another reason, so the run
+            // proves no refusal of young versions alone.
+            Some(NativeAgeReport { failure, .. }) => Err(failure),
+        }
+    }
+
+    async fn native_gate_baseline(
+        &self,
+        query: NativeGateQuery<'_>,
+    ) -> Result<Option<NativeGateRefusal>> {
+        if !self.native_gate_may_refuse(query).await? {
+            return Ok(None);
+        }
+        let project = query.project;
+        // Each run names at least one version the runs before it did not, so the lock's own
+        // entries bound how many it takes.
+        let entries = L::parse(&read_lock::<L>(project)?)?;
+        let runs = registry_version_lines(&entries)
+            .values()
+            .map(BTreeSet::len)
+            .sum::<usize>();
+        let mut refused = Vec::<cooldown_core::LockedVersion>::new();
+        let mut named = HashSet::new();
+        let mut first_detail = None;
+        let mut excludes = Vec::new();
+        for _ in 0..=runs {
+            let Some(report) = self.verify_native_gate(project, &excludes).await? else {
+                return Ok(first_detail.map(|detail| NativeGateRefusal {
+                    versions: refused,
+                    detail,
+                }));
+            };
+            let NativeAgeReport {
+                refusal: MinimumAgeRefusal { listed, omitted },
+                detail,
+                ..
+            } = report;
+            let before = refused.len();
+            for version in listed {
+                if named.insert(version.clone()) {
+                    refused.push(version);
+                }
+            }
+            if refused.len() == before {
+                return Err(CoreError::System(
+                    "pnpm refused only versions its command-line minimumReleaseAgeExclude \
+                     already exempts, so the versions it refuses in the lock cannot all be named"
+                        .to_string(),
+                ));
+            }
+            let detail = first_detail.get_or_insert(detail);
+            if omitted == 0 {
+                return Ok(Some(NativeGateRefusal {
+                    versions: refused,
+                    detail: detail.clone(),
+                }));
+            }
+            // pnpm lists the refusals it omitted only once the ones it named are exempt.
+            let pins: Vec<(String, String)> = refused
+                .iter()
+                .map(|version| (version.name.clone(), version.version.to_string()))
+                .collect();
+            excludes = self.joint_update_exclusions(project, &pins).await?;
+        }
+        Err(CoreError::System(
+            "pnpm kept refusing new versions past every entry of the lock, so the versions it \
+             refuses there cannot all be named"
+                .to_string(),
+        ))
+    }
+
     async fn write_native(
         &self,
         project: &Project,
@@ -4639,27 +5229,35 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
             });
         };
         // Policy-exempt names and admitted young versions must also pass pnpm's rolling age gate.
-        let exclusions = if let Some(admitted) = &policy.admitted_versions {
-            let mut exact_versions = BTreeMap::<String, BTreeSet<String>>::new();
-            for admitted in admitted {
-                exact_versions
-                    .entry(admitted.name.clone())
-                    .or_default()
-                    .insert(admitted.version.to_string());
+        let existing: Vec<String> = NativeAge::read(&path)?
+            .exclusions
+            .into_vec()
+            .into_iter()
+            .filter(|entry| exact_exclusion(entry).is_some())
+            .collect();
+        let exemptions = match &policy.admitted_versions {
+            Some(admitted) => {
+                self.sync_exemptions(project, minutes, admitted, &existing, &mut warnings)
+                    .await?
             }
-            minimum_age_exclusions(&selectors.written, &exact_versions)
-        } else {
-            // Without complete evidence, preserve exact entry strings even for missing pins.
-            // Policy globs and the default window can still be synchronized safely.
-            let existing = NativeAge::read(&path)?.exclusions.into_vec();
-            let mut exclusions = minimum_age_exclusions(&selectors.written, &BTreeMap::new());
-            exclusions.extend(
-                existing
-                    .into_iter()
-                    .filter(|entry| exact_exclusion(entry).is_some()),
-            );
-            exclusions
+            None => None,
         };
+        let complete = exemptions.is_some();
+        // Without complete evidence, whether admissions, pnpm's window or its routing, every
+        // exact entry pnpm still reads is kept as written, even for missing pins, while the
+        // policy globs and the default window are still synchronized.
+        let listed: Vec<String> = selectors.written.iter().chain(&existing).cloned().collect();
+        let semantics = self.match_semantics(project, &listed).await;
+        let exclusions = crate::admissions::synced_rules(
+            &selectors.written,
+            &existing,
+            semantics,
+            exemptions.as_ref().map(SyncExemptions::evidence).as_ref(),
+            &exemptions
+                .as_ref()
+                .map(SyncExemptions::granted)
+                .unwrap_or_default(),
+        );
         // An emptied list stays as an explicit `[]` wherever the key exists, since removing it
         // would expose the exclusions pnpm inherits from user or global configuration.
         // A policy without selectors leaves an absent key absent, while a policy whose selectors
@@ -4670,15 +5268,37 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         } else {
             EmptyList::Explicit
         };
-        let mut changed =
-            set_yaml_scalar(&path, "minimumReleaseAge", &minutes.to_string(), dry_run)?;
-        changed |= set_yaml_block_list(
+        // Both edits are rendered and verified in memory, each against the document before it,
+        // so the file is written once, and not at all when either is refused.
+        let original = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(CoreError::Filesystem(format!("{path}: {error}"))),
+        };
+        let windowed =
+            render_yaml_scalar(&original, &path, "minimumReleaseAge", &minutes.to_string())?
+                .unwrap_or_else(|| original.clone());
+        let rendered = render_yaml_block_list(
+            &windowed,
             &path,
             "minimumReleaseAgeExclude",
             &exclusions,
             empty,
-            dry_run,
-        )?;
+        )?
+        .unwrap_or(windowed);
+        let changed = rendered != original;
+        if changed && !dry_run {
+            crate::native::write_settings(&path, &rendered)?;
+        }
+        if complete
+            && !dry_run
+            && let Some(admitted) = &policy.admitted_versions
+            && let Some(warning) = self
+                .overridden_admission_warning(project, &path, admitted)
+                .await
+        {
+            warnings.push(warning);
+        }
         Ok(if changed {
             SyncReport::Written { path, warnings }
         } else {
@@ -4873,6 +5493,7 @@ mod tests {
                 "@typescript-eslint/eslint-plugin@8.0.0".to_string(),
                 "--lockfile-only".to_string(),
                 "--no-save".to_string(),
+                "--config.minimumReleaseAgeStrict=false".to_string(),
                 "--config.minimumReleaseAge=20160".to_string(),
                 "--config.minimumReleaseAgeExclude=@typescript-eslint/eslint-plugin@8.0.0"
                     .to_string(),
@@ -4888,6 +5509,7 @@ mod tests {
                 "@typescript-eslint/eslint-plugin@8.0.0".to_string(),
                 "--lockfile-only".to_string(),
                 "--no-save".to_string(),
+                "--config.minimumReleaseAgeStrict=false".to_string(),
             ])
         );
         let exclusions = [
@@ -4901,6 +5523,8 @@ mod tests {
                 "--lockfile-only".to_string(),
                 "--resolution-only".to_string(),
                 "--trust-lockfile".to_string(),
+                "--no-save".to_string(),
+                "--config.minimumReleaseAgeStrict=false".to_string(),
                 "--config.minimumReleaseAge=20160".to_string(),
                 "--config.minimumReleaseAgeExclude=eslint@9.4.0".to_string(),
                 "--config.minimumReleaseAgeExclude=@typescript-eslint/*".to_string(),
@@ -4912,6 +5536,8 @@ mod tests {
                 "install".to_string(),
                 "--lockfile-only".to_string(),
                 "--trust-lockfile".to_string(),
+                "--no-save".to_string(),
+                "--config.minimumReleaseAgeStrict=false".to_string(),
             ])
         );
         assert_eq!(
@@ -5812,6 +6438,8 @@ packages:
         );
     }
 
+    /// Without complete evidence sync keeps every exact entry as written, the one for a version
+    /// the lock may no longer hold included.
     #[tokio::test]
     async fn write_native_preserves_exact_entries_verbatim_when_evaluation_fails()
     -> eyre::Result<()> {
@@ -5824,8 +6452,7 @@ packages:
             minimumReleaseAge: 120
             minimumReleaseAgeExclude:
               - "old-glob"
-              - "@corp/pkg@2.0.1||1.2.2"
-              - "gone@1.0.0"
+              - "corp-pkg@2.0.1||1.2.2"
               - "gone@1.0.0"
         "#};
         std::fs::write(&path, before)?;
@@ -5846,11 +6473,7 @@ packages:
             package_windows: std::collections::BTreeMap::new(),
             admitted_versions: None,
         };
-        let cache = tempfile::tempdir()?;
-        let tool = NpmTool::<Pnpm>::from_http(SharedHttp::new(
-            cache.path(),
-            cooldown_registry::HttpOptions::default(),
-        )?);
+        let (_cache, tool) = pnpm_sync_tool()?;
         std::assert_matches!(
             tool.write_native(&project, &policy, true).await?,
             SyncReport::Written { .. }
@@ -5861,13 +6484,7 @@ packages:
         assert_eq!(written.minutes, Some(20160));
         assert_eq!(
             written.exclusions.into_vec(),
-            vec![
-                "@corp/*",
-                "new-glob",
-                "@corp/pkg@2.0.1||1.2.2",
-                "gone@1.0.0",
-                "gone@1.0.0",
-            ]
+            vec!["@corp/*", "new-glob", "corp-pkg@2.0.1||1.2.2", "gone@1.0.0",]
         );
         std::assert_matches!(
             tool.write_native(&project, &policy, false).await?,
@@ -5903,6 +6520,8 @@ packages:
                     .map(|(name, version)| cooldown_core::AdmittedVersion {
                         name: (*name).to_string(),
                         version: Version::new(*version),
+                        // A day old, so young under the 14-day window the policy writes.
+                        age: jiff::SignedDuration::from_hours(24),
                     })
                     .collect()
             }),
@@ -5945,9 +6564,648 @@ packages:
         Ok((cache, tool))
     }
 
+    /// A sync tool for `root` whose lock holds every `versions` entry from the configured
+    /// registry, and whose scripted pnpm routes everything to the public registry and sets no
+    /// window of its own, so each admitted version's origin is proven.
+    #[cfg(unix)]
+    fn pnpm_sync_tool_proving(
+        root: &Utf8Path,
+        versions: &[(&str, &str)],
+    ) -> eyre::Result<(tempfile::TempDir, NpmTool<Pnpm>)> {
+        pnpm_sync_tool_routed(
+            root,
+            versions,
+            r#"echo '{"registry":"https://registry.npmjs.org/"}'; exit 0"#,
+        )
+    }
+
+    /// A sync tool for `root` whose lock holds every `versions` entry from the configured
+    /// registry, and whose scripted pnpm 11 answers `config list` with the shell `routing` and
+    /// sets no window of its own.
+    #[cfg(unix)]
+    fn pnpm_sync_tool_routed(
+        root: &Utf8Path,
+        versions: &[(&str, &str)],
+        routing: &str,
+    ) -> eyre::Result<(tempfile::TempDir, NpmTool<Pnpm>)> {
+        use std::fmt::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut lock = String::from("lockfileVersion: '9.0'\n\npackages:\n");
+        for (name, version) in versions {
+            write!(
+                lock,
+                "\n  '{name}@{version}':\n    resolution: {{integrity: sha512-x}}\n"
+            )?;
+        }
+        std::fs::write(root.join("pnpm-lock.yaml"), lock)?;
+        let script = root.join("fake-pnpm.sh");
+        std::fs::write(
+            &script,
+            indoc::formatdoc! {r#"
+                #!/bin/sh
+                case "$*" in
+                  *"config list"*)
+                    {routing} ;;
+                  *"config get"*)
+                    echo 'undefined'; exit 0 ;;
+                  *"--version"*)
+                    echo '11.8.0'; exit 0 ;;
+                esac
+                echo "unexpected args: $*" >&2; exit 1
+            "#},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let (cache, tool) = pnpm_sync_tool()?;
+        Ok((
+            cache,
+            tool.with_driver(crate::nodecmd::NodeCmd::with_bin(script.as_str())),
+        ))
+    }
+
+    /// A routing query that fails is incomplete evidence, not a disproof: sync keeps every
+    /// existing exact entry verbatim, the one for a version the lock no longer holds included,
+    /// adds none, and says why.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_native_keeps_exact_entries_when_the_routing_query_fails() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                packages: []
+                minimumReleaseAge: 20160
+                minimumReleaseAgeExclude:
+                  - "kept@1.0.0"
+                  - "gone@1.0.0"
+            "#},
+        )?;
+        let project = pnpm_sync_project(&root);
+        let policy = pnpm_sync_policy(&[], Some(&[("kept", "1.0.0"), ("young", "1.0.0")]));
+        let (_cache, tool) = pnpm_sync_tool_routed(
+            &root,
+            &[("kept", "1.0.0"), ("young", "1.0.0")],
+            "echo 'registry unreachable' >&2; exit 1",
+        )?;
+
+        let report = tool.write_native(&project, &policy, false).await?;
+
+        assert_eq!(
+            NativeAge::read(&path)?.exclusions.into_vec(),
+            ["kept@1.0.0", "gone@1.0.0"]
+        );
+        assert!(
+            sync_warnings(&report)
+                .iter()
+                .any(|warning| warning.message.contains("could not be read")),
+            "{report:?}"
+        );
+        Ok(())
+    }
+
+    /// An integrity-only lock entry proves no origin where a pnpmfile may route packages, so sync
+    /// cannot show an existing exact exemption unneeded: one for a locked version stays, whether
+    /// cooldown admits it or not, until the lock no longer holds that version.
+    /// Without a pnpmfile the origin is proven, so the exemption of a locked version cooldown does
+    /// not admit goes, as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_keeps_an_unproven_exemption_while_its_version_is_locked() -> eyre::Result<()> {
+        for (pnpmfile, kept) in [
+            (false, &["young@1.0.0"][..]),
+            (true, &["young@1.0.0", "held@1.0.0"][..]),
+        ] {
+            let directory = tempfile::tempdir()?;
+            let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+                .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+            let path = root.join("pnpm-workspace.yaml");
+            std::fs::write(
+                &path,
+                indoc! {r#"
+                    packages: []
+                    minimumReleaseAge: 20160
+                    minimumReleaseAgeExclude:
+                      - "young@1.0.0"
+                      - "held@1.0.0"
+                      - "gone@1.0.0"
+                "#},
+            )?;
+            if pnpmfile {
+                std::fs::write(root.join(".pnpmfile.cjs"), "module.exports = {}\n")?;
+            }
+            let project = pnpm_sync_project(&root);
+            let (_cache, tool) =
+                pnpm_sync_tool_proving(&root, &[("young", "1.0.0"), ("held", "1.0.0")])?;
+
+            let policy = pnpm_sync_policy(&[], Some(&[("young", "1.0.0")]));
+            tool.write_native(&project, &policy, false).await?;
+            assert_eq!(
+                NativeAge::read(&path)?.exclusions.into_vec(),
+                kept,
+                "pnpmfile {pnpmfile}"
+            );
+
+            std::fs::write(
+                root.join("pnpm-lock.yaml"),
+                "lockfileVersion: '9.0'\n\npackages:\n\n  'young@2.0.0':\n    resolution: {integrity: sha512-x}\n",
+            )?;
+            let moved = pnpm_sync_policy(&[], Some(&[("young", "2.0.0")]));
+            tool.write_native(&project, &moved, false).await?;
+            let expected: &[&str] = if pnpmfile { &[] } else { &["young@2.0.0"] };
+            assert_eq!(
+                NativeAge::read(&path)?.exclusions.into_vec(),
+                expected,
+                "pnpmfile {pnpmfile}"
+            );
+        }
+        Ok(())
+    }
+
+    /// An upgrade's assessment likewise keeps the exemption of a locked admitted young version
+    /// whose origin a pnpmfile leaves unproven, and prunes it once the lock no longer holds it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn assessment_keeps_an_unproven_exemption_while_its_version_is_locked() -> eyre::Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            indoc! {r#"
+                packages: []
+                minimumReleaseAge: 20160
+                minimumReleaseAgeExclude:
+                  - "young@1.0.0"
+                  - "other@1.0.0"
+            "#},
+        )?;
+        std::fs::write(root.join(".pnpmfile.cjs"), "module.exports = {}\n")?;
+        let (_cache, tool) =
+            pnpm_sync_tool_proving(&root, &[("young", "1.0.0"), ("other", "1.0.0")])?;
+        let project = pnpm_sync_project(&root);
+        let now: jiff::Timestamp = "2026-11-20T00:00:00Z".parse()?;
+        let a_day_ago = Some(now.checked_sub(jiff::SignedDuration::from_hours(24))?);
+        let assess = |version: &'static str| {
+            let tool = &tool;
+            let project = &project;
+            let root = &root;
+            async move {
+                let pins = [cooldown_core::JudgedPin {
+                    name: "young".to_string(),
+                    version: Version::new(version),
+                    published_at: a_day_ago,
+                    admitted: true,
+                }];
+                let snapshot = ProjectMutationJournal::capture(
+                    root,
+                    ["pnpm-lock.yaml", "pnpm-workspace.yaml"],
+                )?
+                .capture_state()?;
+                eyre::Ok(
+                    tool.assess_native_admissions(NativeAdmissionQuery {
+                        project,
+                        pins: &pins,
+                        refused_at_start: &HashSet::new(),
+                        evaluated_at: now,
+                        snapshot: &snapshot,
+                    })
+                    .await?,
+                )
+            }
+        };
+
+        assert_eq!(assess("1.0.0").await?, NativeAssessment::default());
+
+        std::fs::write(
+            root.join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n\npackages:\n\n  'young@2.0.0':\n    resolution: {integrity: sha512-x}\n\n  'other@1.0.0':\n    resolution: {integrity: sha512-x}\n",
+        )?;
+        let moved = assess("2.0.0").await?;
+        assert!(moved.grants.is_empty(), "{moved:?}");
+        let edit = moved
+            .edit
+            .ok_or_else(|| eyre::eyre!("the unlocked exemption is pruned"))?;
+        assert_eq!(
+            String::from_utf8(edit.contents)?,
+            indoc! {r#"
+                packages: []
+                minimumReleaseAge: 20160
+                minimumReleaseAgeExclude:
+                  - "other@1.0.0"
+            "#}
+        );
+        Ok(())
+    }
+
+    /// Runs sync and an upgrade's assessment over `exclusions` in a project whose integrity-only
+    /// lock holds `locked` and whose `.pnpmfile.cjs` leaves every origin unproven, with `admitted`
+    /// young, and returns the list each would write.
+    #[cfg(unix)]
+    async fn unproven_native_lists(
+        exclusions: &[&str],
+        locked: &[(&str, &str)],
+        admitted: &[(&str, &str)],
+    ) -> eyre::Result<(Vec<String>, Vec<String>)> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        let mut lines = vec![
+            "packages: []".to_string(),
+            "minimumReleaseAge: 20160".to_string(),
+            "minimumReleaseAgeExclude:".to_string(),
+        ];
+        for entry in exclusions {
+            lines.push(format!("  - {}", serde_json::to_string(entry)?));
+        }
+        std::fs::write(&path, lines.join("\n") + "\n")?;
+        std::fs::write(root.join(".pnpmfile.cjs"), "module.exports = {}\n")?;
+        let (_cache, tool) = pnpm_sync_tool_proving(&root, locked)?;
+        let project = pnpm_sync_project(&root);
+
+        let now: jiff::Timestamp = "2026-11-20T00:00:00Z".parse()?;
+        let a_day_ago = Some(now.checked_sub(jiff::SignedDuration::from_hours(24))?);
+        let pins: Vec<cooldown_core::JudgedPin> = locked
+            .iter()
+            .map(|(name, version)| cooldown_core::JudgedPin {
+                name: (*name).to_string(),
+                version: Version::new(*version),
+                published_at: a_day_ago,
+                admitted: admitted.contains(&(*name, *version)),
+            })
+            .collect();
+        let snapshot =
+            ProjectMutationJournal::capture(&root, ["pnpm-lock.yaml", "pnpm-workspace.yaml"])?
+                .capture_state()?;
+        let assessment = tool
+            .assess_native_admissions(NativeAdmissionQuery {
+                project: &project,
+                pins: &pins,
+                refused_at_start: &HashSet::new(),
+                evaluated_at: now,
+                snapshot: &snapshot,
+            })
+            .await?;
+        let assessed = match assessment.edit {
+            Some(edit) => NativeAge::parse(&String::from_utf8(edit.contents)?, &path)?
+                .exclusions
+                .into_vec(),
+            None => NativeAge::read(&path)?.exclusions.into_vec(),
+        };
+
+        tool.write_native(&project, &pnpm_sync_policy(&[], Some(admitted)), false)
+            .await?;
+        let synced = NativeAge::read(&path)?.exclusions.into_vec();
+        Ok((synced, assessed))
+    }
+
+    /// pnpm reads `foo@v1.2.3` as an exact rule, as node-semver does, so sync and an upgrade's
+    /// assessment judge it like any other: its version is locked and its origin unproven, so both
+    /// keep it as written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_v_prefixed_exemption_is_judged_like_any_other() -> eyre::Result<()> {
+        let (synced, assessed) =
+            unproven_native_lists(&["foo@v1.2.3"], &[("foo", "1.2.3")], &[("foo", "1.2.3")])
+                .await?;
+        assert_eq!(synced, ["foo@v1.2.3"]);
+        assert_eq!(assessed, ["foo@v1.2.3"]);
+        Ok(())
+    }
+
+    /// pnpm reads only the first rule for a package, so `foo@2.0.0` behind `foo@1.0.0` exempts
+    /// nothing; pruning the stale first rule must not let it exempt the locked `foo@2.0.0`
+    /// cooldown never admitted, so sync and an upgrade's assessment both end with neither rule.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pruning_never_activates_a_shadowed_rule() -> eyre::Result<()> {
+        let before = ["foo@1.0.0", "foo@2.0.0"];
+        let (synced, assessed) = unproven_native_lists(&before, &[("foo", "2.0.0")], &[]).await?;
+        assert_eq!(synced, [] as [String; 0]);
+        assert_eq!(assessed, [] as [String; 0]);
+        let before: Vec<String> = before.iter().map(ToString::to_string).collect();
+        assert!(!crate::exclusions::exempts(&before, "foo", "2.0.0"));
+        Ok(())
+    }
+
+    /// An unscoped sync grants an admitted version against the window it writes: a 10-day-old
+    /// pin is mature under a 7-day window and earns no entry, while under a 14-day window it does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_native_grants_against_the_written_window() -> eyre::Result<()> {
+        for (window_days, granted) in [(7, false), (14, true)] {
+            let directory = tempfile::tempdir()?;
+            let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+                .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+            let path = root.join("pnpm-workspace.yaml");
+            std::fs::write(&path, "packages: []\n")?;
+            let mut policy = pnpm_sync_policy(&[], Some(&[("next", "16.4.6")]));
+            policy.default_window = Some(cooldown_core::WindowSpec::MinAge(
+                jiff::SignedDuration::from_hours(24 * window_days),
+            ));
+            if let Some(admitted) = policy.admitted_versions.as_mut() {
+                for version in admitted {
+                    version.age = jiff::SignedDuration::from_hours(24 * 10);
+                }
+            }
+            let (_cache, tool) = pnpm_sync_tool_proving(&root, &[("next", "16.4.6")])?;
+
+            tool.write_native(&pnpm_sync_project(&root), &policy, false)
+                .await?;
+
+            let written = NativeAge::read(&path)?;
+            assert_eq!(written.minutes, Some(window_days * 24 * 60));
+            let expected: &[&str] = if granted { &["next@16.4.6"] } else { &[] };
+            assert_eq!(
+                written.exclusions.into_vec(),
+                expected,
+                "{window_days}-day window"
+            );
+        }
+        Ok(())
+    }
+
+    /// After a real write, an admitted version the file admits but bare pnpm here still refuses,
+    /// because a setting above the file replaces its window, earns one warning naming it, while
+    /// a dry run reports none.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_native_warns_about_an_admission_a_higher_setting_overrides() -> eyre::Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(root.join("pnpm-workspace.yaml"), "packages: []\n")?;
+        let mut policy = pnpm_sync_policy(&[], Some(&[("aged", "1.0.0")]));
+        if let Some(admitted) = policy.admitted_versions.as_mut() {
+            for version in admitted {
+                version.age = jiff::SignedDuration::from_hours(24 * 20);
+            }
+        }
+        // The scripted pnpm also reports a 30-day effective window, as an environment variable
+        // would set it over the file's 14 days.
+        let (_cache, tool) = pnpm_sync_tool_routed(
+            &root,
+            &[("aged", "1.0.0")],
+            r#"echo '{"registry":"https://registry.npmjs.org/"}'; exit 0 ;;
+                  *"config get minimumReleaseAge "*|*"config get minimumReleaseAge") echo 43200; exit 0"#,
+        )?;
+        let project = pnpm_sync_project(&root);
+
+        let dry = tool.write_native(&project, &policy, true).await?;
+        assert!(
+            !sync_warnings(&dry)
+                .iter()
+                .any(|warning| warning.message.contains("higher-precedence")),
+            "{dry:?}"
+        );
+
+        let report = tool.write_native(&project, &policy, false).await?;
+        let overridden: Vec<&str> = sync_warnings(&report)
+            .iter()
+            .map(|warning| warning.message.as_str())
+            .filter(|message| message.contains("higher-precedence"))
+            .collect();
+        assert_eq!(overridden.len(), 1, "{report:?}");
+        assert!(overridden[0].contains("aged@1.0.0"), "{overridden:?}");
+        Ok(())
+    }
+
+    /// A longer effective window than the one sync writes keeps a grant bare pnpm here still
+    /// needs: a 10-day-old admitted pin keeps its exact entry under a 7-day written window while
+    /// an environment sets 14 days, and earns no override warning, since the entry exempts it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_native_keeps_a_grant_a_longer_effective_window_needs() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                packages: []
+                minimumReleaseAge: 10080
+                minimumReleaseAgeExclude:
+                  - "next@16.4.6"
+            "#},
+        )?;
+        let mut policy = pnpm_sync_policy(&[], Some(&[("next", "16.4.6")]));
+        policy.default_window = Some(cooldown_core::WindowSpec::MinAge(
+            jiff::SignedDuration::from_hours(24 * 7),
+        ));
+        if let Some(admitted) = policy.admitted_versions.as_mut() {
+            for version in admitted {
+                version.age = jiff::SignedDuration::from_hours(24 * 10);
+            }
+        }
+        // The scripted pnpm reports a 14-day effective window, as an environment variable would
+        // set it over the file's 7 days, and the file's exclusions as its effective ones.
+        let (_cache, tool) = pnpm_sync_tool_routed(
+            &root,
+            &[("next", "16.4.6")],
+            r#"echo '{"registry":"https://registry.npmjs.org/"}'; exit 0 ;;
+                  *"config get minimumReleaseAge "*) echo 20160; exit 0 ;;
+                  *"config get minimumReleaseAgeExclude"*) echo '["next@16.4.6"]'; exit 0"#,
+        )?;
+
+        let report = tool
+            .write_native(&pnpm_sync_project(&root), &policy, false)
+            .await?;
+
+        let written = NativeAge::read(&path)?;
+        assert_eq!(written.minutes, Some(10080));
+        assert_eq!(written.exclusions.into_vec(), ["next@16.4.6"]);
+        assert!(
+            !sync_warnings(&report)
+                .iter()
+                .any(|warning| warning.message.contains("next@16.4.6")),
+            "{report:?}"
+        );
+        Ok(())
+    }
+
+    /// Sync renders the window and the list before writing either, so a list it cannot rewrite
+    /// safely, a quoted key here, fails the sync with the file byte for byte as it was, the
+    /// raised window included.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_native_writes_nothing_when_one_edit_is_refused() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        let before =
+            "packages: []\nminimumReleaseAge: 10080\n\"minimumReleaseAgeExclude\": [\"legacy\"]\n";
+        std::fs::write(&path, before)?;
+        let policy = pnpm_sync_policy(&[], Some(&[("next", "16.4.6")]));
+        let (_cache, tool) = pnpm_sync_tool_proving(&root, &[("next", "16.4.6")])?;
+
+        let refused = tool
+            .write_native(&pnpm_sync_project(&root), &policy, false)
+            .await;
+
+        std::assert_matches!(refused, Err(CoreError::Config(_)));
+        assert_eq!(std::fs::read_to_string(&path)?, before);
+        Ok(())
+    }
+
+    /// A failed query for pnpm's effective window is incomplete evidence too: sync keeps every
+    /// existing exact entry verbatim, adds none, and says why.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_native_keeps_exact_entries_when_the_window_query_fails() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                packages: []
+                minimumReleaseAge: 20160
+                minimumReleaseAgeExclude:
+                  - "kept@1.0.0"
+                  - "gone@1.0.0"
+            "#},
+        )?;
+        let policy = pnpm_sync_policy(&[], Some(&[("kept", "1.0.0"), ("young", "1.0.0")]));
+        let (_cache, tool) = pnpm_sync_tool_routed(
+            &root,
+            &[("kept", "1.0.0"), ("young", "1.0.0")],
+            r#"echo '{"registry":"https://registry.npmjs.org/"}'; exit 0 ;;
+                  *"config get minimumReleaseAge "*) echo 'config unreadable' >&2; exit 1"#,
+        )?;
+
+        let report = tool
+            .write_native(&pnpm_sync_project(&root), &policy, false)
+            .await?;
+
+        assert_eq!(
+            NativeAge::read(&path)?.exclusions.into_vec(),
+            ["kept@1.0.0", "gone@1.0.0"]
+        );
+        assert!(
+            sync_warnings(&report).iter().any(|warning| warning
+                .message
+                .contains("minimumReleaseAge could not be read")),
+            "{report:?}"
+        );
+        Ok(())
+    }
+
+    /// A linked pnpm-workspace.yaml stays a link: sync writes through to the file it names, as a
+    /// plain write does, rather than replacing the link with a regular file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_native_writes_through_a_linked_settings_file() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::create_dir(root.join("settings"))?;
+        let target = root.join("settings").join("workspace.yaml");
+        std::fs::write(&target, "packages: []\n")?;
+        let link = root.join("pnpm-workspace.yaml");
+        std::os::unix::fs::symlink("settings/workspace.yaml", &link)?;
+        let policy = pnpm_sync_policy(&["@types/*"], Some(&[]));
+        let (_cache, tool) = pnpm_sync_tool()?;
+
+        tool.write_native(&pnpm_sync_project(&root), &policy, false)
+            .await?;
+
+        assert!(std::fs::symlink_metadata(&link)?.file_type().is_symlink());
+        let written = NativeAge::read(&target)?;
+        assert_eq!(written.minutes, Some(20160));
+        assert_eq!(written.exclusions.into_vec(), ["@types/*"]);
+        Ok(())
+    }
+
+    /// The same failure proves no origin, so an upgrade's assessment grants no admitted version,
+    /// while a version pnpm refused in the starting lock is granted on pnpm's verdict alone and
+    /// the exact entry for a version the lock no longer holds is pruned, neither of which needs
+    /// an origin.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_routing_failure_grants_only_what_pnpm_refused_at_the_start() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            indoc! {r#"
+                packages: []
+                minimumReleaseAge: 20160
+                minimumReleaseAgeExclude:
+                  - "gone@1.0.0"
+            "#},
+        )?;
+        let (_cache, tool) = pnpm_sync_tool_routed(
+            &root,
+            &[("young", "1.0.0"), ("held", "1.0.0"), ("migrated", "1.0.0")],
+            "echo 'registry unreachable' >&2; exit 1",
+        )?;
+        let now: jiff::Timestamp = "2026-11-20T00:00:00Z".parse()?;
+        let a_day_ago = Some(now.checked_sub(jiff::SignedDuration::from_hours(24))?);
+        let pins = [
+            cooldown_core::JudgedPin {
+                name: "young".to_string(),
+                version: Version::new("1.0.0"),
+                published_at: a_day_ago,
+                admitted: true,
+            },
+            cooldown_core::JudgedPin {
+                name: "held".to_string(),
+                version: Version::new("1.0.0"),
+                published_at: a_day_ago,
+                admitted: false,
+            },
+        ];
+        let snapshot =
+            ProjectMutationJournal::capture(&root, ["pnpm-lock.yaml", "pnpm-workspace.yaml"])?
+                .capture_state()?;
+
+        let assessment = tool
+            .assess_native_admissions(NativeAdmissionQuery {
+                project: &pnpm_sync_project(&root),
+                pins: &pins,
+                refused_at_start: &HashSet::from([cooldown_core::LockedVersion {
+                    name: "migrated".to_string(),
+                    version: Version::new("1.0.0"),
+                }]),
+                evaluated_at: now,
+                snapshot: &snapshot,
+            })
+            .await?;
+
+        assert_eq!(
+            assessment.grants,
+            [cooldown_core::LockedVersion {
+                name: "migrated".to_string(),
+                version: Version::new("1.0.0"),
+            }]
+        );
+        let edit = assessment
+            .edit
+            .ok_or_else(|| eyre::eyre!("the refused version is granted"))?;
+        assert_eq!(
+            String::from_utf8(edit.contents)?,
+            indoc! {r#"
+                packages: []
+                minimumReleaseAge: 20160
+                minimumReleaseAgeExclude:
+                  - "migrated@1.0.0"
+            "#}
+        );
+        Ok(())
+    }
+
     /// With complete admission evidence, sync writes the selectors pnpm reads as cooldown does,
     /// keeps an admitted exact union that only an omitted selector covers, and reports each
     /// omitted selector, in a dry run as in a real one.
+    #[cfg(unix)]
     #[tokio::test]
     async fn write_native_writes_only_selectors_pnpm_reads_identically() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
@@ -5969,7 +7227,14 @@ packages:
                 ("react-dom", "19.0.0"),
             ]),
         );
-        let (_cache, tool) = pnpm_sync_tool()?;
+        let (_cache, tool) = pnpm_sync_tool_proving(
+            &root,
+            &[
+                ("@types/node", "22.0.0"),
+                ("@types/react-utils", "1.0.0"),
+                ("react-dom", "19.0.0"),
+            ],
+        )?;
         let omitted = ["@types/{node,react}", "react-?om"];
 
         // A dry run reports the write and the omissions without touching the file.
@@ -6042,6 +7307,8 @@ packages:
         let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
             .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
         let path = root.join("pnpm-workspace.yaml");
+        // The lock holds nothing, so no exact entry is still needed.
+        std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n")?;
         let project = pnpm_sync_project(&root);
         let (_cache, tool) = pnpm_sync_tool()?;
         let explicit_empty = indoc! {"
@@ -6368,6 +7635,7 @@ packages:
 
     /// The young locked versions cooldown admits under a withheld selector are written as exact
     /// unions instead of the package-wide entry, and a re-sync leaves them unchanged.
+    #[cfg(unix)]
     #[tokio::test]
     async fn write_native_admits_exact_versions_under_a_withheld_selector() -> eyre::Result<()> {
         let directory = tempfile::tempdir()?;
@@ -6380,7 +7648,8 @@ packages:
             &["@corp/*"],
             Some(&[("@corp/ui", "2.0.0"), ("@corp/ui", "1.0.0")]),
         );
-        let (_cache, tool) = pnpm_sync_tool()?;
+        let (_cache, tool) =
+            pnpm_sync_tool_proving(&root, &[("@corp/ui", "2.0.0"), ("@corp/ui", "1.0.0")])?;
 
         let written = tool.write_native(&project, &policy, false).await?;
         std::assert_matches!(written, SyncReport::Written { .. });
@@ -6391,6 +7660,52 @@ packages:
         );
         let again = tool.write_native(&project, &policy, false).await?;
         std::assert_matches!(again, SyncReport::Unchanged { .. });
+        Ok(())
+    }
+
+    /// `sync` exempts an admitted version only by the rule an upgrade grants by: one the lock
+    /// does not prove came from the public registry, and one already mature under the window
+    /// sync writes, earn no exact entry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_native_exempts_only_young_versions_of_proven_origin() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        std::fs::write(&path, "packages: []\n")?;
+        let project = pnpm_sync_project(&root);
+        let mut policy = pnpm_sync_policy(
+            &[],
+            Some(&[
+                ("young", "1.0.0"),
+                ("unlocked", "1.0.0"),
+                ("mature", "1.0.0"),
+            ]),
+        );
+        if let Some(admitted) = policy.admitted_versions.as_mut()
+            && let Some(mature) = admitted
+                .iter_mut()
+                .find(|admitted| admitted.name == "mature")
+        {
+            mature.age = jiff::SignedDuration::from_hours(24 * 30);
+        }
+        let (_cache, tool) =
+            pnpm_sync_tool_proving(&root, &[("young", "1.0.0"), ("mature", "1.0.0")])?;
+
+        let report = tool.write_native(&project, &policy, false).await?;
+
+        assert_eq!(
+            NativeAge::read(&path)?.exclusions.into_vec(),
+            ["young@1.0.0"]
+        );
+        // Only the young version left out is worth a warning, since pnpm keeps refusing it.
+        let warned: Vec<&str> = sync_warnings(&report)
+            .iter()
+            .map(|warning| warning.message.as_str())
+            .collect();
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(warned[0].contains("`unlocked@1.0.0`"), "{warned:?}");
         Ok(())
     }
 
@@ -9399,6 +10714,7 @@ mod whole_graph_tests {
     use crate::lock::Pnpm;
     use camino::Utf8PathBuf;
     use color_eyre::eyre;
+    use cooldown_core::{JudgedPin, LockedVersion};
     use indoc::{formatdoc, indoc};
     use std::fmt::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
@@ -9550,15 +10866,29 @@ mod whole_graph_tests {
                 case "$*" in
                   *"config get minimumReleaseAgeExclude"*)
                     {exclusion_answer} ;;
+                {body}
                   *"config get"*)
                     echo 'null'; exit 0 ;;
-                {body}
                 esac
                 echo "unexpected args: $*" >&2; exit 1
             "#},
         )?;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
         Ok(script)
+    }
+
+    /// Runs the native backstop on `project` with no publish time known, so no lock reads as
+    /// all mature.
+    async fn probe(
+        tool: &NpmTool<Pnpm>,
+        project: &Project,
+    ) -> cooldown_core::Result<Option<NativeGateRefusal>> {
+        tool.native_gate_refusal(NativeGateQuery {
+            project,
+            published: &HashMap::new(),
+            evaluated_at: jiff::Timestamp::now(),
+        })
+        .await
     }
 
     fn tool_with(script: &Utf8Path) -> eyre::Result<NpmTool<Pnpm>> {
@@ -10417,8 +11747,9 @@ mod whole_graph_tests {
     };
 
     /// A persisted admission keeps the native rules in pnpm's order: it joins the package's first
-    /// matching rule (here a negated one, ahead of which it gets its own), the shadowed stale rule
-    /// goes, and every other rule keeps its place and spelling, a backslash included.
+    /// matching rule (here a negated one, ahead of which it gets its own), the stale rule the
+    /// negation shadows goes, and every other rule keeps its place and spelling, a backslash
+    /// included.
     #[tokio::test]
     async fn persisted_admissions_keep_the_native_rule_order() -> eyre::Result<()> {
         for direct in [true, false] {
@@ -10426,8 +11757,8 @@ mod whole_graph_tests {
                 direct,
                 &[],
                 &NativeRules {
-                    before: &["!other@1.0.0", "foo@0.9.0", "@corp/*", r"back\slash"],
-                    persisted: &["foo@1.1.0", "!other@1.0.0", "@corp/*", r"back\slash"],
+                    before: &[r"back\slash", "!other@1.0.0", "foo@0.9.0", "@corp/*"],
+                    persisted: &[r"back\slash", "foo@1.1.0", "!other@1.0.0", "@corp/*"],
                 },
             )
             .await?;
@@ -10453,6 +11784,10 @@ mod whole_graph_tests {
         let script = fake_pnpm_with_exclusions(
             &root,
             indoc! {r#"
+                      *"config list"*)
+                        echo '{"registry":"https://registry.npmjs.org/"}'; exit 0 ;;
+                      *"config get minimumReleaseAge"*)
+                        echo 10080; exit 0 ;;
                       *"--frozen-lockfile"*)
                         grep -q 'foo@1.1.0' pnpm-workspace.yaml || exit 1
                         exit 0 ;;
@@ -10483,14 +11818,11 @@ mod whole_graph_tests {
         let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
         let report = tool.apply(&mutation).await?;
         assert_eq!(applied_names(&report), vec!["foo"], "direct={direct}");
-        let native = read(&root, "pnpm-workspace.yaml")?;
-        assert!(!native.contains("overrides:"), "{native}");
+        // The apply records no exemption of its own: only the gate's verdicts decide them.
         assert_eq!(
-            NativeAge::read(&root.join("pnpm-workspace.yaml"))?
-                .exclusions
-                .into_vec(),
-            rules.persisted,
-            "direct={direct}: {native}"
+            read(&root, "pnpm-workspace.yaml")?,
+            native_before,
+            "direct={direct}"
         );
         for exclusion in effective_exclusions {
             assert!(
@@ -10501,6 +11833,46 @@ mod whole_graph_tests {
         if direct {
             assert_joint_update_exempts_the_pin(&root, effective_exclusions)?;
         }
+
+        // The gate admitted the two-day-old target, so its exact version is granted.
+        let pins = [JudgedPin {
+            name: "foo".to_string(),
+            version: Version::new("1.1.0"),
+            published_at: Some(now.checked_sub(jiff::SignedDuration::from_hours(48))?),
+            admitted: true,
+        }];
+        let mut expected = mutation.journal().capture_state()?;
+        let assessment = tool
+            .assess_native_admissions(NativeAdmissionQuery {
+                project: &project,
+                pins: &pins,
+                refused_at_start: &HashSet::new(),
+                evaluated_at: now,
+                snapshot: &expected,
+            })
+            .await?;
+        assert_eq!(
+            assessment.grants,
+            [LockedVersion {
+                name: "foo".to_string(),
+                version: Version::new("1.1.0"),
+            }],
+            "direct={direct}"
+        );
+        let edit = assessment
+            .edit
+            .ok_or_else(|| eyre::eyre!("the grant changes the native settings"))?;
+        // The application writes the edit unchanged, into the state the journal expects.
+        expected.write_owned(&edit.path, &edit.contents)?;
+        let native = read(&root, "pnpm-workspace.yaml")?;
+        assert!(!native.contains("overrides:"), "{native}");
+        assert_eq!(
+            NativeAge::read(&root.join("pnpm-workspace.yaml"))?
+                .exclusions
+                .into_vec(),
+            rules.persisted,
+            "direct={direct}: {native}"
+        );
         assert_eq!(
             tool.verify_lock_current(&project).await?.status,
             cooldown_core::LockStatus::Current,
@@ -10508,11 +11880,770 @@ mod whole_graph_tests {
         );
 
         // Candidate rejection uses the same journal after the native write, so the exact
-        // allowance must disappear together with the rejected lock.
-        mutation.journal().restore()?;
+        // allowance disappears together with the rejected lock, as cooldown's own write.
+        mutation.journal().restore_if_unchanged(&expected)?;
         assert_eq!(read(&root, "package.json")?, manifest_before);
         assert_eq!(read(&root, "pnpm-workspace.yaml")?, native_before);
         assert_eq!(read(&root, "pnpm-lock.yaml")?, lock);
+        Ok(())
+    }
+
+    /// With no window configured anywhere, the floor is the one the manager applies by itself:
+    /// pnpm 11 holds a two-hour-old admitted version for a day, so it is granted, while pnpm 10
+    /// applies no window and grants nothing.
+    #[tokio::test]
+    async fn the_native_floor_defaults_to_the_managers_builtin_window() -> eyre::Result<()> {
+        for (version, granted) in [("11.8.0", true), ("10.14.0", false)] {
+            let (_dir, root) = tempdir_root()?;
+            single_direct_dependency(&root)?;
+            std::fs::write(root.join("pnpm-workspace.yaml"), "packages: []\n")?;
+            let script = fake_pnpm_with_exclusions(
+                &root,
+                &formatdoc! {r#"
+                      *"config list"*)
+                        echo '{{"registry":"https://registry.npmjs.org/"}}'; exit 0 ;;
+                      *"--version"*)
+                        echo '{version}'; exit 0 ;;
+                "#},
+                &[],
+            )?;
+            let tool = tool_with(&script)?;
+            let now: jiff::Timestamp = "2026-01-18T00:00:00Z".parse()?;
+            let pins = [JudgedPin {
+                name: "foo".to_string(),
+                version: Version::new("1.0.0"),
+                published_at: Some(now.checked_sub(jiff::SignedDuration::from_hours(2))?),
+                admitted: true,
+            }];
+
+            let snapshot =
+                ProjectMutationJournal::capture(&root, ["pnpm-lock.yaml", "pnpm-workspace.yaml"])?
+                    .capture_state()?;
+            let assessment = tool
+                .assess_native_admissions(NativeAdmissionQuery {
+                    project: &project(&root),
+                    pins: &pins,
+                    refused_at_start: &HashSet::new(),
+                    evaluated_at: now,
+                    snapshot: &snapshot,
+                })
+                .await?;
+
+            assert_eq!(!assessment.grants.is_empty(), granted, "pnpm {version}");
+            assert_eq!(assessment.edit.is_some(), granted, "pnpm {version}");
+        }
+        Ok(())
+    }
+
+    /// The answer of a scripted pnpm whose frozen verification passes and records itself under
+    /// the cache it was given, as pnpm does.
+    const RECORDS_AND_PASSES: &str = r#"cache="${*##*--config.cache-dir=}"; cache="${cache%% *}"; echo '{}' > "$cache/lockfile-verified.jsonl"; exit 0"#;
+
+    /// A verification that passes without recording itself under the cache cooldown gave it ran
+    /// under another cache, as a pnpmfile can arrange, so its verdict is an error from a pnpm that
+    /// records its verifications, unless pnpm trusts the lock and verifies nothing; an earlier
+    /// pnpm records nothing, so its pass stands.
+    #[tokio::test]
+    async fn a_pass_recorded_elsewhere_is_not_trusted() -> eyre::Result<()> {
+        for (version, trust, trusted) in [
+            ("11.8.0", "null", false),
+            ("11.8.0", "true", true),
+            ("10.34.9", "null", true),
+        ] {
+            let (_dir, root) = tempdir_root()?;
+            single_direct_dependency(&root)?;
+            let script = fake_pnpm_with_exclusions(
+                &root,
+                &formatdoc! {r#"
+                      *"config get minimumReleaseAge "*)
+                        echo 1440; exit 0 ;;
+                      *"config get trustLockfile"*)
+                        echo '{trust}'; exit 0 ;;
+                      *"--version"*)
+                        echo '{version}'; exit 0 ;;
+                      *"--frozen-lockfile"*)
+                        exit 0 ;;
+                "#},
+                &[],
+            )?;
+            let tool = tool_with(&script)?;
+
+            let verdict = probe(&tool, &project(&root)).await;
+
+            if trusted {
+                assert_eq!(verdict?, None, "pnpm {version}, trust {trust}");
+            } else {
+                std::assert_matches!(
+                    verdict,
+                    Err(CoreError::System(message))
+                        if message.contains("did not use the verification cache")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A lock whose every version the gate knows to be older than pnpm's window, by a publish
+    /// time from the registry pnpm resolves it from, gives the age gate nothing to refuse, so no
+    /// verification runs; one version of unknown publish time, a young one, or one whose origin
+    /// pnpm's routing leaves unproven makes it run.
+    #[tokio::test]
+    async fn a_lock_known_to_be_mature_runs_no_verification() -> eyre::Result<()> {
+        let public = r#"{"registry":"https://registry.npmjs.org/"}"#;
+        let mirrored = r#"{"registry":"https://npm.mirror.example/"}"#;
+        for (routing, mature_skips) in [(public, true), (mirrored, false), ("", false)] {
+            let (_dir, root) = tempdir_root()?;
+            single_direct_dependency(&root)?;
+            let routing_answer = if routing.is_empty() {
+                "echo 'unreachable' >&2; exit 1".to_string()
+            } else {
+                format!("echo '{routing}'; exit 0")
+            };
+            let script = fake_pnpm_with_exclusions(
+                &root,
+                &format!(
+                    "  *\"config list\"*)\n    {routing_answer} ;;\n  *\"config get minimumReleaseAge \"*)\n    echo 1440; exit 0 ;;\n  *\"--frozen-lockfile\"*)\n    {RECORDS_AND_PASSES} ;;\n"
+                ),
+                &[],
+            )?;
+            let tool = tool_with(&script)?;
+            let project = project(&root);
+            let now: jiff::Timestamp = "2026-11-20T00:00:00Z".parse()?;
+            let locked = registry_version_lines(&Pnpm::parse(&read_lock::<Pnpm>(&project)?)?);
+            let published_at =
+                |age_hours: i64| now.checked_sub(jiff::SignedDuration::from_hours(age_hours));
+            let mut published = HashMap::new();
+            for (name, versions) in &locked {
+                for version in versions {
+                    published.insert(
+                        LockedVersion {
+                            name: name.clone(),
+                            version: Version::new(version.as_str()),
+                        },
+                        published_at(24 * 30)?,
+                    );
+                }
+            }
+            let verifications = || {
+                legs(&root)
+                    .iter()
+                    .filter(|leg| leg.contains("--frozen-lockfile"))
+                    .count()
+            };
+            let run = |published: HashMap<LockedVersion, jiff::Timestamp>| {
+                let tool = &tool;
+                let project = &project;
+                async move {
+                    tool.native_gate_refusal(NativeGateQuery {
+                        project,
+                        published: &published,
+                        evaluated_at: now,
+                    })
+                    .await
+                }
+            };
+
+            assert_eq!(run(published.clone()).await?, None);
+            let expected = usize::from(!mature_skips);
+            assert_eq!(verifications(), expected, "routing {routing:?}");
+            if !mature_skips {
+                continue;
+            }
+
+            let mut young = published.clone();
+            if let Some(time) = young.values_mut().next() {
+                *time = published_at(2)?;
+            }
+            assert_eq!(run(young).await?, None);
+            assert_eq!(verifications(), 1);
+
+            assert_eq!(run(HashMap::new()).await?, None);
+            assert_eq!(verifications(), 2);
+        }
+        Ok(())
+    }
+
+    /// A pnpmfile's `updateConfig` hook can set a window that pnpm's configuration queries do not
+    /// report, so wherever one may be loaded the verification runs even for a lock known to be
+    /// mature, or with no window configured: a default pnpmfile of either kind beside the lock, or
+    /// one the effective configuration names.
+    #[tokio::test]
+    async fn a_pnpmfile_that_may_be_loaded_always_runs_the_verification() -> eyre::Result<()> {
+        let public = r#"{"registry":"https://registry.npmjs.org/"}"#;
+        let configured =
+            r#"{"registry":"https://registry.npmjs.org/","pnpmfile":["/repo/hooks.cjs"]}"#;
+        let cases = [
+            (Some(".pnpmfile.cjs"), public, "1440", true),
+            (Some(".pnpmfile.mjs"), public, "1440", true),
+            (None, configured, "1440", true),
+            (Some(".pnpmfile.cjs"), public, "0", true),
+            (None, public, "1440", false),
+            (None, public, "0", false),
+        ];
+        for (file, routing, window, verifies) in cases {
+            let (_dir, root) = tempdir_root()?;
+            single_direct_dependency(&root)?;
+            if let Some(file) = file {
+                std::fs::write(root.join(file), "module.exports = {}\n")?;
+            }
+            let script = fake_pnpm_with_exclusions(
+                &root,
+                &formatdoc! {r#"
+                      *"config list"*)
+                        echo '{routing}'; exit 0 ;;
+                      *"config get minimumReleaseAge "*)
+                        echo {window}; exit 0 ;;
+                      *"--frozen-lockfile"*)
+                        {RECORDS_AND_PASSES} ;;
+                "#},
+                &[],
+            )?;
+            let tool = tool_with(&script)?;
+            let project = project(&root);
+            let now: jiff::Timestamp = "2026-11-20T00:00:00Z".parse()?;
+            let a_month_ago = now.checked_sub(jiff::SignedDuration::from_hours(24 * 30))?;
+            let locked = registry_version_lines(&Pnpm::parse(&read_lock::<Pnpm>(&project)?)?);
+            let published: HashMap<LockedVersion, jiff::Timestamp> = locked
+                .iter()
+                .flat_map(|(name, versions)| {
+                    versions.iter().map(move |version| {
+                        (
+                            LockedVersion {
+                                name: name.clone(),
+                                version: Version::new(version.as_str()),
+                            },
+                            a_month_ago,
+                        )
+                    })
+                })
+                .collect();
+
+            let verdict = tool
+                .native_gate_refusal(NativeGateQuery {
+                    project: &project,
+                    published: &published,
+                    evaluated_at: now,
+                })
+                .await?;
+
+            assert_eq!(verdict, None);
+            let verifications = legs(&root)
+                .iter()
+                .filter(|leg| leg.contains("--frozen-lockfile"))
+                .count();
+            assert_eq!(
+                verifications,
+                usize::from(verifies),
+                "{file:?}, {routing}, window {window}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A pnpmfile may route a scope without pnpm's configuration queries reporting it, so where
+    /// one may be loaded an integrity-only entry, whose registry is the configured one, proves no
+    /// origin, while an entry recording its public tarball URL still does; without one, both do.
+    #[tokio::test]
+    async fn a_pnpmfile_leaves_only_recorded_urls_as_origin_proof() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        std::fs::write(
+            root.join("pnpm-lock.yaml"),
+            indoc! {"
+                lockfileVersion: '9.0'
+
+                packages:
+
+                  lodash@4.17.21:
+                    resolution: {integrity: sha512-a}
+
+                  is-number@7.0.0:
+                    resolution: {integrity: sha512-b, tarball: https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz}
+            "},
+        )?;
+        let script = fake_pnpm_with_exclusions(
+            &root,
+            indoc! {r#"
+                  *"config list"*)
+                    echo '{"registry":"https://registry.npmjs.org/"}'; exit 0 ;;
+            "#},
+            &[],
+        )?;
+        let tool = tool_with(&script)?;
+        let project = project(&root);
+        let entries = Pnpm::parse(&read_lock::<Pnpm>(&project)?)?;
+        let proven_names = || async {
+            let proven = tool
+                .origin_proven_versions(&project, &entries)
+                .await
+                .ok_or_else(|| eyre::eyre!("pnpm's routing was read"))?;
+            let mut names: Vec<String> = proven.into_keys().collect();
+            names.sort_unstable();
+            eyre::Ok(names)
+        };
+
+        assert_eq!(proven_names().await?, ["is-number", "lodash"]);
+
+        std::fs::write(root.join(".pnpmfile.cjs"), "module.exports = {}\n")?;
+        assert_eq!(proven_names().await?, ["is-number"]);
+        Ok(())
+    }
+
+    /// pnpm decides a package by its first matching rule from 10.19.0 up to 11.9.0, so there a rule
+    /// behind an earlier match for its package goes; 10.18 folds the list into one name matcher,
+    /// where `@team/safe-legacy` re-includes the package `!*-legacy` excluded, 11.9.0 on joins the
+    /// matching exact rules, and a version that cannot be read may be either, so they all keep
+    /// every rule.
+    #[tokio::test]
+    async fn only_a_first_match_pnpm_loses_its_shadowed_rules() -> eyre::Result<()> {
+        let rules = ["@team/*", "!*-legacy", "@team/safe-legacy"];
+        for (version, kept) in [
+            ("echo 11.8.0; exit 0", false),
+            ("echo 10.18.0; exit 0", true),
+            ("echo 11.16.0; exit 0", true),
+            ("echo 'unreadable' >&2; exit 1", true),
+        ] {
+            let (_dir, root) = tempdir_root()?;
+            single_direct_dependency(&root)?;
+            write_native_rules(&root, &rules)?;
+            let script = fake_pnpm_with_exclusions(
+                &root,
+                &formatdoc! {r#"
+                      *"config list"*)
+                        echo '{{"registry":"https://registry.npmjs.org/"}}'; exit 0 ;;
+                      *"config get minimumReleaseAge "*)
+                        echo 10080; exit 0 ;;
+                      *"--version"*)
+                        {version} ;;
+                "#},
+                &[],
+            )?;
+            let tool = tool_with(&script)?;
+            let snapshot =
+                ProjectMutationJournal::capture(&root, ["pnpm-lock.yaml", "pnpm-workspace.yaml"])?
+                    .capture_state()?;
+
+            let assessment = tool
+                .assess_native_admissions(NativeAdmissionQuery {
+                    project: &project(&root),
+                    pins: &[],
+                    refused_at_start: &HashSet::new(),
+                    evaluated_at: jiff::Timestamp::now(),
+                    snapshot: &snapshot,
+                })
+                .await?;
+
+            let written = match assessment.edit {
+                Some(edit) => NativeAge::parse(
+                    &String::from_utf8(edit.contents)?,
+                    &root.join("pnpm-workspace.yaml"),
+                )?
+                .exclusions
+                .into_vec(),
+                None => rules.iter().map(ToString::to_string).collect(),
+            };
+            let expected: &[&str] = if kept {
+                &rules
+            } else {
+                &["@team/*", "!*-legacy"]
+            };
+            assert_eq!(written, expected, "{version}");
+        }
+        Ok(())
+    }
+
+    /// One young-version refusal pnpm prints, listing `listed` of `counted` refused entries, each
+    /// named `<prefix>-<index>@1.0.0`, with the tail pnpm closes a truncated list with.
+    fn age_refusal(prefix: &str, listed: std::ops::Range<usize>, counted: usize) -> String {
+        let shown = listed.len();
+        let mut lines = vec![format!(
+            "[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] {counted} lockfile entries failed verification:"
+        )];
+        lines.extend(listed.map(|index| {
+            format!(
+                "  {prefix}-{index:02}@1.0.0 was published at 2026-11-19T00:00:00.000Z, within the minimumReleaseAge cutoff (2026-11-06T00:00:00.000Z)"
+            )
+        }));
+        if counted > shown {
+            lines.push(format!("  \u{2026}and {} more", counted - shown));
+        }
+        lines.join("\n") + "\n"
+    }
+
+    /// pnpm lists at most 20 refusals, so the verdict on the starting lock runs again with the
+    /// versions found so far exempt on the command line, beside the project's own list, until pnpm
+    /// names the rest; a trial's verdict reads a truncated report as the failure it is.
+    #[tokio::test]
+    async fn the_starting_verdict_names_refusals_past_the_listed_twenty() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        single_direct_dependency(&root)?;
+        let first = age_refusal("pkg", 0..20, 25);
+        let rest = age_refusal("pkg", 20..25, 5);
+        let script = fake_pnpm_with_exclusions(
+            &root,
+            &formatdoc! {r#"
+                  *"--frozen-lockfile"*"minimumReleaseAgeExclude="*)
+                    printf '%s' '{rest}' >&2; exit 1 ;;
+                  *"--frozen-lockfile"*)
+                    printf '%s' '{first}' >&2; exit 1 ;;
+            "#},
+            &["@corp/*"],
+        )?;
+        let tool = tool_with(&script)?;
+        let project = project(&root);
+        let query = NativeGateQuery {
+            project: &project,
+            published: &HashMap::new(),
+            evaluated_at: jiff::Timestamp::now(),
+        };
+
+        let refusal = tool
+            .native_gate_baseline(query)
+            .await?
+            .ok_or_else(|| eyre::eyre!("the starting lock is refused"))?;
+
+        let named: Vec<String> = refusal
+            .versions
+            .iter()
+            .map(|version| format!("{}@{}", version.name, version.version))
+            .collect();
+        let expected: Vec<String> = (0..25)
+            .map(|index| format!("pkg-{index:02}@1.0.0"))
+            .collect();
+        assert_eq!(named, expected);
+        let verifications: Vec<String> = legs(&root)
+            .into_iter()
+            .filter(|leg| leg.contains("--frozen-lockfile"))
+            .collect();
+        assert_eq!(verifications.len(), 2, "{verifications:?}");
+        assert!(!verifications[0].contains("minimumReleaseAgeExclude"));
+        let exempt: Vec<&str> = verifications[1]
+            .split(' ')
+            .filter_map(|arg| arg.strip_prefix("--config.minimumReleaseAgeExclude="))
+            .collect();
+        let mut expected_exempt = vec!["@corp/*".to_string()];
+        expected_exempt.extend((0..20).map(|index| format!("pkg-{index:02}@1.0.0")));
+        assert_eq!(exempt, expected_exempt);
+
+        std::assert_matches!(
+            tool.native_gate_refusal(query).await,
+            Err(CoreError::Tool { .. })
+        );
+        Ok(())
+    }
+
+    /// A verdict on the starting lock that names nothing new, as when pnpm ignores the exclusions
+    /// it was given, or that keeps naming new versions past every entry of the lock, is an error
+    /// rather than a partial list.
+    #[tokio::test]
+    async fn a_starting_verdict_that_names_nothing_new_is_an_error() -> eyre::Result<()> {
+        let stuck = format!(
+            "printf '%s' '{}' >&2; exit 1",
+            age_refusal("pkg", 0..20, 25)
+        );
+        let runaway = indoc! {r#"
+            run=$(cat runs 2>/dev/null || echo 0); echo $((run + 1)) > runs
+            { echo "[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] 21 lockfile entries failed verification:"; index=0; while [ $index -lt 20 ]; do echo "  run$run-pkg-$index@1.0.0 was published at 2026-11-19T00:00:00.000Z, within the minimumReleaseAge cutoff (2026-11-06T00:00:00.000Z)"; index=$((index + 1)); done; echo "  …and 1 more"; } >&2; exit 1
+        "#};
+        for (answer, runs, reason) in [
+            (stuck.as_str(), 2, "already exempts"),
+            (runaway, 2, "past every entry"),
+        ] {
+            let (_dir, root) = tempdir_root()?;
+            single_direct_dependency(&root)?;
+            let script = fake_pnpm_with_exclusions(
+                &root,
+                &format!("  *\"--frozen-lockfile\"*)\n    {answer} ;;\n"),
+                &[],
+            )?;
+            let tool = tool_with(&script)?;
+
+            let verdict = tool
+                .native_gate_baseline(NativeGateQuery {
+                    project: &project(&root),
+                    published: &HashMap::new(),
+                    evaluated_at: jiff::Timestamp::now(),
+                })
+                .await;
+
+            std::assert_matches!(
+                verdict,
+                Err(CoreError::System(message)) if message.contains(reason)
+            );
+            let verifications = legs(&root)
+                .iter()
+                .filter(|leg| leg.contains("--frozen-lockfile"))
+                .count();
+            assert_eq!(verifications, runs, "{reason}");
+        }
+        Ok(())
+    }
+
+    /// Without a window, pnpm's age gate has nothing to refuse, so no verification runs: neither
+    /// when the window is set to zero nor under a pnpm whose built-in default is none.
+    #[tokio::test]
+    async fn no_window_runs_no_verification() -> eyre::Result<()> {
+        for (window, version) in [("0", "11.8.0"), ("null", "10.34.9")] {
+            let (_dir, root) = tempdir_root()?;
+            single_direct_dependency(&root)?;
+            let script = fake_pnpm_with_exclusions(
+                &root,
+                &formatdoc! {r#"
+                      *"config list"*)
+                        echo '{{"registry":"https://registry.npmjs.org/"}}'; exit 0 ;;
+                      *"config get minimumReleaseAge "*)
+                        echo '{window}'; exit 0 ;;
+                      *"--version"*)
+                        echo '{version}'; exit 0 ;;
+                "#},
+                &[],
+            )?;
+            let tool = tool_with(&script)?;
+
+            assert_eq!(probe(&tool, &project(&root)).await?, None);
+            assert!(
+                !legs(&root)
+                    .iter()
+                    .any(|leg| leg.contains("--frozen-lockfile")),
+                "window {window}, pnpm {version}: {:?}",
+                legs(&root)
+            );
+        }
+        Ok(())
+    }
+
+    /// Two projects never share a verification cache, so registry metadata fetched with one
+    /// project's credentials never serves another.
+    #[tokio::test]
+    async fn each_project_verifies_under_its_own_cache() -> eyre::Result<()> {
+        let (_first_dir, first) = tempdir_root()?;
+        let (_second_dir, second) = tempdir_root()?;
+        let script = fake_pnpm_with_exclusions(
+            &first,
+            &format!("  *\"--frozen-lockfile\"*)\n    {RECORDS_AND_PASSES} ;;\n"),
+            &[],
+        )?;
+        let tool = tool_with(&script)?;
+        for root in [&first, &second, &first] {
+            single_direct_dependency(root)?;
+            assert_eq!(probe(&tool, &project(root)).await?, None);
+        }
+        // The scripted pnpm logs each run in the project it runs in.
+        let cache_of = |root: &Utf8Path| -> BTreeSet<String> {
+            legs(root)
+                .iter()
+                .filter(|leg| leg.contains("--frozen-lockfile"))
+                .filter_map(|leg| {
+                    leg.split(' ')
+                        .find_map(|arg| arg.strip_prefix("--config.cache-dir="))
+                        .map(ToString::to_string)
+                })
+                .collect()
+        };
+        let (first_caches, second_caches) = (cache_of(&first), cache_of(&second));
+        assert_eq!(first_caches.len(), 1, "{first_caches:?}");
+        assert_eq!(second_caches.len(), 1, "{second_caches:?}");
+        assert!(first_caches.is_disjoint(&second_caches));
+        Ok(())
+    }
+
+    /// Every probe runs under the same cooldown-owned cache, so the registry metadata stays warm,
+    /// and finds no verification record there: the one an earlier probe left is removed first.
+    #[tokio::test]
+    async fn every_probe_removes_the_verification_records_first() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        single_direct_dependency(&root)?;
+        // The scripted pnpm fails when it finds a record, then leaves one, as a passing
+        // verification does.
+        let script = fake_pnpm_with_exclusions(
+            &root,
+            indoc! {r#"
+                  *"--frozen-lockfile"*)
+                    cache="${*##*--config.cache-dir=}"; cache="${cache%% *}"
+                    if [ -e "$cache/lockfile-verified.jsonl" ]; then echo "record found" >&2; exit 1; fi
+                    echo '{}' > "$cache/lockfile-verified.jsonl"; exit 0 ;;
+            "#},
+            &[],
+        )?;
+        let tool = tool_with(&script)?;
+
+        for _ in 0..2 {
+            assert_eq!(probe(&tool, &project(&root)).await?, None);
+        }
+        let caches: BTreeSet<String> = legs(&root)
+            .into_iter()
+            .filter(|leg| leg.contains("--frozen-lockfile"))
+            .filter_map(|leg| {
+                leg.split(' ')
+                    .find_map(|arg| arg.strip_prefix("--config.cache-dir="))
+                    .map(ToString::to_string)
+            })
+            .collect();
+        assert_eq!(caches.len(), 1, "{caches:?}");
+        Ok(())
+    }
+
+    /// A record that cannot be removed fails the probe rather than being trusted.
+    #[test]
+    fn records_that_cannot_be_removed_fail_the_probe() -> eyre::Result<()> {
+        let (_dir, root) = tempdir_root()?;
+        clear_verification_records(&root)?;
+        std::fs::create_dir(root.join(VERIFICATION_RECORDS))?;
+        std::assert_matches!(
+            clear_verification_records(&root),
+            Err(CoreError::Filesystem(_))
+        );
+        Ok(())
+    }
+
+    /// The floor a grant is judged against is pnpm's effective window, whatever the workspace
+    /// file says: an environment window of an hour makes a two-hour-old admitted version mature
+    /// despite the file's week.
+    #[tokio::test]
+    async fn the_effective_window_decides_the_floor() -> eyre::Result<()> {
+        for (minutes, granted) in [("60", false), ("10080", true)] {
+            let (_dir, root) = tempdir_root()?;
+            let mut lock = workspace(
+                &root,
+                &[Importer {
+                    path: ".",
+                    name: "app",
+                    deps: vec![("foo", "^1.0.0", "1.0.0"), ("bar", "^1.0.0", "1.0.0")],
+                }],
+            )?;
+            lock.push('\n');
+            std::fs::write(root.join("pnpm-lock.yaml"), &lock)?;
+            std::fs::write(
+                root.join("pnpm-workspace.yaml"),
+                "packages: []\nminimumReleaseAge: 10080\n",
+            )?;
+            let script = fake_pnpm_with_exclusions(
+                &root,
+                &formatdoc! {r#"
+                      *"config list"*)
+                        echo '{{"registry":"https://registry.npmjs.org/"}}'; exit 0 ;;
+                      *"config get minimumReleaseAge"*)
+                        echo '{minutes}'; exit 0 ;;
+                "#},
+                &[],
+            )?;
+            let tool = tool_with(&script)?;
+            let now: jiff::Timestamp = "2026-01-18T00:00:00Z".parse()?;
+            let two_hours_ago = Some(now.checked_sub(jiff::SignedDuration::from_hours(2))?);
+            let pins = [
+                JudgedPin {
+                    name: "foo".to_string(),
+                    version: Version::new("1.0.0"),
+                    published_at: two_hours_ago,
+                    admitted: true,
+                },
+                JudgedPin {
+                    name: "bar".to_string(),
+                    version: Version::new("1.0.0"),
+                    published_at: two_hours_ago,
+                    admitted: false,
+                },
+            ];
+            let snapshot =
+                ProjectMutationJournal::capture(&root, ["pnpm-lock.yaml", "pnpm-workspace.yaml"])?
+                    .capture_state()?;
+
+            let assessment = tool
+                .assess_native_admissions(NativeAdmissionQuery {
+                    project: &project(&root),
+                    pins: &pins,
+                    refused_at_start: &HashSet::new(),
+                    evaluated_at: now,
+                    snapshot: &snapshot,
+                })
+                .await?;
+
+            assert_eq!(!assessment.grants.is_empty(), granted, "window {minutes}");
+        }
+        Ok(())
+    }
+
+    /// The native backstop runs pnpm's own frozen verification under cooldown's own cache, with
+    /// no shortcut past it for a lock pnpm believes it installed before, and names the versions a
+    /// minimum-age refusal lists, while a stale lock or any other failure stays an error.
+    #[tokio::test]
+    async fn the_native_backstop_reads_only_minimum_age_refusals_as_refusals() -> eyre::Result<()> {
+        let refusal = indoc! {"
+            [ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] 1 lockfile entries failed verification:
+              @sentry/types@5.30.0 was published at 2021-01-13T11:40:12.849Z, within the minimumReleaseAge cutoff (2020-09-01T00:00:38.279Z)
+        "};
+        let cases = [
+            (RECORDS_AND_PASSES, None),
+            (
+                &*format!("printf '%s' '{refusal}' >&2; exit 1"),
+                Some("@sentry/types@5.30.0"),
+            ),
+        ];
+        for (answer, refused) in cases {
+            let (_dir, root) = tempdir_root()?;
+            single_direct_dependency(&root)?;
+            let script = fake_pnpm_with_exclusions(
+                &root,
+                &format!("  *\"--frozen-lockfile\"*)\n    {answer} ;;\n"),
+                &[],
+            )?;
+            let tool = tool_with(&script)?;
+
+            let verdict = probe(&tool, &project(&root)).await?;
+
+            let named: Option<Vec<String>> = verdict.as_ref().map(|refusal| {
+                refusal
+                    .versions
+                    .iter()
+                    .map(|version| format!("{}@{}", version.name, version.version))
+                    .collect()
+            });
+            assert_eq!(named, refused.map(|refused| vec![refused.to_string()]));
+            let verification = legs(&root)
+                .into_iter()
+                .find(|leg| leg.contains("--frozen-lockfile"))
+                .expect("the backstop runs the frozen verification");
+            let cache = verification
+                .split(' ')
+                .find_map(|arg| arg.strip_prefix("--config.cache-dir="))
+                .expect("the verification runs under cooldown's own cache");
+            assert!(!Utf8Path::new(cache).starts_with(&root), "{cache}");
+            assert!(
+                !verification.contains("minimumReleaseAge"),
+                "{verification}"
+            );
+            // pnpm would otherwise skip verifying a lock it believes it installed before.
+            assert!(
+                verification.contains("--config.optimistic-repeat-install=false"),
+                "{verification}"
+            );
+            // A frozen install may otherwise still save settings, such as pruned catalogs.
+            assert!(verification.contains("--no-save"), "{verification}");
+        }
+
+        for (answer, stale) in [
+            (
+                "echo '[ERR_PNPM_OUTDATED_LOCKFILE] Cannot install' >&2; exit 1",
+                true,
+            ),
+            (
+                "echo '[ERR_PNPM_META_FETCH_FAIL] GET failed' >&2; exit 1",
+                false,
+            ),
+        ] {
+            let (_dir, root) = tempdir_root()?;
+            single_direct_dependency(&root)?;
+            let script = fake_pnpm_with_exclusions(
+                &root,
+                &format!("  *\"--frozen-lockfile\"*)\n    {answer} ;;\n"),
+                &[],
+            )?;
+            let tool = tool_with(&script)?;
+
+            let error = probe(&tool, &project(&root))
+                .await
+                .expect_err("only a minimum-age refusal is a refusal");
+            assert_eq!(matches!(error, CoreError::StaleLock(_)), stale, "{error:?}");
+        }
         Ok(())
     }
 

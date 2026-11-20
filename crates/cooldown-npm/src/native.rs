@@ -1,8 +1,6 @@
 //! pnpm native cooldown configuration parsing and text-preserving updates.
 
-use crate::exclusions::{
-    configured_rules, drop_versionless_rules, is_pnpm_safe_selector, name_matches,
-};
+use crate::exclusions::{configured_rules, drop_versionless_rules, is_pnpm_safe_selector};
 use camino::Utf8Path;
 use cooldown_core::{CoreError, Result, WindowSpec};
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,37 +29,6 @@ impl NativeSelectors {
             .partition(|selector| is_pnpm_safe_selector(selector));
         NativeSelectors { written, omitted }
     }
-}
-
-/// Renders the written selectors before exact version unions, omitting the versions of a name a
-/// written selector already covers under pnpm's own matcher.
-///
-/// `selectors` must be pnpm-safe ([`NativeSelectors::written`]): such a selector carries no
-/// version and no negation, so it exempts every version of each name it matches and an exact
-/// union after it would never be reached.
-pub(crate) fn minimum_age_exclusions(
-    selectors: &[String],
-    exact_versions: &BTreeMap<String, BTreeSet<String>>,
-) -> Vec<String> {
-    let mut exclusions = selectors.to_vec();
-    exclusions.extend(exact_versions.iter().filter_map(|(name, versions)| {
-        if versions.is_empty()
-            || selectors
-                .iter()
-                .any(|selector| name_matches(selector, name))
-        {
-            return None;
-        }
-        Some(format!(
-            "{name}@{}",
-            versions
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join("||")
-        ))
-    }));
-    exclusions
 }
 
 /// Drops every existing `minimumReleaseAgeExclude` rule at `path` that exempts every version of
@@ -98,20 +65,7 @@ pub(crate) fn prune_exclusions(
     set_yaml_block_list(path, "minimumReleaseAgeExclude", &retained, empty, dry_run)
 }
 
-/// Recognizes cooldown-owned exact entries without claiming user-authored version ranges.
-pub(crate) fn exact_exclusion(entry: &str) -> Option<(&str, Vec<&str>)> {
-    let (name, union) = entry.rsplit_once('@')?;
-    if name.is_empty() {
-        return None;
-    }
-    let versions: Vec<_> = union.split("||").collect();
-    versions
-        .iter()
-        .all(|version| crate::version::parse(version).is_some())
-        .then_some((name, versions))
-}
-
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Clone)]
 #[serde(untagged)]
 pub(crate) enum ConfigStringList {
     One(String),
@@ -144,11 +98,15 @@ pub(crate) struct NativeAge {
 impl NativeAge {
     pub(crate) fn read(path: &Utf8Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(content) => serde_saphyr::from_str(&content)
-                .map_err(|err| CoreError::Parse(format!("{path}: {err}"))),
+            Ok(content) => Self::parse(&content, path),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(err) => Err(CoreError::Filesystem(format!("{path}: {err}"))),
         }
+    }
+
+    /// Reads the settings from `content`, the text of the file at `path`.
+    pub(crate) fn parse(content: &str, path: &Utf8Path) -> Result<Self> {
+        serde_saphyr::from_str(content).map_err(|err| CoreError::Parse(format!("{path}: {err}")))
     }
 }
 
@@ -166,65 +124,144 @@ pub(crate) fn window_minutes(spec: &WindowSpec) -> Option<i64> {
     i64::try_from(seconds.div_ceil(60)).ok()
 }
 
-/// Sets one top-level YAML scalar while preserving comments and key order.
+/// The document `content`, the text of the file at `path`, with the top-level scalar `key` set
+/// to `value`, or `None` when the setting already reads as `value`, however it is spelled.
 ///
-/// pnpm settings are top-level scalars, so a line-level edit avoids a full YAML round trip that
-/// would drop comments.
-/// A missing file is created unless `dry_run` is enabled, and the return value reports whether the
-/// file changed or would change.
+/// pnpm settings are top-level scalars, so a line-level edit keeps comments and key order where a
+/// full YAML round trip would drop them.
+/// An absent key is added at the top of the document.
 ///
 /// # Errors
 ///
-/// Returns a [`CoreError`] when the file cannot be read or written.
-pub(crate) fn set_yaml_scalar(
+/// Returns a [`CoreError`] when the document cannot be parsed or `value` is no YAML scalar, and
+/// [`CoreError::Config`] when the line edit would not read back as `key: value` beside the
+/// document's other settings ([`verify_top_level_edit`]).
+pub(crate) fn render_yaml_scalar(
+    content: &str,
     path: &Utf8Path,
     key: &str,
     value: &str,
-    dry_run: bool,
-) -> Result<bool> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(CoreError::Filesystem(format!("{path}: {error}"))),
-    };
+) -> Result<Option<String>> {
+    let intended: serde_json::Value = serde_saphyr::from_str(value)
+        .map_err(|error| CoreError::Serialization(format!("{key}: {error}")))?;
+    if top_level_settings(content, path)?.get(key) == Some(&intended) {
+        return Ok(None);
+    }
     let target = format!("{key}: {value}");
     let prefix = format!("{key}:");
     let mut lines: Vec<String> = Vec::new();
     let mut found = false;
-    let mut changed = false;
     for line in content.lines() {
         // The colon prevents a short key from matching a longer key with the same prefix.
-        if !line.starts_with(char::is_whitespace) && line.starts_with(&prefix) {
+        if !found && !line.starts_with(char::is_whitespace) && line.starts_with(&prefix) {
             found = true;
-            if line == target {
-                lines.push(line.to_string());
-            } else {
-                changed = true;
-                lines.push(target.clone());
-            }
+            lines.push(target.clone());
         } else {
             lines.push(line.to_string());
         }
     }
-    if !found {
-        if !dry_run {
-            let mut out = target;
-            out.push('\n');
-            out.push_str(&content);
-            std::fs::write(path, out)
-                .map_err(|error| CoreError::Filesystem(format!("{path}: {error}")))?;
-        }
-        return Ok(true);
-    }
-    if changed && !dry_run {
-        let mut out = lines.join("\n");
+    let text = if found {
+        let mut text = lines.join("\n");
         if content.ends_with('\n') {
-            out.push('\n');
+            text.push('\n');
         }
-        std::fs::write(path, out)
-            .map_err(|error| CoreError::Filesystem(format!("{path}: {error}")))?;
+        text
+    } else {
+        let mut text = target;
+        text.push('\n');
+        text.push_str(content);
+        text
+    };
+    verify_top_level_edit(path, content, &text, key, Some(&intended))?;
+    Ok(Some(text))
+}
+
+/// Writes `text` to the settings file at `path` atomically, through to the file a symbolic link
+/// at `path` names, so a linked settings file stays linked as a plain write leaves it.
+///
+/// # Errors
+///
+/// Returns a [`CoreError`] when a link cannot be read, the links form a loop, or the file cannot
+/// be written.
+pub(crate) fn write_settings(path: &Utf8Path, text: &str) -> Result<()> {
+    cooldown_core::fs::atomic_write(&link_target(path)?, text.as_bytes())
+}
+
+/// The file the symbolic links starting at `path` end at, which need not exist yet, or `path`
+/// itself when it is no link.
+fn link_target(path: &Utf8Path) -> Result<std::path::PathBuf> {
+    // The bound the operating systems themselves put on a chain of links.
+    const MAX_LINKS: usize = 40;
+    let mut target = path.as_std_path().to_path_buf();
+    for _ in 0..MAX_LINKS {
+        match std::fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let link = std::fs::read_link(&target)
+                    .map_err(|error| CoreError::Filesystem(format!("{path}: {error}")))?;
+                target = match target.parent() {
+                    Some(parent) => parent.join(link),
+                    None => link,
+                };
+            }
+            Ok(_) => return Ok(target),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(target),
+            Err(error) => return Err(CoreError::Filesystem(format!("{path}: {error}"))),
+        }
     }
-    Ok(changed)
+    Err(CoreError::Filesystem(format!(
+        "{path}: too many levels of symbolic links"
+    )))
+}
+
+/// The top-level settings of the YAML document `content`, the text of the file at `path`.
+///
+/// An empty document, or one of comments alone, has none.
+fn top_level_settings(
+    content: &str,
+    path: &Utf8Path,
+) -> Result<BTreeMap<String, serde_json::Value>> {
+    let settings: Option<BTreeMap<String, serde_json::Value>> = serde_saphyr::from_str(content)
+        .map_err(|error| CoreError::Parse(format!("{path}: {error}")))?;
+    Ok(settings.unwrap_or_default())
+}
+
+/// Checks that `rendered`, a line edit of `original` (the text of the file at `path`), sets the
+/// top-level `key` to `intended`, or removes it when that is `None`, and reads back with every
+/// other top-level setting unchanged.
+///
+/// The line editors find a key only as a plain top-level key followed by its block, so a key they
+/// miss, such as a quoted one, would gain a duplicate, and a value they cannot delimit, such as a
+/// flow collection spanning lines, would be cut in half.
+/// This check turns either into an error rather than a document pnpm reads differently or cannot
+/// read at all.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Config`], naming the file and the key, when the edit does not read back
+/// as intended, and [`CoreError::Parse`] when `original` itself is no readable YAML mapping.
+fn verify_top_level_edit(
+    path: &Utf8Path,
+    original: &str,
+    rendered: &str,
+    key: &str,
+    intended: Option<&serde_json::Value>,
+) -> Result<()> {
+    let mut before = top_level_settings(original, path)?;
+    before.remove(key);
+    let unsupported = || {
+        CoreError::Config(format!(
+            "{path}: cooldown cannot rewrite `{key}` in the form it is written, such as a quoted \
+             key or a flow collection spanning lines; write it as a plain top-level `{key}:` key \
+             with a block value"
+        ))
+    };
+    let mut after = top_level_settings(rendered, path).map_err(|_| unsupported())?;
+    let actual = after.remove(key);
+    if actual.as_ref() == intended && after == before {
+        Ok(())
+    } else {
+        Err(unsupported())
+    }
 }
 
 /// The exclusive end of the block belonging to a top-level key, scanning `lines` from `start`
@@ -240,7 +277,7 @@ pub(crate) fn set_yaml_scalar(
 fn block_end(lines: &[&str], start: usize) -> usize {
     let mut end = start;
     while let Some(line) = lines.get(end) {
-        if line.starts_with(char::is_whitespace) {
+        if continues_block(line) {
             end += 1;
             continue;
         }
@@ -251,7 +288,7 @@ fn block_end(lines: &[&str], start: usize) -> usize {
         let mut probe = end + 1;
         let continues = loop {
             match lines.get(probe) {
-                Some(next) if next.starts_with(char::is_whitespace) => break true,
+                Some(next) if continues_block(next) => break true,
                 Some(next) if next.is_empty() || next.starts_with('#') => probe += 1,
                 _ => break false,
             }
@@ -263,6 +300,18 @@ fn block_end(lines: &[&str], start: usize) -> usize {
         end = probe;
     }
     end
+}
+
+/// Whether `line` belongs to the value of the top-level key above it: an indented line, or an
+/// item of an indentless block sequence (`key:` followed by `- item` at column zero).
+///
+/// A top-level mapping cannot hold a sequence item of its own, so a column-zero `-` followed by
+/// whitespace or nothing is always the value of the key before it; `---` is a document marker.
+fn continues_block(line: &str) -> bool {
+    line.starts_with(char::is_whitespace)
+        || line
+            .strip_prefix('-')
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
 }
 
 /// Replaces the block of the first top-level `prefix` key in `lines` with `desired`, returning
@@ -338,9 +387,49 @@ pub(crate) fn set_yaml_block_list(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(CoreError::Filesystem(format!("{path}: {error}"))),
     };
+    let Some(text) = render_yaml_block_list(&content, path, key, items, empty)? else {
+        return Ok(false);
+    };
+    if !dry_run {
+        std::fs::write(path, text)
+            .map_err(|error| CoreError::Filesystem(format!("{path}: {error}")))?;
+    }
+    Ok(true)
+}
+
+/// The document `content`, the text of the file at `path`, with one top-level YAML block
+/// sequence set as [`set_yaml_block_list`] sets it, or `None` when the setting already reads as
+/// those items, however it is spelled.
+///
+/// # Errors
+///
+/// Returns a [`CoreError`] when the document cannot be parsed or an item cannot be serialized,
+/// and [`CoreError::Config`] when the line edit would not read back as the intended list beside
+/// the document's other settings ([`verify_top_level_edit`]).
+pub(crate) fn render_yaml_block_list(
+    content: &str,
+    path: &Utf8Path,
+    key: &str,
+    items: &[String],
+    empty: EmptyList,
+) -> Result<Option<String>> {
+    let current = top_level_settings(content, path)?.remove(key);
+    let present = current.is_some();
+    // An empty list leaves an absent key absent unless it must be written explicitly.
+    let intended = (present || !items.is_empty() || empty == EmptyList::Explicit).then(|| {
+        serde_json::Value::Array(
+            items
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        )
+    });
+    if current == intended {
+        return Ok(None);
+    }
     let prefix = format!("{key}:");
     let lines: Vec<&str> = content.lines().collect();
-    let present = replace_top_level_block(&lines, &prefix, &[]).is_some();
     // An empty desired block leaves an absent key absent; `key: []` keeps it explicitly empty.
     let desired: Vec<String> = if items.is_empty() {
         match empty {
@@ -368,15 +457,15 @@ pub(crate) fn set_yaml_block_list(
     } else {
         !desired.is_empty()
     };
-    if !changed || dry_run {
-        return Ok(changed);
+    if !changed {
+        return Ok(None);
     }
 
     let mut text = if found {
         out.join("\n")
     } else {
         // New keys follow the existing document without disturbing its text.
-        let mut text = content.clone();
+        let mut text = content.to_string();
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
@@ -386,9 +475,8 @@ pub(crate) fn set_yaml_block_list(
     if content.ends_with('\n') || !found {
         text.push('\n');
     }
-    std::fs::write(path, text)
-        .map_err(|error| CoreError::Filesystem(format!("{path}: {error}")))?;
-    Ok(true)
+    verify_top_level_edit(path, content, &text, key, intended.as_ref())?;
+    Ok(Some(text))
 }
 
 /// Sets one top-level YAML string map while preserving the rest of the document.
@@ -398,7 +486,9 @@ pub(crate) fn set_yaml_block_list(
 ///
 /// # Errors
 ///
-/// Returns a [`CoreError`] when values cannot be serialized or the file cannot be read or written.
+/// Returns a [`CoreError`] when values cannot be serialized or the file cannot be read, parsed, or
+/// written, and [`CoreError::Config`] when the line edit would not read back as the intended map
+/// beside the file's other settings ([`verify_top_level_edit`]).
 pub(crate) fn set_yaml_string_map(
     path: &Utf8Path,
     key: &str,
@@ -409,6 +499,19 @@ pub(crate) fn set_yaml_string_map(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(CoreError::Filesystem(format!("{path}: {error}"))),
     };
+    let intended = (!items.is_empty()).then(|| {
+        serde_json::Value::Object(
+            items
+                .iter()
+                .map(|(item_key, value)| {
+                    (item_key.clone(), serde_json::Value::String(value.clone()))
+                })
+                .collect(),
+        )
+    });
+    if top_level_settings(&content, path)?.remove(key) == intended {
+        return Ok(false);
+    }
     let mut desired = Vec::new();
     if !items.is_empty() {
         desired.push(format!("{key}:"));
@@ -449,6 +552,7 @@ pub(crate) fn set_yaml_string_map(
     if content.ends_with('\n') || !found {
         text.push('\n');
     }
+    verify_top_level_edit(path, &content, &text, key, intended.as_ref())?;
     std::fs::write(path, text)
         .map_err(|error| CoreError::Filesystem(format!("{path}: {error}")))?;
     Ok(true)
@@ -460,33 +564,6 @@ mod tests {
     use camino::Utf8PathBuf;
     use color_eyre::eyre;
     use indoc::indoc;
-
-    #[test]
-    fn minimum_age_exclusions_render_globs_then_exact_version_unions() {
-        let globs = vec!["z-*".to_string(), "@scope/*".to_string(), "z-*".to_string()];
-        let versions = BTreeMap::from([
-            (
-                "a".to_string(),
-                BTreeSet::from(["2.0.1".to_string(), "1.2.2".to_string()]),
-            ),
-            (
-                "@scope/a".to_string(),
-                BTreeSet::from(["1.0.0".to_string()]),
-            ),
-            ("z-tool".to_string(), BTreeSet::from(["1.0.0".to_string()])),
-            ("b".to_string(), BTreeSet::from(["3.0.0".to_string()])),
-            ("empty".to_string(), BTreeSet::new()),
-        ]);
-        let selectors = NativeSelectors::partition(&globs);
-        assert_eq!(
-            minimum_age_exclusions(&selectors.written, &versions),
-            ["@scope/*", "z-*", "a@1.2.2||2.0.1", "b@3.0.0"]
-        );
-        assert_eq!(
-            minimum_age_exclusions(&[], &BTreeMap::new()),
-            [] as [String; 0]
-        );
-    }
 
     /// Only selectors pnpm reads exactly as cooldown does are written; the others are returned
     /// for reporting, both sorted and deduplicated.
@@ -514,43 +591,6 @@ mod tests {
         );
     }
 
-    /// An admitted exact version stays in the list unless a *written* selector covers its name
-    /// under pnpm's matcher: an omitted brace selector cooldown matches it with covers nothing on
-    /// pnpm's side, so dropping the union would leave the admitted version gated.
-    #[test]
-    fn an_exact_union_survives_a_selector_pnpm_cannot_read() {
-        let selectors = NativeSelectors::partition(&["@types/{node,react}".to_string()]);
-        let versions = BTreeMap::from([(
-            "@types/node".to_string(),
-            BTreeSet::from(["22.0.0".to_string()]),
-        )]);
-        let exclusions = minimum_age_exclusions(&selectors.written, &versions);
-        assert_eq!(exclusions, ["@types/node@22.0.0"]);
-        assert!(crate::exclusions::exempts(
-            &exclusions,
-            "@types/node",
-            "22.0.0"
-        ));
-
-        // A written wildcard that pnpm matches the name with still makes the union redundant.
-        let selectors = NativeSelectors::partition(&["@types/*".to_string()]);
-        assert_eq!(
-            minimum_age_exclusions(&selectors.written, &versions),
-            ["@types/*"]
-        );
-    }
-
-    #[test]
-    fn exact_exclusion_only_claims_full_version_unions() {
-        assert_eq!(
-            exact_exclusion("@scope/a@1.2.2||2.0.1"),
-            Some(("@scope/a", vec!["1.2.2", "2.0.1"]))
-        );
-        for entry in ["a", "@scope/*", "a@^1.2.2", "a@1.2.2||*", "a@", "@1.2.2"] {
-            assert_eq!(exact_exclusion(entry), None, "{entry}");
-        }
-    }
-
     #[test]
     fn configured_string_list_accepts_pnpm_singletons_and_arrays() -> eyre::Result<()> {
         let one = serde_json::from_str::<ConfigStringList>("\"nanoid\"")?;
@@ -565,57 +605,34 @@ mod tests {
     }
 
     #[test]
-    fn set_yaml_scalar_adds_updates_and_is_idempotent() -> eyre::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = Utf8PathBuf::from_path_buf(dir.path().join("pnpm-workspace.yaml"))
-            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
-        std::fs::write(&path, "packages:\n  - \"a\"\n# keep me\n")?;
+    fn render_yaml_scalar_adds_updates_and_is_idempotent() -> eyre::Result<()> {
+        let path = Utf8Path::new("pnpm-workspace.yaml");
+        let original = "packages:\n  - \"a\"\n# keep me\n";
 
         // Absent key → prepended, comments and existing content preserved.
-        assert!(set_yaml_scalar(&path, "minimumReleaseAge", "20160", false)?);
-        let after = std::fs::read_to_string(&path)?;
-        assert!(after.contains("minimumReleaseAge: 20160"));
-        assert!(after.contains("# keep me"), "comments preserved");
-        assert!(after.contains("packages:"), "existing content preserved");
+        let added = render_yaml_scalar(original, path, "minimumReleaseAge", "20160")?
+            .ok_or_else(|| eyre::eyre!("the key is added"))?;
+        assert!(added.contains("minimumReleaseAge: 20160"));
+        assert!(added.contains("# keep me"), "comments preserved");
+        assert!(added.contains("packages:"), "existing content preserved");
 
         // Idempotent.
-        assert!(!set_yaml_scalar(
-            &path,
-            "minimumReleaseAge",
-            "20160",
-            false
-        )?);
+        assert_eq!(
+            render_yaml_scalar(&added, path, "minimumReleaseAge", "20160")?,
+            None
+        );
 
         // Update in place.
-        assert!(set_yaml_scalar(&path, "minimumReleaseAge", "30", false)?);
-        let updated = std::fs::read_to_string(&path)?;
+        let updated = render_yaml_scalar(&added, path, "minimumReleaseAge", "30")?
+            .ok_or_else(|| eyre::eyre!("the value changes"))?;
         assert!(updated.contains("minimumReleaseAge: 30"));
         assert!(!updated.contains("20160"));
-        Ok(())
-    }
 
-    #[test]
-    fn set_yaml_scalar_dry_run_reports_change_without_writing() -> eyre::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = Utf8PathBuf::from_path_buf(dir.path().join("pnpm-workspace.yaml"))
-            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
-        let before = "packages:\n  - \"a\"\n";
-        std::fs::write(&path, before)?;
-
-        // Dry run on an absent key reports it would change but writes nothing.
-        assert!(set_yaml_scalar(&path, "minimumReleaseAge", "20160", true)?);
-        assert_eq!(std::fs::read_to_string(&path)?, before);
-
-        // Dry run on a missing file reports a change but does not create the file.
-        let missing = Utf8PathBuf::from_path_buf(dir.path().join("absent.yaml"))
-            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
-        assert!(set_yaml_scalar(
-            &missing,
-            "minimumReleaseAge",
-            "20160",
-            true
-        )?);
-        assert!(!missing.exists(), "dry run must not create the file");
+        // An empty document gains the key alone.
+        assert_eq!(
+            render_yaml_scalar("", path, "minimumReleaseAge", "20160")?.as_deref(),
+            Some("minimumReleaseAge: 20160\n")
+        );
         Ok(())
     }
 
@@ -877,6 +894,173 @@ mod tests {
             "next section intact"
         );
         Ok(())
+    }
+
+    /// A list written as an indentless block sequence, with its items at column zero, is the
+    /// key's value: a rewrite replaces every item and keeps the keys after it, and the rewritten
+    /// document reads back as the rules written beside the settings it had.
+    #[test]
+    fn set_yaml_block_list_replaces_an_indentless_sequence() -> eyre::Result<()> {
+        let path = Utf8Path::new("pnpm-workspace.yaml");
+        let original = indoc! {r#"
+            packages: []
+            minimumReleaseAgeExclude:
+            - "a"
+            - "b@1.0.0"
+            minimumReleaseAge: 20160
+        "#};
+        assert_eq!(
+            NativeAge::parse(original, path)?.exclusions.into_vec(),
+            ["a", "b@1.0.0"]
+        );
+
+        let rendered = render_yaml_block_list(
+            original,
+            path,
+            "minimumReleaseAgeExclude",
+            &["c@2.0.0".to_string()],
+            EmptyList::IfPresent,
+        )?
+        .ok_or_else(|| eyre::eyre!("the list changes"))?;
+        assert_eq!(
+            rendered,
+            indoc! {r#"
+                packages: []
+                minimumReleaseAgeExclude:
+                  - "c@2.0.0"
+                minimumReleaseAge: 20160
+            "#}
+        );
+        let after = NativeAge::parse(&rendered, path)?;
+        assert_eq!(after.exclusions.into_vec(), ["c@2.0.0"]);
+        assert_eq!(after.minutes, Some(20160));
+
+        // The same items read back unchanged, so the indentless list is not rewritten.
+        assert_eq!(
+            render_yaml_block_list(
+                original,
+                path,
+                "minimumReleaseAgeExclude",
+                &["a".to_string(), "b@1.0.0".to_string()],
+                EmptyList::IfPresent,
+            )?,
+            None
+        );
+        Ok(())
+    }
+
+    /// A list that already reads as the intended rules is never rewritten, whatever its quoting,
+    /// spelling, or form, and an absent key stays absent for an empty list.
+    #[test]
+    fn an_unchanged_list_is_not_rewritten() -> eyre::Result<()> {
+        let path = Utf8Path::new("pnpm-workspace.yaml");
+        let render = |content: &str, items: &[&str]| {
+            let items: Vec<String> = items.iter().map(ToString::to_string).collect();
+            render_yaml_block_list(
+                content,
+                path,
+                "minimumReleaseAgeExclude",
+                &items,
+                EmptyList::IfPresent,
+            )
+        };
+        for content in [
+            "minimumReleaseAgeExclude:\n  - legacy # kept by hand\n  - 'a@1.0.0'\n",
+            "minimumReleaseAgeExclude: [legacy, \"a@1.0.0\"]\n",
+            "\"minimumReleaseAgeExclude\": [\"legacy\", \"a@1.0.0\"]\n",
+        ] {
+            assert_eq!(render(content, &["legacy", "a@1.0.0"])?, None, "{content}");
+        }
+        assert_eq!(render("packages: []\n", &[])?, None);
+        assert_eq!(render("", &[])?, None);
+        assert_eq!(render("# settings follow\n", &[])?, None);
+        assert_eq!(
+            render("# settings follow\n", &["a@1.0.0"])?.as_deref(),
+            Some("# settings follow\nminimumReleaseAgeExclude:\n  - \"a@1.0.0\"\n")
+        );
+        assert_eq!(render("minimumReleaseAgeExclude: []\n", &[])?, None);
+        Ok(())
+    }
+
+    /// A quoted key the line editor cannot find is refused rather than duplicated, and so is a
+    /// flow sequence spanning lines, which the editor would cut in half; a one-line flow
+    /// sequence is rewritten as a block list.
+    #[test]
+    fn a_list_the_line_editor_cannot_rewrite_is_refused() -> eyre::Result<()> {
+        let path = Utf8Path::new("pnpm-workspace.yaml");
+        let items = ["legacy".to_string(), "new@1.0.0".to_string()];
+        let render = |content: &str| {
+            render_yaml_block_list(
+                content,
+                path,
+                "minimumReleaseAgeExclude",
+                &items,
+                EmptyList::IfPresent,
+            )
+        };
+
+        for content in [
+            "packages: []\n\"minimumReleaseAgeExclude\": [\"legacy\"]\n",
+            "minimumReleaseAgeExclude: [\n  \"legacy\"\n]\npackages: []\n",
+        ] {
+            let refused = render(content);
+            std::assert_matches!(
+                &refused,
+                Err(CoreError::Config(message))
+                    if message.contains("pnpm-workspace.yaml")
+                        && message.contains("minimumReleaseAgeExclude"),
+                "{content}"
+            );
+        }
+
+        let flow = render("minimumReleaseAgeExclude: [\"legacy\"]\npackages: []\n")?
+            .ok_or_else(|| eyre::eyre!("the list changes"))?;
+        assert_eq!(
+            flow,
+            indoc! {r#"
+                minimumReleaseAgeExclude:
+                  - "legacy"
+                  - "new@1.0.0"
+                packages: []
+            "#}
+        );
+        Ok(())
+    }
+
+    /// The window renderer leaves a setting that already reads as the value alone and refuses a
+    /// quoted key it would otherwise duplicate.
+    #[test]
+    fn the_scalar_renderer_compares_and_verifies_structurally() -> eyre::Result<()> {
+        let path = Utf8Path::new("pnpm-workspace.yaml");
+        assert_eq!(
+            render_yaml_scalar(
+                "minimumReleaseAge: 20160 # two weeks\n",
+                path,
+                "minimumReleaseAge",
+                "20160"
+            )?,
+            None
+        );
+        std::assert_matches!(
+            render_yaml_scalar(
+                "\"minimumReleaseAge\": 1440\npackages: []\n",
+                path,
+                "minimumReleaseAge",
+                "20160"
+            ),
+            Err(CoreError::Config(_))
+        );
+        Ok(())
+    }
+
+    /// A column-zero document marker is no sequence item, so it still bounds the block.
+    #[test]
+    fn a_document_marker_bounds_a_block() {
+        assert!(!continues_block("---"));
+        assert!(continues_block("- \"a\""));
+        assert!(continues_block("-"));
+        assert!(continues_block("  - \"a\""));
+        assert!(!continues_block("minimumReleaseAge: 1"));
     }
 
     /// A trailing blank/comment run before the next top-level key belongs to the *following*
