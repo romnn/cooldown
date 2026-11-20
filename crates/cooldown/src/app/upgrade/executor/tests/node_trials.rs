@@ -18,7 +18,8 @@ use cooldown_core::{
     NativeGateRefusal, NativePolicyLayer, PackageAdvisories, PackageId, Plan, PolicyLayer,
     PolicyStack, PreparedMutation, Project, ProjectMarker, ProjectMutationJournal, RawAdvisory,
     Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs, SkipReason, Skipped,
-    TargetFallback, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
+    TargetFallback, ToolId, ToolRead, ToolTermination, ToolWrite, UpdateKind, VerifyReport,
+    Version,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -168,6 +169,19 @@ struct Script {
     members: &'static [&'static str],
     /// A member a float leaves behind, recorded in the lock as a `<name>@<member>` entry.
     straggler: Option<Straggler>,
+    /// The `name@target`s whose trials fail instead of resolving, and how.
+    failures: Vec<(&'static str, Failure)>,
+}
+
+/// How a trial carrying a scripted target fails.
+#[derive(Clone, Copy)]
+enum Failure {
+    /// The resolver prints a conflict and then aborts, as Cargo did in #130.
+    Crash,
+    /// The apply reports recovery evidence it still owns, leaving the project as it found it.
+    PendingRecovery,
+    /// The manifest is edited while the apply runs, which the apply then reports.
+    Drift,
 }
 
 /// A native exemption list the fake keeps beside its lock, the way pnpm keeps
@@ -340,6 +354,33 @@ impl FakeNode {
             offending: None,
             detail: Some("the registry moved between trials".to_string()),
         })
+    }
+
+    /// Fails a trial planning a target scripted to fail, the way [`Failure`] describes.
+    fn fail_as_scripted(&self, project: &Project, plan: &Plan) -> cooldown_core::Result<()> {
+        let failure = self.script.failures.iter().find_map(|(target, failure)| {
+            plan.changes
+                .iter()
+                .any(|change| format!("{}@{}", change.package.name, change.to) == *target)
+                .then_some(*failure)
+        });
+        match failure {
+            None => Ok(()),
+            Some(Failure::Crash) => Err(CoreError::Tool {
+                tool: "fakenode".to_string(),
+                termination: ToolTermination::Signal(6),
+                stderr: "conflicting peer requirements\ncorrupted double-linked list".to_string(),
+            }),
+            Some(Failure::PendingRecovery) => Err(CoreError::PendingRecovery(
+                "the resolver left recovery evidence".to_string(),
+            )),
+            Some(Failure::Drift) => {
+                std::fs::write(project.root.join(MANIFEST), r#"{"drift":true}"#)?;
+                Err(CoreError::LockConflict(
+                    "package.json changed during the apply".to_string(),
+                ))
+            }
+        }
     }
 
     /// The row of the scripted partial float, when the batch landed a planned move of its trigger
@@ -723,6 +764,7 @@ impl ToolWrite for FakeNode {
             trials.push(targets);
             earlier
         };
+        self.fail_as_scripted(project, plan)?;
         // Each change moves its own copy, the one the starting lock holds at its source version.
         let starting = versions.clone();
         let mut report = ApplyReport::default();
@@ -1429,6 +1471,209 @@ async fn restoration_conflict_after_a_current_line_trial_stops_the_project() -> 
         "{:?}",
         fixture.fake.trials()
     );
+    Ok(())
+}
+
+/// The crash a scripted [`Failure::Crash`] reports.
+const CRASH: &str = "corrupted double-linked list";
+
+/// Asserts that the failure naming `needle` is reported once, as a project error naming no
+/// package, and that no row carries an error.
+fn assert_project_error(
+    errors: &[cooldown_core::Diagnostic],
+    items: &[crate::app::UpgradeItem],
+    needle: &str,
+) {
+    let reported: Vec<_> = errors
+        .iter()
+        .filter(|error| error.message.contains(needle))
+        .collect();
+    assert_eq!(reported.len(), 1, "{errors:?}");
+    assert!(
+        reported.iter().all(|error| error.package.is_none()),
+        "{errors:?}"
+    );
+    assert!(items.iter().all(|item| item.error.is_none()), "{items:?}");
+}
+
+/// A current-line trial that fails is reported for the project, while the companion the first
+/// trial verified is still replayed and lands beside the major's hold.
+#[tokio::test]
+async fn a_failed_current_line_trial_keeps_and_replays_the_verified_set() -> eyre::Result<()> {
+    let fixture = fixture(
+        dom_and_safe(
+            TargetFallback::CurrentLine,
+            Script {
+                holds: vec![peer_held_dom()],
+                failures: vec![("dom@1.1.0", Failure::Crash)],
+                ..Script::default()
+            },
+            true,
+        ),
+        &[("dom", "1.0.0"), ("safe", "1.0.0")],
+    )?;
+
+    let outcome = fixture.workspace.upgrade(&major()).await;
+
+    assert_project_error(&outcome.errors, &outcome.items, CRASH);
+    assert_ne!(outcome.exit, Exit::Ok);
+    assert_eq!(locked(&fixture, "dom")?.as_deref(), Some("1.0.0"));
+    assert_eq!(locked(&fixture, "safe")?.as_deref(), Some("1.1.0"));
+    assert_eq!(
+        rows(&outcome.items),
+        sorted(vec![
+            skipped(
+                "dom",
+                "1.0.0",
+                "2.0.0",
+                SkipReason::PeerHeld,
+                "plugin@1.0.0 peer-requires dom@^1.0.0"
+            ),
+            applied("safe", "1.0.0", "1.1.0"),
+        ])
+    );
+    // The initial trial, the failed current-line attempt, and the replay of the verified set.
+    let trials = fixture.fake.trials();
+    assert_eq!(trials.len(), 3, "{trials:?}");
+    assert_eq!(trials.last(), Some(&vec!["safe@1.1.0".to_string()]));
+    Ok(())
+}
+
+/// Two held majors, each with a matured in-line target, where each `failing` target crashes
+/// every trial that carries it.
+fn alpha_and_beta(failing: &[&'static str]) -> eyre::Result<NodeFixture> {
+    alpha_and_beta_failing(failing, Failure::Crash)
+}
+
+fn alpha_and_beta_failing(failing: &[&'static str], failure: Failure) -> eyre::Result<NodeFixture> {
+    let held = |target| Hold {
+        target,
+        reason: SkipReason::PeerHeld,
+        offending: None,
+        detail: Some("plugin peer-requires ^1.0.0"),
+    };
+    let lines = [("1.0.0", false), ("1.1.0", false), ("2.0.0", false)];
+    let fake = FakeNode::new(
+        TargetFallback::CurrentLine,
+        Script {
+            holds: vec![held("alpha@2.0.0"), held("beta@2.0.0")],
+            failures: failing.iter().map(|target| (*target, failure)).collect(),
+            ..Script::default()
+        },
+    )
+    .with_releases("alpha", &lines)
+    .with_releases("beta", &lines);
+    fixture(fake, &[("alpha", "1.0.0"), ("beta", "1.0.0")])
+}
+
+/// The rows of the two held majors, beside the in-line moves in `landed`.
+fn alpha_and_beta_rows(landed: &[&str]) -> Vec<Row> {
+    let mut rows: Vec<Row> = landed
+        .iter()
+        .map(|name| applied(name, "1.0.0", "1.1.0"))
+        .collect();
+    rows.extend(["alpha", "beta"].map(|name| {
+        skipped(
+            name,
+            "1.0.0",
+            "2.0.0",
+            SkipReason::PeerHeld,
+            "plugin peer-requires ^1.0.0",
+        )
+    }));
+    sorted(rows)
+}
+
+/// An in-line target one pass landed survives a later pass whose trial fails, and the failure
+/// is reported.
+#[tokio::test]
+async fn a_failed_current_line_trial_keeps_an_earlier_landed_alternative() -> eyre::Result<()> {
+    let fixture = alpha_and_beta(&["beta@1.1.0"])?;
+
+    let outcome = fixture.workspace.upgrade(&major()).await;
+
+    assert_project_error(&outcome.errors, &outcome.items, CRASH);
+    assert_eq!(locked(&fixture, "alpha")?.as_deref(), Some("1.1.0"));
+    assert_eq!(locked(&fixture, "beta")?.as_deref(), Some("1.0.0"));
+    assert_eq!(rows(&outcome.items), alpha_and_beta_rows(&["alpha"]));
+    // The initial trial, the failed joint attempt, alpha alone, beta on top of alpha, and the
+    // replay.
+    let trials = fixture.fake.trials();
+    assert_eq!(trials.len(), 5, "{trials:?}");
+    assert_eq!(trials.last(), Some(&vec!["alpha@1.1.0".to_string()]));
+    Ok(())
+}
+
+/// A failed joint attempt and a failed attempt of its own do not stop an independent in-line
+/// target from landing alone, while the failure is reported.
+#[tokio::test]
+async fn an_independent_current_line_target_lands_after_failed_trials() -> eyre::Result<()> {
+    let fixture = alpha_and_beta(&["alpha@1.1.0"])?;
+
+    let outcome = fixture.workspace.upgrade(&major()).await;
+
+    assert_project_error(&outcome.errors, &outcome.items, CRASH);
+    assert_eq!(locked(&fixture, "alpha")?.as_deref(), Some("1.0.0"));
+    assert_eq!(locked(&fixture, "beta")?.as_deref(), Some("1.1.0"));
+    assert_eq!(rows(&outcome.items), alpha_and_beta_rows(&["beta"]));
+    let trials = fixture.fake.trials();
+    assert_eq!(trials.len(), 5, "{trials:?}");
+    assert_eq!(trials.last(), Some(&vec!["beta@1.1.0".to_string()]));
+    Ok(())
+}
+
+/// With both majors held and every current-line trial failing, nothing is verified: the failure
+/// is reported once, nothing replays, and nothing lands.
+#[tokio::test]
+async fn failed_current_line_trials_with_nothing_verified_land_nothing() -> eyre::Result<()> {
+    let fixture = alpha_and_beta(&["alpha@1.1.0", "beta@1.1.0"])?;
+
+    let outcome = fixture.workspace.upgrade(&major()).await;
+
+    assert_project_error(&outcome.errors, &outcome.items, CRASH);
+    assert_ne!(outcome.exit, Exit::Ok);
+    assert_eq!(locked(&fixture, "alpha")?.as_deref(), Some("1.0.0"));
+    assert_eq!(locked(&fixture, "beta")?.as_deref(), Some("1.0.0"));
+    assert_eq!(rows(&outcome.items), alpha_and_beta_rows(&[]));
+    // The initial trial and the three failed attempts, and no replay.
+    let trials = fixture.fake.trials();
+    assert_eq!(trials.len(), 4, "{trials:?}");
+    Ok(())
+}
+
+/// A failed current-line trial that leaves a restore conflict still stops the project without a
+/// replay: whether its apply reports recovery evidence it still owns while the rollback itself
+/// succeeds, or the rollback meets an edit made behind cooldown's back, which is kept.
+#[tokio::test]
+async fn a_failed_current_line_trial_with_a_restore_conflict_stops_without_a_replay()
+-> eyre::Result<()> {
+    for failure in [Failure::PendingRecovery, Failure::Drift] {
+        let fixture = alpha_and_beta_failing(&["alpha@1.1.0"], failure)?;
+        let manifest = std::fs::read_to_string(fixture.project.root.join(MANIFEST))?;
+
+        let outcome = fixture.workspace.upgrade(&major()).await;
+
+        assert!(
+            !outcome.errors.is_empty() || outcome.items.iter().any(|item| item.error.is_some()),
+            "{:?}",
+            outcome.items
+        );
+        assert_ne!(outcome.exit, Exit::Ok);
+        assert!(outcome.items.iter().all(|item| !item.applied));
+        assert_eq!(locked(&fixture, "beta")?.as_deref(), Some("1.0.0"));
+        let expected = if matches!(failure, Failure::Drift) {
+            r#"{"drift":true}"#.to_string()
+        } else {
+            manifest
+        };
+        assert_eq!(
+            std::fs::read_to_string(fixture.project.root.join(MANIFEST))?,
+            expected
+        );
+        // No trial runs after the failed joint attempt.
+        let trials = fixture.fake.trials();
+        assert_eq!(trials.len(), 2, "{trials:?}");
+    }
     Ok(())
 }
 
