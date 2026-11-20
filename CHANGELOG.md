@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **A failed fallback trial no longer discards the upgrades already verified.** When a trial of
+  older or in-line fallback targets failed, for example because Cargo printed a resolver conflict
+  and then crashed, `upgrade` dropped every change the project had verified, reported each one as
+  an error carrying that trial's message, and left the lock unchanged. The failure is now
+  reported once as a project error, and it rejects only the alternatives that trial tried: the
+  search goes on with its remaining trials, and the best set they verify still lands. The held
+  candidates keep their own hold reasons. When the fallback targets cannot be looked up at all,
+  the failure is reported the same way and the verified set still lands, so `outdated` treats
+  that verification as incomplete instead of marking packages `blocked`. A trial whose rollback
+  cannot restore the project still stops it. Closes #130.
 - **The `upgrade` report says why a dependency did not move.** A direct dependency an authored
   exact pin held, such as `gpui = { package = "gpui-pre", version = "=0.3.9" }`, vanished from
   the report although `outdated` lists it as held. It is now a `pin_held` row naming the pin, the

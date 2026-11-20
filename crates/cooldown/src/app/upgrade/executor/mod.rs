@@ -1783,10 +1783,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .await
         {
             Ok(candidates) => candidates,
+            // Without alternatives there is nothing older to try, but the accepted set was
+            // verified by settled trials, so it still replays instead of being discarded.
             Err(error) => {
-                let mut outcome = BatchOutcome::default();
-                outcome.errors.push(*error);
-                return UpgradeSelectionResult::Aborted { outcome, rejected };
+                self.record_fallback_failure([*error]);
+                return UpgradeSelectionResult::Selected { accepted, rejected };
             }
         };
         // Retry only rejected candidates. Joint substitutions preserve coupled exact families;
@@ -1841,9 +1842,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     }
                     UpgradeTrialResult::PolicyBlocked(_) => {}
                     UpgradeTrialResult::Aborted(outcomes) => {
-                        let outcome =
-                            self.settle_aborted_trial(rollback, baseline, state, outcomes);
-                        return UpgradeSelectionResult::Aborted { outcome, rejected };
+                        match self.settle_failed_fallback(rollback, baseline, state, outcomes) {
+                            ControlFlow::Continue(()) => continue,
+                            ControlFlow::Break(outcome) => {
+                                return UpgradeSelectionResult::Aborted { outcome, rejected };
+                            }
+                        }
                     }
                 }
                 let mut outcome = BatchOutcome::default();
@@ -1938,8 +1942,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 }
                 UpgradeTrialResult::PolicyBlocked(_) => {}
                 UpgradeTrialResult::Aborted(outcomes) => {
-                    let outcome = self.settle_aborted_trial(rollback, baseline, state, outcomes);
-                    return UpgradeSelectionResult::Aborted { outcome, rejected };
+                    match self.settle_failed_fallback(rollback, baseline, state, outcomes) {
+                        ControlFlow::Continue(()) => continue,
+                        ControlFlow::Break(outcome) => {
+                            return UpgradeSelectionResult::Aborted { outcome, rejected };
+                        }
+                    }
                 }
             }
             let mut outcome = BatchOutcome::default();
@@ -2500,6 +2508,50 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 outcome
             }
         }
+    }
+
+    /// Settles a failed fallback trial, reporting its failure once the project is back on its
+    /// baseline, so the caller's search goes on without the alternatives the trial tried.
+    ///
+    /// The trial was a speculative addition to a set earlier trials verified, so its failure
+    /// says nothing about the alternatives of other trials (#130): the failure is reported as a
+    /// project error, never on the rows of changes the trial did not decide, and the verified set
+    /// still replays, since that replay has to land every verified target before anything
+    /// commits.
+    /// A restore conflict, from the outer rollback or one the trial's own apply reported while
+    /// that rollback still succeeded, leaves no known state to search or replay from, so its
+    /// outcome breaks the selection instead.
+    fn settle_failed_fallback(
+        &mut self,
+        snapshot: &mut TrialRollback,
+        baseline: &TrialState,
+        state: &mut TrialState,
+        outcomes: Vec<BatchOutcome>,
+    ) -> ControlFlow<BatchOutcome> {
+        let outcome = self.settle_aborted_trial(snapshot, baseline, state, outcomes);
+        if outcome.has_restore_conflict() {
+            return ControlFlow::Break(outcome);
+        }
+        let diagnostics: Vec<Diagnostic> = outcome
+            .errors
+            .iter()
+            .chain(outcome.items.iter().filter_map(|item| item.error.as_ref()))
+            .cloned()
+            .collect();
+        self.record_fallback_failure(diagnostics);
+        ControlFlow::Continue(())
+    }
+
+    /// Reports a failed fallback trial or lookup as project errors: an error the failure put on
+    /// each of its changes names the project once, without any of those changes.
+    fn record_fallback_failure(&mut self, diagnostics: impl IntoIterator<Item = Diagnostic>) {
+        for mut diagnostic in diagnostics {
+            diagnostic.package = None;
+            if !self.acc.errors.contains(&diagnostic) {
+                self.acc.errors.push(diagnostic);
+            }
+        }
+        self.acc.strict_incomplete = true;
     }
 
     /// The project's dependencies in the mode's scope, or `None` after recording why the graph

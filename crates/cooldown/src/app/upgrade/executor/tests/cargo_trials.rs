@@ -15,8 +15,8 @@ use cooldown_core::{
     LockStatus, LockVerifyReport, MajorKey, NativePolicyLayer, Origin, PackageId, PatternGlob,
     Plan, PolicyLayer, PolicyStack, PreparedMutation, Project, ProjectMarker,
     ProjectMutationJournal, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, Rule, Selector,
-    SkipReason, Skipped, TargetFallback, ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport,
-    Version,
+    SkipReason, Skipped, TargetFallback, ToolId, ToolRead, ToolTermination, ToolWrite, UpdateKind,
+    VerifyReport, Version,
 };
 use indoc::indoc;
 use std::collections::{BTreeMap, HashSet};
@@ -70,12 +70,31 @@ enum Resolver {
         fresh_newest: bool,
         child_start: &'static str,
     },
+    /// Holds each `name@target` in `held`, as a resolver conflict, and lands every other target.
+    Scripted {
+        held: &'static [&'static str],
+    },
+}
+
+/// How a trial carrying a scripted target fails instead of resolving.
+#[derive(Clone, Copy)]
+enum Failure {
+    /// Cargo prints a resolver conflict and then aborts, as in #130.
+    Crash,
+    /// The apply reports recovery evidence it still owns, leaving the lock as it found it.
+    PendingRecovery,
+    /// The apply rewrites the lock and then reports that the project changed under it.
+    Drift,
 }
 
 struct FakeCargo {
     resolver: Resolver,
     releases: BTreeMap<String, Vec<Release>>,
     edge_rebinds_on_apply: Vec<EdgeRebind>,
+    /// The `name@target`s whose trials fail, and how.
+    failures: Vec<(&'static str, Failure)>,
+    /// The packages whose releases the registry cannot serve.
+    unavailable_releases: &'static [&'static str],
 }
 
 fn timestamp(value: &str) -> jiff::Timestamp {
@@ -261,6 +280,21 @@ impl FakeCargo {
             Resolver::PersistentPair { coupled, .. } if coupled && !sibling_planned => &["sibling"],
             Resolver::PersistentPair { .. } => &["parent", "sibling"],
             Resolver::MajorParent => &["parent"],
+            Resolver::Scripted { held } => {
+                return plan
+                    .changes
+                    .iter()
+                    .filter(|change| {
+                        held.contains(&format!("{}@{}", change.package.name, change.to).as_str())
+                    })
+                    .map(|change| Skipped {
+                        change: change.clone(),
+                        reason: SkipReason::ResolverConflict,
+                        offending: None,
+                        detail: Some(format!("{} is held by holder", change.package.name)),
+                    })
+                    .collect();
+            }
             _ => return Vec::new(),
         };
         plan.changes
@@ -303,6 +337,47 @@ impl FakeCargo {
         }
     }
 
+    /// Fails a trial planning a target scripted to fail, the way [`Failure`] describes, over
+    /// the lock's `versions`.
+    fn fail_as_scripted(
+        &self,
+        project: &Project,
+        plan: &Plan,
+        versions: &BTreeMap<String, String>,
+    ) -> cooldown_core::Result<()> {
+        let Some(failure) = plan.changes.iter().find_map(|change| {
+            let target = format!("{}@{}", change.package.name, change.to);
+            self.failures
+                .iter()
+                .find(|(failing, _)| *failing == target)
+                .map(|(_, failure)| *failure)
+        }) else {
+            return Ok(());
+        };
+        Err(match failure {
+            Failure::Crash => CoreError::Tool {
+                tool: "cargo".to_string(),
+                termination: ToolTermination::Signal(6),
+                stderr: "error: failed to select a version for `child`.\n\
+                         corrupted double-linked list"
+                    .to_string(),
+            },
+            Failure::PendingRecovery => {
+                CoreError::PendingRecovery("cargo left recovery evidence".to_string())
+            }
+            Failure::Drift => {
+                let mut drifted = versions.clone();
+                drifted.insert("drift".to_string(), "1.0.0".to_string());
+                std::fs::write(
+                    project.root.join("Cargo.lock"),
+                    serde_json::to_vec(&drifted)
+                        .map_err(|err| CoreError::System(err.to_string()))?,
+                )?;
+                CoreError::LockConflict("Cargo.lock changed during the apply".to_string())
+            }
+        })
+    }
+
     fn exact_child(&self, versions: &BTreeMap<String, String>) -> bool {
         match self.resolver {
             Resolver::Caret
@@ -311,6 +386,7 @@ impl FakeCargo {
             | Resolver::PersistentPair { .. }
             | Resolver::MajorParent
             | Resolver::MajorChild { .. }
+            | Resolver::Scripted { .. }
             | Resolver::SnapshotFamily { .. } => false,
             Resolver::AnchoredPair => versions
                 .get("parent")
@@ -445,6 +521,14 @@ impl ReleaseFetcher for FakeCargo {
         _fetch: &FetchContext<'_>,
         _candidates: CandidateScope,
     ) -> cooldown_core::Result<Vec<Release>> {
+        if self
+            .unavailable_releases
+            .contains(&dep.package.name.as_str())
+        {
+            return Err(CoreError::Transient(
+                format!("the registry cannot serve {}", dep.package.name).into(),
+            ));
+        }
         Ok(self
             .releases
             .get(&dep.package.name)
@@ -512,6 +596,7 @@ impl ToolWrite for FakeCargo {
         // Which search each batch asked for, apart from `trials` so their expectations stay put.
         let search = if plan.fast { "fast" } else { "exhaustive" };
         log_batch(&project.root.join("searches"), search, plan)?;
+        self.fail_as_scripted(project, plan, &versions)?;
         let mut skipped = Vec::new();
         let mut applied = Vec::new();
         if let Resolver::PersistentParent {
@@ -568,6 +653,7 @@ impl ToolWrite for FakeCargo {
                     | Resolver::PersistentPair { .. }
                     | Resolver::MajorParent
                     | Resolver::MajorChild { .. }
+                    | Resolver::Scripted { .. }
                     | Resolver::PersistentParent { .. } => {
                         let child = self.resolved_child(&versions);
                         versions.insert("child".to_string(), child.to_string());
@@ -656,6 +742,7 @@ fn fixture_adapter(
         Resolver::CoupledPatchFrom(_)
             | Resolver::HeldParent { .. }
             | Resolver::PersistentPair { .. }
+            | Resolver::Scripted { .. }
     ) {
         parents.clone()
     } else {
@@ -664,6 +751,8 @@ fn fixture_adapter(
     let mut fake = FakeCargo {
         resolver,
         edge_rebinds_on_apply,
+        failures: Vec::new(),
+        unavailable_releases: &[],
         releases: BTreeMap::from([
             ("parent".to_string(), parents),
             (
@@ -777,6 +866,40 @@ fn fixture_with_edges(
     sibling: bool,
     edge_rebinds_on_apply: Vec<EdgeRebind>,
 ) -> eyre::Result<CargoFixture> {
+    fixture_with(
+        resolver,
+        newest,
+        sibling,
+        edge_rebinds_on_apply,
+        Faults::default(),
+    )
+}
+
+/// What the fixture's fake Cargo and registry fail at.
+#[derive(Default)]
+struct Faults {
+    /// The `name@target`s whose trials fail, and how.
+    trials: Vec<(&'static str, Failure)>,
+    /// The packages whose releases the registry cannot serve.
+    releases: &'static [&'static str],
+}
+
+impl From<Vec<(&'static str, Failure)>> for Faults {
+    fn from(trials: Vec<(&'static str, Failure)>) -> Self {
+        Faults {
+            trials,
+            ..Faults::default()
+        }
+    }
+}
+
+fn fixture_with(
+    resolver: Resolver,
+    newest: u32,
+    sibling: bool,
+    edge_rebinds_on_apply: Vec<EdgeRebind>,
+    faults: Faults,
+) -> eyre::Result<CargoFixture> {
     let directory = tempfile::tempdir()?;
     let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
         .map_err(|path| eyre::eyre!("non-UTF-8 root: {}", path.display()))?;
@@ -820,7 +943,11 @@ fn fixture_with_edges(
     };
     let initial = initial_lock(resolver, newest, sibling);
     std::fs::write(root.join("Cargo.lock"), serde_json::to_vec(&initial)?)?;
-    let fake = fixture_adapter(resolver, newest, edge_rebinds_on_apply);
+    let fake = FakeCargo {
+        failures: faults.trials,
+        unavailable_releases: faults.releases,
+        ..fixture_adapter(resolver, newest, edge_rebinds_on_apply)
+    };
     let mut adapters = AdapterSet::new();
     adapters.register_target_verified_mutator(Arc::new(fake))?;
     let context = ProjectCtx {
@@ -1687,6 +1814,441 @@ async fn exhausted_resolver_fallback_is_incomplete_in_strict_mode() -> eyre::Res
     assert_eq!(
         parent.skipped.as_ref().expect("resolver hold").reason,
         SkipReason::ResolverConflict
+    );
+    Ok(())
+}
+
+/// One report row reduced to what the fallback decides: the move, whether it landed, and the
+/// reason it was held.
+type Row = (String, String, String, bool, Option<SkipReason>);
+
+fn rows(outcome: &UpgradeOutcome) -> Vec<Row> {
+    let mut rows: Vec<Row> = outcome
+        .items
+        .iter()
+        .map(|item| {
+            (
+                item.name.clone(),
+                item.from.clone(),
+                item.to.clone(),
+                item.applied,
+                item.skipped.as_ref().map(|skipped| skipped.reason),
+            )
+        })
+        .collect();
+    rows.sort_by(|left, right| (&left.0, &left.2).cmp(&(&right.0, &right.2)));
+    rows
+}
+
+fn row(name: &str, from: &str, to: &str, held: Option<SkipReason>) -> Row {
+    (
+        name.to_string(),
+        from.to_string(),
+        to.to_string(),
+        held.is_none(),
+        held,
+    )
+}
+
+/// The trials that carried `target`.
+fn trials_with(trials: &str, target: &str) -> usize {
+    trials
+        .lines()
+        .filter(|line| line.split([':', ',']).any(|entry| entry == target))
+        .count()
+}
+
+/// The crash a scripted [`Failure::Crash`] reports.
+const CRASH: &str = "corrupted double-linked list";
+
+/// Asserts that the failure naming `needle` is reported once, as a project error naming no
+/// package, and that no row carries an error.
+fn assert_project_error(errors: &[cooldown_core::Diagnostic], items: &[UpgradeItem], needle: &str) {
+    let reported: Vec<_> = errors
+        .iter()
+        .filter(|error| error.message.contains(needle))
+        .collect();
+    assert_eq!(reported.len(), 1, "{errors:?}");
+    assert!(
+        reported.iter().all(|error| error.package.is_none()),
+        "{errors:?}"
+    );
+    assert!(items.iter().all(|item| item.error.is_none()), "{items:?}");
+}
+
+/// Crashes every trial carrying one of `targets`.
+fn crashes(targets: &[&'static str]) -> Faults {
+    targets
+        .iter()
+        .map(|target| (*target, Failure::Crash))
+        .collect::<Vec<_>>()
+        .into()
+}
+
+/// Every lower-line trial of the held parent fails, as Cargo's crash did in #130: the failure
+/// is reported once for the project, every bounded attempt still runs, and the verified sibling
+/// is replayed and lands beside the parent's original hold.
+#[tokio::test]
+async fn failed_fallback_trials_are_reported_and_keep_the_verified_set() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture_with(
+        Resolver::Scripted {
+            held: &["parent@1.4.0"],
+        },
+        4,
+        true,
+        Vec::new(),
+        crashes(&["parent@1.3.0", "parent@1.2.0", "parent@1.1.0"]),
+    )?;
+    let outcome = workspace.upgrade(&RunOpts::default()).await;
+    assert_project_error(&outcome.errors, &outcome.items, CRASH);
+    assert_ne!(outcome.exit, Exit::Ok);
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("parent").map(String::as_str), Some("1.0.0"));
+    assert_eq!(versions.get("sibling").map(String::as_str), Some("1.4.0"));
+    assert_eq!(
+        rows(&outcome),
+        [
+            row(
+                "parent",
+                "1.0.0",
+                "1.4.0",
+                Some(SkipReason::ResolverConflict)
+            ),
+            row("sibling", "1.0.0", "1.4.0", None),
+        ]
+    );
+    let trials = std::fs::read_to_string(project.root.join("trials"))?;
+    for target in ["parent@1.3.0", "parent@1.2.0", "parent@1.1.0"] {
+        assert_eq!(trials_with(&trials, target), 1, "{trials}");
+    }
+    assert_eq!(
+        trials.lines().last(),
+        Some("1.0.0:sibling@1.4.0"),
+        "{trials}"
+    );
+    Ok(())
+}
+
+/// A failed fallback trial affects only its own alternative: the parent's next lower target is
+/// still tried and lands beside the verified sibling, while the failure is reported.
+#[tokio::test]
+async fn a_failed_fallback_trial_rejects_only_its_own_alternative() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture_with(
+        Resolver::Scripted {
+            held: &["parent@1.4.0"],
+        },
+        4,
+        true,
+        Vec::new(),
+        crashes(&["parent@1.3.0"]),
+    )?;
+    let outcome = workspace.upgrade(&RunOpts::default()).await;
+    assert_project_error(&outcome.errors, &outcome.items, CRASH);
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("parent").map(String::as_str), Some("1.2.0"));
+    assert_eq!(versions.get("sibling").map(String::as_str), Some("1.4.0"));
+    assert_eq!(
+        rows(&outcome),
+        [
+            row("parent", "1.0.0", "1.2.0", None),
+            row("sibling", "1.0.0", "1.4.0", None),
+        ]
+    );
+    let trials = std::fs::read_to_string(project.root.join("trials"))?;
+    assert_eq!(trials_with(&trials, "parent@1.1.0"), 0, "{trials}");
+    assert_eq!(
+        trials.lines().last(),
+        Some("1.0.0:sibling@1.4.0,parent@1.2.0"),
+        "{trials}"
+    );
+    Ok(())
+}
+
+/// A joint fallback trial that landed the sibling's next lower target stays the pass's best
+/// after the pass's later trials fail.
+#[tokio::test]
+async fn failed_fallback_trials_keep_an_earlier_better_fallback() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture_with(
+        Resolver::Scripted {
+            held: &[
+                "parent@1.4.0",
+                "parent@1.3.0",
+                "parent@1.2.0",
+                "parent@1.1.0",
+                "sibling@1.4.0",
+            ],
+        },
+        4,
+        true,
+        Vec::new(),
+        crashes(&["sibling@1.2.0", "sibling@1.1.0"]),
+    )?;
+    let outcome = workspace.upgrade(&RunOpts::default()).await;
+    assert_project_error(&outcome.errors, &outcome.items, CRASH);
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("parent").map(String::as_str), Some("1.0.0"));
+    assert_eq!(versions.get("sibling").map(String::as_str), Some("1.3.0"));
+    assert_eq!(
+        rows(&outcome),
+        [
+            row(
+                "parent",
+                "1.0.0",
+                "1.4.0",
+                Some(SkipReason::ResolverConflict)
+            ),
+            row("sibling", "1.0.0", "1.3.0", None),
+        ]
+    );
+    let trials = std::fs::read_to_string(project.root.join("trials"))?;
+    assert_eq!(trials_with(&trials, "sibling@1.2.0"), 1, "{trials}");
+    assert_eq!(trials_with(&trials, "sibling@1.1.0"), 1, "{trials}");
+    // The parent's individual retries build on the kept best rather than on nothing.
+    for parent in ["parent@1.3.0", "parent@1.2.0", "parent@1.1.0"] {
+        let retry = format!("1.0.0:sibling@1.3.0,{parent}");
+        assert!(trials.lines().any(|line| line == retry), "{trials}");
+    }
+    assert_eq!(
+        trials.lines().last(),
+        Some("1.0.0:sibling@1.3.0"),
+        "{trials}"
+    );
+    Ok(())
+}
+
+/// Failed joint trials and the sibling's own failed trials do not stop the parent's independent
+/// lower target from landing in its individual pass.
+#[tokio::test]
+async fn an_independent_fallback_lands_after_failed_trials() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture_with(
+        Resolver::Scripted {
+            held: &["parent@1.4.0", "sibling@1.4.0"],
+        },
+        4,
+        true,
+        Vec::new(),
+        crashes(&["sibling@1.3.0", "sibling@1.2.0", "sibling@1.1.0"]),
+    )?;
+    let outcome = workspace.upgrade(&RunOpts::default()).await;
+    assert_project_error(&outcome.errors, &outcome.items, CRASH);
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("parent").map(String::as_str), Some("1.3.0"));
+    assert_eq!(versions.get("sibling").map(String::as_str), Some("1.0.0"));
+    assert_eq!(
+        rows(&outcome),
+        [
+            row("parent", "1.0.0", "1.3.0", None),
+            row(
+                "sibling",
+                "1.0.0",
+                "1.4.0",
+                Some(SkipReason::ResolverConflict)
+            ),
+        ]
+    );
+    let trials = std::fs::read_to_string(project.root.join("trials"))?;
+    assert_eq!(
+        trials.lines().last(),
+        Some("1.0.0:parent@1.3.0"),
+        "{trials}"
+    );
+    Ok(())
+}
+
+/// With every planned change held and every fallback trial failing, nothing is verified: the
+/// failure is reported once, nothing replays, and nothing lands.
+#[tokio::test]
+async fn failed_fallback_trials_with_nothing_verified_land_nothing() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture_with(
+        Resolver::Scripted {
+            held: &["parent@1.4.0", "sibling@1.4.0"],
+        },
+        4,
+        true,
+        Vec::new(),
+        crashes(&[
+            "parent@1.3.0",
+            "parent@1.2.0",
+            "parent@1.1.0",
+            "sibling@1.3.0",
+            "sibling@1.2.0",
+            "sibling@1.1.0",
+        ]),
+    )?;
+    let before = lock(&project)?;
+    let outcome = workspace.upgrade(&RunOpts::default()).await;
+    assert_project_error(&outcome.errors, &outcome.items, CRASH);
+    assert_ne!(outcome.exit, Exit::Ok);
+    assert_eq!(lock(&project)?, before);
+    assert_eq!(
+        rows(&outcome),
+        [
+            row(
+                "parent",
+                "1.0.0",
+                "1.4.0",
+                Some(SkipReason::ResolverConflict)
+            ),
+            row(
+                "sibling",
+                "1.0.0",
+                "1.4.0",
+                Some(SkipReason::ResolverConflict)
+            ),
+        ]
+    );
+    // The initial trial, then three joint and three individual attempts per candidate, all
+    // failed, and no replay.
+    let trials = std::fs::read_to_string(project.root.join("trials"))?;
+    assert_eq!(trials.lines().count(), 10, "{trials}");
+    Ok(())
+}
+
+/// A failed fallback trial that leaves a restore conflict still stops the project without a
+/// replay: whether its apply reports recovery evidence it still owns while the rollback itself
+/// succeeds, or the rollback meets the lock it rewrote, which is kept.
+#[tokio::test]
+async fn a_failed_fallback_trial_with_a_restore_conflict_stops_without_a_replay() -> eyre::Result<()>
+{
+    for failure in [Failure::PendingRecovery, Failure::Drift] {
+        let CargoFixture {
+            directory: _directory,
+            workspace,
+            project,
+        } = fixture_with(
+            Resolver::Scripted {
+                held: &["parent@1.4.0"],
+            },
+            4,
+            true,
+            Vec::new(),
+            vec![("parent@1.3.0", failure)].into(),
+        )?;
+        let before = lock(&project)?;
+        let outcome = workspace.upgrade(&RunOpts::default()).await;
+        assert!(
+            !outcome.errors.is_empty() || outcome.items.iter().any(|item| item.error.is_some()),
+            "{:?}",
+            outcome.items
+        );
+        assert_ne!(outcome.exit, Exit::Ok);
+        assert!(outcome.items.iter().all(|item| !item.applied));
+        let mut expected = before;
+        if matches!(failure, Failure::Drift) {
+            expected.insert("drift".to_string(), "1.0.0".to_string());
+        }
+        assert_eq!(lock(&project)?, expected);
+        // No trial runs after the conflicted fallback attempt.
+        let trials = std::fs::read_to_string(project.root.join("trials"))?;
+        assert_eq!(
+            trials.lines().last(),
+            Some("1.0.0:sibling@1.4.0,parent@1.3.0"),
+            "{trials}"
+        );
+    }
+    Ok(())
+}
+
+/// A preview, which looks the held parent's lower targets up only once its trial has run, cannot
+/// fetch them: the failed lookup is reported for the project, so a caller such as `outdated`
+/// knows the preview is incomplete, while the verified sibling still replays and lands beside
+/// the parent's original hold.
+#[tokio::test]
+async fn an_unavailable_fallback_lookup_still_replays_the_verified_set() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project: _,
+    } = fixture_with(
+        Resolver::Scripted {
+            held: &["parent@1.4.0"],
+        },
+        4,
+        true,
+        Vec::new(),
+        Faults {
+            releases: &["parent"],
+            ..Faults::default()
+        },
+    )?;
+    let changes = ["parent", "sibling"]
+        .into_iter()
+        .map(|name| Change {
+            package: PackageId::new(CARGO, name, Some("crates.io".to_string())),
+            from: Version::new("1.0.0"),
+            to: Version::new("1.4.0"),
+            kind: UpdateKind::Minor,
+            downgrade: false,
+            direct: true,
+            members: Vec::new(),
+        })
+        .collect();
+    let progress = Progress::plain().project(CARGO, ".");
+    let preview = workspace
+        .preview_project_upgrade(
+            workspace.projects().first().expect("fixture project"),
+            &RunOpts::default(),
+            &progress,
+            changes,
+            PreviewEvidence {
+                manifest_only: HashSet::default(),
+                advisories: None,
+                excluded_members: Vec::new(),
+            },
+        )
+        .await;
+    assert_project_error(
+        &preview.errors,
+        &preview.items,
+        "the registry cannot serve parent",
+    );
+    assert!(
+        preview
+            .warnings
+            .iter()
+            .all(|warning| !warning.message.contains("the registry cannot serve parent")),
+        "{:?}",
+        preview.warnings
+    );
+    let mut rows: Vec<_> = preview
+        .items
+        .iter()
+        .map(|item| {
+            (
+                item.name.as_str(),
+                item.to.as_str(),
+                item.applied,
+                item.skipped.as_ref().map(|skipped| skipped.reason),
+            )
+        })
+        .collect();
+    rows.sort_by_key(|row| row.0);
+    assert_eq!(
+        rows,
+        [
+            ("parent", "1.4.0", false, Some(SkipReason::ResolverConflict)),
+            ("sibling", "1.4.0", true, None),
+        ]
     );
     Ok(())
 }
