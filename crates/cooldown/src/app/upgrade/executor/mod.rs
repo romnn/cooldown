@@ -1579,8 +1579,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     }
                 }
                 UpgradeTrialResult::Aborted(outcomes) => {
-                    let outcome = self.settle_aborted_trial(rollback, baseline, state, outcomes);
-                    return UpgradeSelectionResult::Aborted { outcome, rejected };
+                    // The candidates earlier settled trials accepted still replay; this group
+                    // leaves the selection with its failure reported once.
+                    if let ControlFlow::Break(outcome) =
+                        self.settle_failed_trial(rollback, baseline, state, outcomes)
+                    {
+                        return UpgradeSelectionResult::Aborted { outcome, rejected };
+                    }
+                    self.ctx.progress.candidates_decided(&group);
                 }
             }
         }
@@ -1842,7 +1848,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     }
                     UpgradeTrialResult::PolicyBlocked(_) => {}
                     UpgradeTrialResult::Aborted(outcomes) => {
-                        match self.settle_failed_fallback(rollback, baseline, state, outcomes) {
+                        match self.settle_failed_trial(rollback, baseline, state, outcomes) {
                             ControlFlow::Continue(()) => continue,
                             ControlFlow::Break(outcome) => {
                                 return UpgradeSelectionResult::Aborted { outcome, rejected };
@@ -1942,7 +1948,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 }
                 UpgradeTrialResult::PolicyBlocked(_) => {}
                 UpgradeTrialResult::Aborted(outcomes) => {
-                    match self.settle_failed_fallback(rollback, baseline, state, outcomes) {
+                    match self.settle_failed_trial(rollback, baseline, state, outcomes) {
                         ControlFlow::Continue(()) => continue,
                         ControlFlow::Break(outcome) => {
                             return UpgradeSelectionResult::Aborted { outcome, rejected };
@@ -2510,18 +2516,18 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
     }
 
-    /// Settles a failed fallback trial, reporting its failure once the project is back on its
-    /// baseline, so the caller's search goes on without the alternatives the trial tried.
+    /// Settles a failed selection or fallback trial, reporting its failure once the project is
+    /// back on its baseline, so the caller's search goes on without the changes the trial added.
     ///
     /// The trial was a speculative addition to a set earlier trials verified, so its failure
-    /// says nothing about the alternatives of other trials (#130): the failure is reported as a
+    /// says nothing about the changes of other trials (#130, #146): the failure is reported as a
     /// project error, never on the rows of changes the trial did not decide, and the verified set
     /// still replays, since that replay has to land every verified target before anything
     /// commits.
     /// A restore conflict, from the outer rollback or one the trial's own apply reported while
     /// that rollback still succeeded, leaves no known state to search or replay from, so its
     /// outcome breaks the selection instead.
-    fn settle_failed_fallback(
+    fn settle_failed_trial(
         &mut self,
         snapshot: &mut TrialRollback,
         baseline: &TrialState,

@@ -39,7 +39,8 @@ pub struct UpgradeOutcome {
     pub meta: UpgradeMeta,
     /// Applied / skipped / error counts.
     pub summary: UpgradeSummary,
-    /// One entry per planned change, marked applied, skipped (with reason), or errored.
+    /// One entry per planned change a trial decided, marked applied, skipped (with reason), or
+    /// errored; a change whose trial failed before deciding it is covered by [`Self::errors`].
     pub items: Vec<UpgradeItem>,
     /// Non-fatal diagnostics.
     pub warnings: Vec<Diagnostic>,

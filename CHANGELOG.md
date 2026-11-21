@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **A failed isolation trial no longer discards the candidates already verified.** When a batch
+  that broke the upgrade policy was split to find its safe candidates and a later trial failed,
+  for example because the package manager crashed, `upgrade` dropped the candidates earlier
+  trials had verified and landed nothing. The failed trial is now reported once as a project
+  error and leaves out only its own candidates, while the search goes on and the verified
+  candidates still land. A trial whose rollback cannot restore the project still stops it.
+  Closes #146.
+
 - **`sync` keeps an exemption the lock still needs.** An exact `minimumReleaseAgeExclude` entry for a
   locked version cooldown does not admit, such as the one an `upgrade` writes for a pin pnpm already
   refused when its window was switched on, was pruned by the next `sync`, so bare pnpm refused the
