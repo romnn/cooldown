@@ -31,6 +31,9 @@ pub enum Detail {
     /// rejected releases are summarized in their evaluation instead of one
     /// [`Event::ReleaseFiltered`] each, and a native output stream is recorded once complete, so
     /// identical output refers to an earlier copy.
+    ///
+    /// A registry document whose decoded content the evaluations carry, such as an npm package
+    /// document, is recorded as an [`Event::ArtifactSummary`] instead of its bytes.
     Compact,
 }
 
@@ -430,6 +433,15 @@ pub enum Event<'a> {
         /// Original text or bytes, without a whole-artifact buffer.
         content: Content<'a>,
     },
+    /// A complete artifact recorded by its identity alone, without its bytes, in a compact trace.
+    ArtifactSummary {
+        /// The input or response the bytes came from.
+        source: ArtifactSource<'a>,
+        /// The number of original bytes.
+        bytes: u64,
+        /// The lowercase hex SHA-256 of the original bytes.
+        sha256: &'a str,
+    },
     /// An artifact's terminal state; only complete captures establish available graph evidence.
     ArtifactFinished {
         /// The matching artifact identity.
@@ -676,6 +688,19 @@ pub enum Mutation<'a> {
 /// Emits already-owned bytes as bounded artifact records without cloning the stream.
 pub fn artifact(source: ArtifactSource<'_>, bytes: &[u8]) {
     captured_artifact(source, bytes, ArtifactOutcome::Complete);
+}
+
+/// Emits the length and hash of `bytes` as an [`Event::ArtifactSummary`], without the bytes.
+pub fn summarized_artifact(source: ArtifactSource<'_>, bytes: &[u8]) {
+    if !enabled() {
+        return;
+    }
+    Event::ArtifactSummary {
+        source,
+        bytes: bytes.len() as u64,
+        sha256: &hex_sha256(bytes),
+    }
+    .emit();
 }
 
 /// Emits bytes captured before `outcome` as bounded artifact records.

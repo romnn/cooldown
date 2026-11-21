@@ -21,7 +21,8 @@ use std::time::Instant;
 /// Version 2 records repeated identical artifact content as a `duplicate_of` reference.
 /// Version 3 compresses the file and, unless the trace is full, records release lists as
 /// `release_set`s, rejected releases in their evaluation, and native output once complete.
-const SCHEMA_VERSION: u32 = 3;
+/// Version 4 records a decoded npm package document in a compact trace as an `artifact_summary`.
+const SCHEMA_VERSION: u32 = 4;
 /// The oldest schema whose files this producer still recognizes as its own, so pruning keeps
 /// removing traces written before the current version.
 const OLDEST_OWNED_SCHEMA_VERSION: u32 = 1;

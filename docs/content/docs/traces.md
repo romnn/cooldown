@@ -107,7 +107,7 @@ mutation inputs also preserve evidence read while resolving staged projects.
 ## Compact and full traces
 
 A long run judges the same packages many times, so most of a complete record is repetition. By
-default, cooldown records a compact trace (schema version 3) with the same decisions and evidence:
+default, cooldown records a compact trace (schema version 4) with the same decisions and evidence:
 
 - Each distinct release list is recorded once as a `release_set` event, with its `sha256` and
   `releases`. An `evaluation` names its list in `releaseSet` instead of carrying `releases`.
@@ -117,6 +117,10 @@ default, cooldown records a compact trace (schema version 3) with the same decis
   interrupted, times out, or fails, so identical output, such as repeated `cargo metadata` graphs,
   is a `duplicate_of` reference. Output of a command that is still running at an abrupt termination
   is not in a compact trace.
+- An npm package document that cooldown decoded is an `artifact_summary` with its `http` `source`,
+  length (`bytes`) and `sha256`, not its body; its releases are in the `release_set`. A 404, error
+  or malformed body is recorded in full. Use `--full-trace` to see the document itself, such as the
+  literal `latest` tag or publish times before cooldown's monotonic guard.
 
 `--full-trace` records the trace as it happens: release lists inline in every `evaluation`, one
 `release_filtered` event per rejected release with the full dependency, and native output chunks as

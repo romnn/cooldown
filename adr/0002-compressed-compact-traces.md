@@ -36,6 +36,8 @@ line; every earlier record decompresses.
   `release_filtered` record each.
 - Native stdout and stderr are recorded when the stream ends, including on interruption, timeout,
   or failure, with their hash, so identical output becomes a `duplicate_of` reference.
+- Since schema version 4 ([#136](https://github.com/romnn/cooldown/issues/136)), a decoded npm
+  package document is an `artifact_summary` of its source, length and hash instead of its body.
 
 An artifact becomes a reference target only after its terminal `complete` record, so a reference
 never precedes the bytes it names.

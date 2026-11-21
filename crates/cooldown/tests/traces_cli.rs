@@ -193,9 +193,28 @@ fn baseline_binds_the_exact_native_graph_and_preserves_input_bytes() -> eyre::Re
     Ok(())
 }
 
+/// The cached npm package document of the offline evaluation's dependency, with three releases.
+fn dep_document() -> String {
+    serde_json::json!({
+        "name": "dep", "dist-tags": {"latest": "2.0.0"},
+        "time": {"1.0.0": "2020-01-01T00:00:00Z", "1.1.0": "2020-02-01T00:00:00Z", "2.0.0": "2020-03-01T00:00:00Z"},
+        "versions": {"1.0.0": {"version": "1.0.0"}, "1.1.0": {"version": "1.1.0"}, "2.0.0": {"version": "2.0.0"}},
+    })
+    .to_string()
+}
+
 /// One offline `outdated` evaluation of a single npm dependency with three releases, recorded at
 /// the given trace detail.
 fn offline_evaluation(detail_args: &[&str]) -> eyre::Result<OfflineEvaluation> {
+    let (output, events) = offline_outdated(&dep_document(), detail_args)?;
+    eyre::ensure!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    Ok(OfflineEvaluation { report, events })
+}
+
+/// One offline `outdated` run of a single npm dependency whose cached package document is
+/// `document`, with its trace's records.
+fn offline_outdated(document: &str, detail_args: &[&str]) -> eyre::Result<(Output, Vec<Value>)> {
     let root = tempfile::tempdir()?;
     std::fs::create_dir(root.path().join(".git"))?;
     std::fs::write(
@@ -213,11 +232,6 @@ fn offline_evaluation(detail_args: &[&str]) -> eyre::Result<OfflineEvaluation> {
         root.path().join("package-lock.json"),
         serde_json::to_vec(&lock)?,
     )?;
-    let metadata = serde_json::json!({
-        "name": "dep", "dist-tags": {"latest": "2.0.0"},
-        "time": {"1.0.0": "2020-01-01T00:00:00Z", "1.1.0": "2020-02-01T00:00:00Z", "2.0.0": "2020-03-01T00:00:00Z"},
-        "versions": {"1.0.0": {"version": "1.0.0"}, "1.1.0": {"version": "1.1.0"}, "2.0.0": {"version": "2.0.0"}},
-    });
     cooldown_registry::cache::write_entry(
         &root.path().join("cache").join("cooldown"),
         &cooldown_registry::cache::CacheEntry {
@@ -225,7 +239,7 @@ fn offline_evaluation(detail_args: &[&str]) -> eyre::Result<OfflineEvaluation> {
             fetched_at: jiff::Timestamp::now().to_string(),
             etag: None,
             status: 200,
-            body: metadata.to_string(),
+            body: document.to_string(),
             request_body: None,
         },
     )?;
@@ -239,11 +253,31 @@ fn offline_evaluation(detail_args: &[&str]) -> eyre::Result<OfflineEvaluation> {
     ];
     args.extend_from_slice(detail_args);
     let output = run(root.path(), &config, &args)?;
-    eyre::ensure!(output.status.success(), "{output:?}");
-    let report: Value = serde_json::from_slice(&output.stdout)?;
     let files = traces(&config)?;
     let events = records(files.first().ok_or_else(|| eyre::eyre!("missing trace"))?)?;
-    Ok(OfflineEvaluation { report, events })
+    Ok((output, events))
+}
+
+/// The concatenated chunk text of every artifact recorded for the cached npm document.
+fn npm_document_bytes(events: &[Value]) -> String {
+    let field = |record: &'_ Value, pointer: &str| record.pointer(pointer).cloned();
+    let artifacts: Vec<Option<Value>> = events
+        .iter()
+        .filter(|record| {
+            field(record, "/event/kind") == Some("artifact_started".into())
+                && field(record, "/event/source/key")
+                    == Some("https://registry.npmjs.org/dep".into())
+        })
+        .map(|record| field(record, "/event/artifact"))
+        .collect();
+    events
+        .iter()
+        .filter(|record| {
+            field(record, "/event/kind") == Some("artifact_chunk".into())
+                && artifacts.contains(&field(record, "/event/artifact"))
+        })
+        .filter_map(|record| record.pointer("/event/content/data")?.as_str())
+        .collect()
 }
 
 struct OfflineEvaluation {
@@ -280,14 +314,6 @@ fn offline_evaluation_keeps_metadata_filter_reasons_and_the_printed_report() -> 
     for trace in [&compact, &full] {
         assert!(
             trace
-                .events
-                .iter()
-                .any(|record| record["event"]["kind"] == "artifact_started"
-                    && record["event"]["source"]["kind"] == "http"
-                    && record["event"]["source"]["fromCache"] == true)
-        );
-        assert!(
-            trace
                 .events("report")
                 .iter()
                 .any(|event| event["report"] == trace.report)
@@ -301,6 +327,25 @@ fn offline_evaluation_keeps_metadata_filter_reasons_and_the_printed_report() -> 
             );
         }
     }
+    // A compact trace records the decoded package document by its source, length and hash, and
+    // leaves out its bytes.
+    let summaries = compact.events("artifact_summary");
+    let [summary] = summaries.as_slice() else {
+        eyre::bail!("one npm document summary expected, got {summaries:?}");
+    };
+    let document = dep_document();
+    assert_eq!(summary["source"]["kind"], "http");
+    assert_eq!(summary["source"]["key"], "https://registry.npmjs.org/dep");
+    assert_eq!(summary["source"]["status"], 200);
+    assert_eq!(summary["source"]["fromCache"], true);
+    assert_eq!(summary["bytes"], document.len());
+    assert_eq!(summary["sha256"].as_str().map(str::len), Some(64));
+    assert_eq!(npm_document_bytes(&compact.events), "");
+
+    // A full trace keeps the document's exact bytes and no summary.
+    assert_eq!(npm_document_bytes(&full.events), document);
+    assert_eq!(full.events("artifact_summary"), Vec::<&Value>::new());
+
     let compact_evaluation = compact.evaluation()?;
     let full_evaluation = full.evaluation()?;
 
@@ -339,6 +384,33 @@ fn offline_evaluation_keeps_metadata_filter_reasons_and_the_printed_report() -> 
             .first()
             .map(|event| &event["detail"]),
         Some(&Value::from("full"))
+    );
+    Ok(())
+}
+
+/// A compact trace keeps the bytes of an npm document cooldown could not decode, which show why.
+#[test]
+fn a_malformed_npm_document_keeps_its_bytes_in_a_compact_trace() -> eyre::Result<()> {
+    let (_, events) = offline_outdated("not a package document", &[])?;
+    assert_eq!(npm_document_bytes(&events), "not a package document");
+    // The body the npm adapter records after the request returned keeps the request's operation.
+    let started = events
+        .iter()
+        .find(|record| {
+            record["event"]["kind"] == "artifact_started"
+                && record["event"]["source"]["key"] == "https://registry.npmjs.org/dep"
+        })
+        .ok_or_else(|| eyre::eyre!("no artifact for the npm document"))?;
+    assert!(
+        started["spans"]
+            .as_array()
+            .is_some_and(|spans| spans.iter().any(|span| span["name"] == "registry_request")),
+        "{started}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|record| record["event"]["kind"] == "artifact_summary")
     );
     Ok(())
 }
