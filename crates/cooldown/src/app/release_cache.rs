@@ -536,6 +536,7 @@ mod tests {
         let fetch = FetchContext {
             project: &project,
             artifacts: ArtifactScope::Environment,
+            batch: None,
         };
         let dep = test_dep();
 
@@ -556,6 +557,7 @@ mod tests {
         let fetch = FetchContext {
             project,
             artifacts: ArtifactScope::Environment,
+            batch: None,
         };
         let _ = cache
             .candidate_releases(
@@ -604,6 +606,7 @@ mod tests {
         let fetch = FetchContext {
             project: &project,
             artifacts: ArtifactScope::Environment,
+            batch: None,
         };
         let unbounded = cache
             .candidate_releases(

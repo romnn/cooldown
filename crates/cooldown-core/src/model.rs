@@ -1329,6 +1329,64 @@ pub struct FetchContext<'a> {
     pub project: &'a Project,
     /// Which artifacts to gate.
     pub artifacts: ArtifactScope,
+    /// The batch this fetch belongs to, whose scratch the batch's fetches share, or `None` for a
+    /// fetch outside any batch.
+    pub batch: Option<&'a FetchBatch>,
+}
+
+impl FetchContext<'_> {
+    /// Returns this context for the fetches of `batch`.
+    #[must_use]
+    pub fn in_batch<'b>(&'b self, batch: &'b FetchBatch) -> FetchContext<'b> {
+        FetchContext {
+            project: self.project,
+            artifacts: self.artifacts,
+            batch: Some(batch),
+        }
+    }
+}
+
+/// Scratch state the fetches of one batch share, such as a registry document that several locked
+/// copies of one package read.
+///
+/// The application creates one for each batch of release fetches and drops it when the batch
+/// ends, so nothing an adapter keeps here outlives the batch, and a later batch fetches again.
+/// Entries are keyed by a string the adapter chooses, such as a document URL.
+#[derive(Default)]
+pub struct FetchBatch {
+    entries: std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    >,
+}
+
+impl FetchBatch {
+    /// Returns the entry stored under `key`, first storing the value `init` builds when there is
+    /// none.
+    ///
+    /// Returns `None` when `key` already holds an entry of another type.
+    #[must_use]
+    pub fn entry<T: std::any::Any + Send + Sync>(
+        &self,
+        key: &str,
+        init: impl FnOnce() -> T,
+    ) -> Option<std::sync::Arc<T>> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries
+            .entry(key.to_string())
+            .or_insert_with(|| std::sync::Arc::new(init()))
+            .clone()
+            .downcast::<T>()
+            .ok()
+    }
+}
+
+impl fmt::Debug for FetchBatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FetchBatch").finish_non_exhaustive()
+    }
 }
 
 /// The outcome of a lock-currency probe.

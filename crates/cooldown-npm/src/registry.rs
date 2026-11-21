@@ -3,10 +3,14 @@
 //! per-file split like PyPI), and the document's `time` map gives each version's publish instant.
 
 use async_trait::async_trait;
-use cooldown_core::{ArtifactId, CoreError, PackageId, PackageRegistry, RawRelease, Version};
+use cooldown_core::{
+    ArtifactId, CoreError, FetchBatch, PackageId, PackageRegistry, RawRelease, Version,
+};
 use cooldown_registry::{SharedHttp, ttl};
 use jiff::Timestamp;
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::OnceCell;
 
 const DEFAULT_BASE: &str = "https://registry.npmjs.org";
 
@@ -177,18 +181,108 @@ impl NpmRegistry {
             .map_err(|e| CoreError::Parse(format!("{name}: {e}")))?;
         Ok(Some(doc))
     }
+
+    /// Fetches the package document as [`get_doc`](Self::get_doc) does, once per `batch`.
+    ///
+    /// Every copy of the package that the batch reads gets the outcome of the batch's one fetch,
+    /// success or failure, just as one fetch serves every version of a package.
+    /// A failure that cannot be handed to each copy unchanged is not kept, so the next copy
+    /// fetches on its own.
+    /// Without a batch, each call fetches.
+    async fn batch_doc(
+        &self,
+        name: &str,
+        batch: Option<&FetchBatch>,
+    ) -> Result<Option<Arc<Doc>>, CoreError> {
+        let key = format!("npm package document {}", self.doc_url(name));
+        let Some(cell) = batch.and_then(|batch| batch.entry(&key, OnceCell::<BatchDoc>::new))
+        else {
+            return Ok(self.get_doc(name).await?.map(Arc::new));
+        };
+        let outcome = cell
+            .get_or_try_init(|| async {
+                match self.get_doc(name).await {
+                    Ok(doc) => Ok(Ok(doc.map(Arc::new))),
+                    Err(error) => DocFailure::of(&error).map(Err).ok_or(error),
+                }
+            })
+            .await?;
+        outcome.clone().map_err(CoreError::from)
+    }
+
+    /// Returns the guarded publish instant of `version` from the package document, read once per
+    /// `batch`, or `None` when the package or its publish time is unknown.
+    pub(crate) async fn locked_published_at(
+        &self,
+        pkg: &PackageId,
+        version: &Version,
+        batch: Option<&FetchBatch>,
+    ) -> Result<Option<Timestamp>, CoreError> {
+        let Some(doc) = self.batch_doc(&pkg.name, batch).await? else {
+            return Ok(None);
+        };
+        Ok(self.guard(
+            &pkg.name,
+            version.as_str(),
+            doc.time
+                .get(version.as_str())
+                .and_then(|s| s.parse::<Timestamp>().ok()),
+        ))
+    }
+}
+
+/// A package-document fetch outcome that the copies of one batch share.
+type BatchDoc = Result<Option<Arc<Doc>>, DocFailure>;
+
+/// A failed package-document fetch, in a form every copy that reads the document in one batch can
+/// receive as the same [`CoreError`].
+#[derive(Clone)]
+enum DocFailure {
+    Transient(String),
+    Parse(String),
+    OfflineMiss(String),
+}
+
+impl DocFailure {
+    /// Returns the shareable form of `error`, or `None` for a kind of error the document fetch does
+    /// not produce, which is then not shared.
+    fn of(error: &CoreError) -> Option<Self> {
+        match error {
+            CoreError::Transient(source) => Some(Self::Transient(source.to_string())),
+            CoreError::Parse(message) => Some(Self::Parse(message.clone())),
+            CoreError::OfflineMiss(message) => Some(Self::OfflineMiss(message.clone())),
+            _ => None,
+        }
+    }
+}
+
+impl From<DocFailure> for CoreError {
+    fn from(failure: DocFailure) -> Self {
+        match failure {
+            DocFailure::Transient(message) => CoreError::transient(message),
+            DocFailure::Parse(message) => CoreError::Parse(message),
+            DocFailure::OfflineMiss(message) => CoreError::OfflineMiss(message),
+        }
+    }
 }
 
 impl NpmRegistry {
     /// Fetches the package document and returns both the installable releases and the version the
     /// `latest` dist-tag names — one HTTP round-trip for the two package-level facts adapters need.
     ///
+    /// The document is read once per `batch`, so every locked copy of the package in one batch
+    /// shares a single fetch.
+    ///
     /// # Errors
     ///
     /// Returns [`CoreError::NotFound`] for an unknown package, or the underlying transport/parse
     /// error.
-    pub async fn packument(&self, package: &PackageId) -> Result<NpmPackument, CoreError> {
-        let Some(doc) = self.get_doc(&package.name).await? else {
+    pub async fn packument(
+        &self,
+        package: &PackageId,
+        batch: Option<&FetchBatch>,
+    ) -> Result<NpmPackument, CoreError> {
+        let Some(doc) = self.batch_doc(&package.name, batch).await? else {
             return Err(CoreError::NotFound(package.name.clone()));
         };
         let releases = installable_releases(&doc)
@@ -212,7 +306,7 @@ impl NpmRegistry {
 #[async_trait]
 impl PackageRegistry for NpmRegistry {
     async fn releases(&self, package: &PackageId) -> Result<Vec<RawRelease>, CoreError> {
-        Ok(self.packument(package).await?.releases)
+        Ok(self.packument(package, None).await?.releases)
     }
 
     async fn published_at(
@@ -221,15 +315,7 @@ impl PackageRegistry for NpmRegistry {
         version: &Version,
         _artifacts: &[ArtifactId],
     ) -> Result<Option<Timestamp>, CoreError> {
-        let Some(Doc { time, .. }) = self.get_doc(&pkg.name).await? else {
-            return Ok(None);
-        };
-        Ok(self.guard(
-            &pkg.name,
-            version.as_str(),
-            time.get(version.as_str())
-                .and_then(|s| s.parse::<Timestamp>().ok()),
-        ))
+        self.locked_published_at(pkg, version, None).await
     }
 }
 
@@ -351,17 +437,194 @@ mod tests {
             base: base.clone(),
             revalidate_listings: false,
         };
-        let first = cached.packument(&package).await.expect("first fetch");
+        let first = cached.packument(&package, None).await.expect("first fetch");
         assert_eq!(first.latest_tag.as_deref(), Some("17.0.0"));
 
         // Within the TTL the cached copy still answers — the registry is not consulted, so the
         // downward retag is invisible to the read-only default.
-        let second = cached.packument(&package).await.expect("cached fetch");
+        let second = cached
+            .packument(&package, None)
+            .await
+            .expect("cached fetch");
         assert_eq!(second.latest_tag.as_deref(), Some("17.0.0"));
 
         // The version-adopting configuration revalidates and sees the retag.
         let revalidating = cached.clone().with_listing_revalidation(true);
-        let live = revalidating.packument(&package).await.expect("revalidated");
+        let live = revalidating
+            .packument(&package, None)
+            .await
+            .expect("revalidated");
         assert_eq!(live.latest_tag.as_deref(), Some("16.0.0"));
+    }
+
+    /// A loopback registry that answers each request with what `reply` returns for the zero-based
+    /// request number, dropping the connection on `None`, and counts the requests.
+    fn serve_counting(
+        reply: impl Fn(usize) -> Option<String> + Send + 'static,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::Ordering;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base = format!("http://{}", listener.local_addr().expect("server addr"));
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let hit = counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                if let Some(body) = reply(hit) {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            }
+        });
+        (base, hits)
+    }
+
+    const LEFT_PAD: &str = r#"{"dist-tags":{"latest":"17.0.0"},"versions":{"16.0.0":{},"17.0.0":{}},"time":{"16.0.0":"2025-01-01T00:00:00.000Z","17.0.0":"2025-02-01T00:00:00.000Z"}}"#;
+
+    /// An npm adapter that revalidates every package document against the registry at `base`, as
+    /// a version-adopting run does.
+    fn revalidating_tool(
+        base: String,
+        cache: &tempfile::TempDir,
+    ) -> crate::tool::NpmTool<crate::lock::Npm> {
+        let http = cooldown_registry::SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )
+        .expect("shared http");
+        crate::tool::NpmTool::new(super::NpmRegistry {
+            http,
+            base,
+            revalidate_listings: true,
+        })
+    }
+
+    fn project(root: &str) -> cooldown_core::Project {
+        let root = camino::Utf8PathBuf::from(root);
+        cooldown_core::Project {
+            manifest: root.join("package.json"),
+            root,
+            kind: cooldown_core::ToolId("npm"),
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        }
+    }
+
+    /// A locked copy of `left-pad` at `version`.
+    fn copy(version: &str) -> cooldown_core::Dependency {
+        cooldown_core::Dependency {
+            package: cooldown_core::PackageId::new(
+                cooldown_core::ToolId("npm"),
+                "left-pad".to_string(),
+                None,
+            ),
+            advisory_identity: None,
+            current: cooldown_core::Version::new(version),
+            current_quality: cooldown_core::ReleaseQuality::Stable,
+            direct: false,
+            artifacts: Vec::new(),
+            graph_floor: None,
+            graph_ceiling: None,
+            declared_bound: None,
+            members: Vec::new(),
+            pinned: false,
+            hold_edges: Vec::new(),
+        }
+    }
+
+    fn hits(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The locked copies and candidate reads of one package in a batch share one document fetch
+    /// and each read its own version from it; a later batch revalidates again, and a fetch
+    /// outside any batch fetches on its own.
+    #[tokio::test]
+    async fn a_batch_reads_each_package_document_once() {
+        use cooldown_core::{CandidateScope, FetchBatch, FetchContext, ReleaseFetcher as _};
+
+        let (base, counter) = serve_counting(|_| Some(LEFT_PAD.to_string()));
+        let cache = tempfile::tempdir().expect("tempdir");
+        let tool = revalidating_tool(base, &cache);
+        let project = project("/repo");
+        let outside = FetchContext {
+            project: &project,
+            artifacts: cooldown_core::ArtifactScope::Environment,
+            batch: None,
+        };
+        let (old, new) = (copy("16.0.0"), copy("17.0.0"));
+
+        for batch_number in 1..=2 {
+            let batch = FetchBatch::default();
+            let fetch = outside.in_batch(&batch);
+            let (old_locked, new_locked, candidates) = tokio::join!(
+                tool.locked_release(&old, &fetch),
+                tool.locked_release(&new, &fetch),
+                tool.releases(&old, &fetch, CandidateScope::AllowCrossMajor),
+            );
+
+            // One request per batch served both locked copies and the candidate read.
+            assert_eq!(hits(&counter), batch_number);
+            assert_eq!(
+                old_locked.expect("locked 16").published_at,
+                Some("2025-01-01T00:00:00Z".parse().expect("timestamp"))
+            );
+            assert_eq!(
+                new_locked.expect("locked 17").published_at,
+                Some("2025-02-01T00:00:00Z".parse().expect("timestamp"))
+            );
+            assert_eq!(candidates.expect("candidates").len(), 2);
+        }
+
+        // Without a batch, every read revalidates on its own.
+        tool.locked_release(&old, &outside)
+            .await
+            .expect("locked 16");
+        tool.locked_release(&new, &outside)
+            .await
+            .expect("locked 17");
+        assert_eq!(hits(&counter), 4);
+    }
+
+    /// A batch fetches a failing document once too: every copy receives the same error instead of
+    /// each trying again.
+    #[tokio::test]
+    async fn a_batch_shares_a_failed_document_fetch() {
+        use cooldown_core::{CoreError, FetchBatch, FetchContext, ReleaseFetcher as _};
+
+        // Every connection is dropped unanswered, a registry outage with no cached copy.
+        let (base, counter) = serve_counting(|_| None);
+        let cache = tempfile::tempdir().expect("tempdir");
+        let tool = revalidating_tool(base, &cache);
+        let project = project("/repo");
+        let batch = FetchBatch::default();
+        let fetch = FetchContext {
+            project: &project,
+            artifacts: cooldown_core::ArtifactScope::Environment,
+            batch: Some(&batch),
+        };
+
+        let (old, new, newest) = (copy("16.0.0"), copy("17.0.0"), copy("18.0.0"));
+        let (old, new, newest) = tokio::join!(
+            tool.locked_release(&old, &fetch),
+            tool.locked_release(&new, &fetch),
+            tool.locked_release(&newest, &fetch),
+        );
+
+        // One fetch made its attempt and its single transport retry, and all three copies
+        // received its transient error.
+        assert_eq!(hits(&counter), 2);
+        for result in [old, new, newest] {
+            std::assert_matches!(result, Err(CoreError::Transient(_)));
+        }
     }
 }

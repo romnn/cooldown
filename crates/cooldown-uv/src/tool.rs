@@ -1294,10 +1294,12 @@ mod tests {
         let env_fetch = FetchContext {
             project: &project,
             artifacts: ArtifactScope::Environment,
+            batch: None,
         };
         let all_fetch = FetchContext {
             project: &project,
             artifacts: ArtifactScope::All,
+            batch: None,
         };
 
         let env_releases = build_releases(dep.current.as_str(), raw.clone(), &dep, &env_fetch);
@@ -1384,6 +1386,7 @@ mod tests {
         let fetch = FetchContext {
             project: &project,
             artifacts: ArtifactScope::Environment,
+            batch: None,
         };
 
         let releases = build_releases(dep.current.as_str(), raw, &dep, &fetch);

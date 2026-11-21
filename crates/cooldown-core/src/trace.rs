@@ -216,6 +216,13 @@ pub enum ArtifactSource<'a> {
         from_cache: bool,
         /// Whether the delivered cached body was stale.
         stale: bool,
+        /// The status the server answered, when this request reached it.
+        ///
+        /// It is `304` when the server revalidated the cached copy, whose own status is
+        /// `status`.
+        /// It is absent for a cache hit and for a stale copy served after a network failure.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        network_status: Option<u16>,
     },
     /// A native process's complete standard output.
     Stdout {

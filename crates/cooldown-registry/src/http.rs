@@ -305,21 +305,28 @@ impl SharedHttp {
                 body.as_bytes(),
             );
         }
-        let result = self.request_inner(url, cache_key, ttl, request).await;
-        if let Ok(response) = &result {
-            cooldown_core::trace::artifact(
-                cooldown_core::trace::ArtifactSource::Http {
-                    key: cache_key,
-                    status: response.status,
-                    from_cache: response.from_cache,
-                    stale: response.stale,
-                },
-                response.body.as_bytes(),
-            );
-        } else if let Err(err) = &result {
-            tracing::debug!(error = %err, "registry request failed");
+        match self.request_inner(url, cache_key, ttl, request).await {
+            Ok(Delivered {
+                response,
+                network_status,
+            }) => {
+                cooldown_core::trace::artifact(
+                    cooldown_core::trace::ArtifactSource::Http {
+                        key: cache_key,
+                        status: response.status,
+                        from_cache: response.from_cache,
+                        stale: response.stale,
+                        network_status,
+                    },
+                    response.body.as_bytes(),
+                );
+                Ok(response)
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "registry request failed");
+                Err(err)
+            }
         }
-        result
     }
 
     async fn request_inner(
@@ -328,7 +335,7 @@ impl SharedHttp {
         cache_key: &str,
         ttl: Duration,
         request: RequestKind<'_>,
-    ) -> Result<HttpResponse, CoreError> {
+    ) -> Result<Delivered, CoreError> {
         let cached = read_entry(&self.inner.cache_dir, cache_key).filter(|entry| {
             request
                 .body()
@@ -339,7 +346,7 @@ impl SharedHttp {
             return match cached {
                 Some(entry) if entry.status < 400 => {
                     let stale = !cache_is_fresh(&entry, ttl);
-                    Ok(cached_response(entry, stale))
+                    Ok(Delivered::from_cache(entry, stale))
                 }
                 _ => Err(CoreError::OfflineMiss(url.to_string())),
             };
@@ -356,7 +363,7 @@ impl SharedHttp {
                 status = entry.status,
                 "cache hit"
             );
-            return Ok(cached_response(entry.clone(), false));
+            return Ok(Delivered::from_cache(entry.clone(), false));
         }
 
         let host = reqwest::Url::parse(url)
@@ -391,9 +398,20 @@ impl SharedHttp {
                 .fetch_once(url, cache_key, cached.as_ref(), request)
                 .await
             {
-                Ok(response) => {
-                    tracing::trace!(url, status = response.status, "http response");
-                    return Ok(response);
+                Ok(Fetched {
+                    response,
+                    network_status,
+                }) => {
+                    tracing::trace!(
+                        url,
+                        status = network_status,
+                        from_cache = response.from_cache,
+                        "http response"
+                    );
+                    return Ok(Delivered {
+                        response,
+                        network_status: Some(network_status),
+                    });
                 }
                 Err(FetchError::Backoff(delay)) if attempt <= self.inner.opts.max_retries => {
                     tokio::time::sleep(delay).await;
@@ -409,7 +427,7 @@ impl SharedHttp {
                         && let Some(entry) = &cached
                         && entry.status < 400
                     {
-                        return Ok(cached_response(entry.clone(), true));
+                        return Ok(Delivered::from_cache(entry.clone(), true));
                     }
                     return Err(CoreError::transient(error));
                 }
@@ -433,7 +451,7 @@ impl SharedHttp {
         cache_key: &str,
         cached: Option<&CacheEntry>,
         request: RequestKind<'_>,
-    ) -> Result<HttpResponse, FetchError> {
+    ) -> Result<Fetched, FetchError> {
         let mut outgoing = match request {
             RequestKind::Get => self.inner.client.get(url),
             RequestKind::PostJson { body } => self
@@ -461,7 +479,10 @@ impl SharedHttp {
             let mut refreshed = entry.clone();
             refreshed.fetched_at = Timestamp::now().to_string();
             let _ = write_entry(&self.inner.cache_dir, &refreshed);
-            return Ok(cached_response(refreshed, false));
+            return Ok(Fetched {
+                response: cached_response(refreshed, false),
+                network_status: status,
+            });
         }
 
         if status == 429 || (500..600).contains(&status) {
@@ -496,11 +517,14 @@ impl SharedHttp {
             let _ = write_entry(&self.inner.cache_dir, &entry);
         }
 
-        Ok(HttpResponse {
-            status,
-            body,
-            from_cache: false,
-            stale: false,
+        Ok(Fetched {
+            response: HttpResponse {
+                status,
+                body,
+                from_cache: false,
+                stale: false,
+            },
+            network_status: status,
         })
     }
 }
@@ -529,6 +553,30 @@ impl<'a> RequestKind<'a> {
     const fn uses_etag(self) -> bool {
         matches!(self, Self::Get)
     }
+}
+
+/// A response as [`SharedHttp::request_inner`] delivers it, before it is traced.
+struct Delivered {
+    response: HttpResponse,
+    /// The status the server answered, or `None` when no response came from the network.
+    network_status: Option<u16>,
+}
+
+impl Delivered {
+    fn from_cache(entry: CacheEntry, stale: bool) -> Self {
+        Delivered {
+            response: cached_response(entry, stale),
+            network_status: None,
+        }
+    }
+}
+
+/// The outcome of one network round trip that the server answered.
+struct Fetched {
+    response: HttpResponse,
+    /// The status the server answered, which is `304` when `response` is the revalidated
+    /// cached copy.
+    network_status: u16,
 }
 
 fn cached_response(entry: CacheEntry, stale: bool) -> HttpResponse {
@@ -729,6 +777,203 @@ mod tests {
             .expect("cache hit");
         assert!(hit.from_cache);
         assert_eq!(hit.body, "cached");
+    }
+
+    /// Serves each request on a loopback port with the raw HTTP response `reply` builds, after
+    /// `delay`, and counts the requests it receives.
+    ///
+    /// `reply` gets the zero-based request number and the lowercased request head.
+    /// Every answer closes its connection, so the count is also the number of round trips.
+    async fn serve(
+        delay: Duration,
+        reply: impl Fn(usize, &str) -> String + Send + Sync + 'static,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let reply = Arc::new(reply);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let hit = counter.fetch_add(1, Ordering::SeqCst);
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => head.extend_from_slice(&buf[..read]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head).to_lowercase();
+                    tokio::time::sleep(delay).await;
+                    let _ = stream.write_all(reply(hit, &head).as_bytes()).await;
+                });
+            }
+        });
+        (base, hits)
+    }
+
+    fn ok(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\netag: \"v1\"\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Answers `304` to a request revalidating the `"v1"` copy and `200` with `body` otherwise,
+    /// like a registry whose document has not changed.
+    fn unchanged_document(body: &'static str) -> impl Fn(usize, &str) -> String {
+        move |_, head| {
+            if head.contains("if-none-match: \"v1\"") {
+                "HTTP/1.1 304 Not Modified\r\netag: \"v1\"\r\nconnection: close\r\n\r\n".to_string()
+            } else {
+                ok(body)
+            }
+        }
+    }
+
+    fn hits(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Each zero-TTL request revalidates its cached copy with the registry: the client never
+    /// treats an earlier response as fresh beyond its TTL.
+    #[tokio::test]
+    async fn sequential_zero_ttl_requests_each_revalidate() {
+        let (base, counter) = serve(Duration::ZERO, unchanged_document("doc")).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let http = SharedHttp::new(dir.path(), HttpOptions::default()).expect("shared http");
+        let url = format!("{base}/semver");
+
+        let first = http.get(&url, Duration::ZERO).await.expect("download");
+        let second = http.get(&url, Duration::ZERO).await.expect("revalidation");
+
+        // The second request reached the server, which answered `304` for the cached copy.
+        assert_eq!(hits(&counter), 2);
+        assert!(!first.from_cache);
+        assert!(second.from_cache && !second.stale);
+        assert_eq!(second.body, "doc");
+    }
+
+    /// Offline mode serves the cache or fails with an offline miss, and never sends a request.
+    #[tokio::test]
+    async fn offline_mode_never_touches_the_network() {
+        let (base, counter) = serve(Duration::ZERO, unchanged_document("doc")).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cached_url = format!("{base}/cached");
+        write_entry(dir.path(), &cache_entry(&cached_url)).expect("cache entry");
+        let http = SharedHttp::new(
+            dir.path(),
+            HttpOptions {
+                offline: true,
+                ..Default::default()
+            },
+        )
+        .expect("shared http");
+
+        // An aged entry is served as stale rather than revalidated, twice.
+        for _ in 0..2 {
+            let response = http.get(&cached_url, Duration::ZERO).await.expect("cached");
+            assert!(response.from_cache && response.stale);
+        }
+        let miss = http.get(&format!("{base}/missing"), Duration::ZERO).await;
+        std::assert_matches!(miss, Err(CoreError::OfflineMiss(_)));
+        assert_eq!(hits(&counter), 0);
+    }
+
+    /// The `trace_event` payloads of the run trace, as a recorder at the compact detail sees them.
+    #[derive(Clone, Default)]
+    struct Observed(Arc<Mutex<Vec<serde_json::Value>>>);
+
+    impl Observed {
+        fn install(&self) -> tracing::dispatcher::DefaultGuard {
+            use tracing_subscriber::prelude::*;
+            let filter = tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.target() == cooldown_core::trace::TARGET
+                    && *metadata.level() <= tracing::Level::DEBUG
+            });
+            tracing::dispatcher::set_default(&tracing::Dispatch::new(
+                tracing_subscriber::registry().with(self.clone().with_filter(filter)),
+            ))
+        }
+
+        /// The sources of the HTTP artifacts recorded so far, in order.
+        fn http_sources(&self) -> Vec<serde_json::Value> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|event| event["kind"] == "artifact_started")
+                .map(|event| event["source"].clone())
+                .filter(|source| source["kind"] == "http")
+                .collect()
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Observed {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Payload(Option<serde_json::Value>);
+            impl tracing::field::Visit for Payload {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "trace_event" {
+                        self.0 = serde_json::from_str(value).ok();
+                    }
+                }
+                fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+            }
+            let mut payload = Payload(None);
+            event.record(&mut payload);
+            if let Some(payload) = payload.0 {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(payload);
+            }
+        }
+    }
+
+    /// The trace tells a revalidation from a download: after a `304` the delivered cached copy
+    /// keeps its `200`, and `networkStatus` carries the server's `304`.
+    #[tokio::test]
+    async fn the_trace_records_the_status_the_server_returned() {
+        let (base, _) = serve(Duration::ZERO, unchanged_document("doc")).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let http = SharedHttp::new(dir.path(), HttpOptions::default()).expect("shared http");
+        let url = format!("{base}/semver");
+        let observed = Observed::default();
+        let _subscriber = observed.install();
+
+        // Download, revalidate, then serve the copy from cache within its TTL.
+        http.get(&url, Duration::ZERO).await.expect("download");
+        http.get(&url, Duration::ZERO).await.expect("revalidation");
+        http.get(&url, Duration::from_hours(1))
+            .await
+            .expect("cache hit");
+
+        let sources = observed.http_sources();
+        assert_eq!(sources.len(), 3);
+        // The download
+        assert_eq!(sources[0]["status"], 200);
+        assert_eq!(sources[0]["networkStatus"], 200);
+        assert_eq!(sources[0]["fromCache"], false);
+        // The revalidation
+        assert_eq!(sources[1]["status"], 200);
+        assert_eq!(sources[1]["networkStatus"], 304);
+        assert_eq!(sources[1]["fromCache"], true);
+        // The cache hit, which never reached the server
+        assert_eq!(sources[2]["status"], 200);
+        assert!(sources[2].get("networkStatus").is_none());
+        assert_eq!(sources[2]["fromCache"], true);
     }
 
     #[test]
