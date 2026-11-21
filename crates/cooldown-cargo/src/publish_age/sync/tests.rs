@@ -20,6 +20,7 @@ fn policy(window: WindowSpec) -> ResolvedPolicy {
         exempt_packages: Vec::new(),
         withheld_exemptions: Vec::new(),
         package_windows: BTreeMap::new(),
+        admission_bound: None,
         admitted_versions: Some(Vec::new()),
     }
 }

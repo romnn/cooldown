@@ -49,6 +49,7 @@ pub use ports::{
     JudgedPin, LockedVersion, MutationExecution, MutationRecovery, NativeAdmissionQuery,
     NativeAssessment, NativeEdit, NativeGateQuery, NativeGateRefusal, NativePolicyLayer,
     NativeRule, PackageRegistry, PreparedMutation, RawArtifact, RawRelease, RawWindow,
-    RecoveryDisposition, ReleaseFetcher, ResolveInputs, ResolvedPolicy, SyncReport, SyncScope,
-    TargetFallback, Tool, ToolRead, ToolWrite, debug_assert_sorted, normalize_native,
+    RecoveryDisposition, ReleaseFetcher, ResolveInputs, ResolvedPolicy, SyncAdmissionScope,
+    SyncReport, SyncScope, TargetFallback, Tool, ToolRead, ToolWrite, debug_assert_sorted,
+    normalize_native,
 };

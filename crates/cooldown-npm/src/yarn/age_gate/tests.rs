@@ -88,6 +88,7 @@ fn policy(
         exempt_packages: exempt.iter().map(ToString::to_string).collect(),
         withheld_exemptions: Vec::new(),
         package_windows: std::collections::BTreeMap::new(),
+        admission_bound: None,
         admitted_versions: admitted.map(|admitted| {
             admitted
                 .iter()

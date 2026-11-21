@@ -317,6 +317,7 @@ impl Workspace {
         // admits reach the native list as exact admissions instead.
         let NativeExemptions { exempt, withheld } = native_exemptions(&[context], tool, self.now());
         let mut policy = ResolvedPolicy {
+            admission_bound: None,
             admitted_versions: Some(Vec::new()),
             default_window: Some(window.clone()),
             exempt_packages: exempt,
@@ -336,16 +337,25 @@ impl Workspace {
                 )
             });
             if writer.requires_sync_admission_evaluation(&pctx.project) {
-                policy.admitted_versions =
-                    match self.sync_admitted_versions(pctx, opts, warnings).await {
-                        Ok(admitted) => Some(admitted),
-                        Err(warning) => {
-                            if !warnings.contains(&warning) {
-                                warnings.push(*warning);
-                            }
-                            None
+                let scope = writer.sync_admission_scope(&pctx.project, &policy).await;
+                // The writer checks that its native gate still fits the bound the verdicts were
+                // limited to.
+                policy.admission_bound = match &scope {
+                    cooldown_core::SyncAdmissionScope::Bounded { floor, .. } => Some(*floor),
+                    cooldown_core::SyncAdmissionScope::Every => None,
+                };
+                policy.admitted_versions = match self
+                    .sync_admitted_versions(pctx, opts, scope, warnings)
+                    .await
+                {
+                    Ok(admitted) => Some(admitted),
+                    Err(warning) => {
+                        if !warnings.contains(&warning) {
+                            warnings.push(*warning);
                         }
-                    };
+                        None
+                    }
+                };
             }
             cooldown_core::interrupt::ensure_not_requested("writing native config")
                 .map_err(|err| diag_from_error(&err, tool, &project, None))?;
@@ -423,6 +433,7 @@ impl Workspace {
             self.now(),
         );
         let policy = ResolvedPolicy {
+            admission_bound: None,
             admitted_versions: Some(Vec::new()),
             default_window: Some(window.clone()),
             exempt_packages: Vec::new(),
@@ -747,12 +758,21 @@ mod tests {
         Ok(())
     }
 
+    #[derive(Default)]
     struct AdmissionAdapter {
         deps: Vec<cooldown_core::Dependency>,
         published_at: Option<jiff::Timestamp>,
         fail_fetch: bool,
         /// The unattributed warnings every native sync reports.
         native_warnings: Vec<cooldown_core::Diagnostic>,
+        /// The admission scope the adapter bounds the evaluation to.
+        scope: cooldown_core::SyncAdmissionScope,
+        /// The packages whose locked release fetch fails, beside every one under `fail_fetch`.
+        failing: Vec<&'static str>,
+        /// Whether every locked release is yanked.
+        yanked: bool,
+        /// The packages whose locked release was fetched, in fetch order.
+        fetched: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -824,7 +844,11 @@ mod tests {
             dep: &cooldown_core::Dependency,
             _fetch: &cooldown_core::FetchContext<'_>,
         ) -> cooldown_core::Result<cooldown_core::Release> {
-            if self.fail_fetch {
+            self.fetched
+                .lock()
+                .expect("fetch log")
+                .push(dep.package.name.clone());
+            if self.fail_fetch || self.failing.contains(&dep.package.name.as_str()) {
                 return Err(cooldown_core::CoreError::NotFound(dep.package.name.clone()));
             }
             Ok(cooldown_core::Release {
@@ -836,7 +860,7 @@ mod tests {
                 beyond_declared_bound: false,
                 beyond_latest_tag: false,
                 published_at: self.published_at,
-                yanked: false,
+                yanked: self.yanked,
                 quality: dep.current_quality,
             })
         }
@@ -883,6 +907,14 @@ mod tests {
 
         fn requires_sync_admission_evaluation(&self, _project: &cooldown_core::Project) -> bool {
             true
+        }
+
+        async fn sync_admission_scope(
+            &self,
+            _project: &cooldown_core::Project,
+            _policy: &cooldown_core::ResolvedPolicy,
+        ) -> cooldown_core::SyncAdmissionScope {
+            self.scope.clone()
         }
 
         async fn write_native(
@@ -1008,6 +1040,7 @@ mod tests {
                 published_at,
                 fail_fetch: false,
                 native_warnings: Vec::new(),
+                ..AdmissionAdapter::default()
             },
             "2026-06-17T00:00:00Z".parse()?,
             baseline.clone(),
@@ -1026,6 +1059,7 @@ mod tests {
                 published_at,
                 fail_fetch: false,
                 native_warnings: Vec::new(),
+                ..AdmissionAdapter::default()
             },
             "2026-07-17T00:00:00Z".parse()?,
             baseline,
@@ -1053,6 +1087,7 @@ mod tests {
                 published_at: None,
                 fail_fetch: false,
                 native_warnings: vec![warning.clone()],
+                ..AdmissionAdapter::default()
             },
             "2026-06-17T00:00:00Z".parse()?,
             Baseline::default(),
@@ -1135,6 +1170,7 @@ mod tests {
                 published_at: None,
                 fail_fetch: true,
                 native_warnings: Vec::new(),
+                ..AdmissionAdapter::default()
             },
             "2026-06-17T00:00:00Z".parse()?,
             Baseline::default(),
@@ -1165,6 +1201,7 @@ mod tests {
                 published_at: Some("2026-06-16T00:00:00Z".parse()?),
                 fail_fetch: false,
                 native_warnings: Vec::new(),
+                ..AdmissionAdapter::default()
             },
             "2026-06-17T00:00:00Z".parse()?,
             Baseline::default(),
@@ -1195,6 +1232,7 @@ mod tests {
             published_at: Some("2026-06-14T00:00:00Z".parse()?),
             fail_fetch: false,
             native_warnings: Vec::new(),
+            ..AdmissionAdapter::default()
         };
         let mut adapters = AdapterSet::new();
         adapters.register_target_verified_mutator(Arc::new(adapter))?;
@@ -1232,6 +1270,11 @@ mod tests {
     enum AdmissionFeed {
         Unavailable,
         Stale,
+        /// A fresh feed with one advisory, which `version` of `package` fixes.
+        Fixes {
+            package: &'static str,
+            version: &'static str,
+        },
     }
 
     #[async_trait::async_trait]
@@ -1249,6 +1292,22 @@ mod tests {
                 Self::Unavailable => Err(cooldown_core::CoreError::System(
                     "feed unavailable".to_string(),
                 )),
+                Self::Fixes { package, version } => Ok(cooldown_core::AdvisoryFetch {
+                    packages: vec![cooldown_core::PackageAdvisories {
+                        package: (*package).to_string(),
+                        advisories: vec![cooldown_core::RawAdvisory {
+                            id: "GHSA-test".to_string(),
+                            aliases: Vec::new(),
+                            severity: cooldown_core::AdvisorySeverity::High,
+                            withdrawn: false,
+                            summary: "fixed upstream".to_string(),
+                            ranges: Vec::new(),
+                            affected_versions: Vec::new(),
+                            fixes: vec![(*version).to_string()],
+                        }],
+                    }],
+                    stale: false,
+                }),
                 Self::Stale => Ok(cooldown_core::AdvisoryFetch {
                     packages: packages
                         .iter()
@@ -1286,6 +1345,7 @@ mod tests {
                 published_at: Some("2026-06-16T00:00:00Z".parse()?),
                 fail_fetch: false,
                 native_warnings: Vec::new(),
+                ..AdmissionAdapter::default()
             };
             let mut adapters = AdapterSet::new();
             adapters.register_target_verified_mutator(Arc::new(adapter))?;
@@ -1345,6 +1405,7 @@ mod tests {
                 published_at: None,
                 fail_fetch: false,
                 native_warnings: Vec::new(),
+                ..AdmissionAdapter::default()
             },
             "2026-06-17T00:00:00Z".parse()?,
             Baseline {
@@ -1419,6 +1480,7 @@ mod tests {
             published_at: published_at.map(str::parse).transpose()?,
             fail_fetch: false,
             native_warnings: Vec::new(),
+            ..AdmissionAdapter::default()
         })
     }
 
@@ -1787,6 +1849,256 @@ mod tests {
 
         // A second sync finds nothing left to change.
         assert_eq!(ws.sync(&RunOpts::default()).await.summary.unchanged, 1);
+        Ok(())
+    }
+
+    /// One sync of a fresh project whose locked versions were all published two days before
+    /// the run.
+    #[derive(Default)]
+    struct ScopedFixture {
+        deps: Vec<cooldown_core::Dependency>,
+        /// The policy above the built-in default, lowest authority first.
+        layers: Vec<cooldown_core::PolicyLayer>,
+        baseline: Baseline,
+        feed: Option<Arc<dyn cooldown_core::AdvisorySource>>,
+        /// The packages whose release fetch fails.
+        failing: Vec<&'static str>,
+        /// The exact admissions the native file holds before the sync.
+        existing: &'static str,
+    }
+
+    /// What one [`ScopedFixture`] sync wrote, warned and fetched.
+    struct ScopedSync {
+        /// The exact admissions written.
+        written: String,
+        /// Every warning, sorted by package and message, since releases are fetched concurrently.
+        warnings: Vec<cooldown_core::Diagnostic>,
+        /// The packages whose release was fetched, sorted.
+        fetched: Vec<String>,
+    }
+
+    async fn scoped_sync(
+        fixture: &ScopedFixture,
+        scope: cooldown_core::SyncAdmissionScope,
+    ) -> eyre::Result<ScopedSync> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("native-exclusions");
+        std::fs::write(&path, fixture.existing)?;
+        let fetched = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = AdmissionAdapter {
+            deps: fixture.deps.clone(),
+            published_at: Some("2026-06-15T00:00:00Z".parse()?),
+            scope,
+            failing: fixture.failing.clone(),
+            fetched: Arc::clone(&fetched),
+            ..AdmissionAdapter::default()
+        };
+        let mut ws = policy_workspace(
+            &root,
+            adapter,
+            fixture.baseline.clone(),
+            fixture.layers.clone(),
+        )?;
+        if let Some(feed) = &fixture.feed {
+            ws = ws.with_advisory_source(Arc::clone(feed));
+        }
+        let outcome = ws.sync(&RunOpts::default()).await;
+        assert_eq!(outcome.summary.errors, 0, "{:?}", outcome.items);
+        let mut warnings = outcome.warnings;
+        warnings.sort_by(|left, right| {
+            (&left.package, &left.message).cmp(&(&right.package, &right.message))
+        });
+        let mut fetched = fetched.lock().expect("fetch log").clone();
+        fetched.sort();
+        Ok(ScopedSync {
+            written: std::fs::read_to_string(path)?,
+            warnings,
+            fetched,
+        })
+    }
+
+    /// A seven-day repo window that admits `@next/*` after a day, overriding a stricter native
+    /// 30-day window, so every locked package earns a stricter-native warning.
+    fn next_policy() -> eyre::Result<Vec<cooldown_core::PolicyLayer>> {
+        let mut native = cooldown_core::PolicyLayer::new(cooldown_core::Origin::Native);
+        let mut default = cooldown_core::Rule::new(cooldown_core::Selector::Default);
+        default.window = cooldown_core::ByKind::scalar(cooldown_core::WindowSpec::MinAge(
+            jiff::SignedDuration::from_hours(24 * 30),
+        ));
+        native.rules.push(default);
+        let repo = repo_config(indoc::indoc! {r#"
+            min-age = "7d"
+
+            [package."@next/*"]
+            min-age = "1d"
+        "#})?;
+        Ok(vec![native, repo])
+    }
+
+    /// The scope a seven-day written window bounds, with `packages` named in full.
+    fn seven_day_scope(packages: &[&str]) -> cooldown_core::SyncAdmissionScope {
+        cooldown_core::SyncAdmissionScope::Bounded {
+            floor: jiff::SignedDuration::from_hours(24 * 7),
+            packages: packages.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    /// A sync bounded to the versions cooldown may admit young fetches only those of the short
+    /// glob rule, the baseline and the package an existing exact entry names, yet writes and
+    /// warns exactly as the full evaluation of every locked package does.
+    #[tokio::test]
+    async fn a_bounded_sync_fetches_only_its_scope_and_syncs_as_a_full_one() -> eyre::Result<()> {
+        let mut deps = vec![
+            admission_dependency("@next/swc", false),
+            admission_dependency("listed", true),
+            admission_dependency("acked", false),
+        ];
+        deps.extend(
+            (0..30)
+                .map(|index| admission_dependency(&format!("unrelated-{index}"), index % 2 == 0)),
+        );
+        let fixture = ScopedFixture {
+            deps,
+            layers: next_policy()?,
+            baseline: Baseline {
+                entries: vec![acknowledged("acked")],
+            },
+            ..ScopedFixture::default()
+        };
+
+        let full = scoped_sync(&fixture, cooldown_core::SyncAdmissionScope::Every).await?;
+        let bounded = scoped_sync(&fixture, seven_day_scope(&["listed"])).await?;
+
+        // The full evaluation fetches every locked package; the bounded one only the rule's,
+        // the acknowledged one and the listed one, whose verdict an existing entry reads.
+        assert_eq!(full.fetched.len(), 33);
+        assert_eq!(bounded.fetched, ["@next/swc", "acked", "listed"]);
+        // Both write the same young admissions and the same warnings, a stricter-native one
+        // for each locked package included.
+        assert_eq!(full.written, "@next/swc@1.2.3,acked@1.2.3");
+        assert_eq!(bounded.written, full.written);
+        assert_eq!(bounded.warnings, full.warnings);
+        let stricter = bounded
+            .warnings
+            .iter()
+            .filter(|warning| warning.kind == cooldown_core::DiagnosticKind::StricterNative)
+            .count();
+        assert_eq!(stricter, 33, "{:?}", bounded.warnings);
+        Ok(())
+    }
+
+    /// A package the advisory feed names is evaluated under a bounded scope, since its fix
+    /// version earns the shorter security window, and is admitted exactly as a full evaluation
+    /// admits it.
+    #[tokio::test]
+    async fn a_bounded_sync_evaluates_a_package_the_feed_names() -> eyre::Result<()> {
+        let mut patched = admission_dependency("patched", true);
+        patched.advisory_identity = Some("patched".to_string());
+        let mut clean = admission_dependency("clean", true);
+        clean.advisory_identity = Some("clean".to_string());
+        let mut advised = cooldown_core::PolicyLayer::new(cooldown_core::Origin::Cli);
+        advised.advisories = Some(cooldown_core::AdvisoryPolicy {
+            enabled: Some(true),
+            mode: Some(cooldown_core::AdvisoryMode::Shorten),
+            ..cooldown_core::AdvisoryPolicy::default()
+        });
+        let fixture = ScopedFixture {
+            deps: vec![patched, clean],
+            layers: vec![advised],
+            feed: Some(Arc::new(AdmissionFeed::Fixes {
+                package: "patched",
+                version: "1.2.3",
+            })),
+            ..ScopedFixture::default()
+        };
+
+        let full = scoped_sync(&fixture, cooldown_core::SyncAdmissionScope::Every).await?;
+        let bounded = scoped_sync(&fixture, seven_day_scope(&[])).await?;
+
+        assert_eq!(bounded.fetched, ["patched"]);
+        assert_eq!(full.written, "patched@1.2.3");
+        assert_eq!(bounded.written, full.written);
+        assert_eq!(bounded.warnings, full.warnings);
+        Ok(())
+    }
+
+    /// Under a bounded scope a registry failure on a package outside it leaves the evaluation
+    /// complete, so the young admission is written, while a failure inside it still keeps the
+    /// written exact admissions as they are.
+    #[tokio::test]
+    async fn a_bounded_sync_fails_only_on_a_package_inside_its_scope() -> eyre::Result<()> {
+        let fixture = |failing| -> eyre::Result<ScopedFixture> {
+            Ok(ScopedFixture {
+                deps: vec![
+                    admission_dependency("@next/swc", true),
+                    admission_dependency("unrelated", true),
+                ],
+                layers: next_policy()?,
+                failing: vec![failing],
+                existing: "kept@1.2.3",
+                ..ScopedFixture::default()
+            })
+        };
+        // Whether the sync warns that it could not judge `package`, beyond the stricter-native
+        // warning every package earns.
+        let names = |sync: &ScopedSync, package: &str| {
+            sync.warnings.iter().any(|warning| {
+                warning.kind != cooldown_core::DiagnosticKind::StricterNative
+                    && warning.package.as_deref() == Some(package)
+            })
+        };
+
+        // Outside the scope
+        let outside = scoped_sync(&fixture("unrelated")?, seven_day_scope(&[])).await?;
+        assert_eq!(outside.written, "@next/swc@1.2.3");
+        assert!(!names(&outside, "unrelated"), "{:?}", outside.warnings);
+
+        // Inside the scope
+        let inside = scoped_sync(&fixture("@next/swc")?, seven_day_scope(&[])).await?;
+        assert_eq!(inside.written, "kept@1.2.3");
+        assert!(names(&inside, "@next/swc"), "{:?}", inside.warnings);
+        Ok(())
+    }
+
+    /// The admission evaluation leaves yanked locked versions to `check` and `outdated`, so
+    /// `sync` reports none of them, young or mature.
+    #[tokio::test]
+    async fn sync_reports_no_yanked_locked_versions() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let adapter = AdmissionAdapter {
+            deps: vec![admission_dependency("yanked", true)],
+            published_at: Some("2026-06-16T00:00:00Z".parse()?),
+            yanked: true,
+            ..AdmissionAdapter::default()
+        };
+        let ws = admission_workspace(
+            &root,
+            adapter,
+            "2026-06-17T00:00:00Z".parse()?,
+            Baseline {
+                entries: vec![acknowledged("yanked")],
+            },
+        )?;
+
+        let outcome = ws.sync(&RunOpts::default()).await;
+
+        assert_eq!(outcome.summary.errors, 0, "{:?}", outcome.items);
+        assert_eq!(
+            std::fs::read_to_string(root.join("native-exclusions"))?,
+            "yanked@1.2.3"
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .all(|warning| warning.kind != cooldown_core::DiagnosticKind::Yanked),
+            "{:?}",
+            outcome.warnings
+        );
         Ok(())
     }
 }

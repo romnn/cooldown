@@ -1872,6 +1872,7 @@ mod tests {
         assert!(tool.native_package_windows());
 
         let policy = ResolvedPolicy {
+            admission_bound: None,
             admitted_versions: Some(Vec::new()),
             default_window: Some(cooldown_core::WindowSpec::MinAge(
                 jiff::SignedDuration::from_hours(24 * 14),
@@ -1909,6 +1910,7 @@ mod tests {
         let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
         let tool = uv_tool();
         let policy = ResolvedPolicy {
+            admission_bound: None,
             admitted_versions: Some(Vec::new()),
             default_window: Some(cooldown_core::WindowSpec::Latest),
             exempt_packages: Vec::new(),
@@ -1940,6 +1942,7 @@ mod tests {
             cooldown_core::WindowSpec::MinAge(jiff::SignedDuration::from_hours(24 * count))
         };
         let policy = |packages: &[(&str, cooldown_core::WindowSpec)]| ResolvedPolicy {
+            admission_bound: None,
             admitted_versions: Some(Vec::new()),
             default_window: Some(days(14)),
             exempt_packages: Vec::new(),
@@ -1998,6 +2001,7 @@ mod tests {
         let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
             .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
         let policy = ResolvedPolicy {
+            admission_bound: None,
             admitted_versions: Some(Vec::new()),
             default_window: Some(cooldown_core::WindowSpec::Latest),
             exempt_packages: Vec::new(),
