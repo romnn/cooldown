@@ -7285,15 +7285,16 @@ packages:
 
     /// An integrity-only lock entry proves no origin where a pnpmfile may route packages, so sync
     /// cannot show an existing exact exemption unneeded: one for a locked version stays until the
-    /// lock no longer holds that version.
-    /// Without a pnpmfile the origin is proven, and the exemption of a locked version cooldown does
-    /// not admit still stays, since its age is unknown and bare pnpm may need it.
+    /// lock no longer holds that version, even while cooldown admits that version as mature.
+    /// Without a pnpmfile the origin is proven, so the exemption of the mature admitted version
+    /// goes, while that of a locked version cooldown does not admit stays, since its age is unknown
+    /// and bare pnpm may need it.
     #[cfg(unix)]
     #[tokio::test]
     async fn sync_keeps_an_unproven_exemption_while_its_version_is_locked() -> eyre::Result<()> {
         for (pnpmfile, kept) in [
-            (false, &["young@1.0.0", "held@1.0.0"][..]),
-            (true, &["young@1.0.0", "held@1.0.0"][..]),
+            (false, &["held@1.0.0"][..]),
+            (true, &["pin@1.0.0", "held@1.0.0"][..]),
         ] {
             let directory = tempfile::tempdir()?;
             let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
@@ -7305,7 +7306,7 @@ packages:
                     packages: []
                     minimumReleaseAge: 20160
                     minimumReleaseAgeExclude:
-                      - "young@1.0.0"
+                      - "pin@1.0.0"
                       - "held@1.0.0"
                       - "gone@1.0.0"
                 "#},
@@ -7315,9 +7316,17 @@ packages:
             }
             let project = pnpm_sync_project(&root);
             let (_cache, tool) =
-                pnpm_sync_tool_proving(&root, &[("young", "1.0.0"), ("held", "1.0.0")])?;
+                pnpm_sync_tool_proving(&root, &[("pin", "1.0.0"), ("held", "1.0.0")])?;
 
-            let policy = pnpm_sync_policy(&[], Some(&[("young", "1.0.0")]));
+            // A month old, so mature under the 14-day window.
+            let policy = ResolvedPolicy {
+                admitted_versions: Some(vec![cooldown_core::AdmittedVersion {
+                    name: "pin".to_string(),
+                    version: Version::new("1.0.0"),
+                    age: jiff::SignedDuration::from_hours(24 * 30),
+                }]),
+                ..pnpm_sync_policy(&[], None)
+            };
             tool.write_native(&project, &policy, false).await?;
             assert_eq!(
                 NativeAge::read(&path)?.exclusions.into_vec(),
@@ -7327,11 +7336,11 @@ packages:
 
             std::fs::write(
                 root.join("pnpm-lock.yaml"),
-                "lockfileVersion: '9.0'\n\npackages:\n\n  'young@2.0.0':\n    resolution: {integrity: sha512-x}\n",
+                "lockfileVersion: '9.0'\n\npackages:\n\n  'pin@2.0.0':\n    resolution: {integrity: sha512-x}\n",
             )?;
-            let moved = pnpm_sync_policy(&[], Some(&[("young", "2.0.0")]));
+            let moved = pnpm_sync_policy(&[], Some(&[("pin", "2.0.0")]));
             tool.write_native(&project, &moved, false).await?;
-            let expected: &[&str] = if pnpmfile { &[] } else { &["young@2.0.0"] };
+            let expected: &[&str] = if pnpmfile { &[] } else { &["pin@2.0.0"] };
             assert_eq!(
                 NativeAge::read(&path)?.exclusions.into_vec(),
                 expected,
