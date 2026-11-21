@@ -260,21 +260,23 @@ fn offline_outdated(document: &str, detail_args: &[&str]) -> eyre::Result<(Outpu
 
 /// The concatenated chunk text of every artifact recorded for the cached npm document.
 fn npm_document_bytes(events: &[Value]) -> String {
-    let artifacts: Vec<&Value> = events
+    let field = |record: &'_ Value, pointer: &str| record.pointer(pointer).cloned();
+    let artifacts: Vec<Option<Value>> = events
         .iter()
         .filter(|record| {
-            record["event"]["kind"] == "artifact_started"
-                && record["event"]["source"]["key"] == "https://registry.npmjs.org/dep"
+            field(record, "/event/kind") == Some("artifact_started".into())
+                && field(record, "/event/source/key")
+                    == Some("https://registry.npmjs.org/dep".into())
         })
-        .map(|record| &record["event"]["artifact"])
+        .map(|record| field(record, "/event/artifact"))
         .collect();
     events
         .iter()
         .filter(|record| {
-            record["event"]["kind"] == "artifact_chunk"
-                && artifacts.contains(&&record["event"]["artifact"])
+            field(record, "/event/kind") == Some("artifact_chunk".into())
+                && artifacts.contains(&field(record, "/event/artifact"))
         })
-        .filter_map(|record| record["event"]["content"]["data"].as_str())
+        .filter_map(|record| record.pointer("/event/content/data")?.as_str())
         .collect()
 }
 
