@@ -242,11 +242,12 @@ pub(crate) struct ExemptionEvidence<'a> {
 impl ExemptionEvidence<'_> {
     /// Whether the existing exact exemption of the version of `name` whose identity is `identity`
     /// may go: the lock no longer holds that version, or the mirrored verdicts show, by a publish
-    /// time of proven origin, that cooldown does not admit it or that it is no longer young under
-    /// the floor.
+    /// time of proven origin, that the version cooldown admits is no longer young under the floor.
     ///
-    /// An unproven origin, or missing verdicts, keeps it, since bare pnpm may still need it to
-    /// accept the lock.
+    /// An unproven origin, missing verdicts, or a version cooldown does not admit keeps it, since
+    /// bare pnpm may still need it to accept the lock: a locked version cooldown does not admit,
+    /// such as a pin pnpm already refused when its window was switched on, has no age here, and
+    /// removing its exemption would only break the install until `fix` or `upgrade` moves it.
     pub(crate) fn drops(&self, name: &str, identity: &str) -> bool {
         let holds = |lines: &VersionLines| {
             lines.get(name).is_some_and(|versions| {
@@ -273,7 +274,7 @@ impl ExemptionEvidence<'_> {
                     version.name == name
                         && version_identity(version.version.as_str()).as_deref() == Some(identity)
                 })
-                .is_none_or(|version| !floor.is_some_and(|floor| floor.holds(version.age)))
+                .is_some_and(|version| !floor.is_some_and(|floor| floor.holds(version.age)))
     }
 }
 

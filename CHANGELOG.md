@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **`sync` keeps an exemption the lock still needs.** An exact `minimumReleaseAgeExclude` entry for a
+  locked version cooldown does not admit, such as the one an `upgrade` writes for a pin pnpm already
+  refused when its window was switched on, was pruned by the next `sync`, so bare pnpm refused the
+  lock again until the pin matured. `sync` now removes an existing exact entry only when the lock no
+  longer holds its version, or when the version cooldown admits is shown to be no longer young; a
+  version it does not admit keeps its entry until `fix` or `upgrade` moves it. Closes #138.
 - **A compact trace leaves out the npm package documents cooldown decoded.** These bodies made up
   most of a compact `upgrade --major --sync` trace of a large monorepo, which reached 170 MB
   compressed against the 100 MB budget. A decoded document is now recorded as an
@@ -12,7 +18,7 @@
 - **`sync` fetches release metadata only for the pnpm packages its exemptions can depend on.**
   Before writing `minimumReleaseAgeExclude`, `sync` fetched every locked pnpm package: one large
   monorepo spent 73 seconds on 1737 packages before `upgrade --sync` started any project. Only a
-  version cooldown may admit while it is younger than the written window can earn or keep an exact
+  version cooldown may admit while it is younger than the written window can earn a new exact
   entry: one a shorter package rule, an `allow` or `latest` selector, the baseline or an advisory
   fix version admits. `sync` now fetches those, plus every package an existing exact entry names,
   and writes the same list. It still fetches every package when pnpm's effective window is stricter
