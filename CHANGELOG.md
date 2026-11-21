@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.32
+
 - **A failed isolation trial no longer discards the candidates already verified.** When a batch
   that broke the upgrade policy was split to find its safe candidates and a later trial failed,
   for example because the package manager crashed, `upgrade` dropped the candidates earlier
