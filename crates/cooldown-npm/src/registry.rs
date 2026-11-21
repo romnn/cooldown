@@ -170,16 +170,23 @@ impl NpmRegistry {
     /// lookup).
     async fn get_doc(&self, name: &str) -> Result<Option<Doc>, CoreError> {
         let url = self.doc_url(name);
-        let resp = self.http.get(&url, self.listing_ttl()).await?;
-        if resp.is_not_found() {
-            return Ok(None);
+        let (resp, deferred) = self.http.get_deferred(&url, self.listing_ttl()).await?;
+        let doc = if resp.is_not_found() {
+            Ok(None)
+        } else if !resp.is_success() {
+            Err(CoreError::transient(format!("{url}: HTTP {}", resp.status)))
+        } else {
+            serde_json::from_str(&resp.body)
+                .map(Some)
+                .map_err(|e| CoreError::Parse(format!("{name}: {e}")))
+        };
+        // A compact trace leaves out a decoded document's bytes, often megabytes per package,
+        // because its evaluations carry the releases read from it.
+        // A body that did not decode to a document keeps its bytes, to show why.
+        if let Some(deferred) = deferred {
+            deferred.record(resp.body.as_bytes(), matches!(doc, Ok(Some(_))));
         }
-        if !resp.is_success() {
-            return Err(CoreError::transient(format!("{url}: HTTP {}", resp.status)));
-        }
-        let doc: Doc = serde_json::from_str(&resp.body)
-            .map_err(|e| CoreError::Parse(format!("{name}: {e}")))?;
-        Ok(Some(doc))
+        doc
     }
 
     /// Fetches the package document as [`get_doc`](Self::get_doc) does, once per `batch`.

@@ -259,7 +259,27 @@ impl SharedHttp {
     /// network failure has no stale cache to fall back on, or if the host keeps rate-limiting past
     /// the retry budget.
     pub async fn get(&self, url: &str, ttl: Duration) -> Result<HttpResponse, CoreError> {
-        self.request(url, url, ttl, RequestKind::Get).await
+        let (response, _) = self.request(url, url, ttl, RequestKind::Get, false).await?;
+        Ok(response)
+    }
+
+    /// Performs a `GET` of `url` as [`get`](Self::get) does, but leaves recording the body in a
+    /// compact run trace to the caller.
+    ///
+    /// The returned [`DeferredBody`] names the source the caller records the body under.
+    /// A full trace records the body here, as `get` does, and nothing is deferred.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`get`](Self::get).
+    pub async fn get_deferred(
+        &self,
+        url: &str,
+        ttl: Duration,
+    ) -> Result<(HttpResponse, Option<DeferredBody>), CoreError> {
+        let defer =
+            cooldown_core::trace::Detail::current() == Some(cooldown_core::trace::Detail::Compact);
+        self.request(url, url, ttl, RequestKind::Get, defer).await
     }
 
     /// Performs a `POST` of a JSON `body` to `url`, cached like [`get`](Self::get) under a key
@@ -287,8 +307,10 @@ impl SharedHttp {
             "{url}#{:016x}",
             cooldown_core::fs::fnv1a_64(&format!("{url}\n{body}"))
         );
-        self.request(url, &cache_key, ttl, RequestKind::PostJson { body })
-            .await
+        let (response, _) = self
+            .request(url, &cache_key, ttl, RequestKind::PostJson { body }, false)
+            .await?;
+        Ok(response)
     }
 
     #[tracing::instrument(name = "registry_request", skip_all, fields(url, cache_key))]
@@ -298,7 +320,8 @@ impl SharedHttp {
         cache_key: &str,
         ttl: Duration,
         request: RequestKind<'_>,
-    ) -> Result<HttpResponse, CoreError> {
+        defer: bool,
+    ) -> Result<(HttpResponse, Option<DeferredBody>), CoreError> {
         if let Some(body) = request.body() {
             cooldown_core::trace::artifact(
                 cooldown_core::trace::ArtifactSource::HttpRequest { url },
@@ -310,6 +333,17 @@ impl SharedHttp {
                 response,
                 network_status,
             }) => {
+                if defer {
+                    let body = DeferredBody {
+                        key: cache_key.to_string(),
+                        status: response.status,
+                        from_cache: response.from_cache,
+                        stale: response.stale,
+                        network_status,
+                        span: tracing::Span::current(),
+                    };
+                    return Ok((response, Some(body)));
+                }
                 cooldown_core::trace::artifact(
                     cooldown_core::trace::ArtifactSource::Http {
                         key: cache_key,
@@ -320,7 +354,7 @@ impl SharedHttp {
                     },
                     response.body.as_bytes(),
                 );
-                Ok(response)
+                Ok((response, None))
             }
             Err(err) => {
                 tracing::debug!(error = %err, "registry request failed");
@@ -552,6 +586,39 @@ impl<'a> RequestKind<'a> {
 
     const fn uses_etag(self) -> bool {
         matches!(self, Self::Get)
+    }
+}
+
+/// A delivered body that [`SharedHttp::get_deferred`] left for its caller to record.
+pub struct DeferredBody {
+    key: String,
+    status: u16,
+    from_cache: bool,
+    stale: bool,
+    network_status: Option<u16>,
+    /// The request's span, so the record keeps the request's operation as [`SharedHttp::get`]'s
+    /// would.
+    span: tracing::Span,
+}
+
+impl DeferredBody {
+    /// Records `body` under the source and request [`SharedHttp::get`] would have recorded it
+    /// under: as a summary of its length and digest when `summarize` is set, else in full.
+    pub fn record(&self, body: &[u8], summarize: bool) {
+        let source = cooldown_core::trace::ArtifactSource::Http {
+            key: &self.key,
+            status: self.status,
+            from_cache: self.from_cache,
+            stale: self.stale,
+            network_status: self.network_status,
+        };
+        self.span.in_scope(|| {
+            if summarize {
+                cooldown_core::trace::summarized_artifact(source, body);
+            } else {
+                cooldown_core::trace::artifact(source, body);
+            }
+        });
     }
 }
 

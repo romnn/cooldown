@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **A compact trace leaves out the npm package documents cooldown decoded.** These bodies made up
+  most of a compact `upgrade --major --sync` trace of a large monorepo, which reached 170 MB
+  compressed against the 100 MB budget. A decoded document is now recorded as an
+  `artifact_summary` with its source, length and hash, which brings such a trace within the budget.
+  A 404, error or malformed body keeps its bytes, every other registry is recorded as before, and
+  `--full-trace` still records every body. The trace schema is now version 4. Closes #136.
+
 - **`sync` fetches release metadata only for the pnpm packages its exemptions can depend on.**
   Before writing `minimumReleaseAgeExclude`, `sync` fetched every locked pnpm package: one large
   monorepo spent 73 seconds on 1737 packages before `upgrade --sync` started any project. Only a
