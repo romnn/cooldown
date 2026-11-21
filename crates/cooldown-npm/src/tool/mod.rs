@@ -6836,7 +6836,7 @@ packages:
         locked.extend(others.iter().map(|name| (name.as_str(), "1.0.0")));
         // `next` is two hours old, young under pnpm's built-in day too, so the override
         // warning names it; `stale` is admitted but mature, so its entry goes, and `refused`
-        // is not admitted, so its entry goes as well.
+        // is not admitted, so its still-locked entry stays.
         let mut admitted = vec![
             ("next", "15.0.0", 2),
             ("listed", "1.0.0", 48),
@@ -6866,7 +6866,7 @@ packages:
             NativeAge::parse(&bounded_yaml, Utf8Path::new("pnpm-workspace.yaml"))?
                 .exclusions
                 .into_vec(),
-            ["listed@1.0.0", "next@15.0.0"]
+            ["listed@1.0.0", "refused@1.0.0", "next@15.0.0"]
         );
         assert!(
             bounded_warnings
@@ -6917,9 +6917,13 @@ packages:
     #[cfg(unix)]
     fn ten_day_pin_policy(bound: bool) -> ResolvedPolicy {
         let seven_days = jiff::SignedDuration::from_hours(24 * 7);
+        // A bounded evaluation keeps the young admissions and every package an existing exact
+        // entry names, as `stale` is, which the scope fetches whatever its age.
         let admitted = [("foo", 240), ("young", 24), ("stale", 24 * 60)]
             .into_iter()
-            .filter(|(_, hours)| !bound || jiff::SignedDuration::from_hours(*hours) < seven_days)
+            .filter(|(name, hours)| {
+                !bound || *name == "stale" || jiff::SignedDuration::from_hours(*hours) < seven_days
+            })
             .map(|(name, hours)| cooldown_core::AdmittedVersion {
                 name: name.to_string(),
                 version: Version::new("1.0.0"),
@@ -7280,15 +7284,15 @@ packages:
     }
 
     /// An integrity-only lock entry proves no origin where a pnpmfile may route packages, so sync
-    /// cannot show an existing exact exemption unneeded: one for a locked version stays, whether
-    /// cooldown admits it or not, until the lock no longer holds that version.
-    /// Without a pnpmfile the origin is proven, so the exemption of a locked version cooldown does
-    /// not admit goes, as before.
+    /// cannot show an existing exact exemption unneeded: one for a locked version stays until the
+    /// lock no longer holds that version.
+    /// Without a pnpmfile the origin is proven, and the exemption of a locked version cooldown does
+    /// not admit still stays, since its age is unknown and bare pnpm may need it.
     #[cfg(unix)]
     #[tokio::test]
     async fn sync_keeps_an_unproven_exemption_while_its_version_is_locked() -> eyre::Result<()> {
         for (pnpmfile, kept) in [
-            (false, &["young@1.0.0"][..]),
+            (false, &["young@1.0.0", "held@1.0.0"][..]),
             (true, &["young@1.0.0", "held@1.0.0"][..]),
         ] {
             let directory = tempfile::tempdir()?;
