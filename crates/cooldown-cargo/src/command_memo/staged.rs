@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use cooldown_core::Project;
 
 use super::stable_resolution;
@@ -117,15 +117,15 @@ impl StagedTrees {
         if !inputs.key.is_cacheable() {
             return None;
         }
-        let private = inputs.manifests.iter().all(|manifest| {
-            within(&manifest.directory, &tree)
-                && declared_targets(&manifest.directory, &manifest.document)
-                    .iter()
-                    .all(|target| within(target, &tree))
+        let outside = inputs.manifests.iter().find_map(|manifest| {
+            std::iter::once(manifest.directory.clone())
+                .chain(declared_targets(&manifest.directory, &manifest.document))
+                .find(|path| !within(path, &tree))
         });
-        if !private {
+        if let Some(path) = outside {
             tracing::debug!(
                 dir = %project.root,
+                %path,
                 "cargo outcome reuse bypassed because a package or target source lies outside the staged copy"
             );
             return None;
@@ -137,13 +137,62 @@ impl StagedTrees {
     }
 }
 
-/// Whether `path`, with every symbolic link resolved, lies in `tree`; `false` when it does not
-/// exist.
+/// Whether `path`, with every symbolic link resolved, lies in `tree`.
+///
+/// A path that does not exist counts by where it would be: its deepest existing ancestor, resolved,
+/// with the missing components appended. A target a manifest names but the copy lacks, such as one
+/// of a package staged only for the workspace's topology, is missing for as long as the copy lives,
+/// because cooldown writes only the lock and the manifests there and Cargo creates no target
+/// source. A missing path that would lie outside the tree still disqualifies reuse, since anything
+/// may create it there.
 fn within(path: &Utf8Path, tree: &Utf8Path) -> bool {
-    std::fs::canonicalize(path)
-        .ok()
-        .and_then(|path| Utf8PathBuf::from_path_buf(path).ok())
-        .is_some_and(|path| path.starts_with(tree))
+    resolved(path).is_some_and(|path| path.starts_with(tree))
+}
+
+/// `path` with every symbolic link resolved, its missing components appended to its deepest
+/// existing ancestor, or `None` when it cannot be resolved.
+///
+/// `.` and `..` are removed lexically first, as Cargo normalizes a target path before it opens
+/// it, so a `..` can never step over a symbolic link the check would then miss.
+fn resolved(path: &Utf8Path) -> Option<Utf8PathBuf> {
+    let path = lexically_normal(path);
+    let mut missing = Vec::new();
+    let mut existing = path.as_path();
+    loop {
+        match std::fs::canonicalize(existing) {
+            Ok(base) => {
+                let mut resolved = Utf8PathBuf::from_path_buf(base).ok()?;
+                for name in missing.into_iter().rev() {
+                    resolved.push(name);
+                }
+                return Some(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling symbolic link is not a missing file: anything may create its target.
+                if std::fs::symlink_metadata(existing).is_ok() {
+                    return None;
+                }
+                missing.push(existing.file_name()?);
+                existing = existing.parent()?;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// `path` without `.` components and with each `..` removing the component before it.
+fn lexically_normal(path: &Utf8Path) -> Utf8PathBuf {
+    let mut normal = Utf8PathBuf::new();
+    for component in path.components() {
+        match component {
+            Utf8Component::CurDir => {}
+            Utf8Component::ParentDir => {
+                normal.pop();
+            }
+            other => normal.push(other.as_str()),
+        }
+    }
+    normal
 }
 
 /// The path a target table of a manifest names, if any.
