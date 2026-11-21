@@ -42,7 +42,7 @@ use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, Change, CoreError, Declaration, DepScope,
     Dependency, Diagnostic, DiagnosticKind, FetchContext, LockStatus, LockVerifyReport, MemberRef,
     MutationBaseline, NativeAdmissionQuery, NativeAssessment, NativeGateQuery, NativeGateRefusal,
-    NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation, Project, ProjectMarker,
+    NativePolicyLayer, PackageId, Plan, PreparedMutation, Project, ProjectMarker,
     ProjectMutationJournal, ProjectMutationState, RawRelease, Release, ReleaseFetcher,
     ReleaseOrder, ReleaseQuality, ResolvedPolicy, Result, RewriteMode, SingleCopyPolicy,
     SkipReason, Skipped, SyncReport, SyncScope, TargetFallback, ToolId, ToolRead, ToolWrite,
@@ -913,10 +913,10 @@ impl<L: NodeLock> ReleaseFetcher for NpmTool<L> {
     async fn releases(
         &self,
         dep: &Dependency,
-        _fetch: &FetchContext<'_>,
+        fetch: &FetchContext<'_>,
         _candidates: CandidateScope,
     ) -> Result<Vec<Release>> {
-        let packument = self.registry.packument(&dep.package).await?;
+        let packument = self.registry.packument(&dep.package, fetch.batch).await?;
         Ok(build_releases(
             dep.current.as_str(),
             packument.releases,
@@ -933,10 +933,10 @@ impl<L: NodeLock> ReleaseFetcher for NpmTool<L> {
         }
     }
 
-    async fn locked_release(&self, dep: &Dependency, _fetch: &FetchContext<'_>) -> Result<Release> {
+    async fn locked_release(&self, dep: &Dependency, fetch: &FetchContext<'_>) -> Result<Release> {
         let time = self
             .registry
-            .published_at(&dep.package, &dep.current, &[])
+            .locked_published_at(&dep.package, &dep.current, fetch.batch)
             .await?;
         Ok(Release {
             version: dep.current.clone(),

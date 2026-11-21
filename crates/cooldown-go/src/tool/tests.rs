@@ -357,6 +357,7 @@ fn fetch_ctx(project: &Project) -> FetchContext<'_> {
     FetchContext {
         project,
         artifacts: ArtifactScope::Environment,
+        batch: None,
     }
 }
 

@@ -7,10 +7,10 @@ use crate::scan::{FolderExcludeSet, PackageExcludeSet};
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::fs::ManifestFamily;
 use cooldown_core::{
-    ArtifactScope, CandidateScope, DepScope, Dependency, Diagnostic, DiagnosticKind, FetchContext,
-    LockStatus, LockVerifyReport, MutationRecovery, PatternGlob, PolicyLayer, PolicyStack, Project,
-    RecoveryDisposition, Release, ReleaseFetcher, ResolveContext, ResolvedWindow, ToolId, ToolRead,
-    ToolWrite,
+    ArtifactScope, CandidateScope, DepScope, Dependency, Diagnostic, DiagnosticKind, FetchBatch,
+    FetchContext, LockStatus, LockVerifyReport, MutationRecovery, PatternGlob, PolicyLayer,
+    PolicyStack, Project, RecoveryDisposition, Release, ReleaseFetcher, ResolveContext,
+    ResolvedWindow, ToolId, ToolRead, ToolWrite,
 };
 use futures::stream::{self, StreamExt};
 use jiff::Timestamp;
@@ -1282,6 +1282,7 @@ impl Workspace {
         FetchContext {
             project: &pctx.project,
             artifacts: opts.artifact_scope(),
+            batch: None,
         }
     }
 
@@ -1445,6 +1446,10 @@ impl Workspace {
     /// The cache (a [`ReleaseResolver`]) is the only thing handed the tool's [`ReleaseFetcher`], so
     /// every locked-release read is single-flight-deduplicated and rate-limited by construction —
     /// there is no API to fetch one any other way.
+    ///
+    /// The deps form one batch: they share a [`FetchBatch`] that lives only for this call, so an
+    /// adapter can read a registry document once for every locked copy of its package in the
+    /// batch, and the next batch reads it again.
     #[tracing::instrument(
         level = "debug",
         skip_all,
@@ -1463,6 +1468,8 @@ impl Workspace {
             return no_fetcher_results(adapter.id(), deps);
         };
         progress.packages(deps.len(), "fetching locked release metadata");
+        let batch = FetchBatch::default();
+        let fetch = &fetch.in_batch(&batch);
         let results = stream::iter(deps)
             .map(|dep| {
                 let progress = progress.clone();
@@ -1487,7 +1494,8 @@ impl Workspace {
     }
 
     /// Fetch the candidate releases for each dep through the run's release cache, concurrently. See
-    /// [`fetch_locked_releases`](Self::fetch_locked_releases) for why this is the only fetch path.
+    /// [`fetch_locked_releases`](Self::fetch_locked_releases) for why this is the only fetch path
+    /// and what the batch shares.
     #[tracing::instrument(
         level = "debug",
         skip_all,
@@ -1507,6 +1515,8 @@ impl Workspace {
             return no_fetcher_results(adapter.id(), deps);
         };
         progress.packages(deps.len(), "fetching release metadata");
+        let batch = FetchBatch::default();
+        let fetch = &fetch.in_batch(&batch);
         let results = stream::iter(deps)
             .map(|dep| {
                 let progress = progress.clone();
@@ -1968,6 +1978,90 @@ pub(crate) mod tests {
         );
         drop(refresh);
         ProjectAccessReadGuard::acquire(&root, &project.root, &family, CARGO, false)?;
+        Ok(())
+    }
+
+    /// Counts, in the scratch of its batch, how many of the batch's locked releases it has been
+    /// asked for, and reports that count as the release's error, so a test sees which fetches
+    /// shared a batch.
+    #[async_trait]
+    impl cooldown_core::ReleaseFetcher for FakeReader {
+        async fn releases(
+            &self,
+            _dep: &Dependency,
+            _fetch: &cooldown_core::FetchContext<'_>,
+            _candidates: cooldown_core::CandidateScope,
+        ) -> cooldown_core::Result<Vec<cooldown_core::Release>> {
+            Ok(Vec::new())
+        }
+
+        async fn locked_release(
+            &self,
+            _dep: &Dependency,
+            fetch: &cooldown_core::FetchContext<'_>,
+        ) -> cooldown_core::Result<cooldown_core::Release> {
+            let seen = fetch
+                .batch
+                .and_then(|batch| batch.entry("seen", || std::sync::atomic::AtomicUsize::new(0)))
+                .map_or(0, |seen| {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+                });
+            Err(cooldown_core::CoreError::NotFound(seen.to_string()))
+        }
+    }
+
+    /// The deps of one release fetch share one batch scratch, and the next fetch of the same deps
+    /// starts a fresh one, so nothing an adapter keeps for a batch outlives it.
+    #[tokio::test]
+    async fn each_release_fetch_batch_has_its_own_scratch() -> eyre::Result<()> {
+        let pctx = project_ctx(PNPM, "/repo");
+        let mut adapters = AdapterSet::new();
+        adapters.register_read(Arc::new(FakeReader {
+            id: PNPM,
+            deps: Vec::new(),
+        }))?;
+        let ws = Workspace::new(
+            adapters,
+            vec![pctx],
+            "2026-06-17T00:00:00Z".parse()?,
+            Baseline::default(),
+            Utf8PathBuf::from("/repo"),
+            vec![builtin_default_layer()],
+        );
+        let reader = FakeReader {
+            id: PNPM,
+            deps: Vec::new(),
+        };
+        // Three locked copies of one package, the shape that shares a registry document.
+        let copies = || {
+            ["1.0.0", "2.0.0", "3.0.0"].map(|version| {
+                let mut copy = dep("left-pad", "root", ".");
+                copy.current = Version::new(version);
+                copy
+            })
+        };
+        let opts = RunOpts::default();
+        let fetch = Workspace::fetch_context(&ws.projects()[0], &opts);
+
+        for _ in 0..2 {
+            let fetched = ws
+                .fetch_locked_releases(
+                    &reader,
+                    copies().to_vec(),
+                    &fetch,
+                    &ProjectProgress::default(),
+                    4,
+                )
+                .await;
+            let mut seen: Vec<String> = fetched
+                .into_iter()
+                .filter_map(|fetched| fetched.result.err())
+                .map(|error| error.to_string())
+                .collect();
+            seen.sort();
+            // Each fetch counted the batch's three copies from zero.
+            assert_eq!(seen, ["not found: 1", "not found: 2", "not found: 3"]);
+        }
         Ok(())
     }
 

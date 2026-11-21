@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **A batch fetches each npm package document once, whatever the number of locked copies.**
+  `upgrade` revalidates every npm package document, and each locked copy of a package fetched it
+  again: one large monorepo run asked for `semver` four times at once, once per copy, in each of
+  its locked-release and candidate fetches. The npm, pnpm, Yarn and Bun adapters now read every
+  version a batch needs from one fetch of the document, as a single fetch already serves every
+  version of a package. A later batch fetches the document again, so nothing is reused beyond one
+  fetch. The trace now records the status the server returned, as `networkStatus`, next to the
+  cached copy's `status`, so a `304` revalidation no longer reads as a `200` download.
+  Closes #133.
 - **Cargo reuses command outcomes in nested workspaces again.** A nested project that
   path-depends on its parent workspace stages the manifests of the parent's
   `[workspace.dependencies]` packages only for the workspace's topology, without their target
