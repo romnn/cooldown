@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **`sync` fetches release metadata only for the pnpm packages its exemptions can depend on.**
+  Before writing `minimumReleaseAgeExclude`, `sync` fetched every locked pnpm package: one large
+  monorepo spent 73 seconds on 1737 packages before `upgrade --sync` started any project. Only a
+  version cooldown may admit while it is younger than the written window can earn or keep an exact
+  entry: one a shorter package rule, an `allow` or `latest` selector, the baseline or an advisory
+  fix version admits. `sync` now fetches those, plus every package an existing exact entry names,
+  and writes the same list. It still fetches every package when pnpm's effective window is stricter
+  than the written one or cannot be read, when the window is no positive minute count, or when a
+  pnpmfile may load. `sync` no longer repeats `check`'s yanked warnings for locked versions; run
+  `check` or `outdated` for them. A package no exemption can depend on whose metadata cannot be
+  read no longer freezes the exact entries as written. Closes #134.
 - **pnpm no longer warns `unpaired_move` about requirements that did not move.** A dependent with
   two copies that both moved, such as `@babel/traverse` 7.29.12 → 7.29.13 and 8.0.10 → 8.1.0, kept
   one group of lock records binding several versions on each side, so a requirement still binding

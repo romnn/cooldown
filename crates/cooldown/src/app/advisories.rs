@@ -138,6 +138,14 @@ impl ProjectAdvisories {
         })
     }
 
+    /// Whether an advisory names `dep`'s package, so [`classify`](Self::classify) judges it
+    /// advised.
+    pub(crate) fn names(&self, dep: &Dependency) -> bool {
+        dep.advisory_identity
+            .as_ref()
+            .is_some_and(|package| self.by_package.contains_key(package))
+    }
+
     /// The advisory-package identities among `deps` this fetch never queried, deduplicated.
     /// Dependencies without an identity are not advisory packages at all, so they never count
     /// as unqueried.

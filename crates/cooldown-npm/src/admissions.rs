@@ -33,7 +33,9 @@ const PNPM_11_DEFAULT_MINUTES: i64 = 24 * 60;
 pub(crate) type VersionLines = HashMap<String, BTreeSet<String>>;
 
 /// pnpm's release-age window as the bare manager applies it, in whole minutes.
-#[derive(Debug, Clone, Copy)]
+///
+/// Windows order by length, so the greater of two is the stricter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct NativeFloor {
     minutes: i64,
 }
@@ -55,6 +57,11 @@ impl NativeFloor {
             }),
             (window, None) | (None, window) => window,
         }
+    }
+
+    /// Whether this window is longer than `duration`.
+    pub(crate) fn longer_than(self, duration: SignedDuration) -> bool {
+        self.minutes.saturating_mul(60) > duration.as_secs()
     }
 
     /// Whether a version published `age` before the evaluation instant is still inside the
@@ -215,7 +222,8 @@ impl GrantEvidence<'_> {
 pub(crate) struct MirroredVerdicts<'a> {
     /// The locked versions whose publish time is attributable ([`origin_proven_versions`]).
     pub(crate) proven: &'a VersionLines,
-    /// Every locked version cooldown admits, with its age.
+    /// The locked versions cooldown admits, with their ages: every one young under `floor`
+    /// and every one of a package an existing exact entry names.
     pub(crate) admitted: &'a [AdmittedVersion],
     /// The window the bare manager applies, or `None` when it applies none.
     pub(crate) floor: Option<NativeFloor>,

@@ -13,8 +13,9 @@ use super::{
 };
 use cooldown_core::{
     DepScope, Dependency, Diagnostic, DiagnosticKind, LockVerifyReport, Origin, Resolution,
-    ResolveKind, ResolveQuery, Status, check_pin_advised, resolve,
+    ResolveKind, ResolveQuery, Status, SyncAdmissionScope, check_pin_advised, resolve,
 };
+use std::collections::BTreeSet;
 
 /// If a `Native`-origin layer declared a STRICTER (larger) bare window than the one that won, the
 /// repo/global policy has weakened the project's stated intent. Returns the native window's days.
@@ -115,9 +116,13 @@ struct CheckRunner<'a> {
     opts: &'a RunOpts,
     scope: DepScope,
     acc: CheckAccum,
-    /// Whether this run collects the exact versions cooldown admits, as `sync` does: every one,
-    /// with its age, since the adapter decides which of them its native gate needs.
+    /// Whether this run collects the exact versions cooldown admits, as `sync` does: every one
+    /// inside [`admission_scope`](Self::admission_scope), with its age, since the adapter decides
+    /// which of them its native gate needs.
     collect_admissions: bool,
+    /// The locked versions whose verdicts the collected admissions need; the others are left
+    /// unevaluated.
+    admission_scope: SyncAdmissionScope,
 }
 
 /// `check --transitive hide` skips evaluating transitive deps; every other mode (including
@@ -175,8 +180,11 @@ impl Workspace {
 
     /// Evaluate native exact-version admissions while the caller holds the sync lease.
     ///
-    /// Every admitted locked version is returned with its age, mature ones included: the adapter
-    /// knows which window its native gate applies, so it decides which need an entry.
+    /// Every admitted locked version inside `scope` is returned with its age, mature ones
+    /// included: the adapter knows which window its native gate applies, so it decides which need
+    /// an entry.
+    /// A version outside `scope` is neither fetched nor judged, so a registry failure on it leaves
+    /// the evaluation complete.
     /// Reuses the check gate without refreshing the lock or acquiring another lease, which would
     /// deadlock against the caller's exclusive access.
     /// A frozen resolver probe would reject the very pins whose exact native admissions are missing,
@@ -185,6 +193,7 @@ impl Workspace {
         &self,
         pctx: &super::ProjectCtx,
         opts: &RunOpts,
+        scope: SyncAdmissionScope,
         warnings: &mut Vec<Diagnostic>,
     ) -> Result<Vec<cooldown_core::AdmittedVersion>, Box<Diagnostic>> {
         let progress = opts.progress.project(pctx.tool, pctx.rel_path.as_str());
@@ -198,6 +207,7 @@ impl Workspace {
         // Native policy serves every locked registry version even when the command hides transitives.
         runner.scope = DepScope::Graph;
         runner.collect_admissions = true;
+        runner.admission_scope = scope;
         if let Some(deps) = runner.read_whole_lock(pctx, &read).await {
             runner.evaluate_dependencies(pctx, &read, deps).await;
         }
@@ -238,6 +248,7 @@ impl<'a> CheckRunner<'a> {
             scope: check_scope(opts),
             acc: CheckAccum::default(),
             collect_admissions: false,
+            admission_scope: SyncAdmissionScope::Every,
         }
     }
 
@@ -403,23 +414,128 @@ impl<'a> CheckRunner<'a> {
             self.opts,
             &read.progress,
         );
-        read.progress
-            .phase(format!("checking {} resolved dependencies", deps.len()));
-        let release_fetch = self.ws.fetch_locked_releases(
-            read.adapter,
-            deps,
-            &read.fetch,
-            &read.progress,
-            self.opts.fanout(),
-        );
-        let (advisory_fetch, fetched) = tokio::join!(advisory_fetch, release_fetch);
-        let advisories = advisory_fetch.record(&mut self.acc.warnings, &mut self.acc.errors);
+        let (advisories, fetched) = match self.admission_scope.clone() {
+            SyncAdmissionScope::Every => {
+                read.progress
+                    .phase(format!("checking {} resolved dependencies", deps.len()));
+                let release_fetch = self.ws.fetch_locked_releases(
+                    read.adapter,
+                    deps,
+                    &read.fetch,
+                    &read.progress,
+                    self.opts.fanout(),
+                );
+                let (advisory_fetch, fetched) = tokio::join!(advisory_fetch, release_fetch);
+                let advisories =
+                    advisory_fetch.record(&mut self.acc.warnings, &mut self.acc.errors);
+                (advisories, fetched)
+            }
+            SyncAdmissionScope::Bounded { floor, packages } => {
+                // The feed decides which packages the scope keeps, so the release fetch waits for
+                // it, while the feed is still asked about every package.
+                let advisories = advisory_fetch
+                    .await
+                    .record(&mut self.acc.warnings, &mut self.acc.errors);
+                let (scoped, skipped): (Vec<_>, Vec<_>) = deps.into_iter().partition(|dep| {
+                    self.admission_may_matter(
+                        pctx,
+                        read,
+                        advisories.as_ref(),
+                        dep,
+                        floor,
+                        &packages,
+                    )
+                });
+                // The stricter-native warning needs no release metadata, so a skipped package
+                // still earns it.
+                for dep in &skipped {
+                    self.note_stricter_native(pctx, &read.project_label, dep);
+                }
+                read.progress
+                    .phase(format!("checking {} resolved dependencies", scoped.len()));
+                let fetched = self
+                    .ws
+                    .fetch_locked_releases(
+                        read.adapter,
+                        scoped,
+                        &read.fetch,
+                        &read.progress,
+                        self.opts.fanout(),
+                    )
+                    .await;
+                (advisories, fetched)
+            }
+        };
         for FetchedRelease {
             dependency: dep,
             result,
         } in fetched
         {
             self.gate_pin(pctx, read, advisories.as_ref(), &dep, result);
+        }
+    }
+
+    /// Whether `dep`'s verdict can matter to an admission evaluation bounded to the versions
+    /// cooldown may admit while younger than `floor` and to every version of `packages`.
+    ///
+    /// cooldown admits a version that its window passes, that an `allow` exempts, or that the
+    /// baseline acknowledges ([`admits_exactly`]).
+    /// Only a window whose cutoff reaches past `floor` passes a version younger than it, and the
+    /// advisory feed can shorten a window only for a package it names, so the rest are judged
+    /// from policy alone, by the resolution [`check_pin_advised`] makes.
+    /// The comparison is strict: a version published exactly at a cutoff `floor` before the run
+    /// is as old as `floor`, which the native gate no longer holds as young.
+    fn admission_may_matter(
+        &self,
+        pctx: &super::ProjectCtx,
+        read: &ReadProjectCtx<'_>,
+        advisories: Option<&ProjectAdvisories>,
+        dep: &Dependency,
+        floor: jiff::SignedDuration,
+        packages: &BTreeSet<String>,
+    ) -> bool {
+        if packages.contains(&dep.package.name)
+            || advisories.is_some_and(|advisories| advisories.names(dep))
+        {
+            return true;
+        }
+        let now = self.ws.now();
+        let query = ResolveQuery {
+            tool: read.resolve.tool,
+            package: &dep.package.name,
+            registry: dep.package.registry.as_deref(),
+            project: read.resolve.project,
+            kind: ResolveKind::CurrentPin,
+        };
+        let window = resolve(&pctx.policy.layers, &query, now).window;
+        window.exempt
+            || now
+                .checked_sub(floor)
+                .ok()
+                .is_none_or(|young_from| window.cutoff(now) > young_from)
+            || self.ws.baseline.is_acknowledged(
+                pctx.tool.as_str(),
+                &read.project_label,
+                &dep.package.name,
+                dep.current.as_str(),
+                dep.package.registry.as_deref(),
+                now,
+            )
+    }
+
+    /// Records the stricter-native warning for `dep`, when repo or global policy overrides a
+    /// stricter native window, and trips the gate under `strict-native`.
+    fn note_stricter_native(
+        &mut self,
+        pctx: &super::ProjectCtx,
+        project_label: &str,
+        dep: &Dependency,
+    ) {
+        if let Some(diag) = self.stricter_native_warning(pctx, project_label, dep) {
+            self.acc.warnings.push(diag);
+            if pctx.policy.strict_native {
+                self.acc.stricter_native_tripped = true;
+            }
         }
     }
 
@@ -552,7 +668,8 @@ impl<'a> CheckRunner<'a> {
                 return;
             }
         };
-        if locked.yanked {
+        // A yanked pin is reported by `check` and `outdated`; `sync` collects admissions only.
+        if locked.yanked && !self.collect_admissions {
             self.acc.warnings.push(
                 Diagnostic::new(DiagnosticKind::Yanked, "locked version is yanked")
                     .with_tool(pctx.tool.as_str())
@@ -578,12 +695,7 @@ impl<'a> CheckRunner<'a> {
         if pv.security.is_some() {
             self.acc.security_relevant += 1;
         }
-        if let Some(diag) = self.stricter_native_warning(pctx, project_label, dep) {
-            self.acc.warnings.push(diag);
-            if pctx.policy.strict_native {
-                self.acc.stricter_native_tripped = true;
-            }
-        }
+        self.note_stricter_native(pctx, project_label, dep);
 
         let baseline_acked = pv.status == Status::CurrentInCooldown
             && self.ws.baseline.is_acknowledged(

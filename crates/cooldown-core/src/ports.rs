@@ -1276,6 +1276,27 @@ pub trait ToolWrite: Send + Sync {
         false
     }
 
+    /// Which locked versions of `project` the admission evaluation for `policy` must judge, so a
+    /// sync that needs only a few verdicts does not fetch release metadata for every locked
+    /// package.
+    ///
+    /// Asked only where [`requires_sync_admission_evaluation`] opts in, under the sync lease and
+    /// before the evaluation, with `policy` as [`write_native`] then receives it apart from its
+    /// [`admitted_versions`](ResolvedPolicy::admitted_versions).
+    /// A bounded answer must leave every write and warning of [`write_native`] exactly as the
+    /// full evaluation would, so an adapter that cannot bound them answers
+    /// [`SyncAdmissionScope::Every`], the default.
+    ///
+    /// [`requires_sync_admission_evaluation`]: ToolWrite::requires_sync_admission_evaluation
+    /// [`write_native`]: ToolWrite::write_native
+    async fn sync_admission_scope(
+        &self,
+        _project: &Project,
+        _policy: &ResolvedPolicy,
+    ) -> SyncAdmissionScope {
+        SyncAdmissionScope::Every
+    }
+
     /// Whether a mutation of `project` records the young versions cooldown admits in a native
     /// exemption list (see [`assess_native_admissions`](ToolWrite::assess_native_admissions)).
     ///
@@ -1705,6 +1726,27 @@ pub struct AdmittedVersion {
     pub age: SignedDuration,
 }
 
+/// Which locked versions' admission verdicts can change what `sync` writes into a project's
+/// native exemption list ([`ToolWrite::sync_admission_scope`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SyncAdmissionScope {
+    /// Every locked version's verdict may matter, so every one is evaluated.
+    #[default]
+    Every,
+    /// Only the verdicts on versions cooldown may admit while younger than `floor`, and on every
+    /// version of the `packages` named, matter.
+    ///
+    /// A version outside both is left unevaluated: whatever its verdict, `sync` writes and warns
+    /// the same.
+    Bounded {
+        /// The window the native gate ages admitted versions against.
+        floor: SignedDuration,
+        /// The packages whose every locked version needs its verdict, such as the ones an
+        /// existing exact native entry names.
+        packages: std::collections::BTreeSet<String>,
+    },
+}
+
 /// One locked registry version with the cooldown gate's verdict on it, the evidence a native
 /// exemption list is derived from (see [`ToolWrite::assess_native_admissions`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1833,7 +1875,16 @@ pub struct ResolvedPolicy {
     /// native default window.
     /// Successful evaluation supplies `Some`, including an empty list to prune expired admissions.
     /// `None` preserves every existing exact entry verbatim when evaluation fails.
+    /// Under a bounded [`SyncAdmissionScope`] the list holds only the versions inside it.
     pub admitted_versions: Option<Vec<AdmittedVersion>>,
+    /// The floor of the bounded [`SyncAdmissionScope`] that
+    /// [`admitted_versions`](Self::admitted_versions) was evaluated under, or `None` after a full
+    /// evaluation.
+    ///
+    /// The list lacks every verdict on a version as old as the floor or older, so an adapter whose
+    /// native gate turns out stricter than the floor when it writes cannot judge the exact
+    /// admissions, as when the evaluation failed.
+    pub admission_bound: Option<SignedDuration>,
 }
 
 /// The outcome of a `sync`/[`ToolWrite::write_native`] (post-MVP).

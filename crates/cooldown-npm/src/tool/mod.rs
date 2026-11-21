@@ -310,6 +310,17 @@ impl<L: NodeLock> NpmTool<L> {
         queried
     }
 
+    /// [`Self::effective_config`] for a speculative probe, which reads the manager afresh and
+    /// records nothing: the routing the writer proves origins by is read when the writer needs it,
+    /// as without the probe, so neither a failed nor an outdated probe can stand in for it.
+    async fn probe_effective_config(&self, root: &Utf8Path) -> Option<String> {
+        let args: Vec<String> = ["config", "list", "--json"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        self.cmd.stdout(root, &args).await.ok()
+    }
+
     /// Enables package-document revalidation for version-adopting runs, so the mutable `latest`
     /// dist-tag ceiling is judged against the registry's current state rather than a cached copy
     /// up to a listing-TTL stale (see [`NpmRegistry::with_listing_revalidation`]).
@@ -3225,7 +3236,8 @@ impl<L: NodeLock> NpmTool<L> {
         Ok(crate::admissions::NativeFloor::new(minutes))
     }
 
-    /// What `sync` judges the exact exemptions by: the `admitted` versions it exempts exactly,
+    /// What `sync` judges the exact exemptions by: the versions `policy` admitted that it exempts
+    /// exactly,
     /// the ones an upgrade grants too, young under the stricter of the `minutes` sync writes and
     /// pnpm's effective window here, and resolved from the registry their publish time came
     /// from, and the evidence that lets an `existing` exact entry go
@@ -3242,16 +3254,24 @@ impl<L: NodeLock> NpmTool<L> {
     /// Each young admitted version whose origin is not proven earns a warning in `warnings`
     /// instead, since bare pnpm keeps refusing it.
     ///
-    /// Returns `None` when pnpm's window or routing could not be read, so the evidence is
-    /// incomplete and no exact entry can be judged, which a warning in `warnings` says.
+    /// Returns `None` when the admission evaluation failed, or when pnpm's window or routing
+    /// could not be read, so the evidence is incomplete and no exact entry can be judged, which
+    /// a warning in `warnings` says.
+    /// The evidence is incomplete in the same way when the admissions cover only the versions
+    /// young under a bound ([`ResolvedPolicy::admission_bound`]) and pnpm's window is longer
+    /// than it.
     async fn sync_exemptions<'a>(
         &self,
         project: &Project,
         minutes: i64,
-        admitted: &'a [cooldown_core::AdmittedVersion],
+        policy: &'a ResolvedPolicy,
         existing: &[String],
         warnings: &mut Vec<Diagnostic>,
     ) -> Result<Option<SyncExemptions<'a>>> {
+        let Some(admitted) = policy.admitted_versions.as_deref() else {
+            return Ok(None);
+        };
+        let bound = policy.admission_bound;
         let written = crate::admissions::NativeFloor::new(minutes);
         let mut exemptions = SyncExemptions {
             admitted,
@@ -3260,11 +3280,13 @@ impl<L: NodeLock> NpmTool<L> {
             proven: crate::admissions::VersionLines::new(),
             floor: written,
         };
-        if admitted.is_empty() && existing.is_empty() {
+        if admitted.is_empty() && existing.is_empty() && bound.is_none() {
             return Ok(Some(exemptions));
         }
-        // Only an admitted version's youth needs pnpm's window.
-        if !admitted.is_empty() {
+        // Only an admitted version's youth needs pnpm's window, and a bounded evaluation needs it
+        // to show that its verdicts still cover every version young under that window: one whose
+        // admissions are all mature may have left out a version a full evaluation admits.
+        if !admitted.is_empty() || bound.is_some() {
             let Ok(effective) = self.native_floor(project).await else {
                 warnings.push(Diagnostic::new(
                     DiagnosticKind::ToolFailed,
@@ -3273,6 +3295,15 @@ impl<L: NodeLock> NpmTool<L> {
                 ));
                 return Ok(None);
             };
+            if bound.is_some_and(|bound| effective.is_some_and(|floor| floor.longer_than(bound))) {
+                warnings.push(Diagnostic::new(
+                    DiagnosticKind::ToolFailed,
+                    "pnpm's effective minimumReleaseAge became longer than the window cooldown \
+                     judged admissions under, so sync keeps the exact minimumReleaseAgeExclude \
+                     entries as written and adds none",
+                ));
+                return Ok(None);
+            }
             exemptions.floor = crate::admissions::NativeFloor::stricter(written, effective);
         }
         let young = exemptions
@@ -3340,13 +3371,16 @@ impl<L: NodeLock> NpmTool<L> {
     ///
     /// pnpm is asked for its effective window and exclusions in the project itself.
     /// A query that fails is incomplete evidence, so it yields no warning and no failure.
+    /// Where `admitted` holds only the versions young under a `bound`, a window longer than it
+    /// may refuse a version the list lacks, so the warning then names none.
     async fn overridden_admission_warning(
         &self,
         project: &Project,
         path: &Utf8Path,
         admitted: &[cooldown_core::AdmittedVersion],
+        bound: Option<jiff::SignedDuration>,
     ) -> Option<Diagnostic> {
-        if admitted.is_empty() {
+        if admitted.is_empty() && bound.is_none() {
             return None;
         }
         // The two gates are judged by first match ([`crate::exclusions::exempts`]), which only a
@@ -3358,6 +3392,15 @@ impl<L: NodeLock> NpmTool<L> {
         let written = NativeAge::read(path).ok()?;
         let written_rules = crate::exclusions::configured_rules(written.exclusions);
         let effective_floor = self.native_floor(project).await.ok()?;
+        if bound.is_some_and(|bound| effective_floor.is_some_and(|floor| floor.longer_than(bound)))
+        {
+            return Some(Diagnostic::new(
+                DiagnosticKind::StricterNative,
+                "a higher-precedence setting, such as an environment variable, a CLI flag or a \
+                 pnpmfile, sets a longer minimumReleaseAge than pnpm-workspace.yaml here, so a \
+                 bare pnpm install may refuse versions cooldown admits",
+            ));
+        }
         let effective_rules = self.effective_minimum_age_exclusions(project).await.ok()?;
         let overridden = crate::admissions::overridden_admissions(
             admitted,
@@ -3453,18 +3496,11 @@ impl<L: NodeLock> NpmTool<L> {
     /// It errs towards yes: a default file that exists but cannot be read, or a configuration that
     /// cannot be read, may be one, and `ignorePnpmfile` is not trusted to rule any out.
     async fn pnpmfile_may_load(&self, project: &Project) -> bool {
-        let present = |name: &str| {
-            !matches!(
-                std::fs::symlink_metadata(project.root.join(name)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound
-            )
-        };
-        if present(".pnpmfile.mjs") || present(".pnpmfile.cjs") {
-            return true;
-        }
-        self.effective_config(&project.root)
-            .await
-            .is_none_or(|listing| crate::admissions::configures_pnpmfile(&listing))
+        default_pnpmfile_present(project)
+            || self
+                .effective_config(&project.root)
+                .await
+                .is_none_or(|listing| crate::admissions::configures_pnpmfile(&listing))
     }
 
     /// Runs pnpm's frozen verification of `project`'s lock and returns its refusal of young
@@ -4478,7 +4514,8 @@ const VERIFICATION_RECORDS: &str = "lockfile-verified.jsonl";
 
 /// What `sync` judges the exact exemptions by ([`NpmTool::sync_exemptions`]).
 struct SyncExemptions<'a> {
-    /// Every locked version cooldown admits, with its age.
+    /// The locked versions cooldown admits, with their ages: every one whose verdict a decision
+    /// here reads ([`ToolWrite::sync_admission_scope`]).
     admitted: &'a [cooldown_core::AdmittedVersion],
     /// The admitted versions to exempt exactly.
     grants: Vec<&'a cooldown_core::AdmittedVersion>,
@@ -5027,6 +5064,63 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         L::NATIVE_MIN_AGE_FILE.is_some()
     }
 
+    /// Bounds the evaluation to the versions cooldown may admit while young under the window
+    /// `policy` writes, and to the packages the file's exact entries name, whose verdicts the
+    /// shared drop rule looks up (`ExemptionEvidence::drops`).
+    ///
+    /// The window bounds every other use of a verdict only while pnpm's effective window is no
+    /// stricter than it: grants age against the stricter of the two, and the override warning
+    /// after the write against pnpm's effective window.
+    /// The writer asks pnpm's window again for both, so it checks the bound there
+    /// (`ResolvedPolicy::admission_bound`) and judges no exact entry once pnpm's window has grown
+    /// past it.
+    /// Every version is evaluated when the window cannot be written as a positive minute count,
+    /// pnpm's window cannot be read or is stricter, or a pnpmfile may set a window pnpm's
+    /// configuration queries do not report (`pnpmfile_may_load`).
+    async fn sync_admission_scope(
+        &self,
+        project: &Project,
+        policy: &ResolvedPolicy,
+    ) -> cooldown_core::SyncAdmissionScope {
+        let every = cooldown_core::SyncAdmissionScope::Every;
+        let Some(file) = L::NATIVE_MIN_AGE_FILE else {
+            return every;
+        };
+        let Some(minutes) = policy.default_window.as_ref().and_then(window_minutes) else {
+            return every;
+        };
+        let Some(written) = crate::admissions::NativeFloor::new(minutes) else {
+            return every;
+        };
+        match self.native_floor(project).await {
+            Ok(effective) if effective.is_none_or(|effective| effective <= written) => {}
+            Ok(_) | Err(_) => return every,
+        }
+        // The probe leaves a failed configuration query out of the cache, so a write that reads
+        // the configuration again judges routing by what it reads then.
+        let pnpmfile = default_pnpmfile_present(project)
+            || self
+                .probe_effective_config(&project.root)
+                .await
+                .is_none_or(|listing| crate::admissions::configures_pnpmfile(&listing));
+        if pnpmfile {
+            return every;
+        }
+        let Ok(native) = NativeAge::read(&project.root.join(file)) else {
+            return every;
+        };
+        let packages = native
+            .exclusions
+            .into_vec()
+            .iter()
+            .filter_map(|entry| exact_exclusion(entry).map(|(name, _)| name.to_string()))
+            .collect();
+        cooldown_core::SyncAdmissionScope::Bounded {
+            floor: jiff::SignedDuration::from_secs(minutes.saturating_mul(60)),
+            packages,
+        }
+    }
+
     fn accepts_native_admissions(&self, _project: &Project) -> bool {
         L::NATIVE_MIN_AGE_FILE.is_some()
     }
@@ -5235,13 +5329,9 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
             .into_iter()
             .filter(|entry| exact_exclusion(entry).is_some())
             .collect();
-        let exemptions = match &policy.admitted_versions {
-            Some(admitted) => {
-                self.sync_exemptions(project, minutes, admitted, &existing, &mut warnings)
-                    .await?
-            }
-            None => None,
-        };
+        let exemptions = self
+            .sync_exemptions(project, minutes, policy, &existing, &mut warnings)
+            .await?;
         let complete = exemptions.is_some();
         // Without complete evidence, whether admissions, pnpm's window or its routing, every
         // exact entry pnpm still reads is kept as written, even for missing pins, while the
@@ -5294,7 +5384,7 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
             && !dry_run
             && let Some(admitted) = &policy.admitted_versions
             && let Some(warning) = self
-                .overridden_admission_warning(project, &path, admitted)
+                .overridden_admission_warning(project, &path, admitted, policy.admission_bound)
                 .await
         {
             warnings.push(warning);
@@ -5305,6 +5395,17 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
             SyncReport::Unchanged { path, warnings }
         })
     }
+}
+
+/// Whether one of pnpm's default pnpmfiles, `.pnpmfile.mjs` or `.pnpmfile.cjs`, may exist
+/// beside `project`'s lock; one that cannot be inspected may.
+fn default_pnpmfile_present(project: &Project) -> bool {
+    [".pnpmfile.mjs", ".pnpmfile.cjs"].iter().any(|name| {
+        !matches!(
+            std::fs::symlink_metadata(project.root.join(name)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    })
 }
 
 /// One [`DiagnosticKind::StricterNative`] warning per selector cooldown withholds from pnpm's
@@ -6413,6 +6514,7 @@ packages:
             exempt_packages: vec!["@typescript/native-preview".to_string()],
             withheld_exemptions: Vec::new(),
             package_windows: std::collections::BTreeMap::new(),
+            admission_bound: None,
             admitted_versions: Some(Vec::new()),
         };
 
@@ -6471,6 +6573,7 @@ packages:
             exempt_packages: vec!["new-glob".to_string(), "@corp/*".to_string()],
             withheld_exemptions: Vec::new(),
             package_windows: std::collections::BTreeMap::new(),
+            admission_bound: None,
             admitted_versions: None,
         };
         let (_cache, tool) = pnpm_sync_tool()?;
@@ -6514,6 +6617,7 @@ packages:
             exempt_packages: selectors.iter().map(ToString::to_string).collect(),
             withheld_exemptions: Vec::new(),
             package_windows: std::collections::BTreeMap::new(),
+            admission_bound: None,
             admitted_versions: admitted.map(|admitted| {
                 admitted
                     .iter()
@@ -6588,6 +6692,17 @@ packages:
         versions: &[(&str, &str)],
         routing: &str,
     ) -> eyre::Result<(tempfile::TempDir, NpmTool<Pnpm>)> {
+        pnpm_sync_tool_scripted(root, versions, routing, "echo 'undefined'; exit 0")
+    }
+
+    /// Like [`pnpm_sync_tool_routed`], with the shell `config_get` answering every `config get`.
+    #[cfg(unix)]
+    fn pnpm_sync_tool_scripted(
+        root: &Utf8Path,
+        versions: &[(&str, &str)],
+        routing: &str,
+        config_get: &str,
+    ) -> eyre::Result<(tempfile::TempDir, NpmTool<Pnpm>)> {
         use std::fmt::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
         let mut lock = String::from("lockfileVersion: '9.0'\n\npackages:\n");
@@ -6607,7 +6722,7 @@ packages:
                   *"config list"*)
                     {routing} ;;
                   *"config get"*)
-                    echo 'undefined'; exit 0 ;;
+                    {config_get} ;;
                   *"--version"*)
                     echo '11.8.0'; exit 0 ;;
                 esac
@@ -6620,6 +6735,505 @@ packages:
             cache,
             tool.with_driver(crate::nodecmd::NodeCmd::with_bin(script.as_str())),
         ))
+    }
+
+    /// A 14-day sync policy whose evaluation admitted `admitted`, each with its age in hours.
+    #[cfg(unix)]
+    fn aged_sync_policy(admitted: &[(&str, &str, i64)]) -> ResolvedPolicy {
+        ResolvedPolicy {
+            admitted_versions: Some(
+                admitted
+                    .iter()
+                    .map(|(name, version, hours)| cooldown_core::AdmittedVersion {
+                        name: (*name).to_string(),
+                        version: Version::new(*version),
+                        age: jiff::SignedDuration::from_hours(*hours),
+                    })
+                    .collect(),
+            ),
+            ..pnpm_sync_policy(&[], None)
+        }
+    }
+
+    /// The admissions inside `scope`, the young ones and every one of a package it names, judged
+    /// under its bound, as the application hands a bounded evaluation to the writer.
+    #[cfg(unix)]
+    fn scoped_admissions(
+        policy: &ResolvedPolicy,
+        scope: &cooldown_core::SyncAdmissionScope,
+    ) -> ResolvedPolicy {
+        let cooldown_core::SyncAdmissionScope::Bounded { floor, packages } = scope else {
+            return policy.clone();
+        };
+        ResolvedPolicy {
+            admitted_versions: policy.admitted_versions.as_ref().map(|admitted| {
+                admitted
+                    .iter()
+                    .filter(|version| version.age < *floor || packages.contains(&version.name))
+                    .cloned()
+                    .collect()
+            }),
+            admission_bound: Some(*floor),
+            ..policy.clone()
+        }
+    }
+
+    /// Syncs `policy` into a fresh project whose lock holds `locked` and whose file lists the
+    /// exact entries of `listed`, `stale` and `refused`, judging only the admissions inside the
+    /// adapter's scope when `bounded`, and returns that scope, the file and the warnings.
+    #[cfg(unix)]
+    async fn exclusion_fixture_sync(
+        locked: &[(&str, &str)],
+        policy: &ResolvedPolicy,
+        bounded: bool,
+    ) -> eyre::Result<(cooldown_core::SyncAdmissionScope, String, Vec<Diagnostic>)> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let path = root.join("pnpm-workspace.yaml");
+        std::fs::write(
+            &path,
+            indoc! {r#"
+                packages: []
+                minimumReleaseAge: 20160
+                minimumReleaseAgeExclude:
+                  - "listed@1.0.0"
+                  - "stale@1.0.0"
+                  - "refused@1.0.0"
+            "#},
+        )?;
+        let project = pnpm_sync_project(&root);
+        let (_cache, tool) = pnpm_sync_tool_proving(&root, locked)?;
+        let scope = tool.sync_admission_scope(&project, policy).await;
+        let judged = if bounded {
+            scoped_admissions(policy, &scope)
+        } else {
+            policy.clone()
+        };
+        let report = tool.write_native(&project, &judged, false).await?;
+        Ok((
+            scope,
+            std::fs::read_to_string(&path)?,
+            sync_warnings(&report).to_vec(),
+        ))
+    }
+
+    /// Bounding the evaluation to the versions young under the written window and the packages
+    /// the file's exact entries name writes and warns exactly as the evaluation of every locked
+    /// version does: an unrelated mature entry is still pruned, a young admission granted, and
+    /// the override warning after the write names the same version.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_bounded_admission_scope_syncs_as_a_full_evaluation() -> eyre::Result<()> {
+        // Many mature admitted packages besides the ones whose verdicts decide anything.
+        let others: Vec<String> = (0..20).map(|index| format!("other-{index}")).collect();
+        let mut locked = vec![
+            ("next", "15.0.0"),
+            ("listed", "1.0.0"),
+            ("stale", "1.0.0"),
+            ("refused", "1.0.0"),
+        ];
+        locked.extend(others.iter().map(|name| (name.as_str(), "1.0.0")));
+        // `next` is two hours old, young under pnpm's built-in day too, so the override
+        // warning names it; `stale` is admitted but mature, so its entry goes, and `refused`
+        // is not admitted, so its entry goes as well.
+        let mut admitted = vec![
+            ("next", "15.0.0", 2),
+            ("listed", "1.0.0", 48),
+            ("stale", "1.0.0", 24 * 30),
+        ];
+        admitted.extend(others.iter().map(|name| (name.as_str(), "1.0.0", 24 * 30)));
+        let policy = aged_sync_policy(&admitted);
+
+        let (scope, bounded_yaml, bounded_warnings) =
+            exclusion_fixture_sync(&locked, &policy, true).await?;
+        let (_, full_yaml, full_warnings) = exclusion_fixture_sync(&locked, &policy, false).await?;
+
+        // The scope is the written window and the packages the exact entries name.
+        assert_eq!(
+            scope,
+            cooldown_core::SyncAdmissionScope::Bounded {
+                floor: jiff::SignedDuration::from_hours(24 * 14),
+                packages: ["listed", "refused", "stale"]
+                    .into_iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            }
+        );
+        assert_eq!(bounded_yaml, full_yaml);
+        assert_eq!(bounded_warnings, full_warnings);
+        assert_eq!(
+            NativeAge::parse(&bounded_yaml, Utf8Path::new("pnpm-workspace.yaml"))?
+                .exclusions
+                .into_vec(),
+            ["listed@1.0.0", "next@15.0.0"]
+        );
+        assert!(
+            bounded_warnings
+                .iter()
+                .any(|warning| warning.message.contains("next@15.0.0")),
+            "{bounded_warnings:?}"
+        );
+        Ok(())
+    }
+
+    /// A temporary project root for the native sync tests.
+    #[cfg(unix)]
+    fn sync_tempdir() -> eyre::Result<(tempfile::TempDir, Utf8PathBuf)> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        Ok((directory, root))
+    }
+
+    /// A sync tool for `root` whose lock holds `foo@1.0.0` (ten days old), `young@1.0.0` (one
+    /// day old) and `stale@1.0.0`, whose file lists the exact entry of `stale`, and whose
+    /// scripted pnpm answers every `config get` with the shell `config_get`.
+    #[cfg(unix)]
+    fn bound_fixture(
+        root: &Utf8Path,
+        config_get: &str,
+    ) -> eyre::Result<(tempfile::TempDir, NpmTool<Pnpm>)> {
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            indoc! {r#"
+                packages: []
+                minimumReleaseAge: 10080
+                minimumReleaseAgeExclude:
+                  - "stale@1.0.0"
+            "#},
+        )?;
+        pnpm_sync_tool_scripted(
+            root,
+            &[("foo", "1.0.0"), ("young", "1.0.0"), ("stale", "1.0.0")],
+            r#"echo '{"registry":"https://registry.npmjs.org/"}'; exit 0"#,
+            config_get,
+        )
+    }
+
+    /// A seven-day sync policy over the [`bound_fixture`] lock, whose evaluation admitted the
+    /// ten-day-old `foo`, the day-old `young` and the mature `stale`, or under `bound` only
+    /// the versions a seven-day scope keeps.
+    #[cfg(unix)]
+    fn ten_day_pin_policy(bound: bool) -> ResolvedPolicy {
+        let seven_days = jiff::SignedDuration::from_hours(24 * 7);
+        let admitted = [("foo", 240), ("young", 24), ("stale", 24 * 60)]
+            .into_iter()
+            .filter(|(_, hours)| !bound || jiff::SignedDuration::from_hours(*hours) < seven_days)
+            .map(|(name, hours)| cooldown_core::AdmittedVersion {
+                name: name.to_string(),
+                version: Version::new("1.0.0"),
+                age: jiff::SignedDuration::from_hours(hours),
+            })
+            .collect();
+        ResolvedPolicy {
+            default_window: Some(cooldown_core::WindowSpec::MinAge(seven_days)),
+            admitted_versions: Some(admitted),
+            admission_bound: bound.then_some(seven_days),
+            ..pnpm_sync_policy(&[], None)
+        }
+    }
+
+    /// The exact entries of `path` and the messages of `report`'s warnings.
+    #[cfg(unix)]
+    fn written_entries(
+        path: &Utf8Path,
+        report: &SyncReport,
+    ) -> eyre::Result<(Vec<String>, Vec<String>)> {
+        Ok((
+            NativeAge::read(path)?.exclusions.into_vec(),
+            sync_warnings(report)
+                .iter()
+                .map(|warning| warning.message.clone())
+                .collect(),
+        ))
+    }
+
+    /// A bounded evaluation lacks the verdict on a version older than its bound, so when pnpm's
+    /// window has grown past that bound by the time sync writes, the writer keeps the exact
+    /// entries as written and adds none rather than lose a grant: a full evaluation exempts the
+    /// ten-day-old `foo` under pnpm's fourteen-day window, which the bounded one never judged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_bounded_sync_keeps_the_entries_when_pnpms_window_outgrows_the_bound()
+    -> eyre::Result<()> {
+        let fourteen_days = "echo 20160; exit 0";
+
+        // Full evaluation: pnpm's longer window makes the ten-day-old pin young, so it is granted.
+        let (_full_dir, full_root) = sync_tempdir()?;
+        let (_cache, tool) = bound_fixture(&full_root, fourteen_days)?;
+        let path = full_root.join("pnpm-workspace.yaml");
+        let report = tool
+            .write_native(
+                &pnpm_sync_project(&full_root),
+                &ten_day_pin_policy(false),
+                true,
+            )
+            .await?;
+        assert!(sync_warnings(&report).is_empty(), "{report:?}");
+        tool.write_native(
+            &pnpm_sync_project(&full_root),
+            &ten_day_pin_policy(false),
+            false,
+        )
+        .await?;
+        assert_eq!(
+            NativeAge::read(&path)?.exclusions.into_vec(),
+            ["foo@1.0.0", "young@1.0.0"]
+        );
+
+        // Bounded evaluation: the bound no longer holds, so nothing is pruned or granted.
+        let (_bounded_dir, bounded_root) = sync_tempdir()?;
+        let (_cache, tool) = bound_fixture(&bounded_root, fourteen_days)?;
+        let path = bounded_root.join("pnpm-workspace.yaml");
+        let report = tool
+            .write_native(
+                &pnpm_sync_project(&bounded_root),
+                &ten_day_pin_policy(true),
+                false,
+            )
+            .await?;
+        let (entries, warnings) = written_entries(&path, &report)?;
+        assert_eq!(entries, ["stale@1.0.0"]);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("became longer than the window")),
+            "{warnings:?}"
+        );
+
+        // Bounded evaluation whose bound holds: it syncs as the full evaluation does.
+        let (_held_dir, held_root) = sync_tempdir()?;
+        let (_cache, tool) = bound_fixture(&held_root, "echo 10080; exit 0")?;
+        let report = tool
+            .write_native(
+                &pnpm_sync_project(&held_root),
+                &ten_day_pin_policy(true),
+                false,
+            )
+            .await?;
+        let held = written_entries(&held_root.join("pnpm-workspace.yaml"), &report)?;
+        let (_control_dir, control_root) = sync_tempdir()?;
+        let (_cache, tool) = bound_fixture(&control_root, "echo 10080; exit 0")?;
+        let report = tool
+            .write_native(
+                &pnpm_sync_project(&control_root),
+                &ten_day_pin_policy(false),
+                false,
+            )
+            .await?;
+        let control = written_entries(&control_root.join("pnpm-workspace.yaml"), &report)?;
+        assert_eq!(held, control);
+        assert_eq!(held.0, ["young@1.0.0"]);
+        Ok(())
+    }
+
+    /// A bounded evaluation whose admissions are all mature still asks pnpm for its window, so a
+    /// query that fails keeps the exact entries as written and says so, as the full evaluation
+    /// with the same failing query does, instead of pruning the mature entry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_bounded_sync_with_only_mature_admissions_still_checks_pnpms_window()
+    -> eyre::Result<()> {
+        let mature = |bound: bool| ResolvedPolicy {
+            admitted_versions: Some(if bound {
+                Vec::new()
+            } else {
+                vec![cooldown_core::AdmittedVersion {
+                    name: "stale".to_string(),
+                    version: Version::new("1.0.0"),
+                    age: jiff::SignedDuration::from_hours(24 * 60),
+                }]
+            }),
+            admission_bound: bound.then_some(jiff::SignedDuration::from_hours(24 * 7)),
+            ..ten_day_pin_policy(false)
+        };
+        let mut outcomes = Vec::new();
+        for bound in [false, true] {
+            let (_dir, root) = sync_tempdir()?;
+            let (_cache, tool) = bound_fixture(&root, "echo 'boom' >&2; exit 1")?;
+            let report = tool
+                .write_native(&pnpm_sync_project(&root), &mature(bound), false)
+                .await?;
+            outcomes.push(written_entries(&root.join("pnpm-workspace.yaml"), &report)?);
+        }
+
+        assert_eq!(outcomes[0], outcomes[1]);
+        assert_eq!(outcomes[1].0, ["stale@1.0.0"]);
+        assert!(
+            outcomes[1]
+                .1
+                .iter()
+                .any(|warning| warning.contains("could not be read")),
+            "{:?}",
+            outcomes[1].1
+        );
+        Ok(())
+    }
+
+    /// When pnpm's window grows past the bound between the write and the override check after
+    /// it, the bounded list cannot name every version the longer window refuses, so the warning
+    /// says that a bare install may refuse admitted versions without naming any.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_bounded_override_warning_names_no_version_past_the_bound() -> eyre::Result<()> {
+        let (_dir, root) = sync_tempdir()?;
+        // pnpm's window is the written seven days at the write and fourteen days after it.
+        let config_get = r#"case "$*" in
+                    *minimumReleaseAgeExclude*) echo '[]'; exit 0 ;;
+                  esac
+                  if [ -f "$0.asked" ]; then echo 20160; else touch "$0.asked"; echo 10080; fi
+                  exit 0"#;
+        let (_cache, tool) = bound_fixture(&root, config_get)?;
+
+        let report = tool
+            .write_native(&pnpm_sync_project(&root), &ten_day_pin_policy(true), false)
+            .await?;
+
+        let (entries, warnings) = written_entries(&root.join("pnpm-workspace.yaml"), &report)?;
+        assert_eq!(entries, ["young@1.0.0"]);
+        assert_eq!(
+            warnings,
+            [
+                "a higher-precedence setting, such as an environment variable, a CLI flag or a \
+              pnpmfile, sets a longer minimumReleaseAge than pnpm-workspace.yaml here, so a bare \
+              pnpm install may refuse versions cooldown admits"
+            ]
+        );
+        Ok(())
+    }
+
+    /// The scope's probe leaves a failed `config list` out of the cache: it falls back to every
+    /// version, and the writer, whose own query then succeeds, proves the young version's origin
+    /// and grants it instead of keeping the entries as written for unknown routing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_scope_probe_does_not_decide_the_writers_routing() -> eyre::Result<()> {
+        let (_dir, root) = sync_tempdir()?;
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            indoc! {r#"
+                packages: []
+                minimumReleaseAge: 10080
+                minimumReleaseAgeExclude:
+                  - "stale@1.0.0"
+            "#},
+        )?;
+        // The first `config list` fails and every later one succeeds.
+        let (_cache, tool) = pnpm_sync_tool_scripted(
+            &root,
+            &[("foo", "1.0.0"), ("young", "1.0.0"), ("stale", "1.0.0")],
+            r#"if [ -f "$0.listed" ]; then echo '{"registry":"https://registry.npmjs.org/"}'; exit 0; fi
+                    touch "$0.listed"; exit 1"#,
+            "echo 10080; exit 0",
+        )?;
+        let project = pnpm_sync_project(&root);
+        let policy = ten_day_pin_policy(false);
+
+        let scope = tool.sync_admission_scope(&project, &policy).await;
+        let report = tool.write_native(&project, &policy, false).await?;
+
+        assert_eq!(scope, cooldown_core::SyncAdmissionScope::Every);
+        let (entries, warnings) = written_entries(&root.join("pnpm-workspace.yaml"), &report)?;
+        assert_eq!(entries, ["young@1.0.0"]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        Ok(())
+    }
+
+    /// The scope evaluates every locked version wherever the written window cannot bound the
+    /// gate: no positive minute count to write, an unreadable or stricter effective window, or
+    /// a pnpmfile that may set a window the configuration queries do not report.
+    /// A window as long as the written one still bounds it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_admission_scope_falls_back_to_every_version() -> eyre::Result<()> {
+        let fourteen_days = Some(cooldown_core::WindowSpec::MinAge(
+            jiff::SignedDuration::from_hours(24 * 14),
+        ));
+        let undefined = "echo 'undefined'; exit 0";
+        let cases = [
+            (
+                "freeze",
+                Some(cooldown_core::WindowSpec::Freeze(
+                    "2026-01-01T00:00:00Z".parse()?,
+                )),
+                undefined,
+                false,
+                false,
+            ),
+            (
+                "latest",
+                Some(cooldown_core::WindowSpec::Latest),
+                undefined,
+                false,
+                false,
+            ),
+            (
+                "zero",
+                Some(cooldown_core::WindowSpec::MinAge(
+                    jiff::SignedDuration::ZERO,
+                )),
+                undefined,
+                false,
+                false,
+            ),
+            ("no window", None, undefined, false, false),
+            (
+                "failed floor query",
+                fourteen_days.clone(),
+                "echo 'boom' >&2; exit 1",
+                false,
+                false,
+            ),
+            (
+                "stricter floor",
+                fourteen_days.clone(),
+                "echo 20161; exit 0",
+                false,
+                false,
+            ),
+            ("pnpmfile", fourteen_days.clone(), undefined, true, false),
+            (
+                "equal floor",
+                fourteen_days,
+                "echo 20160; exit 0",
+                false,
+                true,
+            ),
+        ];
+        for (case, window, config_get, pnpmfile, bounded) in cases {
+            let directory = tempfile::tempdir()?;
+            let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
+                .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+            std::fs::write(
+                root.join("pnpm-workspace.yaml"),
+                "packages: []\nminimumReleaseAge: 20160\n",
+            )?;
+            if pnpmfile {
+                std::fs::write(root.join(".pnpmfile.cjs"), "module.exports = {}\n")?;
+            }
+            let (_cache, tool) = pnpm_sync_tool_scripted(
+                &root,
+                &[("foo", "1.0.0")],
+                r#"echo '{"registry":"https://registry.npmjs.org/"}'; exit 0"#,
+                config_get,
+            )?;
+            let policy = ResolvedPolicy {
+                default_window: window,
+                ..pnpm_sync_policy(&[], Some(&[]))
+            };
+
+            let scope = tool
+                .sync_admission_scope(&pnpm_sync_project(&root), &policy)
+                .await;
+
+            assert_eq!(
+                matches!(scope, cooldown_core::SyncAdmissionScope::Bounded { .. }),
+                bounded,
+                "{case}: {scope:?}"
+            );
+        }
+        Ok(())
     }
 
     /// A routing query that fails is incomplete evidence, not a disproof: sync keeps every
