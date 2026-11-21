@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **pnpm no longer warns `unpaired_move` about requirements that did not move.** A dependent with
+  two copies that both moved, such as `@babel/traverse` 7.29.12 → 7.29.13 and 8.0.10 → 8.1.0, kept
+  one group of lock records binding several versions on each side, so a requirement still binding
+  the same versions afterwards (`@jridgewell/gen-mapping` at 0.3.13 and 0.4.0-beta.0) was reported
+  as moved "from 0.3.13, 0.4.0-beta.0 to 0.3.13, 0.4.0-beta.0". A requirement whose records bind
+  the same versions before and after no longer warns; one whose versions changed still does. Its
+  edges still credit no landing, since which old record continues as which new one stays unproven.
+  Closes #135.
 - **A batch fetches each npm package document once, whatever the number of locked copies.**
   `upgrade` revalidates every npm package document, and each locked copy of a package fetched it
   again: one large monorepo run asked for `semver` four times at once, once per copy, in each of

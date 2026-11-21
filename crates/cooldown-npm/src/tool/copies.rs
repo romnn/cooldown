@@ -210,15 +210,21 @@ impl CopyLedger {
                     from: binding.version.clone(),
                     fate: Fate::Unpaired,
                 }));
-                ledger.unpaired.push(UnpairedRequirement {
-                    dependent: match &dependent {
-                        Dependent::Importer(path) => format!("importer `{path}`"),
-                        Dependent::Package(name) => name.clone(),
-                    },
-                    name,
-                    before: versions(&before),
-                    after: versions(&after),
-                });
+                // Records whose versions are the same multiset on both sides bind what they bound
+                // before, so the requirement did not move and there is nothing to warn about. The
+                // edges stay unpaired all the same: which old record continues as which new one is
+                // still unproven, so they credit no landing.
+                if version_multiset(&before) != version_multiset(&after) {
+                    ledger.unpaired.push(UnpairedRequirement {
+                        dependent: match &dependent {
+                            Dependent::Importer(path) => format!("importer `{path}`"),
+                            Dependent::Package(name) => name.clone(),
+                        },
+                        name,
+                        before: versions(&before),
+                        after: versions(&after),
+                    });
+                }
             }
         }
         ledger
@@ -446,6 +452,16 @@ fn group<K: Ord>(
         groups.entry(key(&binding)).or_default().1.push(binding);
     }
     groups
+}
+
+/// The versions `bindings` bind, one per binding, sorted.
+fn version_multiset(bindings: &[CopyBinding]) -> Vec<&str> {
+    let mut versions: Vec<&str> = bindings
+        .iter()
+        .map(|binding| binding.version.as_str())
+        .collect();
+    versions.sort_unstable();
+    versions
 }
 
 fn versions(bindings: &[CopyBinding]) -> BTreeSet<String> {
@@ -1026,6 +1042,93 @@ pub(super) mod tests {
         let dropped = ledger.landing(&transitive("leaf", "1.3.0", "1.4.0"));
         assert!(!dropped.replaced(), "{dropped:?}");
         assert!(!dropped.explains_hold(), "{dropped:?}");
+        Ok(())
+    }
+
+    /// A lock whose dependent `p` has a 7.x and an 8.x copy, each binding its own `leaf`.
+    fn two_copies(seven: &str, seven_leaf: &str, eight: &str, eight_leaf: &str) -> String {
+        format!(
+            indoc! {"
+                lockfileVersion: '9.0'
+
+                importers:
+
+                  .:
+                    dependencies:
+                      a:
+                        specifier: ^1.0.0
+                        version: 1.0.0
+
+                snapshots:
+
+                  a@1.0.0: {{}}
+
+                  p@{}:
+                    dependencies:
+                      leaf: {}
+
+                  p@{}:
+                    dependencies:
+                      leaf: {}
+            "},
+            seven, seven_leaf, eight, eight_leaf
+        )
+    }
+
+    /// A dependent with two copies that both moved, each still binding the same version of a
+    /// requirement, warns about nothing: the requirement binds the same versions before and after.
+    /// Its edges stay unpaired, since which old record continues as which new one is unproven, so
+    /// they still credit no landing.
+    #[test]
+    fn moved_copies_binding_the_same_versions_do_not_warn() -> eyre::Result<()> {
+        let ledger = ledger(
+            &two_copies("7.29.12", "0.3.13", "8.0.10", "0.4.0-beta.0"),
+            &two_copies("7.29.13", "0.3.13", "8.1.0", "0.4.0-beta.0"),
+        )?;
+
+        assert_eq!(ledger.unpaired(), []);
+        assert_eq!(moves(&ledger), Vec::<(String, String, String)>::new());
+        let landing = ledger.landing(&transitive("leaf", "0.3.13", "0.3.14"));
+        assert!(!landing.replaced(), "{landing:?}");
+        assert!(landing.explains_hold(), "{landing:?}");
+        Ok(())
+    }
+
+    /// A swap of two versions across the copies binds the same versions afterwards, so it does not
+    /// warn, and it credits neither direction as a move.
+    #[test]
+    fn swapped_versions_across_copies_credit_no_move() -> eyre::Result<()> {
+        let ledger = ledger(
+            &two_copies("7.29.12", "1.0.0", "8.0.10", "2.0.0"),
+            &two_copies("7.29.13", "2.0.0", "8.1.0", "1.0.0"),
+        )?;
+
+        assert_eq!(ledger.unpaired(), []);
+        assert_eq!(moves(&ledger), Vec::<(String, String, String)>::new());
+        let landing = ledger.landing(&transitive("leaf", "1.0.0", "2.0.0"));
+        assert!(!landing.replaced(), "{landing:?}");
+        Ok(())
+    }
+
+    /// A requirement whose versions differ after the resolve still warns, even when one version is
+    /// on both sides, and pairs nothing.
+    #[test]
+    fn a_requirement_whose_versions_changed_still_warns() -> eyre::Result<()> {
+        let ledger = ledger(
+            &two_copies("7.29.12", "1.0.0", "8.0.10", "2.0.0"),
+            &two_copies("7.29.13", "1.0.0", "8.1.0", "3.0.0"),
+        )?;
+
+        assert_eq!(
+            ledger.unpaired(),
+            [UnpairedRequirement {
+                dependent: "p".to_string(),
+                name: "leaf".to_string(),
+                before: BTreeSet::from(["1.0.0".to_string(), "2.0.0".to_string()]),
+                after: BTreeSet::from(["1.0.0".to_string(), "3.0.0".to_string()]),
+            }]
+        );
+        assert_eq!(moves(&ledger), Vec::<(String, String, String)>::new());
         Ok(())
     }
 
