@@ -171,6 +171,8 @@ struct Script {
     straggler: Option<Straggler>,
     /// The `name@target`s whose trials fail instead of resolving, and how.
     failures: Vec<(&'static str, Failure)>,
+    /// How many trials carrying a failing target resolve normally before its failure starts.
+    failing_after: usize,
 }
 
 /// How a trial carrying a scripted target fails.
@@ -358,10 +360,19 @@ impl FakeNode {
 
     /// Fails a trial planning a target scripted to fail, the way [`Failure`] describes.
     fn fail_as_scripted(&self, project: &Project, plan: &Plan) -> cooldown_core::Result<()> {
+        // The trial log already holds this trial.
+        let carried = |target: &str| {
+            self.trials()
+                .iter()
+                .filter(|trial| trial.iter().any(|logged| logged == target))
+                .count()
+        };
         let failure = self.script.failures.iter().find_map(|(target, failure)| {
-            plan.changes
+            (plan
+                .changes
                 .iter()
                 .any(|change| format!("{}@{}", change.package.name, change.to) == *target)
+                && carried(target) > self.script.failing_after)
                 .then_some(*failure)
         });
         match failure {
@@ -2278,6 +2289,135 @@ fn fresh_child_float() -> Float {
         from: "1.0.0",
         to: "1.1.0",
     }
+}
+
+/// `safe` floats a young `child` the native gate refuses, which blocks the whole batch, while
+/// `other` is independent; the second trial carrying `safe` fails the way `failure` describes.
+fn native_refused_safe_failing(failure: Failure) -> eyre::Result<NodeFixture> {
+    let fake = FakeNode::new(
+        TargetFallback::None,
+        Script {
+            float: Some(fresh_child_float()),
+            failures: vec![("safe@1.1.0", failure)],
+            failing_after: 1,
+            ..Script::default()
+        },
+    )
+    .with_releases("safe", &[("1.0.0", false), ("1.1.0", false)])
+    .with_releases("child", &[("1.0.0", false), ("1.1.0", true)])
+    .with_releases("other", &[("1.0.0", false), ("1.1.0", false)])
+    .with_native(NativeList {
+        backstop_refuses: Some("child@1.1.0"),
+        ..NativeList::default()
+    });
+    fixture(
+        fake,
+        &[("child", "1.0.0"), ("other", "1.0.0"), ("safe", "1.0.0")],
+    )
+}
+
+/// A partition trial that aborts after an earlier one verified `other` drops only its own group
+/// (#146): its failure is reported once as a project error, while `other` is still replayed and
+/// lands with no error.
+#[tokio::test]
+async fn an_aborted_partition_trial_keeps_the_candidates_already_verified() -> eyre::Result<()> {
+    let allow = RunOpts {
+        transitive_mode: TransitiveGate::Allow,
+        ..RunOpts::default()
+    };
+    let fixture = native_refused_safe_failing(Failure::Crash)?;
+
+    let outcome = fixture.workspace.upgrade(&allow).await;
+
+    assert_eq!(locked(&fixture, "other")?.as_deref(), Some("1.1.0"));
+    assert_eq!(locked(&fixture, "safe")?.as_deref(), Some("1.0.0"));
+    assert_eq!(locked(&fixture, "child")?.as_deref(), Some("1.0.0"));
+    let other: Vec<_> = outcome
+        .items
+        .iter()
+        .filter(|item| item.name == "other")
+        .collect();
+    assert!(
+        other
+            .iter()
+            .all(|item| item.applied && item.error.is_none()),
+        "{:?}",
+        outcome.items
+    );
+    assert_eq!(other.len(), 1, "{:?}", outcome.items);
+    // The failure is reported once for the project, never on the row of a change it did not
+    // decide.
+    assert!(
+        outcome.items.iter().all(|item| item.name != "safe"),
+        "{:?}",
+        outcome.items
+    );
+    let crash: Vec<_> = outcome
+        .errors
+        .iter()
+        .filter(|error| error.message.contains(CRASH))
+        .collect();
+    assert!(
+        !crash.is_empty() && crash.iter().all(|error| error.package.is_none()),
+        "{:?}",
+        outcome.errors
+    );
+    assert_eq!(outcome.exit, Exit::Environment);
+    // No rollback found the project changed, so the verified candidate could replay.
+    assert!(
+        outcome
+            .errors
+            .iter()
+            .chain(outcome.items.iter().filter_map(|item| item.error.as_ref()))
+            .all(|error| !error.message.contains("indeterminate")),
+        "{:?}",
+        outcome.errors
+    );
+    // The policy-blocked batch, `other` alone, the aborted `other` beside `safe`, and the replay.
+    let trials = fixture.fake.trials();
+    assert_eq!(trials.len(), 4, "{trials:?}");
+    assert_eq!(trials.last(), Some(&vec!["other@1.1.0".to_string()]));
+    Ok(())
+}
+
+/// A partition trial that leaves a restore conflict still stops the project with nothing
+/// applied and no replay: whether its apply reports recovery evidence it still owns while the
+/// rollback itself succeeds, or the rollback meets an edit made behind cooldown's back, which is
+/// kept.
+#[tokio::test]
+async fn a_partition_trial_with_a_restore_conflict_stops_without_a_replay() -> eyre::Result<()> {
+    let allow = RunOpts {
+        transitive_mode: TransitiveGate::Allow,
+        ..RunOpts::default()
+    };
+    for failure in [Failure::PendingRecovery, Failure::Drift] {
+        let fixture = native_refused_safe_failing(failure)?;
+        let manifest = std::fs::read_to_string(fixture.project.root.join(MANIFEST))?;
+
+        let outcome = fixture.workspace.upgrade(&allow).await;
+
+        assert!(
+            !outcome.errors.is_empty() || outcome.items.iter().any(|item| item.error.is_some()),
+            "{:?}",
+            outcome.items
+        );
+        assert_ne!(outcome.exit, Exit::Ok);
+        assert!(outcome.items.iter().all(|item| !item.applied));
+        assert_eq!(locked(&fixture, "other")?.as_deref(), Some("1.0.0"));
+        let expected = if matches!(failure, Failure::Drift) {
+            r#"{"drift":true}"#.to_string()
+        } else {
+            manifest
+        };
+        assert_eq!(
+            std::fs::read_to_string(fixture.project.root.join(MANIFEST))?,
+            expected
+        );
+        // No trial runs after the conflicted partition trial.
+        let trials = fixture.fake.trials();
+        assert_eq!(trials.len(), 3, "{trials:?}");
+    }
+    Ok(())
 }
 
 /// A committed batch is assessed after its apply, and its assessed list is written before the
