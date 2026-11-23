@@ -242,8 +242,9 @@ tool whose mise configuration you do not need.
 Cargo has been seen to crash with a signal, such as a segmentation fault, right after printing an
 ordinary resolver conflict that the same command otherwise reports normally. A cargo read that a
 signal kills runs once more: a `--locked` read always, and a resolve in cooldown's private staged
-copy when its `Cargo.lock` still holds the bytes it had, or is still absent. Nothing is restored, so
-a resolve that changed the lock before it crashed is not run again. The second run's result
+copy while that copy is still the one cooldown prepared and its `Cargo.lock` still holds the bytes it
+had, or is still absent. Nothing is restored, so a resolve that changed the lock before it crashed is
+not run again. The second run's result
 stands; only a second crash fails the project, and its error says cargo was killed by the signal
 after printing its output, instead of presenting that output as the cause.
 

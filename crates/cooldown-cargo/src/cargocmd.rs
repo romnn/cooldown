@@ -4,8 +4,8 @@ use crate::publish_age::{CRATES_IO_AGE_KEY, CargoEnvironment, PublishAgeSettings
 use camino::Utf8Path;
 use cooldown_adapter_util::{resolve_program, supervised_output};
 use cooldown_core::{
-    CoreError, GeneratedMembers, LockStatus, LockVerifyReport, MemberRef, ToolTermination,
-    VerifyReport, failure_detail,
+    CoreError, GeneratedMembers, LockStatus, LockVerifyReport, MemberRef, ProjectMutationJournal,
+    ToolTermination, VerifyReport, failure_detail,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use tokio::process::Command;
@@ -581,42 +581,24 @@ pub(crate) struct StagingPackage {
     pub(crate) workspace_member: bool,
 }
 
-/// What a lock path held, compared before and after a command a signal killed.
-#[derive(Debug, PartialEq, Eq)]
-enum LockSnapshot {
-    /// No file at the path.
-    Absent,
-    /// A regular file with one link and these bytes.
-    File(Vec<u8>),
-    /// Anything that cannot prove the inputs unchanged: a symbolic or second hard link, through
-    /// which a write would reach another file, a directory, an unreadable file.
-    Unknown,
+/// When a Cargo command a signal killed may run once more.
+#[derive(Clone, Copy)]
+pub(crate) enum Rerun<'a> {
+    /// The command writes nothing, as a `--locked` read: it always may.
+    ReadOnly,
+    /// The command may write the lock of the staged project this journal guards: it may while
+    /// the journal still validates the project, whose identity and file topology it checks, and
+    /// the lock holds the bytes it had before the first run, or is still absent.
+    Staged(&'a ProjectMutationJournal),
 }
 
-impl LockSnapshot {
-    fn of(path: &Utf8Path) -> Self {
-        match std::fs::symlink_metadata(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => LockSnapshot::Absent,
-            Ok(metadata) if metadata.file_type().is_file() && single_link(&metadata) => {
-                std::fs::read(path).map_or(LockSnapshot::Unknown, LockSnapshot::File)
-            }
-            _ => LockSnapshot::Unknown,
-        }
+/// The bytes at `path`, `None` when there is no file.
+fn optional_bytes(path: &Utf8Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
-}
-
-/// Whether a file has no other hard link a write through it could reach.
-#[cfg(unix)]
-fn single_link(metadata: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    metadata.nlink() == 1
-}
-
-/// Whether a file has no other hard link a write through it could reach; Windows exposes no link
-/// count on stable Rust, and its staged copies are written by cooldown alone.
-#[cfg(not(unix))]
-fn single_link(_metadata: &std::fs::Metadata) -> bool {
-    true
 }
 
 /// Extracts the version from an exact `=x.y.z` Cargo requirement. Cargo uses a single `=`; the
@@ -1529,22 +1511,28 @@ impl Cargo {
     }
 
     /// Runs Cargo in `dir` with exactly `args`, once more when a signal kills the first run and
-    /// the inputs it may have written are provably as they were.
+    /// `rerun` still allows it.
     ///
     /// Cargo has crashed with a signal right after printing an ordinary resolver conflict, which
     /// the same command reproduces normally, so one crash proves nothing about the inputs.
-    /// `lock` names the lock the command may write: it must still be a regular file with one
-    /// link and the bytes it had, or still be absent, for the command to run again from the same
-    /// inputs.
-    /// `None` is for a command that writes no lock, such as a `--locked` read.
-    /// Nothing is restored: a changed lock leaves the first run's crash as the result.
+    /// Nothing is restored: a run that changed the lock before it crashed leaves its crash as
+    /// the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns the spawn error of either run, and the [`ProjectMutationJournal`]'s refusal when
+    /// the staged project it guards changed while the first run went on.
     pub(crate) async fn spawn_retrying(
         &self,
         dir: &Utf8Path,
         args: &[String],
-        lock: Option<&Utf8Path>,
+        rerun: Rerun<'_>,
     ) -> Result<std::process::Output, CoreError> {
-        let before = lock.map(|path| (path, LockSnapshot::of(path)));
+        let lock = dir.join("Cargo.lock");
+        let before = match rerun {
+            Rerun::ReadOnly => None,
+            Rerun::Staged(_) => Some(optional_bytes(&lock)),
+        };
         let first = self.spawn(dir, args).await?;
         if !matches!(
             ToolTermination::from_exit_status(first.status),
@@ -1552,11 +1540,15 @@ impl Cargo {
         ) {
             return Ok(first);
         }
-        let inputs_unchanged = before.is_none_or(|(path, before)| {
-            before != LockSnapshot::Unknown && LockSnapshot::of(path) == before
-        });
-        if !inputs_unchanged {
-            return Ok(first);
+        if let Rerun::Staged(journal) = rerun {
+            journal.validate_project(dir)?;
+            let unchanged = matches!(
+                (before, optional_bytes(&lock)),
+                (Some(Ok(before)), Ok(after)) if before == after
+            );
+            if !unchanged {
+                return Ok(first);
+            }
         }
         tracing::debug!(
             bin = self.bin,
@@ -1601,7 +1593,9 @@ impl Cargo {
     /// for any other failure.
     pub(crate) async fn locked_metadata_output(&self, dir: &Utf8Path) -> Result<String, CoreError> {
         let command = self.command_line(dir, &LOCKED_METADATA_ARGS)?;
-        let out = self.spawn_retrying(dir, &command.args, None).await?;
+        let out = self
+            .spawn_retrying(dir, &command.args, Rerun::ReadOnly)
+            .await?;
         if out.status.success() {
             return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
         }
@@ -2341,24 +2335,19 @@ mod tests {
         Ok(())
     }
 
-    /// A fake `cargo` in `root` that logs each run to `root/runs`, prints `diagnostic` and kills
-    /// itself with SIGKILL, which leaves no core dump, on its first `crashes` runs, appending to `root/Cargo.lock` first when
-    /// `touch_lock`, and otherwise exits 101.
+    /// A fake `cargo` in `root` that logs each run to `root/runs`, prints `diagnostic`, and on
+    /// its first `crashes` runs runs the shell command `before_crash` and kills itself with
+    /// SIGKILL, which leaves no core dump; otherwise it exits 101.
     #[cfg(unix)]
     fn crashing_cargo(
         root: &Utf8Path,
         diagnostic: &str,
         crashes: usize,
-        touch_lock: bool,
+        before_crash: &str,
     ) -> eyre::Result<Cargo> {
         use std::os::unix::fs::PermissionsExt as _;
 
         let fake = root.join("fake-cargo");
-        let touch = if touch_lock {
-            "echo '# rewritten' >> \"$dir/Cargo.lock\""
-        } else {
-            ":"
-        };
         std::fs::write(
             &fake,
             formatdoc! {r#"
@@ -2367,7 +2356,7 @@ mod tests {
                 echo run >> "$dir/runs"
                 printf '%s\n' '{diagnostic}' >&2
                 if [ "$(wc -l < "$dir/runs")" -le {crashes} ]; then
-                    {touch}
+                    {before_crash}
                     kill -KILL $$
                 fi
                 exit 101
@@ -2383,6 +2372,12 @@ mod tests {
         Ok(std::fs::read_to_string(root.join("runs"))?.lines().count())
     }
 
+    /// The journal of a staged project at `root` whose write set is its lock.
+    #[cfg(unix)]
+    fn lock_journal(root: &Utf8Path) -> eyre::Result<ProjectMutationJournal> {
+        Ok(ProjectMutationJournal::capture(root, ["Cargo.lock"])?)
+    }
+
     /// A signal that kills Cargo after an ordinary resolver conflict runs the command once more,
     /// and the second run's verdict stands.
     #[cfg(unix)]
@@ -2391,16 +2386,11 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let root = Utf8Path::from_path(directory.path())
             .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
-        let cargo = crashing_cargo(
-            root,
-            "error: failed to select a version for `psm`.",
-            1,
-            false,
-        )?;
-        let lock = root.join("Cargo.lock");
+        let cargo = crashing_cargo(root, "error: failed to select a version for `psm`.", 1, ":")?;
+        let journal = lock_journal(root)?;
 
         let out = cargo
-            .spawn_retrying(root, &["metadata".to_string()], Some(&lock))
+            .spawn_retrying(root, &["metadata".to_string()], Rerun::Staged(&journal))
             .await?;
 
         // The second run exited on its own, so its refusal is an ordinary resolver conflict.
@@ -2417,16 +2407,11 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let root = Utf8Path::from_path(directory.path())
             .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
-        let cargo = crashing_cargo(
-            root,
-            "error: failed to select a version for `psm`.",
-            2,
-            false,
-        )?;
-        let lock = root.join("Cargo.lock");
+        let cargo = crashing_cargo(root, "error: failed to select a version for `psm`.", 2, ":")?;
+        let journal = lock_journal(root)?;
 
         let out = cargo
-            .spawn_retrying(root, &["metadata".to_string()], Some(&lock))
+            .spawn_retrying(root, &["metadata".to_string()], Rerun::Staged(&journal))
             .await?;
         let error = cargo.failure(&out);
 
@@ -2455,12 +2440,13 @@ mod tests {
             root,
             "error: failed to select a version for `psm`.",
             1,
-            true,
+            "echo '# rewritten' >> \"$dir/Cargo.lock\"",
         )?;
         let lock = root.join("Cargo.lock");
+        let journal = lock_journal(root)?;
 
         let out = cargo
-            .spawn_retrying(root, &["metadata".to_string()], Some(&lock))
+            .spawn_retrying(root, &["metadata".to_string()], Rerun::Staged(&journal))
             .await?;
 
         assert_eq!(
@@ -2471,6 +2457,39 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&lock)?,
             "version = 4\n# rewritten\n"
+        );
+        Ok(())
+    }
+
+    /// A crash that left the staged project's files no longer the ones its journal guards, such
+    /// as a lock swapped for a link to the same bytes elsewhere, is a coordination failure: the
+    /// command does not run again, and the file the link names is left alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_crash_that_changed_the_project_topology_stops_the_rerun() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let cargo = crashing_cargo(
+            root,
+            "error: failed to select a version for `psm`.",
+            1,
+            "cp \"$dir/Cargo.lock\" \"$dir/source.lock\"; ln -sf source.lock \"$dir/Cargo.lock\"",
+        )?;
+        let journal = lock_journal(root)?;
+
+        let result = cargo
+            .spawn_retrying(root, &["metadata".to_string()], Rerun::Staged(&journal))
+            .await;
+
+        assert!(
+            matches!(result, Err(CoreError::LockConflict(_))),
+            "{result:?}"
+        );
+        assert_eq!(runs(root)?, 1);
+        assert_eq!(
+            std::fs::read_to_string(root.join("source.lock"))?,
+            "version = 4\n"
         );
         Ok(())
     }
@@ -2488,7 +2507,7 @@ mod tests {
             "error: cannot update the lock file /repo/Cargo.lock because --locked was passed to \
              prevent this",
             2,
-            false,
+            ":",
         )?;
 
         let error = cargo.locked_metadata_output(root).await.err();
@@ -2503,31 +2522,6 @@ mod tests {
                 })
             ),
             "{error:?}"
-        );
-        Ok(())
-    }
-
-    /// A lock with a second hard link proves nothing about the file a write reaches, so it is no
-    /// snapshot a retry may rely on.
-    #[cfg(unix)]
-    #[test]
-    fn a_hard_linked_lock_cannot_prove_the_inputs_unchanged() -> eyre::Result<()> {
-        let directory = tempfile::tempdir()?;
-        let root = Utf8Path::from_path(directory.path())
-            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
-        let lock = root.join("Cargo.lock");
-        std::fs::write(&lock, "version = 4\n")?;
-        assert_eq!(
-            LockSnapshot::of(&lock),
-            LockSnapshot::File(b"version = 4\n".to_vec())
-        );
-
-        std::fs::hard_link(&lock, root.join("elsewhere.lock"))?;
-
-        assert_eq!(LockSnapshot::of(&lock), LockSnapshot::Unknown);
-        assert_eq!(
-            LockSnapshot::of(&root.join("absent.lock")),
-            LockSnapshot::Absent
         );
         Ok(())
     }

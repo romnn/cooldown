@@ -56,6 +56,7 @@ struct CommandFixture {
     trees: StagedTrees,
     reads: LockedReads,
     lockstep: LockstepEdges,
+    journal: ProjectMutationJournal,
     #[expect(dead_code, reason = "dropping the guard deletes the fixture directory")]
     directory: tempfile::TempDir,
 }
@@ -89,6 +90,7 @@ impl CommandFixture {
         std::fs::write(root.join("Cargo.lock"), LOCK)?;
         std::fs::write(fixture.join("updated.lock"), "version = 4\n# updated\n")?;
         std::fs::write(fixture.join("resolved.lock"), "version = 4\n# resolved\n")?;
+        let journal = ProjectMutationJournal::capture(&root, ["Cargo.toml", "Cargo.lock"])?;
         let fake = fixture.join("fake-cargo");
         std::fs::write(&fake, SCRIPT)?;
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
@@ -108,6 +110,7 @@ impl CommandFixture {
             trees: StagedTrees::default(),
             reads: LockedReads::default(),
             lockstep: LockstepEdges::default(),
+            journal,
             directory,
         })
     }
@@ -128,6 +131,7 @@ impl CommandFixture {
             reads: &self.reads,
             lockstep: &self.lockstep,
             enabled: false,
+            journal: &self.journal,
         }
     }
 
