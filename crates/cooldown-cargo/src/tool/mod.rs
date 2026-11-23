@@ -3432,11 +3432,7 @@ impl CargoTool {
             if let Some((observer, change)) = notification {
                 observer.resolver_started(Some(change));
             }
-            let resolved = self
-                .resolve_releasing(project, released.nodes(), journal)
-                .await;
-            // A coordination failure forbids restoring files that may now belong to another writer.
-            journal.validate_project(&project.root)?;
+            let resolved = self.resolve_releasing(project, &released, journal).await?;
             let Err(err) = resolved else {
                 break Ok(());
             };
@@ -3938,18 +3934,31 @@ impl CargoTool {
     }
 
     /// Resolves `project`'s graph, first releasing `released` by name, since a metadata resolve
-    /// keeps every locked version its requirements admit.
+    /// keeps every locked version its requirements admit, and returns the resolve's outcome once
+    /// `journal` still validates the project.
+    ///
+    /// # Errors
+    ///
+    /// Returns the journal's refusal when the project changed under the commands: a coordination
+    /// failure that forbids restoring files which may now belong to another writer.
     async fn resolve_releasing(
         &self,
         project: &Project,
-        released: &[PackageKey],
+        released: &Released,
         journal: &ProjectMutationJournal,
-    ) -> Result<()> {
+    ) -> Result<Result<()>> {
         let commands = self.commands(journal);
-        if !released.is_empty() {
-            commands.update_unlocking(project, released).await?;
-        }
-        commands.resolve(project).await
+        let released = released.nodes();
+        let resolved = if released.is_empty() {
+            commands.resolve(project).await
+        } else {
+            match commands.update_unlocking(project, released).await {
+                Ok(()) => commands.resolve(project).await,
+                Err(err) => Err(err),
+            }
+        };
+        journal.validate_project(&project.root)?;
+        Ok(resolved)
     }
 
     /// Whether a refusal naming `parties` names a member of a lockstep family in `lock`, whatever
