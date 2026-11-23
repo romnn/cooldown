@@ -237,6 +237,17 @@ ahead of mise's shims on `PATH`.
 An override names a program and nothing else: it applies no mise environment, so use it only for a
 tool whose mise configuration you do not need.
 
+### When cargo crashes
+
+Cargo has been seen to crash with a signal, such as a segmentation fault, right after printing an
+ordinary resolver conflict that the same command otherwise reports normally. A cargo read that a
+signal kills runs once more: a `--locked` read always, and a resolve in cooldown's private staged
+copy while that copy is still the one cooldown prepared and its `Cargo.lock` still holds the bytes it
+had, or is still absent. Nothing is restored, so a resolve that changed the lock before it crashed is
+not run again. The second run's result
+stands; only a second crash fails the project, and its error says cargo was killed by the signal
+after printing its output, instead of presenting that output as the cause.
+
 ## Registries and native cooldowns
 
 Some ecosystems already ship a native cooldown — uv's `exclude-newer`, pnpm's `minimumReleaseAge`, yarn's `npmMinimalAgeGate`, Cargo's `min-publish-age`. Where one exists, [`cooldown sync`]({{< relref "../commands/other.md" >}}) (or the global `--sync` flag) writes the resolved policy *down* into that native config, so `cooldown.toml` stays the single source of truth and the native tool sees the same window you set once.

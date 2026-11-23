@@ -32,10 +32,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
-use cooldown_core::{CoreError, Project};
+use cooldown_core::{CoreError, Project, ProjectMutationJournal};
 
 use crate::cargocmd::{
-    Cargo, CommandLine, PackageKey, RESOLVE_ARGS, ResolvedGraph, as_strs,
+    Cargo, CommandLine, PackageKey, RESOLVE_ARGS, Rerun, ResolvedGraph, as_strs,
     memoizable_resolver_rejection, update_precise_args, update_unlocking_args,
 };
 use crate::locked_reads::{LockedReader, LockedReads};
@@ -209,6 +209,9 @@ pub(crate) struct MemoizedCargo<'a> {
     /// Whether outcomes are recorded and replayed at all, which the rejection memo's switch
     /// decides.
     pub(crate) enabled: bool,
+    /// The journal of the mutation the commands run for, which must still validate a staged
+    /// project before a command a signal killed there runs again.
+    pub(crate) journal: &'a ProjectMutationJournal,
 }
 
 /// A command that ran or replayed, with what recording a fresh outcome takes.
@@ -334,6 +337,38 @@ impl MemoizedCargo<'_> {
         Ok(graph)
     }
 
+    /// Resolves `project`'s whole graph like [`Self::metadata`], always running Cargo and
+    /// recording nothing, for a final read whose result no earlier one may stand in for.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Cargo::metadata`].
+    pub(crate) async fn fresh_metadata(
+        &self,
+        project: &Project,
+    ) -> Result<ResolvedGraph, CoreError> {
+        let command = self.cargo.command_line(&project.root, &RESOLVE_ARGS)?;
+        let output = self.launch(project, &command).await?;
+        let stdout = self.cargo.stdout_of(&output)?;
+        Cargo::parse_graph(&stdout, &project.generated_members)
+    }
+
+    /// Runs `command` in `project`, once more after a signal when the project is a staged copy,
+    /// which only cooldown writes, and the mutation's journal still validates it.
+    async fn launch(
+        &self,
+        project: &Project,
+        command: &CommandLine,
+    ) -> Result<std::process::Output, CoreError> {
+        if self.trees.is_staged(&project.root) {
+            self.cargo
+                .spawn_retrying(&project.root, &command.args, Rerun::Staged(self.journal))
+                .await
+        } else {
+            self.cargo.spawn(&project.root, &command.args).await
+        }
+    }
+
     /// Replays the outcome recorded for this command's inputs, or runs Cargo.
     async fn run(&self, project: &Project, args: &[&str], needs: Needs) -> Result<Run, CoreError> {
         let command = self.cargo.command_line(&project.root, args)?;
@@ -359,7 +394,7 @@ impl MemoizedCargo<'_> {
             });
         }
         let started = Instant::now();
-        let output = self.cargo.spawn(&project.root, &command.args).await?;
+        let output = self.launch(project, &command).await?;
         let elapsed = started.elapsed();
         let settled = key.and_then(|key| self.settle(project, &command, key, &output));
         let (lock, record) = match settled {

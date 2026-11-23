@@ -155,9 +155,9 @@ impl CargoTool {
         }
     }
 
-    /// Runs the lock-resolving commands of an apply, replaying an earlier outcome of the same
-    /// native inputs in this run.
-    fn commands(&self) -> MemoizedCargo<'_> {
+    /// Runs the lock-resolving commands of the mutation `journal` guards, replaying an earlier
+    /// outcome of the same native inputs in this run.
+    fn commands<'a>(&'a self, journal: &'a ProjectMutationJournal) -> MemoizedCargo<'a> {
         MemoizedCargo {
             cargo: &self.cargo,
             memo: &self.rejection_memo,
@@ -166,6 +166,7 @@ impl CargoTool {
             reads: &self.locked_reads,
             lockstep: &self.lockstep,
             enabled: self.rejection_memo_enabled,
+            journal,
         }
     }
 
@@ -173,11 +174,12 @@ impl CargoTool {
         &self,
         project: &Project,
         observer: Option<&dyn ApplyObserver>,
+        journal: &ProjectMutationJournal,
     ) -> Result<ResolvedGraph> {
         if let Some(observer) = observer {
             observer.resolver_started(None);
         }
-        self.commands().metadata(project).await
+        self.commands(journal).metadata(project).await
     }
 
     /// Creates an tool from an existing crates.io [`CratesIoIndex`] client.
@@ -213,12 +215,17 @@ impl CargoTool {
 
     /// Registers `staged` as a staged copy of `original` whose topology lives in `tree`, a
     /// directory only cooldown writes.
+    ///
+    /// The copy is registered even with the memo disabled, since a command a signal killed there
+    /// may run once more whether or not outcomes are reused.
     pub(crate) fn register_memo_origin(
         &self,
         staged: &Project,
         original: &Project,
         tree: &Utf8Path,
     ) {
+        self.staged_trees
+            .register(&staged.root, tree, self.rejection_memo_enabled);
         if !self.rejection_memo_enabled {
             return;
         }
@@ -228,7 +235,6 @@ impl CargoTool {
         {
             tracing::debug!(%err, "cargo rejection memo origin unavailable; bypassing memo");
         }
-        self.staged_trees.register(&staged.root, tree);
     }
 
     /// The generated-member facts for `project`: the memoized ones, else established from a
@@ -2520,7 +2526,9 @@ impl CargoTool {
             return Ok(None);
         }
         journal.validate_project(&project.root)?;
-        let resolved = self.metadata_with_observer(project, observer).await;
+        let resolved = self
+            .metadata_with_observer(project, observer, journal)
+            .await;
         journal.validate_project(&project.root)?;
         resolved.map(Some)
     }
@@ -2766,7 +2774,7 @@ impl CargoTool {
         // candidates conflict with is released by name first.
         if !released.is_empty() {
             let unlocked = self
-                .commands()
+                .commands(probe.journal)
                 .update_unlocking(probe.project, released)
                 .await;
             probe.journal.validate_project(&probe.project.root)?;
@@ -2781,7 +2789,7 @@ impl CargoTool {
                 Err(err) => return Err(err),
             }
         }
-        let resolved = self.commands().metadata(probe.project).await;
+        let resolved = self.commands(probe.journal).metadata(probe.project).await;
         // Topology failure forbids any rejected-path restoration through another writer's files.
         probe.journal.validate_project(&probe.project.root)?;
         let graph = match resolved {
@@ -3072,7 +3080,7 @@ impl CargoTool {
         let landed_graph = if probe.metadata_mode() == MemoMetadataMode::Resolve {
             probe.journal.validate_project(&probe.project.root)?;
             let resolved = self
-                .metadata_with_observer(probe.project, probe.observer)
+                .metadata_with_observer(probe.project, probe.observer, probe.journal)
                 .await;
             probe.journal.validate_project(&probe.project.root)?;
             match resolved {
@@ -3247,7 +3255,7 @@ impl CargoTool {
             if let Some(observer) = observer {
                 observer.resolver_started(None);
             }
-            self.commands().resolve(project).await?;
+            self.commands(journal).resolve(project).await?;
             journal.validate_project(&project.root)?;
             let after = read_lock(project)?;
             if let Some(violation) = baseline.violation(&after, &project.generated_members, plan) {
@@ -3424,9 +3432,7 @@ impl CargoTool {
             if let Some((observer, change)) = notification {
                 observer.resolver_started(Some(change));
             }
-            let resolved = self.resolve_releasing(project, released.nodes()).await;
-            // A coordination failure forbids restoring files that may now belong to another writer.
-            journal.validate_project(&project.root)?;
+            let resolved = self.resolve_releasing(project, &released, journal).await?;
             let Err(err) = resolved else {
                 break Ok(());
             };
@@ -3928,12 +3934,31 @@ impl CargoTool {
     }
 
     /// Resolves `project`'s graph, first releasing `released` by name, since a metadata resolve
-    /// keeps every locked version its requirements admit.
-    async fn resolve_releasing(&self, project: &Project, released: &[PackageKey]) -> Result<()> {
-        if !released.is_empty() {
-            self.commands().update_unlocking(project, released).await?;
-        }
-        self.commands().resolve(project).await
+    /// keeps every locked version its requirements admit, and returns the resolve's outcome once
+    /// `journal` still validates the project.
+    ///
+    /// # Errors
+    ///
+    /// Returns the journal's refusal when the project changed under the commands: a coordination
+    /// failure that forbids restoring files which may now belong to another writer.
+    async fn resolve_releasing(
+        &self,
+        project: &Project,
+        released: &Released,
+        journal: &ProjectMutationJournal,
+    ) -> Result<Result<()>> {
+        let commands = self.commands(journal);
+        let released = released.nodes();
+        let resolved = if released.is_empty() {
+            commands.resolve(project).await
+        } else {
+            match commands.update_unlocking(project, released).await {
+                Ok(()) => commands.resolve(project).await,
+                Err(err) => Err(err),
+            }
+        };
+        journal.validate_project(&project.root)?;
+        Ok(resolved)
     }
 
     /// Whether a refusal naming `parties` names a member of a lockstep family in `lock`, whatever
@@ -4057,7 +4082,7 @@ impl CargoTool {
             stats.resolves += 1;
             stats.per_crate += 1;
             let updated = self
-                .commands()
+                .commands(journal)
                 .update_precise_crates_io_unlocking(
                     project,
                     &change.package.name,
@@ -4188,7 +4213,7 @@ impl CargoTool {
         let generated = &project.generated_members;
         let baseline = ResolveBaseline::capture(&CargoLock::parse(&before_text)?, generated);
         let pinned = match self
-            .commands()
+            .commands(journal)
             .update_precise_crates_io(project, &change.package.name, current, change.to.as_str())
             .await
         {
@@ -4271,7 +4296,7 @@ impl CargoTool {
         if let Some(observer) = observer {
             observer.resolver_started(Some(change));
         }
-        self.commands()
+        self.commands(journal)
             .update_precise_crates_io(
                 project,
                 &change.package.name,
@@ -4504,7 +4529,9 @@ impl CargoTool {
             observer,
         } = scope;
         journal.validate_project(&project.root)?;
-        let graph = self.metadata_with_observer(project, observer).await?;
+        let graph = self
+            .metadata_with_observer(project, observer, journal)
+            .await?;
         journal.validate_project(&project.root)?;
         let generated = &project.generated_members;
         let baseline = ResolveBaseline::capture(resolver_lock, generated);
@@ -5312,7 +5339,7 @@ impl ToolWrite for CargoTool {
         before: Option<&[u8]>,
         committed: &[EdgeRebind],
     ) -> Result<EdgeNormalizationReport> {
-        let (project, _, _) = self.mutation_parts(mutation)?;
+        let (project, _, journal) = self.mutation_parts(mutation)?;
         let before_lock = before
             .map(|contents| {
                 std::str::from_utf8(contents)
@@ -5333,22 +5360,14 @@ impl ToolWrite for CargoTool {
                     )
                 });
                 if needs_graph {
-                    Some(
-                        self.cargo
-                            .metadata(&project.root, &project.generated_members)
-                            .await?,
-                    )
+                    Some(self.commands(journal).fresh_metadata(project).await?)
                 } else {
                     None
                 }
             }
             // A metadata failure must remain a project error; otherwise requested canonical
             // healing would degrade to a successful no-op.
-            EdgePolicy::Canonicalize => Some(
-                self.cargo
-                    .metadata(&project.root, &project.generated_members)
-                    .await?,
-            ),
+            EdgePolicy::Canonicalize => Some(self.commands(journal).fresh_metadata(project).await?),
         };
         let generated = self.generated_facts(project, None).await?;
         let mut result = edges::enforce::enforce(

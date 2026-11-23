@@ -4,8 +4,8 @@ use crate::publish_age::{CRATES_IO_AGE_KEY, CargoEnvironment, PublishAgeSettings
 use camino::Utf8Path;
 use cooldown_adapter_util::{resolve_program, supervised_output};
 use cooldown_core::{
-    CoreError, GeneratedMembers, LockStatus, LockVerifyReport, MemberRef, ToolTermination,
-    VerifyReport, failure_detail,
+    CoreError, GeneratedMembers, LockStatus, LockVerifyReport, MemberRef, ProjectMutationJournal,
+    ToolTermination, VerifyReport, failure_detail,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use tokio::process::Command;
@@ -579,6 +579,26 @@ pub(crate) struct StagingPackage {
     pub(crate) target_paths: Vec<camino::Utf8PathBuf>,
     pub(crate) source: Option<String>,
     pub(crate) workspace_member: bool,
+}
+
+/// When a Cargo command a signal killed may run once more.
+#[derive(Clone, Copy)]
+pub(crate) enum Rerun<'a> {
+    /// The command writes nothing, as a `--locked` read: it always may.
+    ReadOnly,
+    /// The command may write the lock of the staged project this journal guards: it may while
+    /// the journal still validates the project, whose identity and file topology it checks, and
+    /// the lock holds the bytes it had before the first run, or is still absent.
+    Staged(&'a ProjectMutationJournal),
+}
+
+/// The bytes at `path`, `None` when there is no file.
+fn optional_bytes(path: &Utf8Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Extracts the version from an exact `=x.y.z` Cargo requirement. Cargo uses a single `=`; the
@@ -1490,6 +1510,55 @@ impl Cargo {
         result
     }
 
+    /// Runs Cargo in `dir` with exactly `args`, once more when a signal kills the first run and
+    /// `rerun` still allows it.
+    ///
+    /// Cargo has crashed with a signal right after printing an ordinary resolver conflict, which
+    /// the same command reproduces normally, so one crash proves nothing about the inputs.
+    /// Nothing is restored: a run that changed the lock before it crashed leaves its crash as
+    /// the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns the spawn error of either run, and the [`ProjectMutationJournal`]'s refusal when
+    /// the staged project it guards changed while the first run went on.
+    pub(crate) async fn spawn_retrying(
+        &self,
+        dir: &Utf8Path,
+        args: &[String],
+        rerun: Rerun<'_>,
+    ) -> Result<std::process::Output, CoreError> {
+        let lock = dir.join("Cargo.lock");
+        let before = match rerun {
+            Rerun::ReadOnly => None,
+            Rerun::Staged(_) => Some(optional_bytes(&lock)),
+        };
+        let first = self.spawn(dir, args).await?;
+        if !matches!(
+            ToolTermination::from_exit_status(first.status),
+            ToolTermination::Signal(_)
+        ) {
+            return Ok(first);
+        }
+        if let Rerun::Staged(journal) = rerun {
+            journal.validate_project(dir)?;
+            let unchanged = matches!(
+                (before, optional_bytes(&lock)),
+                (Some(Ok(before)), Ok(after)) if before == after
+            );
+            if !unchanged {
+                return Ok(first);
+            }
+        }
+        tracing::debug!(
+            bin = self.bin,
+            args = ?args,
+            status = %first.status,
+            "cargo was killed by a signal; running it once more"
+        );
+        self.spawn(dir, args).await
+    }
+
     async fn run(&self, dir: &Utf8Path, args: &[&str]) -> Result<String, CoreError> {
         self.stdout_of(&self.output(dir, args).await?)
     }
@@ -1523,9 +1592,16 @@ impl Cargo {
     /// Returns [`CoreError::StaleLock`] when the lock must be updated, or the Cargo tool error
     /// for any other failure.
     pub(crate) async fn locked_metadata_output(&self, dir: &Utf8Path) -> Result<String, CoreError> {
-        let out = self.output(dir, &LOCKED_METADATA_ARGS).await?;
+        let command = self.command_line(dir, &LOCKED_METADATA_ARGS)?;
+        let out = self
+            .spawn_retrying(dir, &command.args, Rerun::ReadOnly)
+            .await?;
         if out.status.success() {
             return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        // A killed process's text may be cut short, so it proves no stale lock.
+        if ToolTermination::from_exit_status(out.status).is_abnormal() {
+            return Err(self.failure(&out));
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
         if let Some(lock) = stale_lock_diagnostic(&stderr) {
@@ -2256,6 +2332,197 @@ mod tests {
         // The recorded diagnostic is plain text, so the locked blocker is still named.
         assert!(!stderr.contains('\u{1b}'), "{stderr}");
         assert_eq!(conflict_parties(&stderr), [party("psm", Some("0.1.32"))]);
+        Ok(())
+    }
+
+    /// A fake `cargo` in `root` that logs each run to `root/runs`, prints `diagnostic`, and on
+    /// its first `crashes` runs runs the shell command `before_crash` and kills itself with
+    /// SIGKILL, which leaves no core dump; otherwise it exits 101.
+    #[cfg(unix)]
+    fn crashing_cargo(
+        root: &Utf8Path,
+        diagnostic: &str,
+        crashes: usize,
+        before_crash: &str,
+    ) -> eyre::Result<Cargo> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fake = root.join("fake-cargo");
+        std::fs::write(
+            &fake,
+            formatdoc! {r#"
+                #!/bin/sh
+                dir=$(dirname "$0")
+                echo run >> "$dir/runs"
+                printf '%s\n' '{diagnostic}' >&2
+                if [ "$(wc -l < "$dir/runs")" -le {crashes} ]; then
+                    {before_crash}
+                    kill -KILL $$
+                fi
+                exit 101
+            "#},
+        )?;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::write(root.join("Cargo.lock"), "version = 4\n")?;
+        Ok(Cargo::with_bin(fake.as_str()))
+    }
+
+    #[cfg(unix)]
+    fn runs(root: &Utf8Path) -> eyre::Result<usize> {
+        Ok(std::fs::read_to_string(root.join("runs"))?.lines().count())
+    }
+
+    /// The journal of a staged project at `root` whose write set is its lock.
+    #[cfg(unix)]
+    fn lock_journal(root: &Utf8Path) -> eyre::Result<ProjectMutationJournal> {
+        Ok(ProjectMutationJournal::capture(root, ["Cargo.lock"])?)
+    }
+
+    /// A signal that kills Cargo after an ordinary resolver conflict runs the command once more,
+    /// and the second run's verdict stands.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_crashed_cargo_runs_once_more_from_an_unchanged_lock() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let cargo = crashing_cargo(root, "error: failed to select a version for `psm`.", 1, ":")?;
+        let journal = lock_journal(root)?;
+
+        let out = cargo
+            .spawn_retrying(root, &["metadata".to_string()], Rerun::Staged(&journal))
+            .await?;
+
+        // The second run exited on its own, so its refusal is an ordinary resolver conflict.
+        assert_eq!(out.status.code(), Some(101));
+        assert_eq!(runs(root)?, 2);
+        Ok(())
+    }
+
+    /// A second crash is the result, and its error says Cargo was killed after printing its
+    /// output, which therefore does not read as the cause.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_crash_is_reported_as_a_kill_after_the_output() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let cargo = crashing_cargo(root, "error: failed to select a version for `psm`.", 2, ":")?;
+        let journal = lock_journal(root)?;
+
+        let out = cargo
+            .spawn_retrying(root, &["metadata".to_string()], Rerun::Staged(&journal))
+            .await?;
+        let error = cargo.failure(&out);
+
+        assert_eq!(runs(root)?, 2);
+        assert!(error.is_local_environment_failure());
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "tool `{}` was killed by signal 9 after printing: error: failed to select a \
+                 version for `psm`.",
+                root.join("fake-cargo")
+            )
+        );
+        Ok(())
+    }
+
+    /// A crash that changed the lock leaves nothing to prove the inputs unchanged, so the command
+    /// does not run again and nothing is written back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_crash_that_changed_the_lock_is_not_run_again() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let cargo = crashing_cargo(
+            root,
+            "error: failed to select a version for `psm`.",
+            1,
+            "echo '# rewritten' >> \"$dir/Cargo.lock\"",
+        )?;
+        let lock = root.join("Cargo.lock");
+        let journal = lock_journal(root)?;
+
+        let out = cargo
+            .spawn_retrying(root, &["metadata".to_string()], Rerun::Staged(&journal))
+            .await?;
+
+        assert_eq!(
+            ToolTermination::from_exit_status(out.status),
+            ToolTermination::Signal(9)
+        );
+        assert_eq!(runs(root)?, 1);
+        assert_eq!(
+            std::fs::read_to_string(&lock)?,
+            "version = 4\n# rewritten\n"
+        );
+        Ok(())
+    }
+
+    /// A crash that left the staged project's files no longer the ones its journal guards, such
+    /// as a lock swapped for a link to the same bytes elsewhere, is a coordination failure: the
+    /// command does not run again, and the file the link names is left alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_crash_that_changed_the_project_topology_stops_the_rerun() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let cargo = crashing_cargo(
+            root,
+            "error: failed to select a version for `psm`.",
+            1,
+            "cp \"$dir/Cargo.lock\" \"$dir/source.lock\"; ln -sf source.lock \"$dir/Cargo.lock\"",
+        )?;
+        let journal = lock_journal(root)?;
+
+        let result = cargo
+            .spawn_retrying(root, &["metadata".to_string()], Rerun::Staged(&journal))
+            .await;
+
+        assert!(
+            matches!(result, Err(CoreError::LockConflict(_))),
+            "{result:?}"
+        );
+        assert_eq!(runs(root)?, 1);
+        assert_eq!(
+            std::fs::read_to_string(root.join("source.lock"))?,
+            "version = 4\n"
+        );
+        Ok(())
+    }
+
+    /// A locked read writes no lock, so it runs again after a crash, and a stale-lock refusal a
+    /// crash may have cut short is no stale lock.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_crashed_locked_read_is_retried_and_never_read_as_stale() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let cargo = crashing_cargo(
+            root,
+            "error: cannot update the lock file /repo/Cargo.lock because --locked was passed to \
+             prevent this",
+            2,
+            ":",
+        )?;
+
+        let error = cargo.locked_metadata_output(root).await.err();
+
+        assert_eq!(runs(root)?, 2);
+        assert!(
+            matches!(
+                error,
+                Some(CoreError::Tool {
+                    termination: ToolTermination::Signal(9),
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
         Ok(())
     }
 

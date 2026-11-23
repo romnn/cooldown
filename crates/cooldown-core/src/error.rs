@@ -87,10 +87,28 @@ pub fn failure_detail(out: &Output) -> String {
         (false, false) => format!("{stderr}\n{stdout}"),
         (false, true) => stderr,
         (true, false) => stdout,
-        (true, true) => format!(
-            "package manager exited with {}",
-            ToolTermination::from_exit_status(out.status)
-        ),
+        (true, true) => silent_exit_note(ToolTermination::from_exit_status(out.status)),
+    }
+}
+
+/// The detail [`failure_detail`] synthesizes for a process that printed nothing.
+fn silent_exit_note(termination: ToolTermination) -> String {
+    format!("package manager exited with {termination}")
+}
+
+/// The message of a [`CoreError::Tool`].
+fn tool_failure(tool: &str, termination: ToolTermination, detail: &str) -> String {
+    match termination {
+        // A process killed in silence printed nothing to quote, whatever note stands in for it.
+        ToolTermination::Signal(signal)
+            if detail.is_empty() || detail == silent_exit_note(termination) =>
+        {
+            format!("tool `{tool}` was killed by signal {signal}")
+        }
+        ToolTermination::Signal(signal) => {
+            format!("tool `{tool}` was killed by signal {signal} after printing: {detail}")
+        }
+        termination => format!("tool `{tool}` failed with {termination}: {detail}"),
     }
 }
 
@@ -111,7 +129,10 @@ pub enum CoreError {
     Transient(#[source] BoxError),
 
     /// An external tool (`go`, `cargo`, `uv`) exited non-zero after being spawned.
-    #[error("tool `{tool}` failed with {termination}: {stderr}")]
+    ///
+    /// A signal's error says the tool was killed after printing its output, so that output, such
+    /// as a resolver conflict printed just before a crash, does not read as the cause.
+    #[error("{}", tool_failure(tool, *termination, stderr))]
     Tool {
         /// The name of the invoked tool (for example `go`, `cargo`, or `uv`).
         tool: String,
@@ -636,6 +657,39 @@ mod tests {
         assert!(!resolver.is_local_environment_failure());
         assert!(!CoreError::StaleLock("lock is stale".into()).is_local_environment_failure());
         assert!(!CoreError::NotFound("colors@999.0.0".into()).is_local_environment_failure());
+    }
+
+    /// A signal's error says the tool was killed, quoting what it printed and nothing when it
+    /// printed nothing, whichever detail stands in for that silence.
+    #[test]
+    fn a_signal_reads_as_a_kill_after_the_output() {
+        let killed = |stderr: String| {
+            CoreError::Tool {
+                tool: "go".into(),
+                termination: ToolTermination::Signal(9),
+                stderr,
+            }
+            .to_string()
+        };
+        assert_eq!(
+            killed("go: finding module".into()),
+            "tool `go` was killed by signal 9 after printing: go: finding module"
+        );
+        assert_eq!(killed(String::new()), "tool `go` was killed by signal 9");
+        assert_eq!(
+            killed(silent_exit_note(ToolTermination::Signal(9))),
+            "tool `go` was killed by signal 9"
+        );
+        // An exit is still a failure with its own output as the reason.
+        let exited = CoreError::Tool {
+            tool: "go".into(),
+            termination: ToolTermination::ExitCode(1),
+            stderr: "build failed".into(),
+        };
+        assert_eq!(
+            exited.to_string(),
+            "tool `go` failed with exit code 1: build failed"
+        );
     }
 
     #[test]
