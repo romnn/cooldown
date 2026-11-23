@@ -8,6 +8,7 @@ use jiff::{SignedDuration, Timestamp};
 
 const PNPM: ToolId = ToolId("pnpm");
 const UV: ToolId = ToolId("uv");
+const CARGO: ToolId = ToolId("cargo");
 
 fn now() -> Timestamp {
     "2026-01-15T00:00:00Z".parse().expect("timestamp")
@@ -42,6 +43,7 @@ fn project_scope(
         default_layers: layers,
         default_project: project,
         package_windows,
+        writer_exemptions: true,
     };
     omitted_native_fields(
         &[PolicyContext { layers, project }],
@@ -65,6 +67,7 @@ fn repo_scope(repo: &[PolicyLayer], consumers: &[PolicyContext<'_>]) -> Vec<Omit
         default_layers: repo,
         default_project: Utf8Path::new("."),
         package_windows: true,
+        writer_exemptions: false,
     };
     omitted_native_fields(consumers, UV, &encoding, now())
 }
@@ -407,5 +410,114 @@ fn a_freeze_drifting_in_several_windows_names_the_earliest_end() {
             floor: SignedDuration::from_hours(24 * 30),
             until: freeze + SignedDuration::from_hours(24 * 30),
         })
+    );
+}
+
+/// The fields a repo-level Cargo file resolved from `repo` leaves out for `consumers`: Cargo has
+/// one registry-wide age and no package table, and the writer takes no exemptions.
+fn cargo_repo_scope(repo: &[PolicyLayer], consumers: &[PolicyContext<'_>]) -> Vec<OmittedField> {
+    let encoding = NativeEncoding {
+        default_layers: repo,
+        default_project: Utf8Path::new("."),
+        package_windows: false,
+        writer_exemptions: false,
+    };
+    omitted_native_fields(consumers, CARGO, &encoding, now())
+}
+
+/// `min-age = "0d"`, `latest = true` and `allow` exempt a package alike, so a native config that
+/// cannot carry the exemption reports each spelling with the same notice.
+#[test]
+fn every_spelling_of_an_exemption_is_reported_alike() {
+    let spellings = [
+        indoc! {r#"
+            min-age = "14d"
+
+            [package."itoa"]
+            min-age = "0d"
+        "#},
+        indoc! {r#"
+            min-age = "14d"
+
+            [package."itoa"]
+            latest = true
+        "#},
+        indoc! {r#"
+            min-age = "14d"
+            allow = ["itoa"]
+        "#},
+    ];
+    for config in spellings {
+        let layers = repo_layers(config);
+        let notices: Vec<String> = cargo_repo_scope(&layers, &[consumer(".", &layers)])
+            .iter()
+            .map(|field| field.notice(CARGO))
+            .collect();
+        assert_eq!(
+            notices,
+            [
+                "the cooldown exemption from `repo:cooldown.toml:package=itoa` is not represented \
+                 in cargo's native config, so a bare cargo command does not apply it"
+            ],
+            "{config}"
+        );
+    }
+}
+
+/// An exemption is encoded where the native config carries it: in the written default, or for a
+/// literal package in uv's package table, but a glob, `*` included, reaches no package table.
+#[test]
+fn an_exemption_is_encoded_only_where_the_native_config_carries_it() {
+    let layers = repo_layers(indoc! {r#"
+        latest = true
+        allow = ["ruff", "types-*", "*"]
+    "#});
+
+    assert_eq!(
+        keys(&repo_scope(&layers, &[consumer(".", &layers)])),
+        [
+            "repo:cooldown.toml:package=types-* exemption",
+            "repo:cooldown.toml:package=* exemption",
+        ]
+    );
+}
+
+/// A rule that exempts a package and also sets a window keeps the window as its own field.
+#[test]
+fn an_exemption_beside_a_window_reports_both() {
+    let layers = repo_layers(indoc! {r#"
+        allow = ["itoa"]
+
+        [package."itoa"]
+        min-age = { default = "30d", major = "0d" }
+    "#});
+
+    assert_eq!(
+        keys(&cargo_repo_scope(&layers, &[consumer(".", &layers)])),
+        [
+            "repo:cooldown.toml:package=itoa exemption",
+            "repo:cooldown.toml:package=itoa default",
+            "repo:cooldown.toml:package=itoa major",
+        ]
+    );
+}
+
+/// A writer that takes the exemptions, as pnpm's does, writes `latest` and `allow` to its own
+/// list or reports them, while a zero window stays a window.
+#[test]
+fn a_writer_that_takes_exemptions_keeps_a_zero_window_a_window() {
+    let layers = repo_layers(indoc! {r#"
+        allow = ["react"]
+
+        [package."lodash"]
+        latest = true
+
+        [package."zod"]
+        min-age = "0d"
+    "#});
+
+    assert_eq!(
+        keys(&project_scope(&layers, ".", PNPM, false)),
+        ["repo:cooldown.toml:package=zod default"]
     );
 }

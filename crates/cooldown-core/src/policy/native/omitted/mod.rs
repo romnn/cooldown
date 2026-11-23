@@ -29,6 +29,11 @@ pub struct NativeEncoding<'a> {
     /// Whether the native config carries the window of each package a literal package selector
     /// names, as uv's `exclude-newer-package` does.
     pub package_windows: bool,
+    /// Whether this sync hands the package exemptions (`allow`, `latest`) to the writer, which
+    /// writes them to a native exemption list or reports each one it cannot.
+    ///
+    /// Without it, every exemption the native config does not otherwise carry is reported here.
+    pub writer_exemptions: bool,
 }
 
 /// One of the per-kind window fields of a rule.
@@ -69,33 +74,40 @@ pub enum GatingField {
     },
     /// A `floor`.
     Floor(SignedDuration),
+    /// An exemption from the cooldown window: `allow`, or a `default` window of `latest` or of
+    /// zero, which `latest` is sugar for.
+    Exemption,
 }
 
 impl GatingField {
-    /// The field's name in an `explain` trace step: a [`WindowField::name`] or `floor`.
+    /// The field's name in an `explain` trace step: a [`WindowField::name`], `floor` or
+    /// `exemption`.
     #[must_use]
     pub fn name(&self) -> &'static str {
         match self {
             GatingField::Window { kind, .. } => kind.name(),
             GatingField::Floor(_) => "floor",
+            GatingField::Exemption => "exemption",
         }
     }
 
-    /// The field as `cooldown.toml` spells it, such as `major = "30d"`.
-    fn declaration(&self) -> String {
+    /// The field as a notice names it: as `cooldown.toml` spells it, such as `` `major = "30d"` ``,
+    /// or as the exemption that `allow`, `latest` and a zero `min-age` all declare.
+    fn subject(&self) -> String {
         match self {
             GatingField::Window {
                 kind: WindowField::Default,
                 spec: WindowSpec::Freeze(instant),
-            } => format!("freeze = \"{instant}\""),
+            } => format!("`freeze = \"{instant}\"`"),
             GatingField::Window {
                 kind: WindowField::Default,
                 spec,
-            } => format!("min-age = \"{}\"", spec_text(spec)),
+            } => format!("`min-age = \"{}\"`", spec_text(spec)),
             GatingField::Window { kind, spec } => {
-                format!("{} = \"{}\"", kind.name(), spec_text(spec))
+                format!("`{} = \"{}\"`", kind.name(), spec_text(spec))
             }
-            GatingField::Floor(floor) => format!("floor = \"{}\"", duration_text(*floor)),
+            GatingField::Floor(floor) => format!("`floor = \"{}\"`", duration_text(*floor)),
+            GatingField::Exemption => "the cooldown exemption".to_string(),
         }
     }
 }
@@ -143,15 +155,15 @@ impl OmittedField {
     /// The notice `sync` reports for this field when it syncs `target`'s native config.
     #[must_use]
     pub fn notice(&self, target: ToolId) -> String {
-        let declaration = self.field.declaration();
+        let subject = self.field.subject();
         let source = self.source();
         match self.reason {
             None => format!(
-                "`{declaration}` from `{source}` is not represented in {target}'s native config, \
-                 so a bare {target} command does not apply it"
+                "{subject} from `{source}` is not represented in {target}'s native config, so a \
+                 bare {target} command does not apply it"
             ),
             Some(OmissionReason::FreezeUnderFloor { floor, until }) => format!(
-                "`{declaration}` from `{source}` is written to {target}'s native config as the \
+                "{subject} from `{source}` is written to {target}'s native config as the \
                  {floor} floor that binds today, so from {until} a bare {target} command admits \
                  releases published after the freeze",
                 floor = duration_text(floor),
@@ -165,7 +177,12 @@ impl OmittedField {
 /// Each context is a stack whose packages read the native config: the project for a
 /// project-scoped tool, every project that consumes the repo-level file for a repo-scoped one.
 /// A gating field is a window field set to anything but [`WindowSpec::Latest`], or a `floor`.
-/// `allow` and `latest` are left to the native exemption lists, and `max-major` is no window.
+/// When the writer does not take the package exemptions
+/// ([`NativeEncoding::writer_exemptions`]), a rule's `allow`, or its `default` window of
+/// [`WindowSpec::Latest`] or of zero, is a gating field too: one [`GatingField::Exemption`],
+/// whichever way it is spelled.
+/// Otherwise `allow` and `latest` are left to the writer's native exemption list.
+/// `max-major` is no window.
 ///
 /// A field is encoded, and so not reported, only when it is a window `default` or a `floor`
 /// declared in one of [`NativeEncoding::default_layers`], matched by origin, on a selector the
@@ -175,6 +192,9 @@ impl OmittedField {
 /// - a [`Selector::Project`] matching [`NativeEncoding::default_project`];
 /// - a [`Selector::Package`] whose pattern is exactly `*`;
 /// - a literal [`Selector::Package`], when [`NativeEncoding::package_windows`] is set.
+///
+/// An exemption is encoded the same way, except that a package exemption reaches only the
+/// native package table, so no glob, `*` included, folds it in.
 ///
 /// Every other gating field is reported: every per-kind window, any glob package rule but `*`
 /// (even one matching the empty name), and every field of a layer only a consumer has, such as a
@@ -212,6 +232,7 @@ impl OmittedField {
 ///     default_layers: &layers,
 ///     default_project: project,
 ///     package_windows: false,
+///     writer_exemptions: true,
 /// };
 /// let context = PolicyContext {
 ///     layers: &layers,
@@ -254,17 +275,19 @@ pub fn omitted_native_fields(
                 if !applies(&rule.selector, target, context.project) {
                     continue;
                 }
-                for field in gating_fields(rule) {
-                    let carries_default = matches!(
-                        field,
-                        GatingField::Window {
-                            kind: WindowField::Default,
-                            ..
-                        } | GatingField::Floor(_)
-                    );
-                    let encoded = carries_default
-                        && default_layer
-                        && folded_in(&rule.selector, target, encoding);
+                for field in gating_fields(rule, encoding) {
+                    let encoded = default_layer
+                        && match field {
+                            GatingField::Window {
+                                kind: WindowField::Default,
+                                ..
+                            }
+                            | GatingField::Floor(_) => folded_in(&rule.selector, target, encoding),
+                            GatingField::Exemption => {
+                                exemption_folded_in(&rule.selector, target, encoding)
+                            }
+                            GatingField::Window { .. } => false,
+                        };
                     if !encoded {
                         record(
                             &mut omitted,
@@ -311,13 +334,43 @@ fn folded_in(selector: &Selector, target: ToolId, encoding: &NativeEncoding<'_>)
     }
 }
 
-/// The gating fields `rule` sets, window fields first.
-fn gating_fields(rule: &Rule) -> impl Iterator<Item = GatingField> + '_ {
-    [
-        (WindowField::Default, &rule.window.default),
-        (WindowField::Major, &rule.window.major),
-        (WindowField::Minor, &rule.window.minor),
-        (WindowField::Patch, &rule.window.patch),
+/// Whether the written default, or uv's native package table, carries an exemption of a rule
+/// with `selector` from one of the default's layers.
+///
+/// A package exemption reaches only a package table, never the default: the catch-all `*` lets
+/// the default fall back to the bare window it does not exempt.
+fn exemption_folded_in(selector: &Selector, target: ToolId, encoding: &NativeEncoding<'_>) -> bool {
+    match selector {
+        Selector::Package { glob, .. } => encoding.package_windows && glob.is_literal(),
+        selector => folded_in(selector, target, encoding),
+    }
+}
+
+/// The gating fields `rule` sets: its exemption, then its windows, then its floor.
+///
+/// Its `allow`, or a `default` window of `latest` or of zero, is one [`GatingField::Exemption`]
+/// when the writer does not take the exemptions; otherwise `latest` and `allow` are the writer's,
+/// and a zero `default` stays a window.
+fn gating_fields<'r>(
+    rule: &'r Rule,
+    encoding: &NativeEncoding<'_>,
+) -> impl Iterator<Item = GatingField> + 'r {
+    let exempting_default = matches!(
+        rule.window.default,
+        Some(WindowSpec::Latest | WindowSpec::MinAge(SignedDuration::ZERO))
+    );
+    let exemption = !encoding.writer_exemptions && (rule.allow || exempting_default);
+    // An exempting default is reported as the exemption, not as a window too.
+    let default = if exemption && exempting_default {
+        None
+    } else {
+        rule.window.default.as_ref()
+    };
+    let windows = [
+        (WindowField::Default, default),
+        (WindowField::Major, rule.window.major.as_ref()),
+        (WindowField::Minor, rule.window.minor.as_ref()),
+        (WindowField::Patch, rule.window.patch.as_ref()),
     ]
     .into_iter()
     .filter_map(|(kind, spec)| match spec {
@@ -326,8 +379,12 @@ fn gating_fields(rule: &Rule) -> impl Iterator<Item = GatingField> + '_ {
             spec: spec.clone(),
         }),
         _ => None,
-    })
-    .chain(rule.floor.map(GatingField::Floor))
+    });
+    exemption
+        .then_some(GatingField::Exemption)
+        .into_iter()
+        .chain(windows)
+        .chain(rule.floor.map(GatingField::Floor))
 }
 
 /// Adds `field` unless an entry for its origin, selector and field name exists, in which case

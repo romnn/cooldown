@@ -8,6 +8,12 @@
   member list is now a `member_set` record that an evaluation's `dependency.memberSet` names, and an
   identical `policy_resolved` record is written once; `--full-trace` still records both in full.
   The trace schema moves to version 5. Closes #159.
+- **`sync` reports every spelling of a package exemption alike.** For uv and Cargo, whose one file
+  has no place for a package's exemption, `[package."itoa"] min-age = "0d"` was reported as not
+  represented, while its sugar `latest = true` and `allow = ["itoa"]` were silently dropped. All
+  three now give the same warning, ``the cooldown exemption from `repo:cooldown.toml:package=itoa`
+  is not represented in cargo's native config``, unless uv's package table carries the literal
+  package. pnpm and Yarn, which write exemptions to their own lists, are unchanged. Closes #157.
 
 ## v0.0.32
 
