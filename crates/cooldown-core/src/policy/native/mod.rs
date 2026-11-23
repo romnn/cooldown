@@ -169,33 +169,24 @@ pub fn native_default_resolution(
     project: &Utf8Path,
     now: Timestamp,
 ) -> ResolvedWindow {
-    let unnamed = unnamed_window(layers, target, project, ResolveKind::CurrentPin, now);
+    let window = |kind| {
+        let query = ResolveQuery {
+            tool: target,
+            package: "",
+            registry: None,
+            project,
+            kind,
+        };
+        resolve(layers, &query, now).window
+    };
+    // The empty name stands for a package no rule names: only a glob matching the empty name,
+    // such as `*`, applies to it.
+    let unnamed = window(ResolveKind::CurrentPin);
     if unnamed.effective_spec(now) == WindowSpec::Latest {
-        unnamed_window(layers, target, project, ResolveKind::EffectiveDefault, now)
+        window(ResolveKind::EffectiveDefault)
     } else {
         unnamed
     }
-}
-
-/// The `kind` window of a package no rule names.
-///
-/// The empty name stands for that package: only a glob matching the empty name, such as `*`,
-/// applies to it.
-pub(super) fn unnamed_window(
-    layers: &[PolicyLayer],
-    target: ToolId,
-    project: &Utf8Path,
-    kind: ResolveKind,
-    now: Timestamp,
-) -> ResolvedWindow {
-    let query = ResolveQuery {
-        tool: target,
-        package: "",
-        registry: None,
-        project,
-        kind,
-    };
-    resolve(layers, &query, now).window
 }
 
 /// The package glob of `rule` when it is a `latest`/`allow` package rule that applies to `target`.

@@ -464,10 +464,10 @@ fn every_spelling_of_an_exemption_is_reported_alike() {
     }
 }
 
-/// An exemption is encoded where the native config carries it: in the written default, or for a
-/// literal package in uv's package table, but a glob, `*` included, reaches no package table.
+/// An exemption is encoded where a window would be: in the written default, which a `*` rule
+/// sets, or for a literal package in uv's package table, while any other glob reaches neither.
 #[test]
-fn an_exemption_is_encoded_only_where_the_native_config_carries_it() {
+fn an_exemption_is_encoded_where_a_window_would_be() {
     let layers = repo_layers(indoc! {r#"
         latest = true
         allow = ["ruff", "types-*", "*"]
@@ -475,10 +475,7 @@ fn an_exemption_is_encoded_only_where_the_native_config_carries_it() {
 
     assert_eq!(
         keys(&repo_scope(&layers, &[consumer(".", &layers)])),
-        [
-            "repo:cooldown.toml:package=types-* exemption",
-            "repo:cooldown.toml:package=* exemption",
-        ]
+        ["repo:cooldown.toml:package=types-* exemption"]
     );
 }
 
@@ -520,24 +517,4 @@ fn a_writer_that_takes_exemptions_keeps_a_zero_window_a_window() {
         keys(&project_scope(&layers, ".", PNPM, false)),
         ["repo:cooldown.toml:package=zod default"]
     );
-}
-
-/// A `*` exemption is carried while the written default is the window it sets: the floor's age
-/// under a binding floor, or a zero window, which `sync` hands the writer as is.
-/// `latest` without a binding floor is the one case `sync` writes the bare default instead, so
-/// only then is the exemption reported.
-#[test]
-fn a_catch_all_exemption_is_reported_only_when_the_default_falls_back() {
-    let reported = |config: &str| {
-        let layers = repo_layers(config);
-        keys(&cargo_repo_scope(&layers, &[consumer(".", &layers)]))
-    };
-    for spelling in ["latest = true", "min-age = \"0d\""] {
-        let floored = format!("min-age = \"14d\"\nfloor = \"3d\"\n\n[package.\"*\"]\n{spelling}\n");
-        assert_eq!(reported(&floored), Vec::<String>::new(), "{spelling}");
-    }
-    let zero = "min-age = \"14d\"\n\n[package.\"*\"]\nmin-age = \"0d\"\n";
-    assert_eq!(reported(zero), Vec::<String>::new());
-    let latest = "min-age = \"14d\"\n\n[package.\"*\"]\nlatest = true\n";
-    assert_eq!(reported(latest), ["repo:cooldown.toml:package=* exemption"]);
 }
