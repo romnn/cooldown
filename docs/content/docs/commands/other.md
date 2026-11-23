@@ -131,9 +131,10 @@ cooldown's own commands still enforce every one of these fields; the warning say
 - every `major`, `minor` and `patch` window;
 - the window and `floor` of a package rule whose pattern is anything but `*`, including a literal package for pnpm, Yarn and Cargo, which have no per-package window;
 - for uv and Cargo, whose one file serves every project in the repository, a project rule that does not match the repository root, and every field of a `cooldown.toml` below the root, which the root's default never sees;
-- a `freeze` whose `floor` still binds: `sync` writes the floor's rolling age, which stops matching cooldown on the date the warning names, once the floor reaches past the freeze date.
+- a `freeze` whose `floor` still binds: `sync` writes the floor's rolling age, which stops matching cooldown on the date the warning names, once the floor reaches past the freeze date;
+- for uv and Cargo, a package exemption their file cannot carry: `allow`, `latest = true`, or `min-age = "0d"`, which all read the same, as ``the cooldown exemption from `repo:cooldown.toml:package=itoa` is not represented in cargo's native config``. Cargo has no per-package setting, and uv's package table carries only a literal package, so any other glob but `*` is reported for both.
 
-`latest`, `allow` and `max-major` are not reported here: the exemptions are covered by the native exemption lists described below, and `max-major` is no window. Two boundaries stay outside the report. A `[registry."…"]` rule never reaches a native config, since cooldown tags every package with its tool's fixed registry. And a native config nearer to a project than the file `sync` writes, such as a nested uv project's own `[tool.uv]` table or a nearer `.cargo` configuration, shadows the written file for that project.
+For pnpm and Yarn, `latest` and `allow` are not reported here: the native exemption lists described below cover them, and the writer reports each selector it withholds or leaves out. A `min-age = "0d"` package rule stays a window for them, reported like any other. `max-major` is no window and never reported. Two boundaries stay outside the report. A `[registry."…"]` rule never reaches a native config, since cooldown tags every package with its tool's fixed registry. And a native config nearer to a project than the file `sync` writes, such as a nested uv project's own `[tool.uv]` table or a nearer `.cargo` configuration, shadows the written file for that project.
 
 ### pnpm
 

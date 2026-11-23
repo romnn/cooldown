@@ -307,6 +307,8 @@ impl Workspace {
                 default_layers: &pctx.policy.layers,
                 default_project: &pctx.rel_path,
                 package_windows: writer.native_package_windows(),
+                // The exemptions reach the writer below, which writes or reports each one.
+                writer_exemptions: true,
             },
             self.now(),
         );
@@ -429,6 +431,8 @@ impl Workspace {
                 default_layers: self.repo_layers(tool),
                 default_project: Utf8Path::new("."),
                 package_windows: writer.native_package_windows(),
+                // A repo-level file carries no package-wide exemption (see `ResolvedPolicy`).
+                writer_exemptions: false,
             },
             self.now(),
         );
