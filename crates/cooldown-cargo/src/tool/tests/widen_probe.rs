@@ -392,6 +392,9 @@ async fn a_probe_that_drops_every_candidate_still_blames_each_one() -> eyre::Res
                 DiagnosticOrigin::Acceptance,
                 "{culprit_drop:?}"
             );
+            // The candidate itself reached its target in that resolve, so a later per-change
+            // widen overshooting the target cannot replace this split.
+            assert_eq!(detail.reach, TargetReach::Reached, "{culprit_drop:?}");
             assert!(
                 detail.text.contains(split),
                 "{culprit_drop:?}: {} blamed with {}",

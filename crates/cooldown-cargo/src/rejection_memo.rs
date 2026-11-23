@@ -196,14 +196,20 @@ impl MemoKey {
 pub(crate) enum DiagnosticOrigin {
     /// Cargo refused the resolve.
     Resolver,
-    /// The resolve landed but moved the change's own declaration past its target, so it broke
-    /// the acceptance rule for a move the plan never asked for.
-    ///
-    /// It still says more than a Cargo refusal, but less than a violation of the planned move,
-    /// such as the split an earlier joint attempt at the exact target found.
-    Overshoot,
     /// The resolve landed but broke the acceptance rule and was restored.
     Acceptance,
+}
+
+/// What the step behind an acceptance-rule rejection showed of the change's own target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetReach {
+    /// Nothing either way.
+    Unknown,
+    /// The change's members bound its exact target, so the violation is one of the planned move.
+    Reached,
+    /// The change's own declaration moved past its target, so the step judged a move the plan
+    /// never asked for.
+    Overshot,
 }
 
 /// The rejection recorded for one planned change, which its held row reports.
@@ -215,6 +221,9 @@ pub(crate) struct RejectionDetail {
     /// The packages Cargo's refusal set against each other, read from its raw stderr; empty for
     /// an acceptance-rule violation.
     pub(crate) parties: Vec<ConflictParty>,
+    /// What the rejected step showed of the change's target; [`TargetReach::Unknown`] for a
+    /// Cargo refusal.
+    pub(crate) reach: TargetReach,
 }
 
 impl RejectionDetail {
@@ -224,25 +233,18 @@ impl RejectionDetail {
             text,
             origin: DiagnosticOrigin::Resolver,
             parties,
+            reach: TargetReach::Unknown,
         }
     }
 
-    /// An acceptance-rule violation, described by `text`.
-    pub(crate) fn violation(text: String) -> Self {
+    /// An acceptance-rule violation, described by `text`, of a step that showed `reach` of the
+    /// change's target.
+    pub(crate) fn violation(text: String, reach: TargetReach) -> Self {
         Self {
             text,
             origin: DiagnosticOrigin::Acceptance,
             parties: Vec::new(),
-        }
-    }
-
-    /// An acceptance-rule violation of a step that overshot the change's target, described by
-    /// `text`.
-    pub(crate) fn overshoot(text: String) -> Self {
-        Self {
-            text,
-            origin: DiagnosticOrigin::Overshoot,
-            parties: Vec::new(),
+            reach,
         }
     }
 }
@@ -290,13 +292,20 @@ impl MemoRejection {
     /// Records each effect in order, keeping per change the detail of the highest
     /// [`DiagnosticOrigin`] and the latest of that origin.
     ///
+    /// The one exception: a violation of a step that overshot the change's target never replaces
+    /// one of a step that reached it, such as the split a joint attempt at the exact target found,
+    /// which names the hold that decided the move.
+    ///
     /// A cold attempt records through this too, so a replayed refusal reports what the attempt
     /// it replays reported.
     pub(crate) fn apply(&self, rejections: &mut PinRejections) {
         for effect in &self.effects {
             match rejections.entry(effect.key.clone()) {
                 Entry::Occupied(mut recorded) => {
-                    if effect.detail.origin >= recorded.get().origin {
+                    let kept = recorded.get();
+                    let overshoots_a_reached_target = kept.reach == TargetReach::Reached
+                        && effect.detail.reach == TargetReach::Overshot;
+                    if effect.detail.origin >= kept.origin && !overshoots_a_reached_target {
                         recorded.insert(effect.detail.clone());
                     }
                 }
@@ -1963,8 +1972,8 @@ mod tests {
     }
 
     /// Replay keeps the latest detail of the highest origin: a violation outranks every resolver
-    /// error before or after it, and a later violation replaces an earlier one, while an overshoot
-    /// ranks between the two.
+    /// error before or after it, and a later violation replaces an earlier one unless it overshot
+    /// a target the earlier one reached.
     #[test]
     fn replay_keeps_the_latest_detail_of_the_highest_origin() {
         let key: (String, String, String) = ("dep".into(), "1".into(), "2".into());
@@ -1996,7 +2005,10 @@ mod tests {
         assert_eq!(
             replay(vec![
                 effect(RejectionDetail::resolver("cargo".into(), Vec::new())),
-                effect(RejectionDetail::violation("guard".into())),
+                effect(RejectionDetail::violation(
+                    "guard".into(),
+                    TargetReach::Unknown
+                )),
                 effect(RejectionDetail::resolver("trailing pin".into(), Vec::new())),
             ])
             .as_deref(),
@@ -2004,8 +2016,14 @@ mod tests {
         );
         assert_eq!(
             replay(vec![
-                effect(RejectionDetail::violation("first guard".into())),
-                effect(RejectionDetail::violation("last guard".into())),
+                effect(RejectionDetail::violation(
+                    "first guard".into(),
+                    TargetReach::Unknown
+                )),
+                effect(RejectionDetail::violation(
+                    "last guard".into(),
+                    TargetReach::Unknown
+                )),
             ])
             .as_deref(),
             Some("last guard")
@@ -2016,23 +2034,55 @@ mod tests {
         MemoRejection::default().apply(&mut rejections);
         assert!(rejections.is_empty());
 
-        // An overshoot past the target keeps an earlier violation of the planned move, such as
-        // the split a joint attempt at the exact target found, and replaces a resolver error.
+        // An overshoot past the target keeps an earlier violation at the exact target, such as
+        // the split a joint attempt found, but replaces one that showed nothing of the target and
+        // a resolver error.
+        let overshoot =
+            || RejectionDetail::violation("past the target".into(), TargetReach::Overshot);
         assert_eq!(
             replay(vec![
-                effect(RejectionDetail::violation("split".into())),
-                effect(RejectionDetail::overshoot("moved past the target".into())),
+                effect(RejectionDetail::violation(
+                    "split".into(),
+                    TargetReach::Reached
+                )),
+                effect(overshoot()),
             ])
             .as_deref(),
             Some("split")
         );
         assert_eq!(
             replay(vec![
-                effect(RejectionDetail::resolver("cargo".into(), Vec::new())),
-                effect(RejectionDetail::overshoot("moved past the target".into())),
+                effect(RejectionDetail::violation(
+                    "named split".into(),
+                    TargetReach::Unknown
+                )),
+                effect(overshoot()),
             ])
             .as_deref(),
-            Some("moved past the target")
+            Some("past the target")
+        );
+        assert_eq!(
+            replay(vec![
+                effect(RejectionDetail::resolver("cargo".into(), Vec::new())),
+                effect(overshoot()),
+            ])
+            .as_deref(),
+            Some("past the target")
+        );
+        // A later violation at the target still replaces an earlier one.
+        assert_eq!(
+            replay(vec![
+                effect(RejectionDetail::violation(
+                    "first split".into(),
+                    TargetReach::Reached
+                )),
+                effect(RejectionDetail::violation(
+                    "last split".into(),
+                    TargetReach::Reached
+                )),
+            ])
+            .as_deref(),
+            Some("last split")
         );
     }
 }

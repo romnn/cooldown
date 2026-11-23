@@ -16,11 +16,10 @@
   package. pnpm and Yarn, which write exemptions to their own lists, are unchanged. Closes #157.
 - **A held Cargo dependency keeps the hold that decided it.** `zip 8.6.0 → 9.5.0` was reported as
   `would move directly declared zip 8.6.0 to 9.7.3`, although every attempt at the target was
-  refused by the duplicate-line guard because the git dependency `gdown` keeps zip on 8.x. A
-  per-change widen whose resolve binds the change's own declaration past its target now ranks
-  below a violation of the planned move itself, so the row names the guard and `gdown`, while still
-  outranking a Cargo refusal. The per-change widen also logs the violation it was refused for.
-  Closes #156.
+  refused by the duplicate-line guard because the git dependency `gdown` keeps zip on 8.x. A later
+  per-change widen, whose resolve bound zip past its target after Cargo refused to pin it, no
+  longer replaces a violation found with the change at its exact target, so the row names the
+  guard and `gdown`. The per-change widen also logs the violation it was refused for. Closes #156.
 
 ## v0.0.32
 
