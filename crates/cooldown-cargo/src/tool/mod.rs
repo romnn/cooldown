@@ -1355,7 +1355,7 @@ impl GroupResolve {
                     let reach = if landed.reached(change) {
                         TargetReach::Reached
                     } else {
-                        TargetReach::Unknown
+                        TargetReach::Missed
                     };
                     Some(RejectionEffect {
                         key: rejection_key(change),

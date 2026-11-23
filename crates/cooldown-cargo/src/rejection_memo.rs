@@ -186,7 +186,7 @@ impl MemoKey {
     }
 }
 
-/// Where a planned change's recorded rejection comes from, in increasing precedence.
+/// Where a planned change's recorded rejection comes from.
 ///
 /// A resolve that landed but broke the [acceptance rule](crate::tool::acceptance) names the hold
 /// that decided the step.
@@ -200,6 +200,19 @@ pub(crate) enum DiagnosticOrigin {
     Acceptance,
 }
 
+/// The rank [`MemoRejection::apply`] keeps a change's detail by, the weakest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Precedence {
+    /// A joint attribution that missed the change's target.
+    MissedAttribution,
+    /// A violation of a step that overshot the change's target.
+    Overshoot,
+    /// Cargo's refusal.
+    Refusal,
+    /// Any other acceptance-rule violation.
+    Violation,
+}
+
 /// What the step behind an acceptance-rule rejection showed of the change's own target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TargetReach {
@@ -207,8 +220,11 @@ pub(crate) enum TargetReach {
     Unknown,
     /// The change's members bound its exact target, so the violation is one of the planned move.
     Reached,
+    /// A joint step blamed the change by its crate's name although the change did not reach its
+    /// target there, so the violation may be a sibling move's.
+    Missed,
     /// The change's own declaration moved past its target, so the step judged a move the plan
-    /// never asked for.
+    /// never asked for and says nothing of the target.
     Overshot,
 }
 
@@ -234,6 +250,23 @@ impl RejectionDetail {
             origin: DiagnosticOrigin::Resolver,
             parties,
             reach: TargetReach::Unknown,
+        }
+    }
+
+    /// How much this detail says about why the change missed its target, the weakest first.
+    ///
+    /// An acceptance-rule violation names the hold that decided the step, which outranks Cargo's
+    /// refusal of another attempt at the same change, such as a precise pin across lines that
+    /// Cargo refuses whatever holds the change.
+    /// A violation of a step that overshot the target says nothing of the target, so even that
+    /// refusal, which names the requirement blocking the target, outranks it.
+    /// A joint attribution that missed the target may be a sibling move's, so it ranks lowest.
+    pub(crate) fn precedence(&self) -> Precedence {
+        match (self.reach, self.origin) {
+            (TargetReach::Missed, _) => Precedence::MissedAttribution,
+            (TargetReach::Overshot, _) => Precedence::Overshoot,
+            (_, DiagnosticOrigin::Resolver) => Precedence::Refusal,
+            (_, DiagnosticOrigin::Acceptance) => Precedence::Violation,
         }
     }
 
@@ -290,11 +323,7 @@ pub(crate) struct SplitHeal {
 
 impl MemoRejection {
     /// Records each effect in order, keeping per change the detail of the highest
-    /// [`DiagnosticOrigin`] and the latest of that origin.
-    ///
-    /// The one exception: a violation of a step that overshot the change's target never replaces
-    /// one of a step that reached it, such as the split a joint attempt at the exact target found,
-    /// which names the hold that decided the move.
+    /// [`RejectionDetail::precedence`] and the latest of that precedence.
     ///
     /// A cold attempt records through this too, so a replayed refusal reports what the attempt
     /// it replays reported.
@@ -302,10 +331,7 @@ impl MemoRejection {
         for effect in &self.effects {
             match rejections.entry(effect.key.clone()) {
                 Entry::Occupied(mut recorded) => {
-                    let kept = recorded.get();
-                    let overshoots_a_reached_target = kept.reach == TargetReach::Reached
-                        && effect.detail.reach == TargetReach::Overshot;
-                    if effect.detail.origin >= kept.origin && !overshoots_a_reached_target {
+                    if effect.detail.precedence() >= recorded.get().precedence() {
                         recorded.insert(effect.detail.clone());
                     }
                 }
@@ -1972,8 +1998,8 @@ mod tests {
     }
 
     /// Replay keeps the latest detail of the highest origin: a violation outranks every resolver
-    /// error before or after it, and a later violation replaces an earlier one unless it overshot
-    /// a target the earlier one reached.
+    /// error before or after it, and a later violation replaces an earlier one, while an overshoot
+    /// of the target and a joint attribution that missed it rank below a refusal.
     #[test]
     fn replay_keeps_the_latest_detail_of_the_highest_origin() {
         let key: (String, String, String) = ("dep".into(), "1".into(), "2".into());
@@ -2034,11 +2060,12 @@ mod tests {
         MemoRejection::default().apply(&mut rejections);
         assert!(rejections.is_empty());
 
-        // An overshoot past the target keeps an earlier violation at the exact target, such as
-        // the split a joint attempt found, but replaces one that showed nothing of the target and
-        // a resolver error.
+        // An overshoot past the target says nothing of it: a Cargo refusal of the exact target and
+        // a violation found there outrank it, and it outranks only a joint attribution that
+        // missed the target.
         let overshoot =
             || RejectionDetail::violation("past the target".into(), TargetReach::Overshot);
+        let missed = || RejectionDetail::violation("sibling split".into(), TargetReach::Missed);
         assert_eq!(
             replay(vec![
                 effect(RejectionDetail::violation(
@@ -2051,38 +2078,32 @@ mod tests {
             Some("split")
         );
         assert_eq!(
+            replay(vec![effect(missed()), effect(overshoot())]).as_deref(),
+            Some("past the target")
+        );
+        assert_eq!(
+            replay(vec![effect(overshoot()), effect(missed())]).as_deref(),
+            Some("past the target")
+        );
+        // The order one change's attempts run in: its pin is refused, a joint probe blames it by
+        // name while it stays on its old line, its widened pin is refused by the requirement that
+        // actually blocks it, and the widen's resolve overshoots the target. The refusal naming
+        // the blocker stays.
+        assert_eq!(
             replay(vec![
-                effect(RejectionDetail::violation(
-                    "named split".into(),
-                    TargetReach::Unknown
+                effect(RejectionDetail::resolver(
+                    "member requirement".into(),
+                    Vec::new()
+                )),
+                effect(missed()),
+                effect(RejectionDetail::resolver(
+                    "held by gdown".into(),
+                    Vec::new()
                 )),
                 effect(overshoot()),
             ])
             .as_deref(),
-            Some("past the target")
-        );
-        assert_eq!(
-            replay(vec![
-                effect(RejectionDetail::resolver("cargo".into(), Vec::new())),
-                effect(overshoot()),
-            ])
-            .as_deref(),
-            Some("past the target")
-        );
-        // A later violation at the target still replaces an earlier one.
-        assert_eq!(
-            replay(vec![
-                effect(RejectionDetail::violation(
-                    "first split".into(),
-                    TargetReach::Reached
-                )),
-                effect(RejectionDetail::violation(
-                    "last split".into(),
-                    TargetReach::Reached
-                )),
-            ])
-            .as_deref(),
-            Some("last split")
+            Some("held by gdown")
         );
     }
 }
