@@ -33,6 +33,8 @@ struct StagedTree {
     /// The canonical directory the copy lives in, which only cooldown writes.
     tree: Utf8PathBuf,
     registration: u64,
+    /// Whether outcomes in the copy may be reused, which disabling the memo turns off.
+    reusable: bool,
 }
 
 /// What a reusable outcome in a staged copy depends on besides its directory and arguments.
@@ -58,8 +60,8 @@ impl StagedInputs {
 
 impl StagedTrees {
     /// Registers `staged` as a staged project root whose copy lives in the canonical directory
-    /// `tree`, which only cooldown writes.
-    pub(crate) fn register(&self, staged: &Utf8Path, tree: &Utf8Path) {
+    /// `tree`, which only cooldown writes, with outcome reuse in it on when `reusable`.
+    pub(crate) fn register(&self, staged: &Utf8Path, tree: &Utf8Path, reusable: bool) {
         let registration = self.registrations.fetch_add(1, Ordering::Relaxed);
         self.trees
             .lock()
@@ -69,6 +71,7 @@ impl StagedTrees {
                 StagedTree {
                     tree: tree.to_owned(),
                     registration,
+                    reusable,
                 },
             );
     }
@@ -100,7 +103,14 @@ impl StagedTrees {
         command: &CommandLine,
         lock: LockSource,
     ) -> Option<StagedInputs> {
-        let StagedTree { tree, registration } = self.get(&project.root)?;
+        let StagedTree {
+            tree,
+            registration,
+            reusable,
+        } = self.get(&project.root)?;
+        if !reusable {
+            return None;
+        }
         if !stable_resolution(
             &project.root,
             &CargoEnvironment::current(),

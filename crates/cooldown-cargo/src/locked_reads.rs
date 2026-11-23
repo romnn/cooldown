@@ -263,7 +263,7 @@ mod tests {
         /// Registers the project as the staged copy of `original` living in `tree`.
         fn stage(&self, tree: &Utf8Path, original: &Utf8Path) -> eyre::Result<()> {
             self.memo.register_origin(&self.project.root, original)?;
-            self.trees.register(&self.project.root, tree);
+            self.trees.register(&self.project.root, tree, true);
             Ok(())
         }
 
@@ -439,7 +439,7 @@ mod tests {
         fixture.read().await?;
         fixture
             .trees
-            .register(&fixture.project.root, &fixture.fixture);
+            .register(&fixture.project.root, &fixture.fixture, true);
         fixture.read().await?;
         fixture.read().await?;
 

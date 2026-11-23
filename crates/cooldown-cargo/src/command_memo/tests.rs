@@ -9,10 +9,13 @@ use std::os::unix::fs::PermissionsExt as _;
 /// `<fixture>/refuse` exists, and fails as a transport error while `<fixture>/transport` exists.
 /// `metadata` writes `<fixture>/resolved.lock` and prints the package `app`.
 /// With `<fixture>/mutate`, a command also edits the manifest while it runs.
+/// With `<fixture>/crash`, a command removes that marker and kills itself with a signal before
+/// doing anything else.
 const SCRIPT: &str = indoc! {r#"
     #!/bin/sh
     set -eu
     printf '%s\n' "$*" >> ../invocations
+    if [ -f ../crash ]; then rm ../crash; kill -KILL $$; fi
     if [ -f ../mutate ]; then printf '# edited\n' >> Cargo.toml; fi
     case "$1" in
       update)
@@ -72,7 +75,7 @@ impl CommandFixture {
     }
 
     fn register_staged(&self) {
-        self.trees.register(&self.project.root, &self.fixture);
+        self.trees.register(&self.project.root, &self.fixture, true);
     }
 
     fn unstaged() -> eyre::Result<Self> {
@@ -111,13 +114,20 @@ impl CommandFixture {
 
     fn commands(&self) -> MemoizedCargo<'_> {
         MemoizedCargo {
+            enabled: true,
+            ..self.commands_without_memo()
+        }
+    }
+
+    fn commands_without_memo(&self) -> MemoizedCargo<'_> {
+        MemoizedCargo {
             cargo: &self.cargo,
             memo: &self.memo,
             outcomes: &self.outcomes,
             trees: &self.trees,
             reads: &self.reads,
             lockstep: &self.lockstep,
-            enabled: true,
+            enabled: false,
         }
     }
 
@@ -160,6 +170,49 @@ impl CommandFixture {
     fn mark(&self, name: &str) -> eyre::Result<()> {
         Ok(std::fs::write(self.fixture.join(name), "")?)
     }
+}
+
+/// A resolve a signal killed in a staged copy runs once more, also with the memo disabled, which
+/// registers the copy without reusing its outcomes.
+#[tokio::test]
+async fn a_killed_staged_resolve_runs_once_more_without_the_memo() -> eyre::Result<()> {
+    let fixture = CommandFixture::unstaged()?;
+    fixture
+        .trees
+        .register(&fixture.project.root, &fixture.fixture, false);
+    fixture.mark("crash")?;
+
+    let graph = fixture
+        .commands_without_memo()
+        .metadata(&fixture.project)
+        .await?;
+
+    assert!(graph.packages.values().any(|package| package.name == "app"));
+    assert_eq!(fixture.invocations()?, 2);
+    Ok(())
+}
+
+/// A tree that is not a staged copy may be written by others, so a killed command there is not
+/// run again.
+#[tokio::test]
+async fn a_killed_resolve_outside_a_staged_copy_is_not_run_again() -> eyre::Result<()> {
+    let fixture = CommandFixture::unstaged()?;
+    fixture.mark("crash")?;
+
+    let error = fixture.commands().metadata(&fixture.project).await.err();
+
+    assert!(
+        matches!(
+            error,
+            Some(CoreError::Tool {
+                termination: cooldown_core::ToolTermination::Signal(9),
+                ..
+            })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(fixture.invocations()?, 1);
+    Ok(())
 }
 
 /// A command repeated from the inputs it ran on replays its result and the lock it wrote, without

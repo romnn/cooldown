@@ -213,12 +213,17 @@ impl CargoTool {
 
     /// Registers `staged` as a staged copy of `original` whose topology lives in `tree`, a
     /// directory only cooldown writes.
+    ///
+    /// The copy is registered even with the memo disabled, since a command a signal killed there
+    /// may run once more whether or not outcomes are reused.
     pub(crate) fn register_memo_origin(
         &self,
         staged: &Project,
         original: &Project,
         tree: &Utf8Path,
     ) {
+        self.staged_trees
+            .register(&staged.root, tree, self.rejection_memo_enabled);
         if !self.rejection_memo_enabled {
             return;
         }
@@ -228,7 +233,6 @@ impl CargoTool {
         {
             tracing::debug!(%err, "cargo rejection memo origin unavailable; bypassing memo");
         }
-        self.staged_trees.register(&staged.root, tree);
     }
 
     /// The generated-member facts for `project`: the memoized ones, else established from a
@@ -5333,22 +5337,14 @@ impl ToolWrite for CargoTool {
                     )
                 });
                 if needs_graph {
-                    Some(
-                        self.cargo
-                            .metadata(&project.root, &project.generated_members)
-                            .await?,
-                    )
+                    Some(self.commands().metadata(project).await?)
                 } else {
                     None
                 }
             }
             // A metadata failure must remain a project error; otherwise requested canonical
             // healing would degrade to a successful no-op.
-            EdgePolicy::Canonicalize => Some(
-                self.cargo
-                    .metadata(&project.root, &project.generated_members)
-                    .await?,
-            ),
+            EdgePolicy::Canonicalize => Some(self.commands().metadata(project).await?),
         };
         let generated = self.generated_facts(project, None).await?;
         let mut result = edges::enforce::enforce(

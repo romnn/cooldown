@@ -586,9 +586,10 @@ pub(crate) struct StagingPackage {
 enum LockSnapshot {
     /// No file at the path.
     Absent,
-    /// A regular file with these bytes.
+    /// A regular file with one link and these bytes.
     File(Vec<u8>),
-    /// Anything that cannot prove the inputs unchanged: a link, a directory, an unreadable file.
+    /// Anything that cannot prove the inputs unchanged: a symbolic or second hard link, through
+    /// which a write would reach another file, a directory, an unreadable file.
     Unknown,
 }
 
@@ -596,12 +597,26 @@ impl LockSnapshot {
     fn of(path: &Utf8Path) -> Self {
         match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => LockSnapshot::Absent,
-            Ok(metadata) if metadata.file_type().is_file() => {
+            Ok(metadata) if metadata.file_type().is_file() && single_link(&metadata) => {
                 std::fs::read(path).map_or(LockSnapshot::Unknown, LockSnapshot::File)
             }
             _ => LockSnapshot::Unknown,
         }
     }
+}
+
+/// Whether a file has no other hard link a write through it could reach.
+#[cfg(unix)]
+fn single_link(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    metadata.nlink() == 1
+}
+
+/// Whether a file has no other hard link a write through it could reach; Windows exposes no link
+/// count on stable Rust, and its staged copies are written by cooldown alone.
+#[cfg(not(unix))]
+fn single_link(_metadata: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// Extracts the version from an exact `=x.y.z` Cargo requirement. Cargo uses a single `=`; the
@@ -1518,11 +1533,11 @@ impl Cargo {
     ///
     /// Cargo has crashed with a signal right after printing an ordinary resolver conflict, which
     /// the same command reproduces normally, so one crash proves nothing about the inputs.
-    /// `lock` names the lock the command may write: it must still be a regular file with the
-    /// bytes it had, or still be absent, for the command to run again from the same inputs.
+    /// `lock` names the lock the command may write: it must still be a regular file with one
+    /// link and the bytes it had, or still be absent, for the command to run again from the same
+    /// inputs.
     /// `None` is for a command that writes no lock, such as a `--locked` read.
-    /// Nothing is restored, so a write by someone else is never overwritten; a changed lock just
-    /// leaves the first run's crash as the result.
+    /// Nothing is restored: a changed lock leaves the first run's crash as the result.
     pub(crate) async fn spawn_retrying(
         &self,
         dir: &Utf8Path,
@@ -1531,14 +1546,16 @@ impl Cargo {
     ) -> Result<std::process::Output, CoreError> {
         let before = lock.map(|path| (path, LockSnapshot::of(path)));
         let first = self.spawn(dir, args).await?;
-        let killed = matches!(
+        if !matches!(
             ToolTermination::from_exit_status(first.status),
             ToolTermination::Signal(_)
-        );
+        ) {
+            return Ok(first);
+        }
         let inputs_unchanged = before.is_none_or(|(path, before)| {
             before != LockSnapshot::Unknown && LockSnapshot::of(path) == before
         });
-        if !killed || !inputs_unchanged {
+        if !inputs_unchanged {
             return Ok(first);
         }
         tracing::debug!(
@@ -1569,18 +1586,10 @@ impl Cargo {
 
     /// The tool error of a command that exited unsuccessfully.
     pub(crate) fn failure(&self, out: &std::process::Output) -> CoreError {
-        let termination = ToolTermination::from_exit_status(out.status);
-        // A process a signal killed in silence printed nothing the error could quote.
-        let silent = out.stdout.trim_ascii().is_empty() && out.stderr.trim_ascii().is_empty();
-        let stderr = if matches!(termination, ToolTermination::Signal(_)) && silent {
-            String::new()
-        } else {
-            failure_detail(out)
-        };
         CoreError::Tool {
             tool: self.bin.clone(),
-            termination,
-            stderr,
+            termination: ToolTermination::from_exit_status(out.status),
+            stderr: failure_detail(out),
         }
     }
 
@@ -2494,6 +2503,31 @@ mod tests {
                 })
             ),
             "{error:?}"
+        );
+        Ok(())
+    }
+
+    /// A lock with a second hard link proves nothing about the file a write reaches, so it is no
+    /// snapshot a retry may rely on.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_lock_cannot_prove_the_inputs_unchanged() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let lock = root.join("Cargo.lock");
+        std::fs::write(&lock, "version = 4\n")?;
+        assert_eq!(
+            LockSnapshot::of(&lock),
+            LockSnapshot::File(b"version = 4\n".to_vec())
+        );
+
+        std::fs::hard_link(&lock, root.join("elsewhere.lock"))?;
+
+        assert_eq!(LockSnapshot::of(&lock), LockSnapshot::Unknown);
+        assert_eq!(
+            LockSnapshot::of(&root.join("absent.lock")),
+            LockSnapshot::Absent
         );
         Ok(())
     }
