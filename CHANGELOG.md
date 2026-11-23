@@ -14,6 +14,14 @@
   three now give the same warning, ``the cooldown exemption from `repo:cooldown.toml:package=itoa`
   is not represented in cargo's native config``, unless uv's package table carries the literal
   package. pnpm and Yarn, which write exemptions to their own lists, are unchanged. Closes #157.
+- **A held Cargo dependency keeps the hold that decided it.** `zip 8.6.0 → 9.5.0` was reported as
+  `would move directly declared zip 8.6.0 to 9.7.3`, although every attempt at the target was
+  refused by the duplicate-line guard because the git dependency `gdown` keeps zip on 8.x. That
+  message came from a per-change widen whose resolve bound zip past its target after Cargo refused
+  to pin the target. Such an overshoot now ranks below every other reason for a held row but a
+  joint attribution that missed the change's target, so the row names the guard and `gdown`, or,
+  when only the per-change widen ran, Cargo's refusal naming `gdown`. The per-change widen also
+  logs the violation it was refused for. Closes #156.
 
 ## v0.0.32
 

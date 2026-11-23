@@ -42,7 +42,7 @@ use crate::native::native_policy_layer;
 use crate::publish_age::CargoEnvironment;
 use crate::rejection_memo::{
     DiagnosticOrigin, MemoKey, MemoMetadataMode, MemoOperation, MemoRejection, PinRejections,
-    RejectionDetail, RejectionEffect, RejectionMemo, SplitHeal,
+    RejectionDetail, RejectionEffect, RejectionMemo, SplitHeal, TargetReach,
 };
 use crate::version;
 use async_trait::async_trait;
@@ -1060,6 +1060,27 @@ impl Violation {
         }
     }
 
+    /// Whether the step bound `change`'s own declaration above its target on the target's line,
+    /// so it judged a move the plan never asked for.
+    ///
+    /// A per-change widen resolves the widened requirement to the newest release it admits, which
+    /// can lie past the target when Cargo refused to pin the target itself.
+    fn overshoots(&self, change: &Change) -> bool {
+        match self {
+            Violation::DeclaredMoved {
+                name,
+                from,
+                to: Some(to),
+            } => {
+                *name == change.package.name
+                    && from == change.from.as_str()
+                    && compatibility_line(to) == compatibility_line(change.to.as_str())
+                    && version::compare(to, change.to.as_str()).is_gt()
+            }
+            _ => false,
+        }
+    }
+
     /// The other planned crate whose own plan the violation enforced against `change`'s step.
     fn planned_constraint(&self, change: &Change) -> Option<&str> {
         match self {
@@ -1205,10 +1226,16 @@ impl CulpritDrop {
         if plan.fast { Self::All } else { Self::First }
     }
 
-    /// The outcome of a resolve that broke the acceptance rule in `violations`, with the culprits
-    /// this mode drops, or `None` when it broke none.
-    fn violated(self, mut violations: impl Iterator<Item = Violation>) -> Option<GroupResolve> {
-        let violation = violations.next()?;
+    /// The outcome of a resolve that bound `landed`: the acceptance-rule breaches in `violations`,
+    /// with the culprits this mode drops, or the resolve itself when it broke none.
+    fn judged(
+        self,
+        mut violations: impl Iterator<Item = Violation>,
+        landed: WidenEvidence,
+    ) -> GroupResolve {
+        let Some(violation) = violations.next() else {
+            return GroupResolve::Resolved(Box::new(landed));
+        };
         tracing::debug!(%violation, "cargo joint widen broke the acceptance rule");
         let mut culprits = BTreeMap::new();
         let mut blame = |violation: &Violation| {
@@ -1226,10 +1253,11 @@ impl CulpritDrop {
                 blame(&further);
             }
         }
-        Some(GroupResolve::Violated {
+        GroupResolve::Violated {
             violation,
             culprits,
-        })
+            landed: Box::new(landed),
+        }
     }
 
     /// The `candidates` a probe retries without after `outcome` refused or violated the group,
@@ -1263,6 +1291,7 @@ impl CulpritDrop {
             GroupResolve::Violated {
                 violation,
                 culprits,
+                ..
             } => match self {
                 Self::First => violation
                     .split_culprits(candidates)
@@ -1297,6 +1326,9 @@ enum GroupResolve {
         /// culprits, the first violation's or every violation's, each with the first violation
         /// that names it.
         culprits: BTreeMap<String, String>,
+        /// What the resolve bound, which tells a culprit blamed by name whether its own move
+        /// reached its target.
+        landed: Box<WidenEvidence>,
     },
     /// The resolve moved a seeded package to a version the plan does not name, or the seed could
     /// not be written.
@@ -1309,7 +1341,10 @@ impl GroupResolve {
     /// Under `--fast` one resolve drops the culprits of several violations, so each dropped
     /// candidate is blamed with its own violation, not the resolve's first.
     fn blame(&self, dropped: &[&Change], rejections: &mut PinRejections) {
-        let Self::Violated { culprits, .. } = self else {
+        let Self::Violated {
+            culprits, landed, ..
+        } = self
+        else {
             return;
         };
         MemoRejection {
@@ -1317,9 +1352,14 @@ impl GroupResolve {
                 .iter()
                 .filter_map(|change| {
                     let violation = culprits.get(&change.package.name)?;
+                    let reach = if landed.reached(change) {
+                        TargetReach::Reached
+                    } else {
+                        TargetReach::Missed
+                    };
                     Some(RejectionEffect {
                         key: rejection_key(change),
-                        detail: RejectionDetail::violation(violation.clone()),
+                        detail: RejectionDetail::violation(violation.clone(), reach),
                     })
                 })
                 .collect(),
@@ -2760,13 +2800,11 @@ impl CargoTool {
             tracing::debug!("cargo joint widen moved a seeded package to an unplanned version");
             return Ok(GroupResolve::Discarded);
         }
-        if let Some(violated) = culprit_drop.violated(probe.violations(&baseline, &lock)) {
-            return Ok(violated);
-        }
-        Ok(GroupResolve::Resolved(Box::new(WidenEvidence {
+        let landed = WidenEvidence {
             versions: lock.crates_io_locked_versions(),
             graph: Some(graph),
-        })))
+        };
+        Ok(culprit_drop.judged(probe.violations(&baseline, &lock), landed))
     }
 
     /// Lands `change`, whose own step split a declared crate, together with the planned moves
@@ -2949,14 +2987,25 @@ impl CargoTool {
         rejections: &mut PinRejections,
         stats: &mut PinBatchStats,
     ) -> Result<TentativeWiden> {
+        tracing::debug!(
+            change = ?rejection_key(change),
+            %violation,
+            "cargo per-change widen broke the acceptance rule"
+        );
         self.note_refusal_constraints(
             &probe.project.root,
             change,
             violation.planned_constraint(change).map(str::to_owned),
         );
+        let reach = if violation.overshoots(change) {
+            TargetReach::Overshot
+        } else {
+            TargetReach::Unknown
+        };
+        let detail = RejectionDetail::violation(violation.to_string(), reach);
         let effect = RejectionEffect {
             key: rejection_key(change),
-            detail: RejectionDetail::violation(violation.to_string()),
+            detail,
         };
         MemoRejection {
             effects: vec![effect.clone()],
@@ -3851,7 +3900,7 @@ impl CargoTool {
         // An unlocking retry that resolved but broke the acceptance rule names the hold that
         // decided the pin, which Cargo's refusal of the plain pin does not.
         let effects: Vec<_> = violation
-            .map(RejectionDetail::violation)
+            .map(|text| RejectionDetail::violation(text, TargetReach::Unknown))
             .or(detail)
             .into_iter()
             .map(|detail| RejectionEffect {
@@ -4172,7 +4221,10 @@ impl CargoTool {
                 );
                 restore()?;
                 Ok(PrecisePinOutcome::Rejected {
-                    detail: Some(RejectionDetail::violation(violation.to_string())),
+                    detail: Some(RejectionDetail::violation(
+                        violation.to_string(),
+                        TargetReach::Unknown,
+                    )),
                     // The verdict depends on the plan, which the memo key omits: a split may land
                     // beside the planned moves that heal it.
                     resolver_rejection: false,
@@ -6278,6 +6330,35 @@ mod tests {
         CargoLock::parse(&content).expect("lock parses")
     }
 
+    /// A per-change widen that bound the change's own declaration past its target on the
+    /// target's line overshot; any other violation, or a move short of or beside the target, did
+    /// not.
+    #[test]
+    fn only_a_move_of_the_own_declaration_past_the_target_overshoots() {
+        let zip = change("zip", "8.6.0", "9.5.0", false);
+        let moved = |name: &str, from: &str, to: Option<&str>| Violation::DeclaredMoved {
+            name: name.to_string(),
+            from: from.to_string(),
+            to: to.map(str::to_string),
+        };
+
+        assert!(moved("zip", "8.6.0", Some("9.7.3")).overshoots(&zip));
+        // Another crate, another starting version, the target itself, another line, and leaving
+        // the lock are no overshoot of this change.
+        assert!(!moved("flate2", "8.6.0", Some("9.7.3")).overshoots(&zip));
+        assert!(!moved("zip", "7.0.0", Some("9.7.3")).overshoots(&zip));
+        assert!(!moved("zip", "8.6.0", Some("9.5.0")).overshoots(&zip));
+        assert!(!moved("zip", "8.6.0", Some("10.0.0")).overshoots(&zip));
+        assert!(!moved("zip", "8.6.0", None).overshoots(&zip));
+        let split = Violation::DirectSplit {
+            name: "zip".to_string(),
+            versions: vec!["8.6.0".to_string(), "9.5.0".to_string()],
+            retainers: Vec::new(),
+            movers: Vec::new(),
+        };
+        assert!(!split.overshoots(&zip));
+    }
+
     fn change(name: &str, from: &str, to: &str, downgrade: bool) -> Change {
         Change {
             package: PackageId::new(CARGO_ID, name, Some(CRATES_IO.to_string())),
@@ -6937,7 +7018,7 @@ mod tests {
         assert_eq!(reported_rejection(&elsewhere, Some(&pinned)), summary);
         let violation = RejectionDetail {
             parties: rejection.parties.clone(),
-            ..RejectionDetail::violation(summary.clone())
+            ..RejectionDetail::violation(summary.clone(), TargetReach::Unknown)
         };
         assert_eq!(reported_rejection(&violation, Some(&pinned)), summary);
         Ok(())
