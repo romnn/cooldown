@@ -1060,6 +1060,27 @@ impl Violation {
         }
     }
 
+    /// Whether the step bound `change`'s own declaration above its target on the target's line,
+    /// so it judged a move the plan never asked for.
+    ///
+    /// A per-change widen resolves the widened requirement to the newest release it admits, which
+    /// can lie past the target when Cargo refused to pin the target itself.
+    fn overshoots(&self, change: &Change) -> bool {
+        match self {
+            Violation::DeclaredMoved {
+                name,
+                from,
+                to: Some(to),
+            } => {
+                *name == change.package.name
+                    && from == change.from.as_str()
+                    && compatibility_line(to) == compatibility_line(change.to.as_str())
+                    && version::compare(to, change.to.as_str()).is_gt()
+            }
+            _ => false,
+        }
+    }
+
     /// The other planned crate whose own plan the violation enforced against `change`'s step.
     fn planned_constraint(&self, change: &Change) -> Option<&str> {
         match self {
@@ -2949,14 +2970,24 @@ impl CargoTool {
         rejections: &mut PinRejections,
         stats: &mut PinBatchStats,
     ) -> Result<TentativeWiden> {
+        tracing::debug!(
+            change = ?rejection_key(change),
+            %violation,
+            "cargo per-change widen broke the acceptance rule"
+        );
         self.note_refusal_constraints(
             &probe.project.root,
             change,
             violation.planned_constraint(change).map(str::to_owned),
         );
+        let detail = if violation.overshoots(change) {
+            RejectionDetail::overshoot(violation.to_string())
+        } else {
+            RejectionDetail::violation(violation.to_string())
+        };
         let effect = RejectionEffect {
             key: rejection_key(change),
-            detail: RejectionDetail::violation(violation.to_string()),
+            detail,
         };
         MemoRejection {
             effects: vec![effect.clone()],
@@ -6276,6 +6307,35 @@ mod tests {
             "#});
         }
         CargoLock::parse(&content).expect("lock parses")
+    }
+
+    /// A per-change widen that bound the change's own declaration past its target on the
+    /// target's line overshot; any other violation, or a move short of or beside the target, did
+    /// not.
+    #[test]
+    fn only_a_move_of_the_own_declaration_past_the_target_overshoots() {
+        let zip = change("zip", "8.6.0", "9.5.0", false);
+        let moved = |name: &str, from: &str, to: Option<&str>| Violation::DeclaredMoved {
+            name: name.to_string(),
+            from: from.to_string(),
+            to: to.map(str::to_string),
+        };
+
+        assert!(moved("zip", "8.6.0", Some("9.7.3")).overshoots(&zip));
+        // Another crate, another starting version, the target itself, another line, and leaving
+        // the lock are no overshoot of this change.
+        assert!(!moved("flate2", "8.6.0", Some("9.7.3")).overshoots(&zip));
+        assert!(!moved("zip", "7.0.0", Some("9.7.3")).overshoots(&zip));
+        assert!(!moved("zip", "8.6.0", Some("9.5.0")).overshoots(&zip));
+        assert!(!moved("zip", "8.6.0", Some("10.0.0")).overshoots(&zip));
+        assert!(!moved("zip", "8.6.0", None).overshoots(&zip));
+        let split = Violation::DirectSplit {
+            name: "zip".to_string(),
+            versions: vec!["8.6.0".to_string(), "9.5.0".to_string()],
+            retainers: Vec::new(),
+            movers: Vec::new(),
+        };
+        assert!(!split.overshoots(&zip));
     }
 
     fn change(name: &str, from: &str, to: &str, downgrade: bool) -> Change {

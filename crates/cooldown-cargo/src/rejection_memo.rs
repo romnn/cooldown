@@ -196,6 +196,12 @@ impl MemoKey {
 pub(crate) enum DiagnosticOrigin {
     /// Cargo refused the resolve.
     Resolver,
+    /// The resolve landed but moved the change's own declaration past its target, so it broke
+    /// the acceptance rule for a move the plan never asked for.
+    ///
+    /// It still says more than a Cargo refusal, but less than a violation of the planned move,
+    /// such as the split an earlier joint attempt at the exact target found.
+    Overshoot,
     /// The resolve landed but broke the acceptance rule and was restored.
     Acceptance,
 }
@@ -226,6 +232,16 @@ impl RejectionDetail {
         Self {
             text,
             origin: DiagnosticOrigin::Acceptance,
+            parties: Vec::new(),
+        }
+    }
+
+    /// An acceptance-rule violation of a step that overshot the change's target, described by
+    /// `text`.
+    pub(crate) fn overshoot(text: String) -> Self {
+        Self {
+            text,
+            origin: DiagnosticOrigin::Overshoot,
             parties: Vec::new(),
         }
     }
@@ -1947,7 +1963,8 @@ mod tests {
     }
 
     /// Replay keeps the latest detail of the highest origin: a violation outranks every resolver
-    /// error before or after it, and a later violation replaces an earlier one.
+    /// error before or after it, and a later violation replaces an earlier one, while an overshoot
+    /// ranks between the two.
     #[test]
     fn replay_keeps_the_latest_detail_of_the_highest_origin() {
         let key: (String, String, String) = ("dep".into(), "1".into(), "2".into());
@@ -1998,5 +2015,24 @@ mod tests {
         let mut rejections = PinRejections::new();
         MemoRejection::default().apply(&mut rejections);
         assert!(rejections.is_empty());
+
+        // An overshoot past the target keeps an earlier violation of the planned move, such as
+        // the split a joint attempt at the exact target found, and replaces a resolver error.
+        assert_eq!(
+            replay(vec![
+                effect(RejectionDetail::violation("split".into())),
+                effect(RejectionDetail::overshoot("moved past the target".into())),
+            ])
+            .as_deref(),
+            Some("split")
+        );
+        assert_eq!(
+            replay(vec![
+                effect(RejectionDetail::resolver("cargo".into(), Vec::new())),
+                effect(RejectionDetail::overshoot("moved past the target".into())),
+            ])
+            .as_deref(),
+            Some("moved past the target")
+        );
     }
 }
