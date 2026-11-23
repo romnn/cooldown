@@ -464,10 +464,11 @@ fn every_spelling_of_an_exemption_is_reported_alike() {
     }
 }
 
-/// An exemption is encoded where a window would be: in the written default, which a `*` rule
-/// sets, or for a literal package in uv's package table, while any other glob reaches neither.
+/// Only uv's package table carries an exemption, for a literal package: no writer writes an
+/// exempt default, a `*` exemption leaves the project window in the default, and any other glob
+/// reaches neither.
 #[test]
-fn an_exemption_is_encoded_where_a_window_would_be() {
+fn only_a_package_table_carries_an_exemption() {
     let layers = repo_layers(indoc! {r#"
         latest = true
         allow = ["ruff", "types-*", "*"]
@@ -475,8 +476,83 @@ fn an_exemption_is_encoded_where_a_window_would_be() {
 
     assert_eq!(
         keys(&repo_scope(&layers, &[consumer(".", &layers)])),
-        ["repo:cooldown.toml:package=types-* exemption"]
+        [
+            "repo:cooldown.toml exemption",
+            "repo:cooldown.toml:package=types-* exemption",
+            "repo:cooldown.toml:package=* exemption",
+        ]
     );
+}
+
+/// `latest = true` and `min-age = "0d"` as the default window are reported alike by every writer,
+/// since none writes an exempt default and a bare command keeps the native config's own cutoff.
+#[test]
+fn every_writer_reports_an_exempt_default_alike() {
+    for config in ["latest = true\n", "min-age = \"0d\"\n"] {
+        let layers = repo_layers(config);
+        let consumers = [consumer(".", &layers)];
+        let cases = [
+            (CARGO, cargo_repo_scope(&layers, &consumers)),
+            (UV, repo_scope(&layers, &consumers)),
+            (PNPM, project_scope(&layers, ".", PNPM, false)),
+        ];
+        for (target, omitted) in cases {
+            let notices: Vec<String> = omitted.iter().map(|field| field.notice(target)).collect();
+            assert_eq!(
+                notices,
+                [format!(
+                    "the cooldown exemption from `repo:cooldown.toml` is not represented in \
+                     {target}'s native config, so a bare {target} command does not apply it"
+                )],
+                "{config} for {target}"
+            );
+        }
+    }
+}
+
+/// `[package."*"]`'s `min-age = "0d"`, `latest = true` and `allow = ["*"]` exempt every package
+/// alike, so a native config whose default keeps the project window reports each spelling with the
+/// same notice, while a writer with an exemption list takes each one.
+#[test]
+fn every_spelling_of_a_catch_all_exemption_is_reported_alike() {
+    let spellings = [
+        indoc! {r#"
+            min-age = "14d"
+
+            [package."*"]
+            min-age = "0d"
+        "#},
+        indoc! {r#"
+            min-age = "14d"
+
+            [package."*"]
+            latest = true
+        "#},
+        indoc! {r#"
+            min-age = "14d"
+            allow = ["*"]
+        "#},
+    ];
+    for config in spellings {
+        let layers = repo_layers(config);
+        let notices: Vec<String> = cargo_repo_scope(&layers, &[consumer(".", &layers)])
+            .iter()
+            .map(|field| field.notice(CARGO))
+            .collect();
+        assert_eq!(
+            notices,
+            [
+                "the cooldown exemption from `repo:cooldown.toml:package=*` is not represented \
+                 in cargo's native config, so a bare cargo command does not apply it"
+            ],
+            "{config}"
+        );
+        assert_eq!(
+            keys(&project_scope(&layers, ".", PNPM, false)),
+            Vec::<String>::new(),
+            "{config}"
+        );
+    }
 }
 
 /// A rule that exempts a package and also sets a window keeps the window as its own field.

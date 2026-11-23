@@ -135,6 +135,31 @@ fn a_freeze_leaves_the_age_alone_with_a_warning() -> eyre::Result<()> {
     Ok(())
 }
 
+/// An exempt default, however it is spelled, leaves the age alone without a warning of the
+/// adapter's own: the application's notice about policy the native config omits names it.
+#[test]
+fn an_exempt_default_leaves_the_age_alone() -> eyre::Result<()> {
+    for window in [WindowSpec::Latest, WindowSpec::MinAge(SignedDuration::ZERO)] {
+        let (_directory, root) = repo()?;
+        let config = root.join(".cargo/config.toml");
+        std::fs::create_dir_all(root.join(".cargo"))?;
+        let original = "[registries.crates-io]\nmin-publish-age = \"2 weeks\"\n";
+        std::fs::write(&config, original)?;
+
+        let report = write_repo_native(
+            &root,
+            &policy(window.clone()),
+            &CargoEnvironment::default(),
+            false,
+        )?;
+
+        assert_eq!(warning_kinds(&report), [], "{window:?}");
+        std::assert_matches!(report, SyncReport::Unchanged { .. });
+        assert_eq!(std::fs::read_to_string(&config)?, original, "{window:?}");
+    }
+    Ok(())
+}
+
 #[test]
 fn reports_policy_cargo_cannot_carry() -> eyre::Result<()> {
     let (_directory, root) = repo()?;

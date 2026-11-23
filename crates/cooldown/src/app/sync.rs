@@ -641,9 +641,10 @@ fn report_warnings(
         .collect()
 }
 
-/// A short window label for display (`14d`, a freeze date, or `latest`).
+/// A short window label for display (`14d`, a freeze date, or `latest`, which a zero age is too).
 fn window_display(spec: &WindowSpec) -> String {
     match spec {
+        _ if spec.is_exemption() => "latest".to_string(),
         WindowSpec::MinAge(duration) => {
             format!("{}d", cooldown_core::duration::duration_as_days(*duration))
         }
@@ -1718,6 +1719,27 @@ mod tests {
                 "#},
                 "14d",
             ),
+            (
+                indoc::indoc! {r#"
+                    min-age = "14d"
+
+                    [package."*"]
+                    min-age = "0d"
+                "#},
+                "14d",
+            ),
+            (
+                indoc::indoc! {r#"
+                    min-age = "14d"
+                    floor = "0d"
+
+                    [package."*"]
+                    latest = true
+                "#},
+                "14d",
+            ),
+            (r#"min-age = "0d""#, "latest"),
+            ("latest = true", "latest"),
             (
                 indoc::indoc! {r#"
                     min-age = "14d"

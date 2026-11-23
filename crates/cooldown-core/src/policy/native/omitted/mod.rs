@@ -177,11 +177,11 @@ impl OmittedField {
 /// Each context is a stack whose packages read the native config: the project for a
 /// project-scoped tool, every project that consumes the repo-level file for a repo-scoped one.
 /// A gating field is a window field set to anything but [`WindowSpec::Latest`], or a `floor`.
-/// When the writer does not take the package exemptions
-/// ([`NativeEncoding::writer_exemptions`]), a rule's `allow`, or its `default` window of
-/// [`WindowSpec::Latest`] or of zero, is a gating field too: one [`GatingField::Exemption`],
-/// whichever way it is spelled.
-/// Otherwise `allow` and `latest` are left to the writer's native exemption list.
+/// A rule's `allow`, or its `default` window of [`WindowSpec::Latest`] or of zero, is a gating
+/// field too: one [`GatingField::Exemption`], whichever way it is spelled.
+/// The exception is a package rule when the writer takes the package exemptions
+/// ([`NativeEncoding::writer_exemptions`]): its `allow` and `latest` are left to the writer's
+/// native exemption list, and its zero `default` stays a window.
 /// `max-major` is no window.
 ///
 /// A field is encoded, and so not reported, only when it is a window `default` or a `floor`
@@ -193,7 +193,10 @@ impl OmittedField {
 /// - a [`Selector::Package`] whose pattern is exactly `*`;
 /// - a literal [`Selector::Package`], when [`NativeEncoding::package_windows`] is set.
 ///
-/// An exemption is encoded the same way, whichever way it is spelled.
+/// An exemption is encoded only on a literal [`Selector::Package`] in one of the default's layers,
+/// when [`NativeEncoding::package_windows`] is set.
+/// No writer writes an exempt default window, and under a `*` exemption
+/// [`native_default_resolution`] writes the project window instead, so neither carries one.
 ///
 /// Every other gating field is reported: every per-kind window, any glob package rule but `*`
 /// (even one matching the empty name), and every field of a layer only a consumer has, such as a
@@ -275,17 +278,25 @@ pub fn omitted_native_fields(
                     continue;
                 }
                 for field in gating_fields(rule, encoding) {
-                    let carries_default = matches!(
-                        field,
-                        GatingField::Window {
-                            kind: WindowField::Default,
-                            ..
-                        } | GatingField::Floor(_)
-                            | GatingField::Exemption
-                    );
-                    let encoded = carries_default
-                        && default_layer
-                        && folded_in(&rule.selector, target, encoding);
+                    let encoded = default_layer
+                        && match field {
+                            GatingField::Window {
+                                kind: WindowField::Default,
+                                ..
+                            }
+                            | GatingField::Floor(_) => folded_in(&rule.selector, target, encoding),
+                            // No writer writes an exempt default, and the default falls back to
+                            // the project window under a `*` exemption, so only a package table
+                            // that takes the literal package carries one.
+                            GatingField::Exemption => {
+                                encoding.package_windows
+                                    && matches!(
+                                        &rule.selector,
+                                        Selector::Package { glob, .. } if glob.is_literal()
+                                    )
+                            }
+                            GatingField::Window { .. } => false,
+                        };
                     if !encoded {
                         record(
                             &mut omitted,
@@ -334,18 +345,21 @@ fn folded_in(selector: &Selector, target: ToolId, encoding: &NativeEncoding<'_>)
 
 /// The gating fields `rule` sets: its exemption, then its windows, then its floor.
 ///
-/// Its `allow`, or a `default` window of `latest` or of zero, is one [`GatingField::Exemption`]
-/// when the writer does not take the exemptions; otherwise `latest` and `allow` are the writer's,
-/// and a zero `default` stays a window.
+/// Its `allow`, or a `default` window of `latest` or of zero, is one [`GatingField::Exemption`],
+/// except on a package rule of a writer that takes the exemptions: there `latest` and `allow` are
+/// the writer's, and a zero `default` stays a window.
 fn gating_fields<'r>(
     rule: &'r Rule,
     encoding: &NativeEncoding<'_>,
 ) -> impl Iterator<Item = GatingField> + 'r {
-    let exempting_default = matches!(
-        rule.window.default,
-        Some(WindowSpec::Latest | WindowSpec::MinAge(SignedDuration::ZERO))
-    );
-    let exemption = !encoding.writer_exemptions && (rule.allow || exempting_default);
+    let exempting_default = rule
+        .window
+        .default
+        .as_ref()
+        .is_some_and(WindowSpec::is_exemption);
+    let writers_list =
+        encoding.writer_exemptions && matches!(rule.selector, Selector::Package { .. });
+    let exemption = !writers_list && (rule.allow || exempting_default);
     // An exempting default is reported as the exemption, not as a window too.
     let default = if exemption && exempting_default {
         None

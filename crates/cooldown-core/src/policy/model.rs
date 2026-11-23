@@ -303,6 +303,17 @@ pub enum WindowSpec {
 }
 
 impl WindowSpec {
+    /// Whether the window admits every release: [`WindowSpec::Latest`], or a zero minimum age,
+    /// which `latest = true` is documented sugar for.
+    #[must_use]
+    pub fn is_exemption(&self) -> bool {
+        match self {
+            WindowSpec::Latest => true,
+            WindowSpec::MinAge(duration) => duration.is_zero(),
+            WindowSpec::Freeze(_) => false,
+        }
+    }
+
     /// The cutoff instant *before* any floor clamp: a release published at or before it is mature.
     #[must_use]
     pub fn base_cutoff(&self, now: Timestamp) -> Timestamp {
@@ -592,6 +603,16 @@ pub struct ResolvedWindow {
 }
 
 impl ResolvedWindow {
+    /// Whether the window is an exemption that stays one: its declared window admits every
+    /// release and no positive floor binds.
+    ///
+    /// A freeze that a zero floor folds into a zero age is no exemption, since it gates again once
+    /// the date passes.
+    #[must_use]
+    pub fn is_exemption(&self, now: Timestamp) -> bool {
+        self.spec.is_exemption() && self.effective_spec(now).is_exemption()
+    }
+
     /// The effective cutoff at `now`, applying the floor max-clamp. A release published at or
     /// before this instant is mature. An `allow` is reflected by `spec == Latest` (base = `now`),
     /// so a residual floor it could not bypass still clamps — the floor is never short-circuited.
