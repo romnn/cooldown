@@ -28,7 +28,9 @@ pub enum Detail {
     /// The default: the same decisions and evidence with repetition removed.
     ///
     /// A release list is recorded once as a [`Event::ReleaseSet`] and evaluations refer to it,
-    /// rejected releases are summarized in their evaluation instead of one
+    /// as is a dependency's member list as a [`Event::MemberSet`].
+    /// An identical [`Event::PolicyResolved`] is recorded once.
+    /// Rejected releases are summarized in their evaluation instead of one
     /// [`Event::ReleaseFiltered`] each, and a native output stream is recorded once complete, so
     /// identical output refers to an earlier copy.
     ///
@@ -82,15 +84,30 @@ pub fn emit(event: &Event<'_>) {
                     ..
                 }
             );
-            let release_set = match event {
-                Event::ReleaseSet { sha256, .. } => Some(*sha256),
-                _ => None,
-            };
-            tracing::debug!(target: TARGET, trace_event = payload.as_str(), trace_artifact = artifact, trace_input_path = input_path, trace_artifact_sha256 = sha256, trace_artifact_finished = matches!(event, Event::ArtifactFinished { .. }), trace_artifact_complete = complete, trace_release_set = release_set);
+            let once = once_key(event, &payload);
+            tracing::debug!(target: TARGET, trace_event = payload.as_str(), trace_artifact = artifact, trace_input_path = input_path, trace_artifact_sha256 = sha256, trace_artifact_finished = matches!(event, Event::ArtifactFinished { .. }), trace_artifact_complete = complete, trace_once = once.as_deref());
         }
         Err(err) => {
             tracing::error!(target: TARGET, error = %err, "trace event serialization failed");
         }
+    }
+}
+
+/// The key under which the recorder writes `event` only once per run, or `None` to write every
+/// occurrence.
+///
+/// Release and member sets are keyed by their kind and hash, so an empty release list and an
+/// empty member list are two records.
+/// In a compact trace a policy resolution is keyed by its whole payload: the same query at the
+/// same clock repeats the same record, while one resolved against other layers is kept.
+fn once_key(event: &Event<'_>, payload: &str) -> Option<String> {
+    match event {
+        Event::ReleaseSet { sha256, .. } => Some(format!("release_set:{sha256}")),
+        Event::MemberSet { sha256, .. } => Some(format!("member_set:{sha256}")),
+        Event::PolicyResolved { .. } if Detail::current() == Some(Detail::Compact) => Some(
+            format!("policy_resolved:{}", hex_sha256(payload.as_bytes())),
+        ),
+        _ => None,
     }
 }
 
@@ -504,12 +521,22 @@ pub enum Event<'a> {
         /// The classified releases.
         releases: &'a serde_json::value::RawValue,
     },
+    /// A member list a judged dependency carries, recorded once per run in a compact trace.
+    MemberSet {
+        /// The lowercase hex SHA-256 of `members`' JSON, which evaluations refer to.
+        sha256: &'a str,
+        /// The workspace members the dependency is attributed to, in its order.
+        members: &'a serde_json::value::RawValue,
+    },
     /// An actual core policy evaluation and its full decision inputs/output.
     Evaluation {
         /// The project identity used by policy selectors.
         project: &'a str,
         /// The dependency being judged, including graph and declared constraints.
-        dependency: &'a Dependency,
+        ///
+        /// In a compact trace its `members` are replaced by a `memberSet` naming the
+        /// [`Event::MemberSet`] that holds them.
+        dependency: &'a serde_json::Value,
         /// All available classified release evidence, in a full trace.
         #[serde(skip_serializing_if = "Option::is_none")]
         releases: Option<&'a [Release]>,
@@ -592,33 +619,31 @@ pub(crate) struct EvaluationRecord<'a> {
 
 /// Emits an [`Event::Evaluation`] in the current recorder's [`Detail`].
 ///
-/// A compact trace records the release list as an [`Event::ReleaseSet`] first, which the
-/// recorder writes once per run however many evaluations refer to it.
+/// A compact trace records the release list as an [`Event::ReleaseSet`] and the dependency's
+/// member list as an [`Event::MemberSet`] first, which the recorder writes once per run however
+/// many evaluations refer to them.
 pub(crate) fn evaluation(record: &EvaluationRecord<'_>) {
     let Some(detail) = Detail::current() else {
         return;
     };
-    let releases = match detail {
-        Detail::Full => None,
-        Detail::Compact => match serde_json::value::to_raw_value(record.releases) {
-            Ok(releases) => Some(releases),
-            Err(err) => {
-                tracing::error!(target: TARGET, error = %err, "trace event serialization failed");
-                return;
-            }
-        },
+    let serialized = match detail {
+        Detail::Full => {
+            serde_json::to_value(record.dependency).map(|dependency| (dependency, None))
+        }
+        Detail::Compact => compact_evaluation_parts(record),
     };
-    let sha256 = releases
-        .as_ref()
-        .map(|releases| hex_sha256(releases.get().as_bytes()));
-    if let (Some(sha256), Some(releases)) = (&sha256, &releases) {
-        Event::ReleaseSet { sha256, releases }.emit();
-    }
+    let (dependency, release_set) = match serialized {
+        Ok(parts) => parts,
+        Err(err) => {
+            tracing::error!(target: TARGET, error = %err, "trace event serialization failed");
+            return;
+        }
+    };
     Event::Evaluation {
         project: record.project,
-        dependency: record.dependency,
-        releases: releases.is_none().then_some(record.releases),
-        release_set: sha256.as_deref(),
+        dependency: &dependency,
+        releases: release_set.is_none().then_some(record.releases),
+        release_set: release_set.as_deref(),
         filtered: record.filtered,
         context: record.context,
         evaluation_at: record.evaluation_at,
@@ -626,6 +651,33 @@ pub(crate) fn evaluation(record: &EvaluationRecord<'_>) {
         filters: record.filters,
     }
     .emit();
+}
+
+/// Emits the release and member sets of a compact evaluation, and returns its dependency with
+/// `members` replaced by `memberSet` beside the release set's hash.
+fn compact_evaluation_parts(
+    record: &EvaluationRecord<'_>,
+) -> Result<(serde_json::Value, Option<String>), serde_json::Error> {
+    let releases = serde_json::value::to_raw_value(record.releases)?;
+    let release_set = hex_sha256(releases.get().as_bytes());
+    Event::ReleaseSet {
+        sha256: &release_set,
+        releases: &releases,
+    }
+    .emit();
+    let members = serde_json::value::to_raw_value(&record.dependency.members)?;
+    let member_set = hex_sha256(members.get().as_bytes());
+    Event::MemberSet {
+        sha256: &member_set,
+        members: &members,
+    }
+    .emit();
+    let mut dependency = serde_json::to_value(record.dependency)?;
+    if let Some(fields) = dependency.as_object_mut() {
+        fields.remove("members");
+        fields.insert("memberSet".to_string(), member_set.into());
+    }
+    Ok((dependency, Some(release_set)))
 }
 
 /// Converts an operation duration to a portable JSON integer without truncating it.

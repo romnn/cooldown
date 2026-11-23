@@ -13,11 +13,12 @@ pub(crate) struct TraceLayer {
     recorder: Arc<Recorder>,
     excluded_artifacts: Mutex<HashSet<u64>>,
     contents: Mutex<Contents>,
-    /// The release sets this recorder wrote, by hash.
+    /// The keys of the records this recorder writes once per run, such as release and member sets
+    /// by kind and hash.
     ///
-    /// Its lock is held while a new set is recorded, so a set always precedes the evaluations
+    /// Its lock is held while a new record is recorded, so a set always precedes the evaluations
     /// that refer to it.
-    release_sets: Mutex<HashSet<String>>,
+    written_once: Mutex<HashSet<String>>,
 }
 
 /// Which artifact content this recorder wrote.
@@ -63,7 +64,7 @@ impl TraceLayer {
             recorder,
             excluded_artifacts: Mutex::new(HashSet::new()),
             contents: Mutex::new(Contents::default()),
-            release_sets: Mutex::new(HashSet::new()),
+            written_once: Mutex::new(HashSet::new()),
         }
     }
 
@@ -105,14 +106,14 @@ impl TraceLayer {
         }
     }
 
-    /// The lock on the written release sets when `sha256` is not among them yet, held until the
-    /// new set is recorded.
-    fn unwritten_release_set(&self, sha256: &str) -> Option<MutexGuard<'_, HashSet<String>>> {
-        let release_sets = self
-            .release_sets
+    /// The lock on the keys written once when `key` is not among them yet, held until the new
+    /// record is recorded.
+    fn unwritten_once(&self, key: &str) -> Option<MutexGuard<'_, HashSet<String>>> {
+        let written = self
+            .written_once
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        (!release_sets.contains(sha256)).then_some(release_sets)
+        (!written.contains(key)).then_some(written)
     }
 
     /// The JSON an event records: the payload of a typed observation, or a diagnostic of any other
@@ -311,17 +312,17 @@ where
             .get("trace_artifact_complete")
             .and_then(Value::as_bool)
             == Some(true);
-        let release_set = match fields.values.remove("trace_release_set") {
-            Some(Value::String(sha256))
+        let once = match fields.values.remove("trace_once") {
+            Some(Value::String(key))
                 if event.metadata().target() == cooldown_core::trace::TARGET =>
             {
-                Some(sha256)
+                Some(key)
             }
             _ => None,
         };
-        let mut release_sets = match &release_set {
-            Some(sha256) => match self.unwritten_release_set(sha256) {
-                Some(release_sets) => Some(release_sets),
+        let mut written_once = match &once {
+            Some(key) => match self.unwritten_once(key) {
+                Some(written) => Some(written),
                 None => return,
             },
             None => None,
@@ -359,10 +360,10 @@ where
             .map(|span| serde_json::json!({"operation": span.operation, "parent": span.parent, "name": span.name, "fields": span.values}))
             .collect();
         self.recorder.record(&payload, &spans);
-        if let (Some(release_sets), Some(sha256)) = (&mut release_sets, release_set) {
-            release_sets.insert(sha256);
+        if let (Some(written), Some(key)) = (&mut written_once, once) {
+            written.insert(key);
         }
-        drop(release_sets);
+        drop(written_once);
         if let Some(artifact) = artifact.filter(|_| finished) {
             self.finished_copy(artifact, complete);
         }
@@ -551,6 +552,62 @@ mod tests {
             .collect();
         assert_eq!(hashes, ["1", "2"]);
         assert_eq!(versions, ["1.0.0", "2.0.0"]);
+        Ok(())
+    }
+
+    /// A member list and a release list with the same bytes are distinct records, each written
+    /// once.
+    #[test]
+    fn member_and_release_sets_are_written_once_per_kind() -> eyre::Result<()> {
+        // An empty release list and an empty member list both serialize to `[]`.
+        let empty = serde_json::value::to_raw_value(&serde_json::json!([]))?;
+        let events = recorded(Detail::Compact, || {
+            for _ in 0..2 {
+                Event::ReleaseSet {
+                    sha256: "empty",
+                    releases: &empty,
+                }
+                .emit();
+                Event::MemberSet {
+                    sha256: "empty",
+                    members: &empty,
+                }
+                .emit();
+            }
+        })?;
+        let kinds: Vec<&Value> = events.iter().map(|event| &event["kind"]).collect();
+        assert_eq!(kinds, ["release_set", "member_set"]);
+        Ok(())
+    }
+
+    /// A compact trace writes an identical policy resolution once, a full trace every time.
+    #[test]
+    fn a_compact_trace_writes_an_identical_policy_resolution_once() -> eyre::Result<()> {
+        let layers = [cooldown_core::config::builtin_default_layer()];
+        let now = jiff::Timestamp::UNIX_EPOCH;
+        let query = |package| cooldown_core::ResolveQuery {
+            tool: cooldown_core::ToolId("cargo"),
+            package,
+            registry: None,
+            project: camino::Utf8Path::new("."),
+            kind: cooldown_core::ResolveKind::CurrentPin,
+        };
+        let resolve_itoa_twice = || {
+            for package in ["itoa", "itoa", "serde"] {
+                let _resolution = cooldown_core::resolve(&layers, &query(package), now);
+            }
+        };
+        let resolutions = |events: &[Value]| {
+            events
+                .iter()
+                .filter(|event| event["kind"] == "policy_resolved")
+                .map(|event| event["query"]["package"].clone())
+                .collect::<Vec<_>>()
+        };
+        let compact = recorded(Detail::Compact, resolve_itoa_twice)?;
+        assert_eq!(resolutions(&compact), ["itoa", "serde"]);
+        let full = recorded(Detail::Full, resolve_itoa_twice)?;
+        assert_eq!(resolutions(&full), ["itoa", "itoa", "serde"]);
         Ok(())
     }
 

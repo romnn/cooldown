@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Compact traces record each member list and policy resolution once.** A compact trace of a large
+  monorepo repeated a Cargo dependency's member list, up to 41 KB, in every `evaluation`, and wrote
+  the same `policy_resolved` record hundreds of times, so it decompressed to 4.3 GB. Each distinct
+  member list is now a `member_set` record that an evaluation's `dependency.memberSet` names, and an
+  identical `policy_resolved` record is written once; `--full-trace` still records both in full.
+  The trace schema moves to version 5. Closes #159.
+
 ## v0.0.32
 
 - **A failed isolation trial no longer discards the candidates already verified.** When a batch
