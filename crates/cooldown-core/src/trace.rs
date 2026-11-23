@@ -536,7 +536,7 @@ pub enum Event<'a> {
         ///
         /// In a compact trace its `members` are replaced by a `memberSet` naming the
         /// [`Event::MemberSet`] that holds them.
-        dependency: &'a serde_json::Value,
+        dependency: &'a serde_json::value::RawValue,
         /// All available classified release evidence, in a full trace.
         #[serde(skip_serializing_if = "Option::is_none")]
         releases: Option<&'a [Release]>,
@@ -628,9 +628,10 @@ pub(crate) fn evaluation(record: &EvaluationRecord<'_>) {
     };
     let serialized = match detail {
         Detail::Full => {
-            serde_json::to_value(record.dependency).map(|dependency| (dependency, None))
+            serde_json::value::to_raw_value(record.dependency).map(|dependency| (dependency, None))
         }
-        Detail::Compact => compact_evaluation_parts(record),
+        Detail::Compact => compact_evaluation_parts(record)
+            .map(|(dependency, release_set)| (dependency, Some(release_set))),
     };
     let (dependency, release_set) = match serialized {
         Ok(parts) => parts,
@@ -657,7 +658,7 @@ pub(crate) fn evaluation(record: &EvaluationRecord<'_>) {
 /// `members` replaced by `memberSet` beside the release set's hash.
 fn compact_evaluation_parts(
     record: &EvaluationRecord<'_>,
-) -> Result<(serde_json::Value, Option<String>), serde_json::Error> {
+) -> Result<(Box<serde_json::value::RawValue>, String), serde_json::Error> {
     let releases = serde_json::value::to_raw_value(record.releases)?;
     let release_set = hex_sha256(releases.get().as_bytes());
     Event::ReleaseSet {
@@ -672,12 +673,19 @@ fn compact_evaluation_parts(
         members: &members,
     }
     .emit();
-    let mut dependency = serde_json::to_value(record.dependency)?;
-    if let Some(fields) = dependency.as_object_mut() {
-        fields.remove("members");
-        fields.insert("memberSet".to_string(), member_set.into());
-    }
-    Ok((dependency, Some(release_set)))
+    // The array is swapped for its name in the serialized text, so the recording path builds no
+    // JSON tree of a member list that can hold thousands of entries.
+    // `"members":` occurs once: it is the dependency's only key of that name, and a quote inside
+    // a string value is escaped.
+    let dependency = serde_json::to_string(record.dependency)?.replacen(
+        &format!("\"members\":{}", members.get()),
+        &format!("\"memberSet\":\"{member_set}\""),
+        1,
+    );
+    Ok((
+        serde_json::value::RawValue::from_string(dependency)?,
+        release_set,
+    ))
 }
 
 /// Converts an operation duration to a portable JSON integer without truncating it.

@@ -581,33 +581,44 @@ mod tests {
     }
 
     /// A compact trace writes an identical policy resolution once, a full trace every time.
+    ///
+    /// The same query at the same clock resolved against other layers is another resolution, as
+    /// when a project's own stack and the repository's cascade both resolve it.
     #[test]
     fn a_compact_trace_writes_an_identical_policy_resolution_once() -> eyre::Result<()> {
-        let layers = [cooldown_core::config::builtin_default_layer()];
-        let now = jiff::Timestamp::UNIX_EPOCH;
-        let query = |package| cooldown_core::ResolveQuery {
+        let builtin = [cooldown_core::config::builtin_default_layer()];
+        let repo = [
+            cooldown_core::config::builtin_default_layer(),
+            cooldown_core::config::parse_config(
+                "min-age = \"30d\"",
+                cooldown_core::Origin::Repo("cooldown.toml".into()),
+            )?,
+        ];
+        let query = cooldown_core::ResolveQuery {
             tool: cooldown_core::ToolId("cargo"),
-            package,
+            package: "itoa",
             registry: None,
             project: camino::Utf8Path::new("."),
             kind: cooldown_core::ResolveKind::CurrentPin,
         };
-        let resolve_itoa_twice = || {
-            for package in ["itoa", "itoa", "serde"] {
-                let _resolution = cooldown_core::resolve(&layers, &query(package), now);
+        let resolve_repeatedly = || {
+            for layers in [&builtin[..], &builtin[..], &repo[..]] {
+                let _resolution =
+                    cooldown_core::resolve(layers, &query, jiff::Timestamp::UNIX_EPOCH);
             }
         };
-        let resolutions = |events: &[Value]| {
+        let deciding_layers = |events: &[Value]| {
             events
                 .iter()
                 .filter(|event| event["kind"] == "policy_resolved")
-                .map(|event| event["query"]["package"].clone())
+                .map(|event| event["resolution"]["window"]["decided_by"].clone())
                 .collect::<Vec<_>>()
         };
-        let compact = recorded(Detail::Compact, resolve_itoa_twice)?;
-        assert_eq!(resolutions(&compact), ["itoa", "serde"]);
-        let full = recorded(Detail::Full, resolve_itoa_twice)?;
-        assert_eq!(resolutions(&full), ["itoa", "itoa", "serde"]);
+        let compact = recorded(Detail::Compact, resolve_repeatedly)?;
+        assert_eq!(deciding_layers(&compact).len(), 2, "{compact:?}");
+        assert_ne!(deciding_layers(&compact)[0], deciding_layers(&compact)[1]);
+        let full = recorded(Detail::Full, resolve_repeatedly)?;
+        assert_eq!(deciding_layers(&full).len(), 3, "{full:?}");
         Ok(())
     }
 
