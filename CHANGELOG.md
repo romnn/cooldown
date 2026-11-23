@@ -22,6 +22,12 @@
   joint attribution that missed the change's target, so the row names the guard and `gdown`, or,
   when only the per-change widen ran, Cargo's refusal naming `gdown`. The per-change widen also
   logs the violation it was refused for. Closes #156.
+- **A cargo run a signal kills runs once more.** Cargo crashed with a segmentation fault right
+  after printing an ordinary resolver conflict, ending an `upgrade` with `tool cargo failed with
+  signal 11: …failed to select a version…`, which read as a resolver failure. A `--locked` read, or
+  a resolve in cooldown's staged copy whose `Cargo.lock` is unchanged, now runs once more, and only
+  a second crash fails; its error says cargo `was killed by signal 11 after printing` its output.
+  Closes #158.
 
 ## v0.0.32
 

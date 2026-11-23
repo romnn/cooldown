@@ -73,6 +73,11 @@ impl StagedTrees {
             );
     }
 
+    /// Whether `root` is a registered staged copy, which only cooldown writes.
+    pub(crate) fn is_staged(&self, root: &Utf8Path) -> bool {
+        self.get(root).is_some()
+    }
+
     fn get(&self, root: &Utf8Path) -> Option<StagedTree> {
         self.trees
             .lock()

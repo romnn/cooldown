@@ -581,6 +581,29 @@ pub(crate) struct StagingPackage {
     pub(crate) workspace_member: bool,
 }
 
+/// What a lock path held, compared before and after a command a signal killed.
+#[derive(Debug, PartialEq, Eq)]
+enum LockSnapshot {
+    /// No file at the path.
+    Absent,
+    /// A regular file with these bytes.
+    File(Vec<u8>),
+    /// Anything that cannot prove the inputs unchanged: a link, a directory, an unreadable file.
+    Unknown,
+}
+
+impl LockSnapshot {
+    fn of(path: &Utf8Path) -> Self {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => LockSnapshot::Absent,
+            Ok(metadata) if metadata.file_type().is_file() => {
+                std::fs::read(path).map_or(LockSnapshot::Unknown, LockSnapshot::File)
+            }
+            _ => LockSnapshot::Unknown,
+        }
+    }
+}
+
 /// Extracts the version from an exact `=x.y.z` Cargo requirement. Cargo uses a single `=`; the
 /// default bare `"1.2.3"` is `^1.2.3`, a range, not a pin.
 fn exact_req_version(req: &str) -> Option<String> {
@@ -1490,6 +1513,43 @@ impl Cargo {
         result
     }
 
+    /// Runs Cargo in `dir` with exactly `args`, once more when a signal kills the first run and
+    /// the inputs it may have written are provably as they were.
+    ///
+    /// Cargo has crashed with a signal right after printing an ordinary resolver conflict, which
+    /// the same command reproduces normally, so one crash proves nothing about the inputs.
+    /// `lock` names the lock the command may write: it must still be a regular file with the
+    /// bytes it had, or still be absent, for the command to run again from the same inputs.
+    /// `None` is for a command that writes no lock, such as a `--locked` read.
+    /// Nothing is restored, so a write by someone else is never overwritten; a changed lock just
+    /// leaves the first run's crash as the result.
+    pub(crate) async fn spawn_retrying(
+        &self,
+        dir: &Utf8Path,
+        args: &[String],
+        lock: Option<&Utf8Path>,
+    ) -> Result<std::process::Output, CoreError> {
+        let before = lock.map(|path| (path, LockSnapshot::of(path)));
+        let first = self.spawn(dir, args).await?;
+        let killed = matches!(
+            ToolTermination::from_exit_status(first.status),
+            ToolTermination::Signal(_)
+        );
+        let inputs_unchanged = before.is_none_or(|(path, before)| {
+            before != LockSnapshot::Unknown && LockSnapshot::of(path) == before
+        });
+        if !killed || !inputs_unchanged {
+            return Ok(first);
+        }
+        tracing::debug!(
+            bin = self.bin,
+            args = ?args,
+            status = %first.status,
+            "cargo was killed by a signal; running it once more"
+        );
+        self.spawn(dir, args).await
+    }
+
     async fn run(&self, dir: &Utf8Path, args: &[&str]) -> Result<String, CoreError> {
         self.stdout_of(&self.output(dir, args).await?)
     }
@@ -1509,10 +1569,18 @@ impl Cargo {
 
     /// The tool error of a command that exited unsuccessfully.
     pub(crate) fn failure(&self, out: &std::process::Output) -> CoreError {
+        let termination = ToolTermination::from_exit_status(out.status);
+        // A process a signal killed in silence printed nothing the error could quote.
+        let silent = out.stdout.trim_ascii().is_empty() && out.stderr.trim_ascii().is_empty();
+        let stderr = if matches!(termination, ToolTermination::Signal(_)) && silent {
+            String::new()
+        } else {
+            failure_detail(out)
+        };
         CoreError::Tool {
             tool: self.bin.clone(),
-            termination: ToolTermination::from_exit_status(out.status),
-            stderr: failure_detail(out),
+            termination,
+            stderr,
         }
     }
 
@@ -1523,9 +1591,14 @@ impl Cargo {
     /// Returns [`CoreError::StaleLock`] when the lock must be updated, or the Cargo tool error
     /// for any other failure.
     pub(crate) async fn locked_metadata_output(&self, dir: &Utf8Path) -> Result<String, CoreError> {
-        let out = self.output(dir, &LOCKED_METADATA_ARGS).await?;
+        let command = self.command_line(dir, &LOCKED_METADATA_ARGS)?;
+        let out = self.spawn_retrying(dir, &command.args, None).await?;
         if out.status.success() {
             return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        // A killed process's text may be cut short, so it proves no stale lock.
+        if ToolTermination::from_exit_status(out.status).is_abnormal() {
+            return Err(self.failure(&out));
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
         if let Some(lock) = stale_lock_diagnostic(&stderr) {
@@ -2256,6 +2329,172 @@ mod tests {
         // The recorded diagnostic is plain text, so the locked blocker is still named.
         assert!(!stderr.contains('\u{1b}'), "{stderr}");
         assert_eq!(conflict_parties(&stderr), [party("psm", Some("0.1.32"))]);
+        Ok(())
+    }
+
+    /// A fake `cargo` in `root` that logs each run to `root/runs`, prints `diagnostic` and kills
+    /// itself with SIGKILL, which leaves no core dump, on its first `crashes` runs, appending to `root/Cargo.lock` first when
+    /// `touch_lock`, and otherwise exits 101.
+    #[cfg(unix)]
+    fn crashing_cargo(
+        root: &Utf8Path,
+        diagnostic: &str,
+        crashes: usize,
+        touch_lock: bool,
+    ) -> eyre::Result<Cargo> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fake = root.join("fake-cargo");
+        let touch = if touch_lock {
+            "echo '# rewritten' >> \"$dir/Cargo.lock\""
+        } else {
+            ":"
+        };
+        std::fs::write(
+            &fake,
+            formatdoc! {r#"
+                #!/bin/sh
+                dir=$(dirname "$0")
+                echo run >> "$dir/runs"
+                printf '%s\n' '{diagnostic}' >&2
+                if [ "$(wc -l < "$dir/runs")" -le {crashes} ]; then
+                    {touch}
+                    kill -KILL $$
+                fi
+                exit 101
+            "#},
+        )?;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::write(root.join("Cargo.lock"), "version = 4\n")?;
+        Ok(Cargo::with_bin(fake.as_str()))
+    }
+
+    #[cfg(unix)]
+    fn runs(root: &Utf8Path) -> eyre::Result<usize> {
+        Ok(std::fs::read_to_string(root.join("runs"))?.lines().count())
+    }
+
+    /// A signal that kills Cargo after an ordinary resolver conflict runs the command once more,
+    /// and the second run's verdict stands.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_crashed_cargo_runs_once_more_from_an_unchanged_lock() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let cargo = crashing_cargo(
+            root,
+            "error: failed to select a version for `psm`.",
+            1,
+            false,
+        )?;
+        let lock = root.join("Cargo.lock");
+
+        let out = cargo
+            .spawn_retrying(root, &["metadata".to_string()], Some(&lock))
+            .await?;
+
+        // The second run exited on its own, so its refusal is an ordinary resolver conflict.
+        assert_eq!(out.status.code(), Some(101));
+        assert_eq!(runs(root)?, 2);
+        Ok(())
+    }
+
+    /// A second crash is the result, and its error says Cargo was killed after printing its
+    /// output, which therefore does not read as the cause.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_crash_is_reported_as_a_kill_after_the_output() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let cargo = crashing_cargo(
+            root,
+            "error: failed to select a version for `psm`.",
+            2,
+            false,
+        )?;
+        let lock = root.join("Cargo.lock");
+
+        let out = cargo
+            .spawn_retrying(root, &["metadata".to_string()], Some(&lock))
+            .await?;
+        let error = cargo.failure(&out);
+
+        assert_eq!(runs(root)?, 2);
+        assert!(error.is_local_environment_failure());
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "tool `{}` was killed by signal 9 after printing: error: failed to select a \
+                 version for `psm`.",
+                root.join("fake-cargo")
+            )
+        );
+        Ok(())
+    }
+
+    /// A crash that changed the lock leaves nothing to prove the inputs unchanged, so the command
+    /// does not run again and nothing is written back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_crash_that_changed_the_lock_is_not_run_again() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let cargo = crashing_cargo(
+            root,
+            "error: failed to select a version for `psm`.",
+            1,
+            true,
+        )?;
+        let lock = root.join("Cargo.lock");
+
+        let out = cargo
+            .spawn_retrying(root, &["metadata".to_string()], Some(&lock))
+            .await?;
+
+        assert_eq!(
+            ToolTermination::from_exit_status(out.status),
+            ToolTermination::Signal(9)
+        );
+        assert_eq!(runs(root)?, 1);
+        assert_eq!(
+            std::fs::read_to_string(&lock)?,
+            "version = 4\n# rewritten\n"
+        );
+        Ok(())
+    }
+
+    /// A locked read writes no lock, so it runs again after a crash, and a stale-lock refusal a
+    /// crash may have cut short is no stale lock.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_crashed_locked_read_is_retried_and_never_read_as_stale() -> eyre::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = Utf8Path::from_path(directory.path())
+            .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?;
+        let cargo = crashing_cargo(
+            root,
+            "error: cannot update the lock file /repo/Cargo.lock because --locked was passed to \
+             prevent this",
+            2,
+            false,
+        )?;
+
+        let error = cargo.locked_metadata_output(root).await.err();
+
+        assert_eq!(runs(root)?, 2);
+        assert!(
+            matches!(
+                error,
+                Some(CoreError::Tool {
+                    termination: ToolTermination::Signal(9),
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
         Ok(())
     }
 

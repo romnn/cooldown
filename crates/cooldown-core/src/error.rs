@@ -94,6 +94,19 @@ pub fn failure_detail(out: &Output) -> String {
     }
 }
 
+/// The message of a [`CoreError::Tool`].
+fn tool_failure(tool: &str, termination: ToolTermination, detail: &str) -> String {
+    match termination {
+        ToolTermination::Signal(signal) if detail.is_empty() => {
+            format!("tool `{tool}` was killed by signal {signal}")
+        }
+        ToolTermination::Signal(signal) => {
+            format!("tool `{tool}` was killed by signal {signal} after printing: {detail}")
+        }
+        termination => format!("tool `{tool}` failed with {termination}: {detail}"),
+    }
+}
+
 /// Errors raised at or below the port boundary.
 ///
 /// The variants separate *classes* of failure so the app can decide retry/exit behaviour without
@@ -111,7 +124,10 @@ pub enum CoreError {
     Transient(#[source] BoxError),
 
     /// An external tool (`go`, `cargo`, `uv`) exited non-zero after being spawned.
-    #[error("tool `{tool}` failed with {termination}: {stderr}")]
+    ///
+    /// A signal's error says the tool was killed after printing its output, so that output, such
+    /// as a resolver conflict printed just before a crash, does not read as the cause.
+    #[error("{}", tool_failure(tool, *termination, stderr))]
     Tool {
         /// The name of the invoked tool (for example `go`, `cargo`, or `uv`).
         tool: String,

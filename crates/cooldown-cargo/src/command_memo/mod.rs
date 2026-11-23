@@ -359,7 +359,16 @@ impl MemoizedCargo<'_> {
             });
         }
         let started = Instant::now();
-        let output = self.cargo.spawn(&project.root, &command.args).await?;
+        // Only a staged copy is cooldown's alone, so only there may a crashed run's lock be
+        // judged unchanged and the command run once more.
+        let output = if self.trees.is_staged(&project.root) {
+            let lock = lock_path(&project.root);
+            self.cargo
+                .spawn_retrying(&project.root, &command.args, Some(&lock))
+                .await?
+        } else {
+            self.cargo.spawn(&project.root, &command.args).await?
+        };
         let elapsed = started.elapsed();
         let settled = key.and_then(|key| self.settle(project, &command, key, &output));
         let (lock, record) = match settled {
