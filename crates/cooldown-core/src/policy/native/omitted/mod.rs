@@ -10,7 +10,7 @@ use super::super::model::{
     Origin, PolicyLayer, ResolveKind, ResolveQuery, ResolvedWindow, Rule, Selector, WindowSpec,
 };
 use super::super::resolve::resolve;
-use super::{PolicyContext, native_default_resolution};
+use super::{PolicyContext, native_default_resolution, unnamed_window};
 use crate::model::ToolId;
 use camino::Utf8Path;
 use jiff::{SignedDuration, Timestamp};
@@ -80,8 +80,8 @@ pub enum GatingField {
 }
 
 impl GatingField {
-    /// The field's name in an `explain` trace step: a [`WindowField::name`], `floor` or
-    /// `exemption`.
+    /// The field's name: a [`WindowField::name`] or `floor`, as an `explain` trace step names it,
+    /// or `exemption`, which only this report uses.
     #[must_use]
     pub fn name(&self) -> &'static str {
         match self {
@@ -193,8 +193,10 @@ impl OmittedField {
 /// - a [`Selector::Package`] whose pattern is exactly `*`;
 /// - a literal [`Selector::Package`], when [`NativeEncoding::package_windows`] is set.
 ///
-/// An exemption is encoded the same way, except that a package exemption reaches only the
-/// native package table, so no glob, `*` included, folds it in.
+/// An exemption is encoded the same way, except that a literal package exemption reaches only
+/// the native package table and another glob reaches nothing.
+/// A `*` exemption reaches the written default only while a binding floor keeps that default
+/// from being `latest`, since `sync` otherwise writes the bare default in its place.
 ///
 /// Every other gating field is reported: every per-kind window, any glob package rule but `*`
 /// (even one matching the empty name), and every field of a layer only a consumer has, such as a
@@ -257,6 +259,17 @@ pub fn omitted_native_fields(
     encoding: &NativeEncoding<'_>,
     now: Timestamp,
 ) -> Vec<OmittedField> {
+    // The written default takes a catch-all exemption only while a binding floor keeps the
+    // unnamed package's window from being `latest`; otherwise `sync` writes the bare default.
+    let catch_all_written = unnamed_window(
+        encoding.default_layers,
+        target,
+        encoding.default_project,
+        ResolveKind::CurrentPin,
+        now,
+    )
+    .effective_spec(now)
+        != WindowSpec::Latest;
     let mut omitted = Vec::new();
     for context in contexts {
         // A native layer is a tool's own config read back, which the tool applies by itself:
@@ -283,9 +296,12 @@ pub fn omitted_native_fields(
                                 ..
                             }
                             | GatingField::Floor(_) => folded_in(&rule.selector, target, encoding),
-                            GatingField::Exemption => {
-                                exemption_folded_in(&rule.selector, target, encoding)
-                            }
+                            GatingField::Exemption => exemption_folded_in(
+                                &rule.selector,
+                                target,
+                                encoding,
+                                catch_all_written,
+                            ),
                             GatingField::Window { .. } => false,
                         };
                     if !encoded {
@@ -337,10 +353,17 @@ fn folded_in(selector: &Selector, target: ToolId, encoding: &NativeEncoding<'_>)
 /// Whether the written default, or uv's native package table, carries an exemption of a rule
 /// with `selector` from one of the default's layers.
 ///
-/// A package exemption reaches only a package table, never the default: the catch-all `*` lets
-/// the default fall back to the bare window it does not exempt.
-fn exemption_folded_in(selector: &Selector, target: ToolId, encoding: &NativeEncoding<'_>) -> bool {
+/// A literal package exemption reaches only a package table, and another glob reaches neither.
+/// The catch-all `*` reaches the default only as `catch_all_written` says: when its exemption
+/// would make the default `latest`, `sync` writes the bare default instead.
+fn exemption_folded_in(
+    selector: &Selector,
+    target: ToolId,
+    encoding: &NativeEncoding<'_>,
+    catch_all_written: bool,
+) -> bool {
     match selector {
+        Selector::Package { glob, .. } if glob.raw() == "*" => catch_all_written,
         Selector::Package { glob, .. } => encoding.package_windows && glob.is_literal(),
         selector => folded_in(selector, target, encoding),
     }
