@@ -22,7 +22,9 @@ use std::time::Instant;
 /// Version 3 compresses the file and, unless the trace is full, records release lists as
 /// `release_set`s, rejected releases in their evaluation, and native output once complete.
 /// Version 4 records a decoded npm package document in a compact trace as an `artifact_summary`.
-const SCHEMA_VERSION: u32 = 4;
+/// Version 5 records a compact evaluation's member list as a `member_set` named by
+/// `dependency.memberSet`, and an identical `policy_resolved` once.
+const SCHEMA_VERSION: u32 = 5;
 /// The oldest schema whose files this producer still recognizes as its own, so pruning keeps
 /// removing traces written before the current version.
 const OLDEST_OWNED_SCHEMA_VERSION: u32 = 1;

@@ -38,6 +38,10 @@ line; every earlier record decompresses.
   or failure, with their hash, so identical output becomes a `duplicate_of` reference.
 - Since schema version 4 ([#136](https://github.com/romnn/cooldown/issues/136)), a decoded npm
   package document is an `artifact_summary` of its source, length and hash instead of its body.
+- Since schema version 5 ([#159](https://github.com/romnn/cooldown/issues/159)), a dependency's
+  member list is recorded once per run as a content-addressed `member_set`, which an evaluation's
+  `dependency.memberSet` names in place of `members`, and an identical `policy_resolved` record is
+  written once.
 
 An artifact becomes a reference target only after its terminal `complete` record, so a reference
 never precedes the bytes it names.

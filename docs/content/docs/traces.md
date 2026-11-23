@@ -107,10 +107,15 @@ mutation inputs also preserve evidence read while resolving staged projects.
 ## Compact and full traces
 
 A long run judges the same packages many times, so most of a complete record is repetition. By
-default, cooldown records a compact trace (schema version 4) with the same decisions and evidence:
+default, cooldown records a compact trace (schema version 5) with the same decisions and evidence:
 
 - Each distinct release list is recorded once as a `release_set` event, with its `sha256` and
   `releases`. An `evaluation` names its list in `releaseSet` instead of carrying `releases`.
+- Each distinct member list is recorded once as a `member_set` event, with its `sha256` and
+  `members`. An `evaluation`'s `dependency` names its list in `memberSet` instead of carrying
+  `members`; schema version 4 traces carry `members` inline.
+- An identical `policy_resolved` event, the same query resolved to the same result at the same
+  evaluation time, is recorded once, with the timestamp and spans of its first occurrence.
 - Every `evaluation` lists the releases its candidate filters rejected, with the reason, in
   `filtered`. A compact trace has no separate `release_filtered` event per release.
 - Native stdout and stderr are recorded when the stream ends, including when the command is
@@ -122,9 +127,9 @@ default, cooldown records a compact trace (schema version 4) with the same decis
   or malformed body is recorded in full. Use `--full-trace` to see the document itself, such as the
   literal `latest` tag or publish times before cooldown's monotonic guard.
 
-`--full-trace` records the trace as it happens: release lists inline in every `evaluation`, one
-`release_filtered` event per rejected release with the full dependency, and native output chunks as
-they arrive. Use it to reproduce a problem whose cause the compact trace does not show; it is
+`--full-trace` records the trace as it happens: release and member lists inline in every
+`evaluation`, every `policy_resolved` event, one `release_filtered` event per rejected release with
+the full dependency, and native output chunks as they arrive. Use it to reproduce a problem whose cause the compact trace does not show; it is
 larger and takes more time to compress.
 
 ## Pruning

@@ -370,6 +370,23 @@ fn offline_evaluation_keeps_metadata_filter_reasons_and_the_printed_report() -> 
     assert!(compact_evaluation.get("releases").is_none());
     assert_eq!(compact.events("release_filtered"), Vec::<&Value>::new());
 
+    // A compact trace names the dependency's member list by hash; a full trace inlines it.
+    let member_sets = compact.events("member_set");
+    let [member_set] = member_sets.as_slice() else {
+        eyre::bail!("one member set expected, got {member_sets:?}");
+    };
+    assert_eq!(
+        compact_evaluation["dependency"]["memberSet"],
+        member_set["sha256"]
+    );
+    assert!(compact_evaluation["dependency"].get("members").is_none());
+    assert_eq!(
+        full_evaluation["dependency"]["members"],
+        member_set["members"]
+    );
+    assert!(full_evaluation["dependency"].get("memberSet").is_none());
+    assert_eq!(full.events("member_set"), Vec::<&Value>::new());
+
     // A full trace inlines the same release list and adds one record per rejected release.
     assert_eq!(full_evaluation["releases"], set["releases"]);
     assert!(full_evaluation.get("releaseSet").is_none());
