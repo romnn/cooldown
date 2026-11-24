@@ -1607,12 +1607,14 @@ async fn outdated_countdown_tracks_latest_or_soonest_maturing() {
 }
 
 #[tokio::test]
-async fn outdated_default_view_never_labels_even_with_an_unclassifiable_newest() {
-    // Regression: the default (`latest`) view must never append a `(version)` label. Here the newest
-    // eligible release 0.15.18 is unclassifiable (`kind_from_current = None`), so it is `verdict.latest`
-    // yet never becomes a candidate; the shown candidate is the next one down, 0.15.17. The label is
-    // suppressed by comparing the shown version against the newest *candidate* (not `verdict.latest`),
-    // so the cell stays bare — byte-identical to the pre-feature output.
+async fn outdated_latest_view_never_labels_even_with_an_unclassifiable_newest() {
+    // Regression: the `latest` view must never append a `(version)` label.
+    // Here the newest eligible release 0.15.18 is unclassifiable (`kind_from_current = None`), so
+    // it is `verdict.latest` yet never becomes a candidate; the shown candidate is the next one
+    // down, 0.15.17.
+    // The `latest` view tracks the newest *candidate*, so the cell stays bare, byte-identical to
+    // the pre-feature output.
+    // Only `--countdown soonest` labels a shown version that differs from Latest.
     let TmpRoot { guard: _g, root } = tmp_root();
     let mut releases = HashMap::new();
     releases.insert(
@@ -1644,14 +1646,18 @@ async fn outdated_default_view_never_labels_even_with_an_unclassifiable_newest()
         ),
         Baseline::default(),
     );
-    let out = ws.outdated(&opts()).await;
+    let latest_opts = RunOpts {
+        cooldown_horizon: CooldownHorizon::Latest,
+        ..opts()
+    };
+    let out = ws.outdated(&latest_opts).await;
     let item = out.items.iter().find(|i| i.name == "ruff").expect("ruff");
     // `latest` reports the unclassifiable newest; the cooldown tracks the newest candidate, unlabelled.
     assert_eq!(item.latest.as_ref().unwrap().version, "0.15.18");
     assert_eq!(item.candidate_age_days, Some(4.0));
     assert_eq!(
         item.cooldown_version, None,
-        "the default view must not label the cooldown version"
+        "the latest view must not label the cooldown version"
     );
 }
 

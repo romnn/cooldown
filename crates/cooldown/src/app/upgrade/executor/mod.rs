@@ -1,5 +1,6 @@
 use super::{UpgradeAccum, UpgradeCtx};
 mod batch;
+mod outcome;
 mod planning;
 mod report;
 mod transitive_gate;
@@ -8,6 +9,8 @@ use self::batch::{
     BatchOutcome, CommittedBatch, HoldAttestation, VerifiedBatchReport, indeterminate_trial,
     trial_errors,
 };
+pub(crate) use self::outcome::CopyOutcome;
+use self::outcome::Provenance;
 use self::planning::{
     EffectiveHold, candidate_scope, crosses_line, current_line_target, dep_resolve_ctx,
     effective_hold, fix_change, is_downgrade, line_leaving_nodes, lower_adoptable_targets,
@@ -560,6 +563,9 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     /// What the writer's native gate makes of the lock the run starts from, asked once, with the
     /// first batch (see [`judge_starting_lock`](Self::judge_starting_lock)).
     starting_verdict: StartingVerdict,
+    /// The first-plan copy each tried change moves, traced only while `outdated`'s dry run
+    /// collects what the pass settled (see [`settle_copies`](Self::settle_copies)).
+    provenance: Provenance,
 }
 
 /// The writer's native gate's verdict on the lock a run starts from.
@@ -624,6 +630,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             violation_ages: HashMap::new(),
             published_times: HashMap::new(),
             starting_verdict: StartingVerdict::Unasked,
+            provenance: Provenance::default(),
         }
     }
 
@@ -638,7 +645,43 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
     pub(super) fn run(&mut self) -> impl std::future::Future<Output = ProjectRunStatus> {
         // Keep the executor's async state out of project orchestration and tracing wrappers.
-        Box::pin(self.run_inner())
+        Box::pin(async move {
+            let status = self.run_inner().await;
+            self.settle_copies().await;
+            status
+        })
+    }
+
+    /// Settles what the pass did with each copy its first plan read, from the graph the pass
+    /// left, when `outdated`'s dry run collects it and a plan ran.
+    async fn settle_copies(&mut self) {
+        if self
+            .acc
+            .facts
+            .as_ref()
+            .is_none_or(|facts| facts.judged.is_none())
+        {
+            return;
+        }
+        let graph = self.scoped_deps(GraphRead::Replan).await;
+        let Some(judged) = self
+            .acc
+            .facts
+            .as_ref()
+            .and_then(|facts| facts.judged.as_ref())
+        else {
+            return;
+        };
+        let outcomes = outcome::settle(
+            judged,
+            &self.provenance,
+            &self.acc.items,
+            &self.acc.errors,
+            graph.as_deref(),
+        );
+        if let Some(facts) = &mut self.acc.facts {
+            facts.outcomes = Some(outcomes);
+        }
     }
 
     async fn run_inner(&mut self) -> ProjectRunStatus {
@@ -1036,6 +1079,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let Some(deps) = self.scoped_deps(GraphRead::Replan).await else {
             return flow;
         };
+        self.provenance.replanned();
         let followers: Vec<_> = deps
             .into_iter()
             .filter(|dep| {
@@ -2412,10 +2456,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         line_leaving_nodes(deps, crossing)
     }
 
-    async fn fetch_upgrade_releases(
-        &self,
-        deps: &[Dependency],
-    ) -> Vec<FetchedRelease<Vec<Release>>> {
+    /// Fetches each dependency's releases and judges them once, so that one verdict decides its
+    /// line, its plan, and the `outdated` row reported from it.
+    async fn judge_upgrade_releases(&self, deps: &[Dependency]) -> Vec<FetchedRelease<Judged>> {
         self.ctx.progress.phase(format!(
             "fetching metadata for {} upgrade candidates",
             deps.len()
@@ -2430,14 +2473,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.ctx.progress,
                 self.ctx.opts.fanout(),
             )
-            .await
-    }
-
-    async fn plan_upgrade_changes(&mut self, deps: &[Dependency]) -> PlannedUpgrade {
-        // Each dependency is judged once, and that one verdict decides its line, its plan, and
-        // the `outdated` row reported from it.
-        let judged: Vec<FetchedRelease<Judged>> = self
-            .fetch_upgrade_releases(deps)
             .await
             .into_iter()
             .map(|FetchedRelease { dependency, result }| FetchedRelease {
@@ -2455,17 +2490,22 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 }),
                 dependency,
             })
-            .collect();
+            .collect()
+    }
+
+    async fn plan_upgrade_changes(&mut self, deps: &[Dependency]) -> PlannedUpgrade {
+        let judged = self.judge_upgrade_releases(deps).await;
         let rctx = upgrade_resolve_ctx(self.ctx.pctx, self.ctx.opts);
         let advisories = self.advisories.clone();
         let leaving = Self::line_leaving(deps, &judged);
         let mut planned = Vec::new();
         let mut deferred = HashSet::new();
-        for FetchedRelease {
-            dependency: dep,
-            result,
-        } in &judged
-        {
+        let mut deferred_copies = Vec::new();
+        for (copy, fact) in judged.iter().enumerate() {
+            let FetchedRelease {
+                dependency: dep,
+                result,
+            } = fact;
             let Judged { releases, verdict } = match result {
                 Ok(judged) => judged,
                 Err(error) => {
@@ -2477,6 +2517,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             let node = (dep.package.name.clone(), dep.current.as_str().to_string());
             if !dep.direct && leaving.contains(&node) {
                 deferred.insert(node);
+                deferred_copies.push(copy);
                 continue;
             }
             let advised = advisories
@@ -2538,23 +2579,58 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     .insert(ChangeKey::of(&change), security);
             }
             self.remember_upgrade_fallbacks(&change, releases, verdict);
+            self.trace_tried(&change, dep, copy);
             planned.push(change);
         }
         sort_planned_changes(&mut planned);
-        self.record_plan_facts(&planned, judged);
+        self.record_first_plan(judged, deferred_copies);
         PlannedUpgrade {
             changes: planned,
             deferred,
         }
     }
 
-    /// Keeps what a plan read and tried for `outdated`, when its dry run collects them.
-    fn record_plan_facts(&mut self, planned: &[Change], judged: Vec<FetchedRelease<Judged>>) {
-        if let Some(facts) = &mut self.acc.facts {
-            facts.tried.extend(planned.iter().cloned());
-            // A follower replan reads the graph the first plan's moves left, while `outdated`
-            // reports the starting one.
-            facts.judged.get_or_insert(judged);
+    /// Keeps a first plan's facts, and the copies it deferred to a follower replan, when
+    /// `outdated`'s dry run collects them.
+    fn record_first_plan(&mut self, judged: Vec<FetchedRelease<Judged>>, deferred: Vec<usize>) {
+        // A follower replan reads the graph the first plan's moves left, while `outdated`
+        // reports the starting one.
+        if let Some(facts) = &mut self.acc.facts
+            && facts.judged.is_none()
+        {
+            facts.judged = Some(judged);
+            self.provenance.await_replan(deferred);
+        }
+    }
+
+    /// Traces `change`, and the fallbacks it may be retried at, to the first-plan copy of `dep`
+    /// it moves, when `outdated`'s dry run collects what the pass settled.
+    ///
+    /// `copy` is `dep`'s index in the plan reading it, which a follower replan maps back to the
+    /// first plan's.
+    fn trace_tried(&mut self, change: &Change, dep: &Dependency, copy: usize) {
+        let Some(facts) = &self.acc.facts else {
+            return;
+        };
+        let origin = match &facts.judged {
+            None => Some(copy),
+            Some(first) => first.iter().position(|fact| {
+                fact.dependency.package == dep.package
+                    && fact.dependency.current == dep.current
+                    && fact.dependency.direct == dep.direct
+            }),
+        };
+        let Some(origin) = origin else {
+            return;
+        };
+        self.provenance.tried(change, origin, &dep.package);
+        for alternative in self
+            .fallback_changes
+            .get(&ChangeKey::of(change))
+            .into_iter()
+            .flatten()
+        {
+            self.provenance.tried(alternative, origin, &dep.package);
         }
     }
 
@@ -4775,11 +4851,31 @@ fn verify_applied_targets(
 }
 
 fn target_reached(deps: &[Dependency], change: &Change) -> bool {
-    if change.direct && !change.members.is_empty() {
-        return change.members.iter().all(|member| {
+    line_reached(
+        deps,
+        &change.package,
+        &change.from,
+        &change.to,
+        change.direct,
+        &change.members,
+    )
+}
+
+/// Whether `deps` holds `package`'s line at `from` on `to`: in every member a direct move names,
+/// with that member's own line gone from `from`, and anywhere otherwise.
+fn line_reached(
+    deps: &[Dependency],
+    package: &PackageId,
+    from: &Version,
+    to: &Version,
+    direct: bool,
+    members: &[MemberRef],
+) -> bool {
+    if direct && !members.is_empty() {
+        return members.iter().all(|member| {
             let reached = deps.iter().any(|dep| {
-                dep.package == change.package
-                    && dep.current == change.to
+                dep.package == *package
+                    && dep.current == *to
                     && dep.members.iter().any(|dep_member| dep_member == member)
             });
             // The planned line must actually have moved. A member that declares the crate twice
@@ -4790,8 +4886,8 @@ fn target_reached(deps: &[Dependency], change: &Change) -> bool {
             // from node the member only *reaches* transitively is fine — its own edges moved).
             let from_line_remains = deps.iter().any(|dep| {
                 dep.direct
-                    && dep.package == change.package
-                    && dep.current == change.from
+                    && dep.package == *package
+                    && dep.current == *from
                     && dep.members.iter().any(|dep_member| dep_member == member)
             });
             reached && !from_line_remains
@@ -4799,7 +4895,7 @@ fn target_reached(deps: &[Dependency], change: &Change) -> bool {
     }
 
     deps.iter()
-        .any(|dep| dep.package == change.package && dep.current == change.to)
+        .any(|dep| dep.package == *package && dep.current == *to)
 }
 
 /// The hold for a candidate the adapter reported applied whose target the post-apply graph does

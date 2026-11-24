@@ -57,11 +57,12 @@ enum Resolver {
     /// Offers `parent` only on its next major, while the transitive `child` it requires has a
     /// matured release on its own line.
     ///
-    /// Unless `lands`, the major stays held.
-    /// When it `lands`, `parent` 1.0.0 pins `child` exactly, its major only requires `child`'s
-    /// line, and the resolver refuses to move `child`.
+    /// Unless `lands`, the major stays held; when it `lands`, the resolver refuses to move `child`.
+    /// When `pinned`, `parent` 1.0.0 pins `child` exactly, while its major only requires `child`'s
+    /// line.
     MajorParent {
         lands: bool,
+        pinned: bool,
     },
     /// Resolves the transitive `child` on its next major exactly while `parent` sits on a minor in
     /// `lowest..=highest`: on the fresh `2.1.0` when `fresh_major`, else on the matured `2.0.0`;
@@ -109,6 +110,8 @@ struct FakeCargo {
     failures: Vec<(&'static str, Failure)>,
     /// The packages whose releases the registry cannot serve.
     unavailable_releases: &'static [&'static str],
+    /// The `name@version` whose locking makes every later scoped graph read fail.
+    unreadable_with: Option<&'static str>,
 }
 
 fn timestamp(value: &str) -> jiff::Timestamp {
@@ -315,8 +318,8 @@ impl FakeCargo {
         let held: &[&str] = match self.resolver {
             Resolver::PersistentPair { coupled, .. } if coupled && !sibling_planned => &["sibling"],
             Resolver::PersistentPair { .. } => &["parent", "sibling"],
-            Resolver::MajorParent { lands: false } => &["parent"],
-            Resolver::MajorParent { lands: true } => &["child"],
+            Resolver::MajorParent { lands: false, .. } => &["parent"],
+            Resolver::MajorParent { lands: true, .. } => &["child"],
             Resolver::Scripted { held } => {
                 return plan
                     .changes
@@ -508,12 +511,12 @@ impl ToolRead for FakeCargo {
                 }
             }
             if name == "child"
-                && let Resolver::MajorParent { lands } = self.resolver
+                && let Resolver::MajorParent { pinned, .. } = self.resolver
             {
                 let parent = versions
                     .get("parent")
                     .ok_or_else(|| CoreError::NotFound("parent".to_string()))?;
-                let exact = lands && parent == "1.0.0";
+                let exact = pinned && parent == "1.0.0";
                 dep.graph_ceiling = exact.then(|| Version::new(version));
                 dep.hold_edges = vec![hold("parent", parent, "1.0.0", exact)];
             } else if name == "child"
@@ -545,6 +548,26 @@ impl ToolRead for FakeCargo {
             }
         }
         Ok(dependencies)
+    }
+
+    // Only a scoped read asks for the manifest's notices, so failing them fails the follower
+    // replan's read and the final one, never the graph reads that verify a batch.
+    async fn manifest_notices(
+        &self,
+        project: &Project,
+    ) -> cooldown_core::Result<Vec<cooldown_core::Diagnostic>> {
+        let locked = lock(project)?;
+        let unreadable = self.unreadable_with.is_some_and(|unreadable| {
+            locked
+                .iter()
+                .any(|(name, version)| format!("{name}@{version}") == unreadable)
+        });
+        if unreadable {
+            return Err(CoreError::LockUnreadable(
+                "the manifest cannot be read".to_string(),
+            ));
+        }
+        Ok(Vec::new())
     }
 
     async fn native_policy(
@@ -808,6 +831,7 @@ fn fixture_adapter(
         edge_rebinds_on_apply,
         failures: Vec::new(),
         unavailable_releases: &[],
+        unreadable_with: None,
         releases: BTreeMap::from([
             ("parent".to_string(), parents),
             (
@@ -945,6 +969,8 @@ struct Overrides {
     trials: Vec<(&'static str, Failure)>,
     /// The packages whose releases the registry cannot serve.
     unavailable: &'static [&'static str],
+    /// The `name@version` whose locking makes every later scoped graph read fail.
+    unreadable_with: Option<&'static str>,
     /// Releases replacing the registry's for their packages.
     releases: BTreeMap<String, Vec<Release>>,
     /// Policy layers after the built-in default.
@@ -1013,6 +1039,7 @@ fn fixture_with(
     let mut fake = FakeCargo {
         failures: overrides.trials,
         unavailable_releases: overrides.unavailable,
+        unreadable_with: overrides.unreadable_with,
         ..fixture_adapter(resolver, newest, edge_rebinds_on_apply)
     };
     fake.releases.extend(overrides.releases);
@@ -1908,7 +1935,14 @@ async fn a_child_deferred_for_a_held_major_parent_still_upgrades() -> eyre::Resu
         directory: _directory,
         workspace,
         project,
-    } = fixture(Resolver::MajorParent { lands: false }, 1, false)?;
+    } = fixture(
+        Resolver::MajorParent {
+            lands: false,
+            pinned: false,
+        },
+        1,
+        false,
+    )?;
     let outcome = workspace
         .upgrade(&RunOpts {
             allow_major: true,
@@ -2677,7 +2711,14 @@ async fn fast_mode_notes_only_the_finally_held_candidates() -> eyre::Result<()> 
         directory: _directory,
         workspace,
         project,
-    } = fixture(Resolver::MajorParent { lands: false }, 1, false)?;
+    } = fixture(
+        Resolver::MajorParent {
+            lands: false,
+            pinned: false,
+        },
+        1,
+        false,
+    )?;
     let outcome = workspace
         .upgrade(&RunOpts {
             allow_major: true,
@@ -3039,7 +3080,10 @@ async fn outdated_judges_a_transitive_within_its_major() -> eyre::Result<()> {
         workspace,
         project: _,
     } = fixture_with(
-        Resolver::MajorParent { lands: false },
+        Resolver::MajorParent {
+            lands: false,
+            pinned: false,
+        },
         1,
         false,
         Vec::new(),
@@ -3088,7 +3132,14 @@ async fn outdated_reports_a_followers_refusal() -> eyre::Result<()> {
         directory: _directory,
         workspace,
         project: _,
-    } = fixture(Resolver::MajorParent { lands: true }, 1, false)?;
+    } = fixture(
+        Resolver::MajorParent {
+            lands: true,
+            pinned: true,
+        },
+        1,
+        false,
+    )?;
     let opts = RunOpts {
         allow_major: true,
         transitive: true,
@@ -3136,6 +3187,56 @@ async fn outdated_reports_a_followers_refusal() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A deferred transitive whose follower replan cannot read the graph is left undecided by a
+/// failure, so `outdated` reports that failure on its row rather than reading it as following
+/// its requirers, beside the requirer's landed major (#173).
+#[tokio::test]
+async fn a_follower_its_replan_cannot_read_carries_the_failure() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project: _,
+    } = fixture_with(
+        Resolver::MajorParent {
+            lands: true,
+            pinned: false,
+        },
+        1,
+        false,
+        Vec::new(),
+        Overrides {
+            unreadable_with: Some("parent@2.0.0"),
+            ..Overrides::default()
+        },
+    )?;
+    let opts = RunOpts {
+        allow_major: true,
+        transitive: true,
+        ..RunOpts::default()
+    };
+
+    let outdated = workspace.outdated(&opts).await;
+
+    assert_eq!(
+        verdict_of(&outdated, "parent"),
+        (OutdatedStatus::Adoptable, Some("2.0.0".to_string()))
+    );
+    let child = outdated
+        .items
+        .iter()
+        .find(|item| item.name == "child")
+        .ok_or_else(|| eyre::eyre!("no child row: {:?}", outdated.items))?;
+    assert_eq!(child.status, OutdatedStatus::Error, "{child:?}");
+    assert!(
+        child
+            .error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("the manifest cannot be read")),
+        "{child:?}"
+    );
+    Ok(())
+}
+
 /// A failure the dry run meets only for a package `explain` does not report reaches the
 /// verdict as a warning, never as the reported row's error (#173).
 #[tokio::test]
@@ -3145,7 +3246,10 @@ async fn explain_notes_another_packages_failure() -> eyre::Result<()> {
         workspace,
         project: _,
     } = fixture_with(
-        Resolver::MajorParent { lands: true },
+        Resolver::MajorParent {
+            lands: true,
+            pinned: true,
+        },
         1,
         false,
         Vec::new(),

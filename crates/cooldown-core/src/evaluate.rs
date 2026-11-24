@@ -543,6 +543,29 @@ pub fn evaluate(
     evaluate_advised(dep, releases, None, layers, ctx, now)
 }
 
+/// The newest release `dep` could move to under `allow_major`, cooled down or not: the
+/// [`Verdict::latest`] that [`evaluate`] reports for a tagged current version.
+///
+/// It is `None` when `releases` lacks the current version.
+#[must_use]
+pub fn newest_eligible(
+    dep: &Dependency,
+    releases: &[Release],
+    allow_major: bool,
+    now: Timestamp,
+) -> Option<Version> {
+    let current = releases
+        .iter()
+        .find(|release| release.version == dep.current)?;
+    releases
+        .iter()
+        .filter(|release| {
+            eligibility_rejection(release, dep, &current.major, allow_major, now).is_none()
+        })
+        .max_by(|a, b| a.order.cmp(&b.order))
+        .map(|release| release.version.clone())
+}
+
 /// [`evaluate`] with an advisory feed: candidates that fix an advisory affecting the current
 /// pin carry [`Candidate::security`], and under [`AdvisoryMode::Shorten`] are judged against
 /// the security window instead of the ordinary one.
@@ -669,13 +692,13 @@ fn eligibility_rejection(
     release: &Release,
     dep: &Dependency,
     current_major: &MajorKey,
-    ctx: &ResolveContext<'_>,
+    allow_major: bool,
     now: Timestamp,
 ) -> Option<crate::trace::ReleaseFilter> {
     use crate::trace::ReleaseFilter;
     if !quality_eligible(release, dep.current_quality) {
         Some(ReleaseFilter::Quality)
-    } else if !major_eligible(release, current_major, ctx.allow_major) {
+    } else if !major_eligible(release, current_major, allow_major) {
         Some(ReleaseFilter::Major)
     } else if release.yanked {
         Some(ReleaseFilter::Yanked)
@@ -772,7 +795,7 @@ fn evaluate_filtered<'r>(
         .filter(|release| {
             log.passes(
                 release,
-                eligibility_rejection(release, dep, &current_major, ctx, now),
+                eligibility_rejection(release, dep, &current_major, ctx.allow_major, now),
             )
         })
         .collect();

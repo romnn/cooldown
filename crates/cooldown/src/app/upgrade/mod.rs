@@ -15,16 +15,16 @@
 mod executor;
 mod run_staled;
 
-pub(super) use self::executor::{Judged, target_package_for, upgrade_verdict};
+pub(super) use self::executor::{CopyOutcome, Judged, upgrade_verdict};
 use self::executor::{PlanMode, ProjectRunStatus, ProjectUpgradeExecutor};
 use self::run_staled::{CurrentAtStart, ProjectPass, TurnLock, refresh_gate};
 use super::lanes::LaneAccess;
 use super::{
-    BuildInfo, Exit, FetchedRelease, ProjectProgress, RunOpts, UpgradeItem, UpgradeMeta,
-    UpgradeSummary, Workspace, diag_from_error,
+    BuildInfo, Exit, FetchedRelease, ProjectProgress, RunOpts, SkippedInfo, UpgradeItem,
+    UpgradeMeta, UpgradeSummary, Workspace, diag_from_error,
 };
 use cooldown_core::{
-    AcceptedPublication, BaselineViolation, Change, Diagnostic, DiagnosticKind, EdgeBindingAction,
+    AcceptedPublication, BaselineViolation, Diagnostic, DiagnosticKind, EdgeBindingAction,
     IsolatedMutation, IsolatedMutationStrategy, LockStatus, MutationExecution, ToolRead, ToolWrite,
 };
 use std::collections::HashSet;
@@ -69,19 +69,20 @@ pub(super) struct UpgradeAccum {
     /// The versions outside a configured `max-major` this project's passes authorized, which a
     /// later refresh of its lock may keep (see [`run_staled`]).
     pub(super) allowed_crossings: HashSet<BaselineViolation>,
-    /// What the project's plans read and tried, which only `outdated`'s dry run collects (see
+    /// What the project's pass read and settled, which only `outdated`'s dry run collects (see
     /// [`Workspace::dry_run_upgrade`]).
     pub(super) facts: Option<PlanFacts>,
 }
 
-/// What one project's upgrade plans read and tried, which `outdated` reports from.
+/// What one project's upgrade pass read and settled, which `outdated` reports from.
 #[derive(Default)]
 pub(super) struct PlanFacts {
     /// Every dependency the first plan read, with the releases and verdict it was planned from;
     /// `None` while no plan has run.
     pub(super) judged: Option<Vec<FetchedRelease<Judged>>>,
-    /// Every change a plan put to a trial, a follower replan's included.
-    pub(super) tried: Vec<Change>,
+    /// What the pass did with each of those dependencies, in the same order; `None` when it
+    /// settled none, because no plan ran or its trial's state was discarded.
+    pub(super) outcomes: Option<Vec<CopyOutcome>>,
 }
 
 /// The read/write adapter pair and shared per-project inputs the upgrade executor needs.
@@ -414,7 +415,8 @@ impl Workspace {
     /// copy of the project, without a build.
     ///
     /// `outdated` reports from it, so its rows say what `upgrade` does with each dependency: the
-    /// pass's own rows and diagnostics, and what its plans read and tried ([`PlanFacts`]).
+    /// pass's own rows and diagnostics, and what it read and settled for each dependency
+    /// ([`PlanFacts`]).
     pub(super) async fn dry_run_upgrade(
         &self,
         pctx: &super::ProjectCtx,
@@ -590,15 +592,30 @@ fn relabel_copy_paths(acc: &mut UpgradeAccum, copy: &camino::Utf8Path, source: &
         .iter_mut()
         .chain(acc.warnings.iter_mut())
         .for_each(&relabel_diag);
+    let relabel_skip = |skipped: &mut SkippedInfo| {
+        relabel(&mut skipped.message);
+        if let Some(offending) = &mut skipped.offending {
+            relabel(offending);
+        }
+    };
     for item in acc.items.iter_mut().chain(acc.edge_items.iter_mut()) {
         if let Some(skipped) = &mut item.skipped {
-            relabel(&mut skipped.message);
-            if let Some(offending) = &mut skipped.offending {
-                relabel(offending);
-            }
+            relabel_skip(skipped);
         }
         if let Some(error) = &mut item.error {
             relabel_diag(error);
+        }
+    }
+    let outcomes = acc
+        .facts
+        .iter_mut()
+        .filter_map(|facts| facts.outcomes.as_mut())
+        .flatten();
+    for outcome in outcomes {
+        match outcome {
+            CopyOutcome::Refused { skip, .. } => relabel_skip(skip),
+            CopyOutcome::Failed(error) => relabel_diag(error),
+            CopyOutcome::Landed { .. } | CopyOutcome::Undecided => {}
         }
     }
 }
@@ -683,14 +700,17 @@ const fn combine_build_ok(left: Option<bool>, right: Option<bool>) -> Option<boo
     }
 }
 
-/// Folds a trial whose state was discarded into `target`: its errors, and what its plans read
-/// and tried, which the discard does not change.
+/// Folds a trial whose state was discarded into `target`: its errors, and what its plans read,
+/// which the discard does not change, while what it settled goes with its rows.
 fn merge_discarded_trial(target: &mut UpgradeAccum, source: UpgradeAccum) {
     target.errors.extend(source.errors);
     target
         .errors
         .extend(source.items.into_iter().filter_map(|item| item.error));
     target.facts = target.facts.take().or(source.facts);
+    if let Some(facts) = &mut target.facts {
+        facts.outcomes = None;
+    }
 }
 
 /// Publishes the trial's accepted state and folds its rows into `acc`.
