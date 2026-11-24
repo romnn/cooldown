@@ -63,36 +63,46 @@ impl Provenance {
     }
 }
 
-/// What the pass did with each copy its first plan read (`judged`), from its rows (`items`), its
+/// One dependency a first plan read, with its releases and verdict, and what the pass settled
+/// for it.
+pub(crate) struct PlannedCopy {
+    pub(crate) fact: FetchedRelease<Judged>,
+    /// `None` until the pass settles the copy, and again once its trial's state is discarded.
+    pub(crate) outcome: Option<CopyOutcome>,
+}
+
+/// Settles what the pass did with each copy its first plan read, from its rows (`items`), its
 /// errors, and the graph it left (`None` when that read failed).
+///
+/// That graph is the only proof of a landing, and a copy lands only at the one version it
+/// confirms for the copy among those its rows moved, or meant to move, it to (see
+/// [`copy_landed`]).
+/// A move that reaches only some of a declared copy's members, splits the copy across versions,
+/// or was undone by a later pass therefore never reads as landed.
 ///
 /// For each copy the first outcome that holds wins:
 ///
-/// - **Landed** by the row of a planned move, which the pass verified as it landed, or else at
-///   the highest version a forward row moves the copy to while `graph` shows the copy moved there
-///   (see [`copy_landed`]).
+/// - **Landed** at that one version.
 /// - **Refused** by the hold of the lowest target a plan tried, whatever the reason.
 /// - **Failed** by the error of such a move, an error naming the package, or the failure that
-///   stopped the pass before it decided a move it tried or a copy it deferred.
+///   stopped the pass before it confirmed a move of the copy or decided a copy it tried or
+///   deferred.
 /// - **Undecided** otherwise.
-///
-/// Evidence short of a landing never settles a copy as landed: a move that reaches only some of
-/// a declared copy's members, or splits them across versions, leaves it refused or undecided.
 pub(super) fn settle(
-    judged: &[FetchedRelease<Judged>],
+    copies: &mut [PlannedCopy],
     provenance: &Provenance,
     items: &[UpgradeItem],
     errors: &[Diagnostic],
     graph: Option<&[Dependency]>,
-) -> Vec<CopyOutcome> {
+) {
     let mut traced: HashMap<usize, Vec<&UpgradeItem>> = HashMap::new();
-    let mut moves: HashMap<(&str, Option<&str>, &str), Vec<&UpgradeItem>> = HashMap::new();
+    let mut by_source: HashMap<(&str, Option<&str>, &str), Vec<&UpgradeItem>> = HashMap::new();
     for item in items.iter().filter(|item| item.edge.is_none()) {
         if let Some(&copy) = provenance.origin.get(&ChangeKey::of_item(item)) {
             traced.entry(copy).or_default().push(item);
         }
         if item.applied && !item.downgrade {
-            moves
+            by_source
                 .entry((
                     item.name.as_str(),
                     item.registry.as_deref(),
@@ -104,93 +114,126 @@ pub(super) fn settle(
     }
     let tried: HashSet<usize> = provenance.origin.values().copied().collect();
     let failure = errors.iter().rev().find(|error| error.package.is_none());
-    judged
-        .iter()
-        .enumerate()
-        .map(|(copy, fact)| {
-            let dep = &fact.dependency;
-            let releases = fact
-                .result
-                .as_ref()
-                .map(|judged| judged.releases.as_slice())
-                .unwrap_or_default();
-            let order = |row: &UpgradeItem| {
-                releases
-                    .iter()
-                    .find(|release| release.version.as_str() == row.to)
-                    .map(|release| &release.order)
-            };
-            let rows = traced.get(&copy).map(Vec::as_slice).unwrap_or_default();
-            let landing = rows
+    for (index, copy) in copies.iter_mut().enumerate() {
+        let dep = &copy.fact.dependency;
+        let rows = traced.get(&index).map(Vec::as_slice).unwrap_or_default();
+        let source = (
+            dep.package.name.as_str(),
+            dep.package.registry.as_deref(),
+            dep.current.as_str(),
+        );
+        let forward = by_source
+            .get(&source)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let landing = graph.and_then(|graph| single_landing(graph, dep, rows, forward));
+        let outcome = if let Some(row) = landing {
+            CopyOutcome::Landed {
+                to: row.to.clone(),
+                security: row.security.clone(),
+            }
+        } else if let Some((row, skip)) = nearest_hold(&copy.fact, rows) {
+            CopyOutcome::Refused {
+                to: row.to.clone(),
+                skip: skip.clone(),
+                security: row.security.clone(),
+            }
+        } else if let Some(error) = rows.iter().find_map(|row| row.error.as_ref()).or_else(|| {
+            errors
                 .iter()
-                .find(|row| row.applied && !row.downgrade)
-                .copied()
-                .or_else(|| {
-                    let graph = graph?;
-                    let source = (
-                        dep.package.name.as_str(),
-                        dep.package.registry.as_deref(),
-                        dep.current.as_str(),
-                    );
-                    moves
-                        .get(&source)?
-                        .iter()
-                        .copied()
-                        .filter(|row| copy_landed(graph, dep, &Version::new(row.to.clone())))
-                        .max_by_key(|row| order(row))
-                });
-            if let Some(row) = landing {
-                return CopyOutcome::Landed {
-                    to: row.to.clone(),
-                    security: row.security.clone(),
-                };
-            }
-            // The nearest move the pass held, such as an in-line fallback below a held major.
-            let refusal = rows
-                .iter()
-                .filter_map(|row| row.skipped.as_ref().map(|skip| (row, skip)))
-                .min_by_key(|(row, _)| {
-                    let order = order(row);
-                    (order.is_none(), order)
-                });
-            if let Some((row, skip)) = refusal {
-                return CopyOutcome::Refused {
-                    to: row.to.clone(),
-                    skip: skip.clone(),
-                    security: row.security.clone(),
-                };
-            }
-            let error = rows.iter().find_map(|row| row.error.as_ref()).or_else(|| {
-                errors
-                    .iter()
-                    .find(|error| error.package.as_ref() == Some(&dep.package.name))
-            });
-            if let Some(error) = error {
-                return CopyOutcome::Failed(error.clone());
-            }
-            let pending = tried.contains(&copy) || provenance.awaiting.contains(&copy);
+                .find(|error| error.package.as_ref() == Some(&dep.package.name))
+        }) {
+            CopyOutcome::Failed(error.clone())
+        } else {
+            // A copy the pass tried or deferred and never settled, or one it moved where the
+            // final read could not confirm the move, is left to the failure that stopped it.
+            let pending = tried.contains(&index)
+                || provenance.awaiting.contains(&index)
+                || (graph.is_none() && !forward.is_empty());
             match failure {
                 Some(failure) if pending => CopyOutcome::Failed(failure.clone()),
                 _ => CopyOutcome::Undecided,
             }
-        })
-        .collect()
+        };
+        copy.outcome = Some(outcome);
+    }
 }
 
-/// Whether `graph` shows `dep`'s copy moved onto `to`.
+/// The one row whose version `graph` confirms for `dep`'s copy among every version its traced
+/// `rows` and the `forward` rows from its version took, or meant to take, it to, or `None` when
+/// it confirms none or several.
 ///
-/// A declared copy has moved once every member declaring it binds `to` and no longer binds the
-/// copy, as a uv fork pin can keep a member on both.
-/// A copy no member declares has moved once `to` is in the graph and the copy is not.
-fn copy_landed(graph: &[Dependency], dep: &Dependency, to: &Version) -> bool {
+/// Applied rows come first, so a landing reports their evidence.
+fn single_landing<'a>(
+    graph: &[Dependency],
+    dep: &Dependency,
+    rows: &[&'a UpgradeItem],
+    forward: &[&'a UpgradeItem],
+) -> Option<&'a UpgradeItem> {
+    let candidates = rows
+        .iter()
+        .chain(forward)
+        .filter(|row| row.applied)
+        .chain(rows.iter().filter(|row| !row.applied))
+        .copied()
+        .filter(|row| !row.downgrade);
+    let mut landings: Vec<&UpgradeItem> = Vec::new();
+    for row in candidates {
+        let seen = landings.iter().any(|landing| {
+            landing.name == row.name && landing.registry == row.registry && landing.to == row.to
+        });
+        // A Go move onto another major lands under that major's module path.
+        let destination = PackageId::new(dep.package.tool, row.name.clone(), row.registry.clone());
+        if !seen && copy_landed(graph, dep, &destination, &Version::new(row.to.clone())) {
+            landings.push(row);
+        }
+    }
+    match landings.as_slice() {
+        [row] => Some(row),
+        _ => None,
+    }
+}
+
+/// The hold on the lowest target a plan tried for the copy `fact` describes, among its traced
+/// `rows`: the nearest move the pass held, such as an in-line fallback below a held major.
+fn nearest_hold<'a>(
+    fact: &FetchedRelease<Judged>,
+    rows: &[&'a UpgradeItem],
+) -> Option<(&'a UpgradeItem, &'a SkippedInfo)> {
+    let releases = fact
+        .result
+        .as_ref()
+        .map(|judged| judged.releases.as_slice())
+        .unwrap_or_default();
+    rows.iter()
+        .filter_map(|row| row.skipped.as_ref().map(|skip| (*row, skip)))
+        .min_by_key(|(row, _)| {
+            let order = releases
+                .iter()
+                .find(|release| release.version.as_str() == row.to)
+                .map(|release| &release.order);
+            (order.is_none(), order)
+        })
+}
+
+/// Whether `graph` shows `dep`'s copy moved onto `destination` at `to`.
+///
+/// A declared copy has moved once every member declaring it binds the destination and no longer
+/// binds the copy, as a uv fork pin can keep a member on both.
+/// A copy no member declares has moved once the destination is in the graph and the copy is
+/// not.
+fn copy_landed(
+    graph: &[Dependency],
+    dep: &Dependency,
+    destination: &PackageId,
+    to: &Version,
+) -> bool {
     let declared = dep.direct && !dep.members.is_empty();
     line_reached(
         graph,
-        &dep.package,
-        &dep.current,
-        to,
-        dep.direct,
-        &dep.members,
+        (&dep.package, &dep.current),
+        (destination, to),
+        declared.then_some(dep.members.as_slice()),
     ) && (declared
         || !graph
             .iter()
@@ -199,7 +242,7 @@ fn copy_landed(graph: &[Dependency], dep: &Dependency, to: &Version) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CopyOutcome, Provenance, settle};
+    use super::{CopyOutcome, PlannedCopy, Provenance, settle};
     use crate::app::upgrade::executor::planning::Judged;
     use crate::app::{FetchedRelease, SkippedInfo, UpgradeItem};
     use cooldown_core::{
@@ -232,9 +275,9 @@ mod tests {
         }
     }
 
-    /// The first plan's facts for `dep`, whose releases are `versions` in ascending order, with
+    /// The first plan's copy of `dep`, whose releases are `versions` in ascending order, with
     /// each version's major key.
-    fn fact(dep: Dependency, versions: &[(&str, &str)]) -> FetchedRelease<Judged> {
+    fn fact(dep: Dependency, versions: &[(&str, &str)]) -> PlannedCopy {
         let releases = versions
             .iter()
             .zip(0_u8..)
@@ -251,18 +294,21 @@ mod tests {
                 quality: ReleaseQuality::Stable,
             })
             .collect();
-        FetchedRelease {
-            dependency: dep,
-            result: Ok(Judged {
-                releases,
-                verdict: Verdict {
-                    status: Status::Adoptable,
-                    adoptable_target: None,
-                    latest: None,
-                    candidates: Vec::new(),
-                    held_reason: None,
-                },
-            }),
+        PlannedCopy {
+            fact: FetchedRelease {
+                dependency: dep,
+                result: Ok(Judged {
+                    releases,
+                    verdict: Verdict {
+                        status: Status::Adoptable,
+                        adoptable_target: None,
+                        latest: None,
+                        candidates: Vec::new(),
+                        held_reason: None,
+                    },
+                }),
+            },
+            outcome: None,
         }
     }
 
@@ -319,6 +365,21 @@ mod tests {
         }
     }
 
+    /// What [`settle`] makes of each of `copies`, given what the pass recorded.
+    fn settled(
+        mut copies: Vec<PlannedCopy>,
+        provenance: &Provenance,
+        items: &[UpgradeItem],
+        errors: &[Diagnostic],
+        graph: Option<&[Dependency]>,
+    ) -> Vec<CopyOutcome> {
+        settle(&mut copies, provenance, items, errors, graph);
+        copies
+            .into_iter()
+            .map(|copy| copy.outcome.unwrap_or(CopyOutcome::Undecided))
+            .collect()
+    }
+
     /// A collateral move counts for a declared copy only once every declaring member binds its
     /// version and no longer binds the copy: a split across two versions, or a member a fork pin
     /// keeps on both, lands nothing and leaves the tried target's hold.
@@ -332,8 +393,8 @@ mod tests {
         let held = row(&tried, &["web", "api"], true);
 
         // A split: each member's edge moved to another version.
-        let split = settle(
-            &[fact(dep.clone(), &versions)],
+        let split = settled(
+            vec![fact(dep.clone(), &versions)],
             &provenance,
             &[
                 collateral(&dep, "1.0.1", &["web"]),
@@ -352,8 +413,8 @@ mod tests {
         );
 
         // A fork pin: `api` reaches `1.2.0` and still binds `1.0.0`.
-        let fork = settle(
-            &[fact(dep.clone(), &versions)],
+        let fork = settled(
+            vec![fact(dep.clone(), &versions)],
             &Provenance::default(),
             &[collateral(&dep, "1.2.0", &["web", "api"])],
             &[],
@@ -365,8 +426,8 @@ mod tests {
         assert_eq!(fork, [CopyOutcome::Undecided]);
 
         // Every member moved.
-        let moved = settle(
-            &[fact(dep.clone(), &versions)],
+        let moved = settled(
+            vec![fact(dep.clone(), &versions)],
             &provenance,
             &[collateral(&dep, "1.2.0", &["web", "api"]), held],
             &[],
@@ -375,34 +436,108 @@ mod tests {
         assert_eq!(moved, [landed("1.2.0")]);
     }
 
-    /// A copy no member declares lands at the highest version it moved to once the graph no
-    /// longer holds it, and never while it does.
+    /// A copy no member declares lands at the version it moved to once the graph holds that
+    /// version and no longer holds the copy, and never while it still does, when its moves
+    /// reached several versions, or when the graph could not be read.
     #[test]
-    fn an_undeclared_copy_lands_once_it_is_gone() {
+    fn an_undeclared_copy_lands_at_one_confirmed_version() {
         let dep = node("child", "1.0.0", false, &[]);
-        let facts = [fact(
-            dep.clone(),
-            &[("1.0.0", "1"), ("1.1.0", "1"), ("1.2.0", "1")],
-        )];
-        let rows = [
+        let facts = || {
+            vec![fact(
+                dep.clone(),
+                &[("1.0.0", "1"), ("1.1.0", "1"), ("1.2.0", "1")],
+            )]
+        };
+        let rows = [collateral(&dep, "1.1.0", &[])];
+        let moved = [node("child", "1.1.0", false, &[])];
+        let gone = settled(facts(), &Provenance::default(), &rows, &[], Some(&moved));
+        assert_eq!(gone, [landed("1.1.0")]);
+
+        let kept = [moved[0].clone(), dep.clone()];
+        let kept = settled(facts(), &Provenance::default(), &rows, &[], Some(&kept));
+        assert_eq!(kept, [CopyOutcome::Undecided]);
+
+        let unread = settled(facts(), &Provenance::default(), &rows, &[], None);
+        assert_eq!(unread, [CopyOutcome::Undecided]);
+
+        // Two destinations coexist, so neither is the copy's landing.
+        let split = [
             collateral(&dep, "1.1.0", &[]),
             collateral(&dep, "1.2.0", &[]),
         ];
-        let moved = [
+        let both = [
             node("child", "1.1.0", false, &[]),
             node("child", "1.2.0", false, &[]),
         ];
-        let gone = settle(&facts, &Provenance::default(), &rows, &[], Some(&moved));
-        assert_eq!(gone, [landed("1.2.0")]);
+        let split = settled(facts(), &Provenance::default(), &split, &[], Some(&both));
+        assert_eq!(split, [CopyOutcome::Undecided]);
+    }
 
-        let mut kept = moved.to_vec();
-        kept.push(dep.clone());
-        let kept = settle(&facts, &Provenance::default(), &rows, &[], Some(&kept));
-        assert_eq!(kept, [CopyOutcome::Undecided]);
+    /// A pnpm split moves one requirer's copy to the planned target and another's elsewhere while
+    /// the settlement holds the planned target, so the copy has not landed and the hold stands.
+    #[test]
+    fn a_pnpm_split_keeps_the_hold() {
+        let dep = node("leaf", "1.0.0", false, &[]);
+        let facts = || {
+            vec![fact(
+                dep.clone(),
+                &[("1.0.0", "1"), ("1.0.1", "1"), ("1.2.0", "1")],
+            )]
+        };
+        let tried = change(&dep, "leaf", "1.2.0");
+        let mut provenance = Provenance::default();
+        provenance.tried(&tried, 0, &dep.package);
 
-        // Without the graph the pass left, nothing proves the move.
-        let unread = settle(&facts, &Provenance::default(), &rows, &[], None);
-        assert_eq!(unread, [CopyOutcome::Undecided]);
+        let outcomes = settled(
+            facts(),
+            &provenance,
+            &[row(&tried, &[], true), collateral(&dep, "1.0.1", &[])],
+            &[],
+            Some(&[
+                node("leaf", "1.2.0", false, &[]),
+                node("leaf", "1.0.1", false, &[]),
+            ]),
+        );
+
+        assert!(
+            matches!(outcomes.as_slice(), [CopyOutcome::Refused { to, .. }] if to == "1.2.0"),
+            "{outcomes:?}"
+        );
+    }
+
+    /// A planned move the pass landed counts only while the graph it left still holds the
+    /// target: a later pass that dropped the package undoes it.
+    #[test]
+    fn a_planned_landing_a_later_pass_undid_has_not_landed() {
+        let dep = node("t", "1.0.0", false, &[]);
+        let facts = || vec![fact(dep.clone(), &[("1.0.0", "1"), ("1.1.0", "1")])];
+        let tried = change(&dep, "t", "1.1.0");
+        let mut provenance = Provenance::default();
+        provenance.tried(&tried, 0, &dep.package);
+        let rows = [row(&tried, &[], false)];
+
+        let kept = settled(
+            facts(),
+            &provenance,
+            &rows,
+            &[],
+            Some(&[node("t", "1.1.0", false, &[])]),
+        );
+        assert_eq!(kept, [landed("1.1.0")]);
+
+        let dropped = settled(facts(), &provenance, &rows, &[], Some(&[]));
+        assert_eq!(dropped, [CopyOutcome::Undecided]);
+
+        // A final read that failed leaves the move to that failure.
+        let unread = Diagnostic::new(DiagnosticKind::ToolFailed, "the read failed");
+        let unconfirmed = settled(
+            facts(),
+            &provenance,
+            &rows,
+            std::slice::from_ref(&unread),
+            None,
+        );
+        assert_eq!(unconfirmed, [CopyOutcome::Failed(unread)]);
     }
 
     /// A Go move onto another major is planned under its target's module path and held under
@@ -415,18 +550,18 @@ mod tests {
         let mut provenance = Provenance::default();
         provenance.tried(&tried, 0, &dep.package);
 
-        let landing = settle(
-            &[fact(dep.clone(), &versions)],
+        let landing = settled(
+            vec![fact(dep.clone(), &versions)],
             &provenance,
             &[row(&tried, &[], false)],
             &[],
-            None,
+            Some(&[node("example.com/m/v2", "v2.0.0", true, &[])]),
         );
         assert_eq!(landing, [landed("v2.0.0")]);
 
         let reported = change(&dep, "example.com/m", "v2.0.0");
-        let hold = settle(
-            &[fact(dep.clone(), &versions)],
+        let hold = settled(
+            vec![fact(dep.clone(), &versions)],
             &provenance,
             &[row(&reported, &[], true)],
             &[],
@@ -448,12 +583,14 @@ mod tests {
         let untouched = node("untouched", "1.0.0", true, &[]);
         let named = node("named", "1.0.0", true, &[]);
         let versions = [("1.0.0", "1"), ("1.1.0", "1")];
-        let facts = [
-            fact(tried.clone(), &versions),
-            fact(deferred, &versions),
-            fact(untouched, &versions),
-            fact(named, &versions),
-        ];
+        let facts = || {
+            vec![
+                fact(tried.clone(), &versions),
+                fact(deferred.clone(), &versions),
+                fact(untouched.clone(), &versions),
+                fact(named.clone(), &versions),
+            ]
+        };
         let mut provenance = Provenance::default();
         provenance.tried(&change(&tried, "tried", "1.1.0"), 0, &tried.package);
         provenance.await_replan(vec![1]);
@@ -463,8 +600,8 @@ mod tests {
         let other =
             Diagnostic::new(DiagnosticKind::ToolFailed, "no metadata").with_package("elsewhere");
 
-        let outcomes = settle(
-            &facts,
+        let outcomes = settled(
+            facts(),
             &provenance,
             &[],
             &[stopped.clone(), fetch.clone(), other],
@@ -483,7 +620,7 @@ mod tests {
 
         // A follower replan that read the graph decided the deferred copy itself.
         provenance.replanned();
-        let replanned = settle(&facts, &provenance, &[], &[], None);
+        let replanned = settled(facts(), &provenance, &[], &[], None);
         assert_eq!(replanned.get(1), Some(&CopyOutcome::Undecided));
     }
 }

@@ -5,16 +5,15 @@ use super::advisories::AdvisoryPackages;
 use super::lanes::LaneAccess;
 use super::lock::ProjectAccessWriteGuard;
 use super::read::ReadProjectCtx;
-use super::upgrade::{CopyOutcome, Judged, PlanFacts, UpgradeAccum, upgrade_verdict};
+use super::upgrade::{CopyOutcome, Judged, PlannedCopy, UpgradeAccum, upgrade_verdict};
 use super::{
     Exit, FetchedRelease, LockReportAction, ProjectProgress, RunOpts, Workspace, age_days,
     diag_from_error, lock_report_outcome, render_window, stale_evaluation_skipped,
 };
 use super::{LatestInfo, OutdatedItem, OutdatedStatus, OutdatedSummary, Window};
 use cooldown_core::{
-    CooldownHorizon, DepScope, Dependency, Diagnostic, DiagnosticKind, LockVerifyReport, MemberRef,
-    PackageId, Release, ResolveKind, ResolveQuery, Status, Verdict, Version, newest_eligible,
-    resolve,
+    CooldownHorizon, DepScope, Dependency, Diagnostic, DiagnosticKind, LockVerifyReport, PackageId,
+    Release, ResolveKind, ResolveQuery, Status, Verdict, Version, newest_eligible, resolve,
 };
 use std::collections::HashMap;
 
@@ -231,14 +230,17 @@ impl<'a> OutdatedRunner<'a> {
         } else {
             None
         };
-        let (planned, mut settled, unsettled) = take_settlement(dry_run.as_mut());
+        let (planned, unsettled) = take_settlement(dry_run.as_mut());
         let judged = self.judge(pctx, &read, deps, planned).await;
 
         let project_label = read.project_label.as_str();
-        for FetchedRelease {
-            dependency: dep,
-            result,
-        } in judged
+        for (
+            FetchedRelease {
+                dependency: dep,
+                result,
+            },
+            outcome,
+        ) in judged
         {
             let item = match result {
                 Ok(judged) => {
@@ -249,8 +251,7 @@ impl<'a> OutdatedRunner<'a> {
                     }
                     let mut item = self.outdated_item(pctx, project_label, &dep, &judged);
                     if dry_run.is_some() {
-                        let outcome =
-                            take_outcome(&mut settled, &dep).unwrap_or_else(|| unsettled.clone());
+                        let outcome = outcome.unwrap_or_else(|| unsettled.clone());
                         settle(&mut item, &dep, &judged.verdict, outcome);
                     }
                     item
@@ -398,26 +399,33 @@ impl<'a> OutdatedRunner<'a> {
         pctx: &super::ProjectCtx,
         read: &ReadProjectCtx<'_>,
         deps: Vec<Dependency>,
-        planned: Vec<FetchedRelease<Judged>>,
-    ) -> Vec<FetchedRelease<Judged>> {
-        let mut plan: HashMap<(PackageId, Version, bool), Vec<Judged>> = HashMap::new();
-        for FetchedRelease { dependency, result } in planned {
-            if let Ok(judged) = result {
-                plan.entry((dependency.package, dependency.current, dependency.direct))
-                    .or_default()
-                    .push(judged);
-            }
+        planned: Vec<PlannedCopy>,
+    ) -> Vec<(FetchedRelease<Judged>, Option<CopyOutcome>)> {
+        let mut plan = PlannedCopies::new();
+        for copy in planned {
+            let dep = &copy.fact.dependency;
+            plan.entry((dep.package.clone(), dep.current.clone(), dep.direct))
+                .or_default()
+                .push(copy);
         }
         let mut judged = Vec::with_capacity(deps.len());
         let mut unjudged = Vec::new();
         for dep in deps {
-            let key = (dep.package.clone(), dep.current.clone(), dep.direct);
-            match plan.get_mut(&key).and_then(Vec::pop) {
-                Some(fact) => judged.push(FetchedRelease {
-                    dependency: dep,
-                    result: Ok(fact),
-                }),
-                None => unjudged.push(dep),
+            match take_copy(&mut plan, &dep, |copy| copy.fact.result.is_ok()) {
+                Some(PlannedCopy {
+                    fact:
+                        FetchedRelease {
+                            result: Ok(fact), ..
+                        },
+                    outcome,
+                }) => judged.push((
+                    FetchedRelease {
+                        dependency: dep,
+                        result: Ok(fact),
+                    },
+                    outcome,
+                )),
+                _ => unjudged.push(dep),
             }
         }
         if unjudged.is_empty() {
@@ -441,25 +449,23 @@ impl<'a> OutdatedRunner<'a> {
         let release_fetch = self.fetch_releases(read, pctx, unjudged);
         let (advisory_fetch, fetched) = tokio::join!(advisory_fetch, release_fetch);
         let advisories = advisory_fetch.record(&mut self.acc.warnings, &mut self.acc.errors);
-        judged.extend(
-            fetched
-                .into_iter()
-                .map(|FetchedRelease { dependency, result }| FetchedRelease {
-                    result: result.map(|releases| Judged {
-                        verdict: upgrade_verdict(
-                            read.adapter,
-                            pctx,
-                            self.opts,
-                            self.ws.now(),
-                            advisories.as_ref(),
-                            &dependency,
-                            &releases,
-                        ),
-                        releases,
-                    }),
-                    dependency,
-                }),
-        );
+        for FetchedRelease { dependency, result } in fetched {
+            // A copy the plan could not judge keeps what the pass settled for it.
+            let outcome = take_copy(&mut plan, &dependency, |_| true).and_then(|copy| copy.outcome);
+            let result = result.map(|releases| Judged {
+                verdict: upgrade_verdict(
+                    read.adapter,
+                    pctx,
+                    self.opts,
+                    self.ws.now(),
+                    advisories.as_ref(),
+                    &dependency,
+                    &releases,
+                ),
+                releases,
+            });
+            judged.push((FetchedRelease { dependency, result }, outcome));
+        }
         judged
     }
 
@@ -828,53 +834,48 @@ fn summarize(items: &[OutdatedItem]) -> OutdatedSummary {
     s
 }
 
-/// What the `upgrade` dry run settled for each copy its first plan read, by package, version,
-/// and whether a member declares it.
-type SettledCopies = HashMap<(PackageId, Version, bool), Vec<(Vec<MemberRef>, CopyOutcome)>>;
+/// The copies the `upgrade` dry run's first plan read, by package, version, and whether a member
+/// declares them.
+type PlannedCopies = HashMap<(PackageId, Version, bool), Vec<PlannedCopy>>;
 
-/// Takes what the dry run's first plan judged, the outcome the pass settled for each copy, and
-/// the outcome of a copy the plan did not read: the failure that stopped a pass which settled
-/// nothing, such as one that failed before planning.
-fn take_settlement(
-    dry_run: Option<&mut UpgradeAccum>,
-) -> (Vec<FetchedRelease<Judged>>, SettledCopies, CopyOutcome) {
+/// Takes the copies the dry run's first plan read, each with what the pass settled for it, and
+/// the outcome of a row no copy settles: the failure that stopped a pass which settled none, such
+/// as one that failed before planning.
+fn take_settlement(dry_run: Option<&mut UpgradeAccum>) -> (Vec<PlannedCopy>, CopyOutcome) {
     let Some(pass) = dry_run else {
-        return (Vec::new(), SettledCopies::new(), CopyOutcome::Undecided);
+        return (Vec::new(), CopyOutcome::Undecided);
     };
-    let PlanFacts { judged, outcomes } = pass.facts.take().unwrap_or_default();
-    let judged = judged.unwrap_or_default();
-    let unsettled = match &outcomes {
-        Some(_) => CopyOutcome::Undecided,
-        None => pass
-            .errors
+    let copies = pass
+        .facts
+        .take()
+        .and_then(|facts| facts.copies)
+        .unwrap_or_default();
+    let unsettled = if copies.iter().any(|copy| copy.outcome.is_some()) {
+        CopyOutcome::Undecided
+    } else {
+        pass.errors
             .iter()
             .rev()
             .find(|error| error.package.is_none())
             .map_or(CopyOutcome::Undecided, |failure| {
                 CopyOutcome::Failed(failure.clone())
-            }),
+            })
     };
-    // The outcomes run in the order of the facts.
-    let mut settled = SettledCopies::new();
-    for (fact, outcome) in judged.iter().zip(outcomes.unwrap_or_default()) {
-        let dep = &fact.dependency;
-        settled
-            .entry((dep.package.clone(), dep.current.clone(), dep.direct))
-            .or_default()
-            .push((dep.members.clone(), outcome));
-    }
-    (judged, settled, unsettled)
+    (copies, unsettled)
 }
 
-/// Takes the outcome the dry run settled for `dep`'s copy, if its first plan read the copy.
-fn take_outcome(settled: &mut SettledCopies, dep: &Dependency) -> Option<CopyOutcome> {
-    let copies = settled.get_mut(&(dep.package.clone(), dep.current.clone(), dep.direct))?;
-    // Copies of one package at one version differ by the members declaring them.
+/// Takes the copy with `dep`'s own declaration that `wanted` accepts, so a row matches one copy
+/// at most and never another copy's outcome.
+fn take_copy(
+    plan: &mut PlannedCopies,
+    dep: &Dependency,
+    wanted: impl Fn(&PlannedCopy) -> bool,
+) -> Option<PlannedCopy> {
+    let copies = plan.get_mut(&(dep.package.clone(), dep.current.clone(), dep.direct))?;
     let at = copies
         .iter()
-        .position(|(members, _)| *members == dep.members)
-        .unwrap_or_default();
-    (at < copies.len()).then(|| copies.swap_remove(at).1)
+        .position(|copy| copy.fact.dependency.members == dep.members && wanted(copy))?;
+    Some(copies.swap_remove(at))
 }
 
 /// Settles `item`, judged `verdict`, on what the `upgrade` dry run did with its copy, so the row's
@@ -882,8 +883,9 @@ fn take_outcome(settled: &mut SettledCopies, dep: &Dependency) -> Option<CopyOut
 ///
 /// A landing is the row's target, whatever its own verdict, and an exempt row that lands stays
 /// `exempt`; a refused move blocks the row at that move's target.
-/// Otherwise a row with a matured target is an `error` when the dry run failed for it, and else
-/// `blocked` because `upgrade` decided no move of it.
+/// A failure makes a row with a matured target, or a held one, an `error`, and a row the dry run
+/// decided nothing about is `blocked` when it has a matured target, because `upgrade` never moves
+/// it.
 /// Every other row keeps its own verdict.
 fn settle(item: &mut OutdatedItem, dep: &Dependency, verdict: &Verdict, outcome: CopyOutcome) {
     let actionable = matches!(verdict.status, Status::Adoptable | Status::Exempt)
@@ -906,8 +908,10 @@ fn settle(item: &mut OutdatedItem, dep: &Dependency, verdict: &Verdict, outcome:
             item.blocked_reason = Some(skip.message);
             (to, security)
         }
-        CopyOutcome::Failed(error) if actionable => {
+        // A held row is one a follower replan can try once its holder moves.
+        CopyOutcome::Failed(error) if actionable || verdict.status == Status::Held => {
             item.status = OutdatedStatus::Error;
+            item.held_by = None;
             item.adoptable_target = None;
             item.error = Some(error);
             return;
@@ -1072,6 +1076,7 @@ mod tests {
             status: match status {
                 OutdatedStatus::Exempt => Status::Exempt,
                 OutdatedStatus::Held => Status::Held,
+                OutdatedStatus::InCooldown => Status::InCooldown,
                 _ => Status::Adoptable,
             },
             adoptable_target: Some(Version::new("1.4.0")),
@@ -1104,8 +1109,8 @@ mod tests {
     }
 
     /// Each outcome the dry run settled maps onto the row: a landing or a refusal reports its own
-    /// version and security evidence, while a failure or an undecided copy changes only a row
-    /// with a matured target, and a held row keeps its verdict unless a move settled it.
+    /// version and security evidence, a failure changes only a row with a matured target or a
+    /// held one, and an undecided copy only a row with a matured target.
     #[test]
     fn settle_maps_each_outcome_onto_the_row() {
         let landed = || CopyOutcome::Landed {
@@ -1123,6 +1128,7 @@ mod tests {
         };
         let failed = || CopyOutcome::Failed(Diagnostic::new(DiagnosticKind::ToolFailed, "crashed"));
         let some = |text: &str| Some(text.to_string());
+        let kept = |status| (status, some("1.4.0"), None, some("1.4.0"));
         let cases = [
             (
                 OutdatedStatus::Adoptable,
@@ -1177,7 +1183,12 @@ mod tests {
             (
                 OutdatedStatus::Held,
                 failed(),
-                (OutdatedStatus::Held, some("1.4.0"), None, some("1.4.0")),
+                (OutdatedStatus::Error, None, some("crashed"), some("1.4.0")),
+            ),
+            (
+                OutdatedStatus::InCooldown,
+                failed(),
+                kept(OutdatedStatus::InCooldown),
             ),
             (
                 OutdatedStatus::Adoptable,
@@ -1192,7 +1203,7 @@ mod tests {
             (
                 OutdatedStatus::Held,
                 CopyOutcome::Undecided,
-                (OutdatedStatus::Held, some("1.4.0"), None, some("1.4.0")),
+                kept(OutdatedStatus::Held),
             ),
         ];
         for (status, outcome, expected) in cases {

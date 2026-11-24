@@ -15,13 +15,13 @@
 mod executor;
 mod run_staled;
 
-pub(super) use self::executor::{CopyOutcome, Judged, upgrade_verdict};
+pub(super) use self::executor::{CopyOutcome, Judged, PlannedCopy, upgrade_verdict};
 use self::executor::{PlanMode, ProjectRunStatus, ProjectUpgradeExecutor};
 use self::run_staled::{CurrentAtStart, ProjectPass, TurnLock, refresh_gate};
 use super::lanes::LaneAccess;
 use super::{
-    BuildInfo, Exit, FetchedRelease, ProjectProgress, RunOpts, SkippedInfo, UpgradeItem,
-    UpgradeMeta, UpgradeSummary, Workspace, diag_from_error,
+    BuildInfo, Exit, ProjectProgress, RunOpts, SkippedInfo, UpgradeItem, UpgradeMeta,
+    UpgradeSummary, Workspace, diag_from_error,
 };
 use cooldown_core::{
     AcceptedPublication, BaselineViolation, Diagnostic, DiagnosticKind, EdgeBindingAction,
@@ -77,12 +77,9 @@ pub(super) struct UpgradeAccum {
 /// What one project's upgrade pass read and settled, which `outdated` reports from.
 #[derive(Default)]
 pub(super) struct PlanFacts {
-    /// Every dependency the first plan read, with the releases and verdict it was planned from;
-    /// `None` while no plan has run.
-    pub(super) judged: Option<Vec<FetchedRelease<Judged>>>,
-    /// What the pass did with each of those dependencies, in the same order; `None` when it
-    /// settled none, because no plan ran or its trial's state was discarded.
-    pub(super) outcomes: Option<Vec<CopyOutcome>>,
+    /// Every dependency the first plan read, with the releases and verdict it was planned from
+    /// and what the pass settled for it; `None` while no plan has run.
+    pub(super) copies: Option<Vec<PlannedCopy>>,
 }
 
 /// The read/write adapter pair and shared per-project inputs the upgrade executor needs.
@@ -609,8 +606,9 @@ fn relabel_copy_paths(acc: &mut UpgradeAccum, copy: &camino::Utf8Path, source: &
     let outcomes = acc
         .facts
         .iter_mut()
-        .filter_map(|facts| facts.outcomes.as_mut())
-        .flatten();
+        .filter_map(|facts| facts.copies.as_mut())
+        .flatten()
+        .filter_map(|copy| copy.outcome.as_mut());
     for outcome in outcomes {
         match outcome {
             CopyOutcome::Refused { skip, .. } => relabel_skip(skip),
@@ -708,8 +706,13 @@ fn merge_discarded_trial(target: &mut UpgradeAccum, source: UpgradeAccum) {
         .errors
         .extend(source.items.into_iter().filter_map(|item| item.error));
     target.facts = target.facts.take().or(source.facts);
-    if let Some(facts) = &mut target.facts {
-        facts.outcomes = None;
+    let copies = target
+        .facts
+        .iter_mut()
+        .filter_map(|facts| facts.copies.as_mut())
+        .flatten();
+    for copy in copies {
+        copy.outcome = None;
     }
 }
 

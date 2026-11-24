@@ -57,9 +57,9 @@ enum Resolver {
     /// Offers `parent` only on its next major, while the transitive `child` it requires has a
     /// matured release on its own line.
     ///
-    /// Unless `lands`, the major stays held; when it `lands`, the resolver refuses to move `child`.
+    /// Unless `lands`, the major stays held.
     /// When `pinned`, `parent` 1.0.0 pins `child` exactly, while its major only requires `child`'s
-    /// line.
+    /// line, and once the major lands the resolver refuses to move `child`.
     MajorParent {
         lands: bool,
         pinned: bool,
@@ -112,6 +112,9 @@ struct FakeCargo {
     unavailable_releases: &'static [&'static str],
     /// The `name@version` whose locking makes every later scoped graph read fail.
     unreadable_with: Option<&'static str>,
+    /// A `name@target` whose landing drops another package from the lock, the way Cargo drops a
+    /// crate nothing requires any more.
+    drops: Option<(&'static str, &'static str)>,
 }
 
 fn timestamp(value: &str) -> jiff::Timestamp {
@@ -319,7 +322,7 @@ impl FakeCargo {
             Resolver::PersistentPair { coupled, .. } if coupled && !sibling_planned => &["sibling"],
             Resolver::PersistentPair { .. } => &["parent", "sibling"],
             Resolver::MajorParent { lands: false, .. } => &["parent"],
-            Resolver::MajorParent { lands: true, .. } => &["child"],
+            Resolver::MajorParent { pinned: true, .. } => &["child"],
             Resolver::Scripted { held } => {
                 return plan
                     .changes
@@ -347,6 +350,17 @@ impl FakeCargo {
                 detail: Some(format!("{} is held by holder", change.package.name)),
             })
             .collect()
+    }
+
+    /// Drops the package [`drops`](Self::drops) names once its trigger is among `applied`.
+    fn drop_as_scripted(&self, versions: &mut BTreeMap<String, String>, applied: &[Change]) {
+        if let Some((trigger, dropped)) = self.drops
+            && applied
+                .iter()
+                .any(|change| format!("{}@{}", change.package.name, change.to) == trigger)
+        {
+            versions.remove(dropped);
+        }
     }
 
     /// The `child` the resolve settles on beside the locked `parent`.
@@ -740,6 +754,7 @@ impl ToolWrite for FakeCargo {
                 }
             }
         }
+        self.drop_as_scripted(&mut versions, &applied);
         // Cargo moves an undeclared parent along with the sibling that pins it exactly.
         if let Resolver::SnapshotFamily {
             undeclared_parent: true,
@@ -832,6 +847,7 @@ fn fixture_adapter(
         failures: Vec::new(),
         unavailable_releases: &[],
         unreadable_with: None,
+        drops: None,
         releases: BTreeMap::from([
             ("parent".to_string(), parents),
             (
@@ -971,6 +987,8 @@ struct Overrides {
     unavailable: &'static [&'static str],
     /// The `name@version` whose locking makes every later scoped graph read fail.
     unreadable_with: Option<&'static str>,
+    /// A `name@target` whose landing drops another package from the lock.
+    drops: Option<(&'static str, &'static str)>,
     /// Releases replacing the registry's for their packages.
     releases: BTreeMap<String, Vec<Release>>,
     /// Policy layers after the built-in default.
@@ -1040,6 +1058,7 @@ fn fixture_with(
         failures: overrides.trials,
         unavailable_releases: overrides.unavailable,
         unreadable_with: overrides.unreadable_with,
+        drops: overrides.drops,
         ..fixture_adapter(resolver, newest, edge_rebinds_on_apply)
     };
     fake.releases.extend(overrides.releases);
@@ -3187,11 +3206,13 @@ async fn outdated_reports_a_followers_refusal() -> eyre::Result<()> {
     Ok(())
 }
 
-/// A deferred transitive whose follower replan cannot read the graph is left undecided by a
-/// failure, so `outdated` reports that failure on its row rather than reading it as following
-/// its requirers, beside the requirer's landed major (#173).
+/// A move the first pass landed is no landing for `outdated` once a follower pass drops the
+/// package from the lock, though `upgrade` still reports the first pass's row: only the lock the
+/// dry run left proves one (#173).
+/// The fake drops the declared sibling to stand in for a transitive the follower's move orphans,
+/// which Cargo's lock diff reports no row for.
 #[tokio::test]
-async fn a_follower_its_replan_cannot_read_carries_the_failure() -> eyre::Result<()> {
+async fn a_landing_a_later_pass_dropped_is_not_adoptable() -> eyre::Result<()> {
     let CargoFixture {
         directory: _directory,
         workspace,
@@ -3202,10 +3223,10 @@ async fn a_follower_its_replan_cannot_read_carries_the_failure() -> eyre::Result
             pinned: false,
         },
         1,
-        false,
+        true,
         Vec::new(),
         Overrides {
-            unreadable_with: Some("parent@2.0.0"),
+            drops: Some(("child@1.1.0", "sibling")),
             ..Overrides::default()
         },
     )?;
@@ -3216,24 +3237,78 @@ async fn a_follower_its_replan_cannot_read_carries_the_failure() -> eyre::Result
     };
 
     let outdated = workspace.outdated(&opts).await;
+    let upgrade = workspace.upgrade(&dry_run(&opts)).await;
 
+    assert_eq!(
+        rows(&upgrade),
+        [
+            row("child", "1.0.0", "1.1.0", None),
+            row("parent", "1.0.0", "2.0.0", None),
+            row("sibling", "1.0.0", "1.1.0", None),
+        ]
+    );
     assert_eq!(
         verdict_of(&outdated, "parent"),
         (OutdatedStatus::Adoptable, Some("2.0.0".to_string()))
     );
-    let child = outdated
-        .items
-        .iter()
-        .find(|item| item.name == "child")
-        .ok_or_else(|| eyre::eyre!("no child row: {:?}", outdated.items))?;
-    assert_eq!(child.status, OutdatedStatus::Error, "{child:?}");
-    assert!(
-        child
-            .error
-            .as_ref()
-            .is_some_and(|error| error.message.contains("the manifest cannot be read")),
-        "{child:?}"
+    assert_eq!(
+        verdict_of(&outdated, "child"),
+        (OutdatedStatus::Adoptable, Some("1.1.0".to_string()))
     );
+    assert_eq!(
+        verdict_of(&outdated, "sibling"),
+        (OutdatedStatus::Blocked, Some("1.1.0".to_string()))
+    );
+    Ok(())
+}
+
+/// A follower replan and a final read that cannot read the graph leave the deferred transitive,
+/// and the requirer's major they could not confirm, to that failure, so `outdated` reports it on
+/// both rows (#173).
+/// The transitive carries it even when its row started out held by the pin the major dropped.
+#[tokio::test]
+async fn a_follower_its_replan_cannot_read_carries_the_failure() -> eyre::Result<()> {
+    for pinned in [false, true] {
+        let CargoFixture {
+            directory: _directory,
+            workspace,
+            project: _,
+        } = fixture_with(
+            Resolver::MajorParent {
+                lands: true,
+                pinned,
+            },
+            1,
+            false,
+            Vec::new(),
+            Overrides {
+                unreadable_with: Some("parent@2.0.0"),
+                ..Overrides::default()
+            },
+        )?;
+        let opts = RunOpts {
+            allow_major: true,
+            transitive: true,
+            ..RunOpts::default()
+        };
+
+        let outdated = workspace.outdated(&opts).await;
+
+        for name in ["parent", "child"] {
+            let row = outdated
+                .items
+                .iter()
+                .find(|item| item.name == name)
+                .ok_or_else(|| eyre::eyre!("no {name} row: {:?}", outdated.items))?;
+            assert_eq!(row.status, OutdatedStatus::Error, "{pinned}: {row:?}");
+            assert!(
+                row.error
+                    .as_ref()
+                    .is_some_and(|error| error.message.contains("the manifest cannot be read")),
+                "{pinned}: {row:?}"
+            );
+        }
+    }
     Ok(())
 }
 

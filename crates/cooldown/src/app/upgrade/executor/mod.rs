@@ -9,8 +9,8 @@ use self::batch::{
     BatchOutcome, CommittedBatch, HoldAttestation, VerifiedBatchReport, indeterminate_trial,
     trial_errors,
 };
-pub(crate) use self::outcome::CopyOutcome;
 use self::outcome::Provenance;
+pub(crate) use self::outcome::{CopyOutcome, PlannedCopy};
 use self::planning::{
     EffectiveHold, candidate_scope, crosses_line, current_line_target, dep_resolve_ctx,
     effective_hold, fix_change, is_downgrade, line_leaving_nodes, lower_adoptable_targets,
@@ -659,28 +659,19 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .acc
             .facts
             .as_ref()
-            .is_none_or(|facts| facts.judged.is_none())
+            .is_none_or(|facts| facts.copies.is_none())
         {
             return;
         }
         let graph = self.scoped_deps(GraphRead::Replan).await;
-        let Some(judged) = self
-            .acc
-            .facts
-            .as_ref()
-            .and_then(|facts| facts.judged.as_ref())
-        else {
-            return;
-        };
-        let outcomes = outcome::settle(
-            judged,
-            &self.provenance,
-            &self.acc.items,
-            &self.acc.errors,
-            graph.as_deref(),
-        );
-        if let Some(facts) = &mut self.acc.facts {
-            facts.outcomes = Some(outcomes);
+        let UpgradeAccum {
+            facts,
+            items,
+            errors,
+            ..
+        } = &mut *self.acc;
+        if let Some(copies) = facts.as_mut().and_then(|facts| facts.copies.as_mut()) {
+            outcome::settle(copies, &self.provenance, items, errors, graph.as_deref());
         }
     }
 
@@ -2596,9 +2587,16 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         // A follower replan reads the graph the first plan's moves left, while `outdated`
         // reports the starting one.
         if let Some(facts) = &mut self.acc.facts
-            && facts.judged.is_none()
+            && facts.copies.is_none()
         {
-            facts.judged = Some(judged);
+            let copies = judged
+                .into_iter()
+                .map(|fact| PlannedCopy {
+                    fact,
+                    outcome: None,
+                })
+                .collect();
+            facts.copies = Some(copies);
             self.provenance.await_replan(deferred);
         }
     }
@@ -2612,12 +2610,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let Some(facts) = &self.acc.facts else {
             return;
         };
-        let origin = match &facts.judged {
+        let origin = match &facts.copies {
             None => Some(copy),
-            Some(first) => first.iter().position(|fact| {
-                fact.dependency.package == dep.package
-                    && fact.dependency.current == dep.current
-                    && fact.dependency.direct == dep.direct
+            Some(first) => first.iter().position(|planned| {
+                let first = &planned.fact.dependency;
+                first.package == dep.package
+                    && first.current == dep.current
+                    && first.direct == dep.direct
             }),
         };
         let Some(origin) = origin else {
@@ -4851,30 +4850,28 @@ fn verify_applied_targets(
 }
 
 fn target_reached(deps: &[Dependency], change: &Change) -> bool {
+    let declared = change.direct && !change.members.is_empty();
     line_reached(
         deps,
-        &change.package,
-        &change.from,
-        &change.to,
-        change.direct,
-        &change.members,
+        (&change.package, &change.from),
+        (&change.package, &change.to),
+        declared.then_some(change.members.as_slice()),
     )
 }
 
-/// Whether `deps` holds `package`'s line at `from` on `to`: in every member a direct move names,
-/// with that member's own line gone from `from`, and anywhere otherwise.
+/// Whether `deps` holds the `destination` line of a move from the `source` line: in each of the
+/// `members` declaring a direct move, with that member's own source line gone, and anywhere for
+/// any other move.
 fn line_reached(
     deps: &[Dependency],
-    package: &PackageId,
-    from: &Version,
-    to: &Version,
-    direct: bool,
-    members: &[MemberRef],
+    (package, from): (&PackageId, &Version),
+    (destination, to): (&PackageId, &Version),
+    members: Option<&[MemberRef]>,
 ) -> bool {
-    if direct && !members.is_empty() {
+    if let Some(members) = members {
         return members.iter().all(|member| {
             let reached = deps.iter().any(|dep| {
-                dep.package == *package
+                dep.package == *destination
                     && dep.current == *to
                     && dep.members.iter().any(|dep_member| dep_member == member)
             });
@@ -4895,7 +4892,7 @@ fn line_reached(
     }
 
     deps.iter()
-        .any(|dep| dep.package == *package && dep.current == *to)
+        .any(|dep| dep.package == *destination && dep.current == *to)
 }
 
 /// The hold for a candidate the adapter reported applied whose target the post-apply graph does
