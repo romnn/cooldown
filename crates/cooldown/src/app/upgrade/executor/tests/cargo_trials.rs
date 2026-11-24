@@ -2,8 +2,8 @@
 
 use crate::app::upgrade::{PreviewEvidence, UpgradeOutcome};
 use crate::app::{
-    AdapterSet, Baseline, Exit, Progress, ProjectCtx, ProjectProgress, RunOpts, UpgradeItem,
-    Workspace,
+    AdapterSet, Baseline, Exit, OutdatedStatus, Progress, ProjectCtx, ProjectProgress, RunOpts,
+    UpgradeItem, Workspace,
 };
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -73,6 +73,14 @@ enum Resolver {
     /// Holds each `name@target` in `held`, as a resolver conflict, and lands every other target.
     Scripted {
         held: &'static [&'static str],
+    },
+    /// Declares `child` beside `parent`, while the undeclared `holder`, which has no successor,
+    /// pins `child` exactly, as `wasm-bindgen-backend` pins `wasm-bindgen-shared` in #165.
+    ///
+    /// The `parent` 1.1.0 release needs `child` 1.1.0 and drops `holder` from the graph.
+    /// The manifest pins `child` exactly too when `pinned_child`.
+    DroppedPinner {
+        pinned_child: bool,
     },
 }
 
@@ -238,6 +246,28 @@ impl FakeCargo {
                 "parent requires child =1.1.0".to_string(),
             ));
         }
+        if matches!(self.resolver, Resolver::DroppedPinner { .. }) {
+            if versions.contains_key("holder")
+                && versions
+                    .get("child")
+                    .is_some_and(|version| version != "1.0.0")
+            {
+                return Err(CoreError::UnacceptableResolve(
+                    "holder requires child =1.0.0".to_string(),
+                ));
+            }
+            if versions
+                .get("parent")
+                .is_some_and(|version| version == "1.1.0")
+                && versions
+                    .get("child")
+                    .is_some_and(|version| version != "1.1.0")
+            {
+                return Err(CoreError::UnacceptableResolve(
+                    "parent 1.1.0 requires child ^1.1.0".to_string(),
+                ));
+            }
+        }
         if matches!(self.resolver, Resolver::Caret)
             && versions
                 .get("holder")
@@ -387,7 +417,8 @@ impl FakeCargo {
             | Resolver::MajorParent
             | Resolver::MajorChild { .. }
             | Resolver::Scripted { .. }
-            | Resolver::SnapshotFamily { .. } => false,
+            | Resolver::SnapshotFamily { .. }
+            | Resolver::DroppedPinner { .. } => false,
             Resolver::AnchoredPair => versions
                 .get("parent")
                 .is_some_and(|version| version == "1.4.0"),
@@ -474,6 +505,16 @@ impl ToolRead for FakeCargo {
                     .get("parent")
                     .ok_or_else(|| CoreError::NotFound("parent".to_string()))?;
                 dep.hold_edges = vec![hold("parent", parent, "1.0.0", false)];
+            } else if name == "child"
+                && let Resolver::DroppedPinner { pinned_child } = self.resolver
+            {
+                dep.direct = true;
+                dep.pinned = pinned_child;
+                if let Some(holder) = versions.get("holder") {
+                    // Like Cargo's adapter, an authored pin masks the ceiling but keeps the edge.
+                    dep.graph_ceiling = (!pinned_child).then(|| Version::new(version));
+                    dep.hold_edges = vec![hold("holder", holder, version, true)];
+                }
             } else if name == "child" {
                 if self.exact_child(&versions) {
                     let parent = versions
@@ -659,6 +700,9 @@ impl ToolWrite for FakeCargo {
                         versions.insert("child".to_string(), child.to_string());
                     }
                     Resolver::SnapshotFamily { .. } => {}
+                    Resolver::DroppedPinner { .. } => {
+                        versions.remove("holder");
+                    }
                 }
             }
         }
@@ -779,6 +823,14 @@ fn fixture_adapter(
             );
         }
     }
+    if matches!(resolver, Resolver::DroppedPinner { .. }) {
+        fake.releases.insert(
+            "child".to_string(),
+            vec![release("1.0.0", false), release("1.1.0", false)],
+        );
+        fake.releases
+            .insert("holder".to_string(), vec![release("1.0.0", false)]);
+    }
     if matches!(resolver, Resolver::MajorParent) {
         fake.releases.insert(
             "parent".to_string(),
@@ -842,7 +894,7 @@ fn initial_lock(resolver: Resolver, newest: u32, sibling: bool) -> BTreeMap<Stri
         _ => (initial_direct, "1.0.0"),
     };
     let mut initial = BTreeMap::from([("parent", initial_parent), ("child", initial_child)]);
-    if matches!(resolver, Resolver::Caret) {
+    if matches!(resolver, Resolver::Caret | Resolver::DroppedPinner { .. }) {
         initial.insert("holder", "1.0.0");
     }
     if sibling {
@@ -1198,10 +1250,25 @@ async fn coordinated_snapshot_family_keeps_unselected_requirers_authoritative() 
         })
         .await;
     assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
-    assert!(outcome.items.iter().all(|item| !item.applied));
     assert_eq!(std::fs::read(project.root.join("Cargo.lock"))?, before);
-    // The unselected sibling caps the parent, which in turn keeps the child capped.
-    assert!(!project.root.join("trials").exists());
+    // The unselected sibling still pins the parent, so the declared pair is tried and refused.
+    assert_eq!(
+        rows(&outcome),
+        [
+            row(
+                "child",
+                "1.0.0",
+                "1.1.0",
+                Some(SkipReason::ResolverConflict)
+            ),
+            row(
+                "parent",
+                "1.0.0",
+                "1.1.0",
+                Some(SkipReason::ResolverConflict)
+            ),
+        ]
+    );
     Ok(())
 }
 
@@ -1224,9 +1291,177 @@ async fn coordinated_snapshot_family_keeps_an_immature_requirer_authoritative() 
     let before = std::fs::read(project.root.join("Cargo.lock"))?;
     let outcome = workspace.upgrade(&RunOpts::default()).await;
     assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
-    assert!(outcome.items.iter().all(|item| !item.applied));
     assert_eq!(std::fs::read(project.root.join("Cargo.lock"))?, before);
+    // The immature sibling stays and still pins the parent, so the declared pair is refused.
+    assert_eq!(
+        rows(&outcome),
+        [
+            row(
+                "child",
+                "1.0.0",
+                "1.1.0",
+                Some(SkipReason::ResolverConflict)
+            ),
+            row(
+                "parent",
+                "1.0.0",
+                "1.1.0",
+                Some(SkipReason::ResolverConflict)
+            ),
+        ]
+    );
+    Ok(())
+}
+
+/// A declared crate a third-party requirer pins exactly moves beside a declared driver whose target
+/// drops that requirer, as `wasm-bindgen` 0.2.105 carries `wasm-bindgen-shared` past the pin of
+/// the `wasm-bindgen-backend` it drops (#165).
+#[tokio::test]
+async fn a_declared_crate_moves_with_a_driver_that_drops_its_pinning_requirer() -> eyre::Result<()>
+{
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(
+        Resolver::DroppedPinner {
+            pinned_child: false,
+        },
+        1,
+        false,
+    )?;
+    let strict = RunOpts {
+        strict: true,
+        ..RunOpts::default()
+    };
+
+    // Before the upgrade, `outdated` already offers both targets the upgrade lands.
+    let outdated = workspace.outdated(&RunOpts::default()).await;
+    let statuses: Vec<_> = outdated
+        .items
+        .iter()
+        .map(|item| (item.name.as_str(), item.status))
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            ("child", OutdatedStatus::Adoptable),
+            ("parent", OutdatedStatus::Adoptable),
+        ]
+    );
+
+    // Both are planned into one trial, land together, and leave `--strict` satisfied.
+    let outcome = workspace.upgrade(&strict).await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    assert_eq!(
+        rows(&outcome),
+        [
+            row("child", "1.0.0", "1.1.0", None),
+            row("parent", "1.0.0", "1.1.0", None),
+        ]
+    );
+    let trials = std::fs::read_to_string(project.root.join("trials"))?;
+    assert!(
+        trials.contains("1.0.0:child@1.1.0,parent@1.1.0"),
+        "{trials}"
+    );
+    let versions = lock(&project)?;
+    assert_eq!(versions.get("child").map(String::as_str), Some("1.1.0"));
+    assert_eq!(versions.get("parent").map(String::as_str), Some("1.1.0"));
+    assert!(!versions.contains_key("holder"));
+    Ok(())
+}
+
+/// A declared crate a surviving requirer still pins exactly is tried, and its refusal is reported
+/// with the resolver's reason, alike by `upgrade`, `outdated` and `explain`.
+///
+/// The row counts as an incomplete move, so `--strict` fails while a default run does not.
+#[tokio::test]
+async fn a_declared_crate_a_surviving_requirer_pins_is_refused_and_reported() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(
+        Resolver::DroppedPinner {
+            pinned_child: false,
+        },
+        0,
+        false,
+    )?;
+    let before = std::fs::read(project.root.join("Cargo.lock"))?;
+    let reason = "holder requires child =1.0.0";
+
+    let outcome = workspace.upgrade(&RunOpts::default()).await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    assert_eq!(
+        rows(&outcome),
+        [row(
+            "child",
+            "1.0.0",
+            "1.1.0",
+            Some(SkipReason::ResolverConflict)
+        )]
+    );
+    let child = item(&outcome, "child")?;
+    assert_eq!(
+        child
+            .skipped
+            .as_ref()
+            .map(|skipped| skipped.message.as_str()),
+        Some(reason)
+    );
+    assert_eq!(std::fs::read(project.root.join("Cargo.lock"))?, before);
+
+    let strict = workspace
+        .upgrade(&RunOpts {
+            strict: true,
+            ..RunOpts::default()
+        })
+        .await;
+    assert!(strict.errors.is_empty(), "{:?}", strict.errors);
+    assert_eq!(strict.exit, Exit::Policy);
+    assert_eq!(std::fs::read(project.root.join("Cargo.lock"))?, before);
+
+    // The previews of `outdated` and `explain` hold the target for the same reason.
+    let outdated = workspace.outdated(&RunOpts::default()).await;
+    let explained = workspace.explain("child", &RunOpts::default()).await?;
+    for verdicts in [&outdated.items, &explained.meta.verdicts] {
+        let child = verdicts
+            .iter()
+            .find(|item| item.name == "child")
+            .ok_or_else(|| eyre::eyre!("missing child verdict"))?;
+        assert_eq!(child.status, OutdatedStatus::Blocked);
+        assert_eq!(child.adoptable_target.as_deref(), Some("1.1.0"));
+        assert_eq!(child.blocked_reason.as_deref(), Some(reason));
+    }
+    assert_eq!(std::fs::read(project.root.join("Cargo.lock"))?, before);
+    Ok(())
+}
+
+/// The workspace author's own exact pin still holds a declared crate a third-party requirer pins
+/// too: it is never tried, and its `pin_held` row leaves `--strict` satisfied.
+#[tokio::test]
+async fn an_authored_exact_pin_holds_a_declared_crate_without_a_trial() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(Resolver::DroppedPinner { pinned_child: true }, 0, false)?;
+    let before = std::fs::read(project.root.join("Cargo.lock"))?;
+    let outcome = workspace
+        .upgrade(&RunOpts {
+            strict: true,
+            ..RunOpts::default()
+        })
+        .await;
+    assert_eq!(outcome.exit, Exit::Ok, "{:?}", outcome.errors);
+    assert_eq!(
+        rows(&outcome),
+        [row("child", "1.0.0", "1.1.0", Some(SkipReason::PinHeld))]
+    );
     assert!(!project.root.join("trials").exists());
+    assert_eq!(std::fs::read(project.root.join("Cargo.lock"))?, before);
     Ok(())
 }
 

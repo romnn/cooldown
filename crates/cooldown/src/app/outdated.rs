@@ -6,7 +6,7 @@ use super::change_key::ChangeKey;
 use super::lanes::LaneAccess;
 use super::lock::ProjectAccessWriteGuard;
 use super::read::ReadProjectCtx;
-use super::upgrade::PreviewEvidence;
+use super::upgrade::{PreviewEvidence, upgrade_view};
 use super::{
     Exit, FetchedRelease, LockReportAction, ProjectProgress, RunOpts, Workspace, age_days,
     diag_from_error, lock_report_outcome, render_window, stale_evaluation_skipped,
@@ -369,10 +369,11 @@ impl<'a> OutdatedRunner<'a> {
                     let advised =
                         advisories.and_then(|project| project.classify(adapter, &dep, &releases));
                     let advisory_ctx = advised.as_ref().map(ClassifiedAdvisories::context);
+                    // Judged as `upgrade` plans it, so the preview below verifies the same targets.
                     let item = self.outdated_item(
                         pctx,
                         project_label,
-                        &dep,
+                        &upgrade_view(&dep),
                         &releases,
                         advisory_ctx.as_ref(),
                         rctx,

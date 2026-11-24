@@ -8,12 +8,12 @@ use self::batch::{
     BatchOutcome, CommittedBatch, HoldAttestation, VerifiedBatchReport, indeterminate_trial,
     trial_errors,
 };
-pub(crate) use self::planning::target_package_for;
 use self::planning::{
-    EffectiveHold, candidate_scope, coordinated_upgrade_nodes, crosses_line, current_line_target,
-    dep_resolve_ctx, effective_hold, fix_change, is_downgrade, line_leaving_nodes,
-    lower_adoptable_targets, plan_baseline_violations, sort_planned_changes, upgrade_dependency,
+    EffectiveHold, candidate_scope, crosses_line, current_line_target, dep_resolve_ctx,
+    effective_hold, fix_change, is_downgrade, line_leaving_nodes, lower_adoptable_targets,
+    plan_baseline_violations, sort_planned_changes,
 };
+pub(crate) use self::planning::{target_package_for, upgrade_view};
 use self::report::{collapse_applied_legs, combine_lock_status, conflict_skip_message, plan_item};
 use self::transitive_gate::{
     TransitiveGateVerdict, admitted_crossings, insert_graph_violation, newly_introduced_violations,
@@ -94,29 +94,6 @@ struct PlannedUpgrade {
     changes: Vec<Change>,
     /// The undeclared nodes every requirer of which leaves its line in `changes`.
     deferred: HashSet<(String, String)>,
-}
-
-/// The nodes an upgrade batch moves, as planning sees them before any trial.
-struct MovingNodes {
-    /// Every node with an adoptable target whose ceiling-imposing requirers can move too.
-    moving: HashSet<(String, String)>,
-    /// The moving nodes planned onto another compatibility line, and the undeclared nodes whose
-    /// every requirer is in this set (see [`line_leaving_nodes`]).
-    leaving: HashSet<(String, String)>,
-}
-
-/// `dep` with its graph ceiling released when every requirer imposing it moves too, for a
-/// declared node only.
-///
-/// The release exists so a declared node a moving requirer pins can be planned beside it, since
-/// the acceptance rule never lets a declared crate move outside the plan; an undeclared node needs
-/// no plan of its own and follows its requirers as collateral.
-fn released_dependency(dep: &Dependency, moving: &HashSet<(String, String)>) -> Dependency {
-    if dep.direct {
-        upgrade_dependency(dep, moving)
-    } else {
-        dep.clone()
-    }
 }
 
 /// Whether the executor moves dependencies *forward* (`upgrade`) or *backward* to a compliant
@@ -2208,7 +2185,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             return Ok(Vec::new());
         };
         let releases = fetched.result?;
-        let verdict = self.fallback_verdict(&dep, &releases);
+        let verdict = self.upgrade_verdict(&dep, &releases);
         self.remember_upgrade_fallbacks(change, &releases, &verdict);
         Ok(self.fallback_changes.get(&key).cloned().unwrap_or_default())
     }
@@ -2271,7 +2248,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         {
             let releases =
                 result.map_err(|err| Box::new(self.project_diag(&err, Some(&dep.package.name))))?;
-            let verdict = self.fallback_verdict(&dep, &releases);
+            let verdict = self.upgrade_verdict(&dep, &releases);
             for change in &pending {
                 if change.package == dep.package && change.from == dep.current {
                     self.remember_upgrade_fallbacks(change, &releases, &verdict);
@@ -2283,7 +2260,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
     /// Judges `dep`'s candidates exactly as the forward planner does, with the run's advisory
     /// snapshot, so a fallback alternative is a target planning would have admitted.
-    fn fallback_verdict(&self, dep: &Dependency, releases: &[Release]) -> cooldown_core::Verdict {
+    fn upgrade_verdict(&self, dep: &Dependency, releases: &[Release]) -> cooldown_core::Verdict {
         let advised = self
             .advisories
             .as_ref()
@@ -2294,7 +2271,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             ..Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts)
         };
         evaluate_advised(
-            dep,
+            &upgrade_view(dep),
             releases,
             advisory_ctx.as_ref(),
             &self.ctx.pctx.policy.layers,
@@ -2641,61 +2618,32 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         Some(deps)
     }
 
-    fn upgrade_moving_nodes(
+    /// The nodes the batch carries off their compatibility line: its planned cross-line moves,
+    /// closed over the undeclared nodes that follow them (see [`line_leaving_nodes`]).
+    ///
+    /// The moves are the ones [`plan_upgrade_changes`](Self::plan_upgrade_changes) plans.
+    /// Its deferral skips only undeclared nodes, which never cross a line: their targets stay on
+    /// their current major.
+    fn line_leaving(
         &self,
         deps: &[Dependency],
         fetched: &[FetchedRelease<Vec<Release>>],
-        rctx: &ResolveContext<'_>,
-    ) -> MovingNodes {
-        // Old exact-pin edges cease to be authoritative when their requirers move in this batch.
-        // Start optimistically, then remove candidates whose pinning parents cannot move under
-        // the selected scope, manifest constraints, pins, or cooldown policy.
-        let potential: HashSet<_> = deps
-            .iter()
-            .map(|dep| (dep.package.name.clone(), dep.current.as_str().to_string()))
-            .collect();
-        let mut crossing = HashSet::new();
-        let moving = fetched
+    ) -> HashSet<(String, String)> {
+        let crossing = fetched
             .iter()
             .filter_map(|fetched| {
                 let dep = &fetched.dependency;
                 let releases = fetched.result.as_ref().ok()?;
-                // An undeclared node is never planned, but it moves as collateral of the requirers
-                // pinning it, so it counts as moving when they all move: otherwise a declared node
-                // it pins in turn could never be released.
-                let effective = upgrade_dependency(dep, &potential);
-                let advised = self
-                    .advisories
-                    .as_ref()
-                    .and_then(|project| project.classify(self.ctx.reader, dep, releases));
-                let advisory_ctx = advised.as_ref().map(ClassifiedAdvisories::context);
-                let verdict = evaluate_advised(
-                    &effective,
-                    releases,
-                    advisory_ctx.as_ref(),
-                    &self.ctx.pctx.policy.layers,
-                    &dep_resolve_ctx(rctx, dep),
-                    self.ws.now(),
-                );
+                let verdict = self.upgrade_verdict(dep, releases);
                 let target = verdict
                     .adoptable_target
                     .as_ref()
                     .filter(|target| verdict.status != Status::Held && **target != dep.current)?;
-                let node = (dep.package.name.clone(), dep.current.as_str().to_string());
-                // Only a node the plan carries leaves its line itself; a collateral one follows.
-                let planned = dep.direct || dep.graph_ceiling.is_none();
-                if planned && crosses_line(releases, &dep.current, target) {
-                    crossing.insert(node.clone());
-                }
-                Some(node)
+                crosses_line(releases, &dep.current, target)
+                    .then(|| (dep.package.name.clone(), dep.current.as_str().to_string()))
             })
             .collect();
-        let moving = coordinated_upgrade_nodes(deps, moving);
-        crossing.retain(|node| moving.contains(node));
-        MovingNodes {
-            leaving: line_leaving_nodes(deps, crossing),
-            moving,
-        }
+        line_leaving_nodes(deps, crossing)
     }
 
     async fn fetch_upgrade_releases(
@@ -2726,7 +2674,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             ..Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts)
         };
         let advisories = self.advisories.clone();
-        let MovingNodes { moving, leaving } = self.upgrade_moving_nodes(deps, &fetched, &rctx);
+        let leaving = self.line_leaving(deps, &fetched);
         let mut planned = Vec::new();
         let mut deferred = HashSet::new();
         for FetchedRelease {
@@ -2751,7 +2699,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .as_ref()
                 .and_then(|project| project.classify(self.ctx.reader, &dep, &releases));
             let advisory_ctx = advised.as_ref().map(ClassifiedAdvisories::context);
-            let effective = released_dependency(&dep, &moving);
+            let effective = upgrade_view(&dep);
             let verdict = evaluate_advised(
                 &effective,
                 &releases,
@@ -2889,8 +2837,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// the report although `outdated` lists it as held.
     /// The row names the pin and the members declaring it, so the reader knows which requirement
     /// to loosen.
-    /// A dependency held only by a requirer's exact pin, a graph ceiling rather than its own
-    /// authored pin, gets no row: [`SkipReason::GraphCeilingHeld`] would fail `--strict`.
+    /// A requirer's exact pin, a graph ceiling rather than the dependency's own authored pin, does
+    /// not hold a direct dependency here: [`upgrade_view`] plans it, and a pin its trial finds
+    /// still in place gets that trial's [`SkipReason::ResolverConflict`] row.
+    /// An undeclared dependency a graph ceiling holds gets no row, since it follows its requirers
+    /// rather than moving on its own.
     fn record_held_pin(
         &mut self,
         dep: &Dependency,

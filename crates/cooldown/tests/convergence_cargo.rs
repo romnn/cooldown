@@ -285,6 +285,94 @@ fn upgrade_stabilizes_a_planned_pin_moved_by_an_earlier_pin() {
     assert_eq!(lock_after, fixture.read_bytes("Cargo.lock"));
 }
 
+/// The cutoff admits the `wasm-bindgen` 0.2.105 family from 2025-10-27, while excluding 0.2.106
+/// from 2025-11-28.
+const DROPPED_PIN_FREEZE: &str = "2025-10-28T00:00:00Z";
+
+/// The seed is the newest graph before the 0.2.105 family, where `wasm-bindgen-backend` 0.2.104,
+/// the backend's last release, pins `wasm-bindgen-shared = "=0.2.104"`.
+/// The run sees the 0.2.105 family, whose `wasm-bindgen-macro-support` no longer requires the
+/// backend.
+const DROPPED_PIN_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2025-10-01T00:00:00Z",
+    run: DROPPED_PIN_FREEZE,
+};
+
+const DROPPED_PIN_MANIFEST: &str = indoc! {r#"
+    [package]
+    name = "cargo-dropped-pin"
+    version = "0.1.0"
+    edition = "2021"
+
+    [dependencies]
+    wasm-bindgen = "0.2"
+    wasm-bindgen-shared = "0.2"
+"#};
+
+/// A declared crate a third-party crate pins exactly moves with the declared driver whose target
+/// drops that crate from the graph, and `outdated` offers both targets beforehand (#165).
+#[test]
+fn upgrade_moves_a_declared_crate_past_the_pin_its_driver_drops() {
+    skip_if_missing!("cargo");
+    let fixture = Fixture::cargo(DROPPED_PIN_AS_OF);
+    fixture
+        .write("Cargo.toml", DROPPED_PIN_MANIFEST)
+        .write("src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+    let seeded = fixture.read_bytes("Cargo.lock");
+    for crate_name in [
+        "wasm-bindgen",
+        "wasm-bindgen-shared",
+        "wasm-bindgen-backend",
+    ] {
+        assert_eq!(
+            cargo_lock_versions_of(crate_name, &seeded),
+            vec!["0.2.104".to_owned()],
+            "the fixture must seed {crate_name} at 0.2.104; {REGISTRY_HISTORY}"
+        );
+    }
+    let declared: BTreeSet<String> = ["wasm-bindgen", "wasm-bindgen-shared"]
+        .map(str::to_owned)
+        .into();
+
+    let outdated = fixture.cooldown_json(&["outdated", "--freeze", DROPPED_PIN_FREEZE]);
+    assert_eq!(
+        outdated.outdated_with_status("adoptable"),
+        declared,
+        "outdated must offer both declared targets the upgrade lands"
+    );
+
+    let upgrade = fixture.cooldown_json(&["upgrade", "--strict", "--freeze", DROPPED_PIN_FREEZE]);
+    for crate_name in &declared {
+        assert_eq!(
+            upgrade.changes_for(crate_name),
+            vec![ChangeVersions::new("0.2.104", "0.2.105")],
+            "{crate_name} must move to the newest release the freeze admits"
+        );
+    }
+    assert!(
+        declared.is_subset(&upgrade.applied_names()),
+        "both declared targets must be applied"
+    );
+    assert_eq!(upgrade.summary_skipped(), 0);
+    assert!(upgrade.ok(), "--strict must succeed when both targets land");
+
+    let lock_after = fixture.read_bytes("Cargo.lock");
+    for crate_name in &declared {
+        assert_eq!(
+            cargo_lock_versions_of(crate_name, &lock_after),
+            vec!["0.2.105".to_owned()],
+            "{crate_name} must land on 0.2.105; {REGISTRY_HISTORY}"
+        );
+    }
+    assert!(
+        cargo_lock_versions_of("wasm-bindgen-backend", &lock_after).is_empty(),
+        "the 0.2.105 family drops the pinning backend"
+    );
+}
+
 #[test]
 fn upgrade_converges_to_a_fixed_point() {
     skip_if_missing!("cargo");

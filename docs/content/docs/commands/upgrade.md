@@ -209,6 +209,14 @@ which of two things happened, because the way forward differs:
 Both fail a `--strict` run. `outdated` reports the same rows as `blocked`, with the same sentence
 in `blockedReason` and under `--why`.
 
+On Cargo, a direct dependency that another package pins exactly with `=` is still planned and
+tried. The batch can move that package or drop it from the graph, as `wasm-bindgen` 0.2.105 drops
+`wasm-bindgen-backend` and with it the backend's pin on `wasm-bindgen-shared`, so only the resolve
+can tell whether the pin survives. When it does, the row is `resolver_conflict` with Cargo's
+sentence naming the pin, as `--package wasm-bindgen-shared` alone shows (`failed to select a
+version for the requirement wasm-bindgen-shared = "=0.2.104" (required by wasm-bindgen
+v0.2.104)`), and it fails `--strict` like any other.
+
 A direct dependency its own exact pin holds below a matured target is never moved, but it is
 listed as `pin_held`, naming the pin and the members declaring it (`pinned to exactly 0.3.9 in
 app; loosen the requirement to adopt 0.3.11`). Like every forward move a pin holds, it never fails

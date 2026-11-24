@@ -1,7 +1,7 @@
 use super::batch::HoldAttestation;
 use super::planning::{
     crosses_line, current_line_target, effective_hold, line_leaving_nodes, lower_adoptable_targets,
-    plan_baseline_violations, target_package, upgrade_dependency,
+    plan_baseline_violations, target_package, upgrade_view,
 };
 use super::{
     AttestedHolds, BatchOutcome, CommittedBatch, PlanMode, TrialRollback, admitted_crossings,
@@ -678,31 +678,34 @@ fn ceiling_edges_follow_their_requirers() {
     assert_eq!(holder.requirer, "fresh-pinner");
 }
 
+/// A declared dependency's upgrade targets disregard a third-party exact pin's ceiling, while an
+/// undeclared dependency and a cap without attribution keep it.
 #[test]
-fn upgrade_ceiling_requires_all_attributed_requirers_to_move() {
-    let mut child = dep("child", "1.0.0");
-    child.graph_ceiling = Some(child.current.clone());
-    child.graph_floor = Some(child.current.clone());
-    child.hold_edges = vec![
-        hold_edge("parent", "2.0.0", "1.0.0", GraphHoldKind::Ceiling),
-        hold_edge("parent", "3.0.0", "1.0.0", GraphHoldKind::Ceiling),
-    ];
-    let partial = violation_set(&[("parent", "2.0.0")]);
-    assert_eq!(
-        upgrade_dependency(&child, &partial).graph_ceiling,
-        child.graph_ceiling
-    );
-    let together = violation_set(&[("parent", "2.0.0"), ("parent", "3.0.0")]);
-    let effective = upgrade_dependency(&child, &together);
-    assert_eq!(effective.graph_ceiling, None);
-    assert_eq!(effective.graph_floor, child.graph_floor);
+fn upgrade_view_lifts_only_an_attributed_ceiling_on_a_declared_dependency() {
+    let mut shared = dep("wasm-bindgen-shared", "0.2.104");
+    shared.graph_ceiling = Some(shared.current.clone());
+    shared.graph_floor = Some(shared.current.clone());
+    shared.hold_edges = vec![hold_edge(
+        "wasm-bindgen-backend",
+        "0.2.104",
+        "0.2.104",
+        GraphHoldKind::Ceiling,
+    )];
 
-    // Missing attribution cannot prove a cap will disappear with the moving parents.
-    child.hold_edges.clear();
-    assert_eq!(
-        upgrade_dependency(&child, &together).graph_ceiling,
-        child.graph_ceiling
-    );
+    // The declared dependency is judged uncapped, and keeps its floor and the pin's evidence.
+    let declared = upgrade_view(&shared);
+    assert_eq!(declared.graph_ceiling, None);
+    assert_eq!(declared.graph_floor, shared.graph_floor);
+    assert_eq!(declared.hold_edges, shared.hold_edges);
+
+    // An undeclared one follows its requirers instead.
+    shared.direct = false;
+    assert_eq!(upgrade_view(&shared).graph_ceiling, shared.graph_ceiling);
+
+    // Without attribution the cap's source is unknown.
+    shared.direct = true;
+    shared.hold_edges.clear();
+    assert_eq!(upgrade_view(&shared).graph_ceiling, shared.graph_ceiling);
 }
 
 /// A release on the major line `line`, which [`rel`] leaves unclassified.
