@@ -2975,7 +2975,6 @@ impl CargoTool {
         let mut coalition = vec![change];
         let mut split = heal;
         let mut tried = Vec::new();
-        let mut refused = None;
         for _ in 0..probe.plan.len() {
             let partners =
                 split_partners(probe.plan, &read_lock(probe.project)?, &split, &coalition);
@@ -3015,15 +3014,14 @@ impl CargoTool {
                     };
                     split = next;
                 }
-                // The refusal reaches the refused member's held row, which a skipped repeat of
-                // the attempt could not report again, so the attempt is not remembered as failed.
+                // The refusal reaches the refused member's held row, which a repeat skipped at
+                // any coalition this completion tried could not report again, so none of them
+                // is remembered as failed.
                 GroupResolve::Refused {
                     short: Some(short), ..
                 } => {
                     restore_widen_checkpoint(probe.project, probe.journal, &checkpoint)?;
-                    tried.pop();
-                    refused = Some(short);
-                    break;
+                    return Ok(SplitCompletion::Refused(Some(short)));
                 }
                 GroupResolve::Resolved(_)
                 | GroupResolve::Refused { .. }
@@ -3040,7 +3038,7 @@ impl CargoTool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extend(tried);
-        Ok(SplitCompletion::Refused(refused))
+        Ok(SplitCompletion::Refused(None))
     }
 
     /// Whether a completion of the same coalition from the same files already failed in this

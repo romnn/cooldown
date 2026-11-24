@@ -2472,12 +2472,20 @@ async fn a_pin_back_refused_first_lands_once_a_later_pin_frees_it() -> eyre::Res
 ///
 /// The joint resolve leaves `pkg001` alone and lands `pkg000`, so only `pkg000` is replayed,
 /// and without `pkg001`'s widen Cargo refuses to pin `pkg000` back.
+/// The project is a registered staged copy, so the warm run replays Cargo's outcomes.
 #[tokio::test]
 async fn a_subset_replay_refused_a_pin_back_keeps_the_reason() -> eyre::Result<()> {
     let fixture = pair_fixture()?;
     for file in ["b-stays", "refuse-alone"] {
         std::fs::write(fixture.project.root.join(file), "")?;
     }
+    let root = &fixture.project.root;
+    fixture.tool.rejection_memo.register_origin(root, root)?;
+    // Staging registers the canonical directory of its copy, and a temporary directory is a
+    // symbolic link on macOS (`/var` is `/private/var`).
+    let tree = Utf8PathBuf::from_path_buf(std::fs::canonicalize(root)?)
+        .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+    fixture.tool.staged_trees.register(root, &tree, true);
     let journal = fixture.journal().await?;
     let manifest = std::fs::read(&fixture.project.manifest)?;
     let lock = std::fs::read(fixture.project.root.join("Cargo.lock"))?;
@@ -2488,6 +2496,7 @@ async fn a_subset_replay_refused_a_pin_back_keeps_the_reason() -> eyre::Result<(
     );
 
     let mut runs = Vec::new();
+    let mut calls = Vec::new();
     for _ in 0..2 {
         let mut rejections = PinRejections::from([(key.clone(), overshoot.clone())]);
         let evidence = fixture
@@ -2507,7 +2516,10 @@ async fn a_subset_replay_refused_a_pin_back_keeps_the_reason() -> eyre::Result<(
             lock
         );
         runs.push(rejections);
+        calls.push(fixture.invocations()?.len());
     }
+    // The warm run replayed outcomes the cold run recorded instead of running Cargo for them.
+    assert!(calls[1] - calls[0] < calls[0], "{calls:?}");
     // Cargo's refusal of the exact target outranks the overshoot, in both runs.
     let detail = runs[0]
         .get(&key)
