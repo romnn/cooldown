@@ -42,15 +42,15 @@ pub(crate) fn write_repo_native(
     let rendered = match &policy.default_window {
         // An exempt default is written to no native config; the policy notices `sync` reports
         // name it.
-        Some(window) if window.is_exemption() => {
-            return Ok(SyncReport::Unchanged { path, warnings });
+        Some(WindowSpec::Latest) => return Ok(SyncReport::Unchanged { path, warnings }),
+        Some(WindowSpec::MinAge(age)) if !age.is_zero() => {
+            render_age(*age).map(|text| (*age, text))
         }
-        Some(WindowSpec::MinAge(age)) => render_age(*age).map(|text| (*age, text)),
         _ => None,
     };
     let Some((age, text)) = rendered else {
-        // A freeze date or a sub-second age has no spelling in cargo's grammar, so the existing
-        // setting stays as it is.
+        // A freeze date, or the zero or sub-second age a floor folds one into, has no spelling in
+        // cargo's grammar, so the existing setting stays as it is.
         warnings.push(Diagnostic::new(
             DiagnosticKind::StricterNative,
             "cargo's min-publish-age is a rolling age in whole seconds, so sync leaves it as it is \

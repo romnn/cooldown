@@ -135,11 +135,19 @@ fn a_freeze_leaves_the_age_alone_with_a_warning() -> eyre::Result<()> {
     Ok(())
 }
 
-/// An exempt default, however it is spelled, leaves the age alone without a warning of the
-/// adapter's own: the application's notice about policy the native config omits names it.
+/// An exempt default leaves the age alone without a warning of the adapter's own, since the
+/// application's notice about policy the native config omits names it, while a zero age, which
+/// only a floor folding a freeze yields, is left alone with the adapter's warning.
 #[test]
 fn an_exempt_default_leaves_the_age_alone() -> eyre::Result<()> {
-    for window in [WindowSpec::Latest, WindowSpec::MinAge(SignedDuration::ZERO)] {
+    let cases = [
+        (WindowSpec::Latest, Vec::new()),
+        (
+            WindowSpec::MinAge(SignedDuration::ZERO),
+            vec![DiagnosticKind::StricterNative],
+        ),
+    ];
+    for (window, kinds) in cases {
         let (_directory, root) = repo()?;
         let config = root.join(".cargo/config.toml");
         std::fs::create_dir_all(root.join(".cargo"))?;
@@ -153,7 +161,7 @@ fn an_exempt_default_leaves_the_age_alone() -> eyre::Result<()> {
             false,
         )?;
 
-        assert_eq!(warning_kinds(&report), [], "{window:?}");
+        assert_eq!(warning_kinds(&report), kinds, "{window:?}");
         std::assert_matches!(report, SyncReport::Unchanged { .. });
         assert_eq!(std::fs::read_to_string(&config)?, original, "{window:?}");
     }
