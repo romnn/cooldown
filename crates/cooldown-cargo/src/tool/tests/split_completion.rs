@@ -377,31 +377,113 @@ async fn a_remembered_split_refusal_stands_only_while_nothing_heals_it() -> eyre
 /// A healing step that overshoots a partner's exact target is restored instead of kept.
 ///
 /// `holder` 1.1.0 holds `dep` past the target, so Cargo refuses to pin `app`'s copy back.
+/// Both rows keep the split their own steps cause, which outranks that refusal, and a second
+/// resolve of the same files and plan reports the same rows.
 #[tokio::test]
 async fn a_split_completion_missing_a_target_is_restored() -> eyre::Result<()> {
     let fixture = SplitFixture::new()?;
     std::fs::write(fixture.directory.path().join("overshoot"), "")?;
     let plan = SplitFixture::plan(vec![declared_dep_move(), holder_move()], RewriteMode::Auto);
 
-    let rejections = fixture.resolve(&plan).await?;
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let journal = fixture
+            .tool
+            .mutation_journal(&fixture.project, &plan)
+            .await?;
+        let rejections = fixture
+            .tool
+            .whole_graph_resolve(&fixture.project, &plan, &journal, None)
+            .await?;
 
-    // Neither move lands, so the project is exactly as before.
-    assert_eq!(fixture.file("Cargo.lock")?, lock("1.0.0", "1.0.0", "1.0.0"));
-    assert_eq!(fixture.file("Cargo.toml")?, MANIFEST);
-    assert!(
-        rejections.contains_key(&(
-            "holder".to_string(),
-            "1.0.0".to_string(),
-            "1.1.0".to_string(),
-        )),
-        "{rejections:?}"
-    );
+        // Neither move lands, so the project is exactly as before.
+        assert_eq!(fixture.file("Cargo.lock")?, lock("1.0.0", "1.0.0", "1.0.0"));
+        assert_eq!(fixture.file("Cargo.toml")?, MANIFEST);
+        journal.restore()?;
+        runs.push(rejections);
+    }
+    for planned in [declared_dep_move(), holder_move()] {
+        let detail = runs[0]
+            .get(&rejection_key(&planned))
+            .ok_or_else(|| eyre::eyre!("{runs:?}"))?;
+        assert_eq!(detail.origin, DiagnosticOrigin::Acceptance, "{detail:?}");
+        assert!(
+            detail
+                .text
+                .contains("would resolve direct dependency dep at another incompatible line"),
+            "{detail:?}"
+        );
+    }
+    assert_eq!(runs[0], runs[1]);
     // The overshot copy was tried at its target.
     assert!(
         fixture
             .file("invocations")?
             .contains("#dep@2.1.0 --precise 2.0.0")
     );
+    Ok(())
+}
+
+/// A coalition whose pin back Cargo refuses hands that refusal to the partner it left short, for
+/// the partner's row to rank against its other reasons, and restores every file.
+///
+/// The failed attempt is not remembered, so a repeat runs it again and reports the same refusal.
+#[tokio::test]
+async fn a_refused_split_completion_hands_the_refusal_to_its_partner() -> eyre::Result<()> {
+    let fixture = SplitFixture::new()?;
+    std::fs::write(fixture.directory.path().join("overshoot"), "")?;
+    let plan = SplitFixture::plan(vec![declared_dep_move(), holder_move()], RewriteMode::Auto);
+    let journal = fixture
+        .tool
+        .mutation_journal(&fixture.project, &plan)
+        .await?;
+    let probe = WidenProbe {
+        project: &fixture.project,
+        plan: &plan.changes,
+        rewrite: RewriteMode::Auto,
+        candidates: &[],
+        protected: &[],
+        followers: &[],
+        journal: &journal,
+        observer: None,
+    };
+    let heal = SplitHeal {
+        name: "dep".to_owned(),
+        retainers: vec![PackageKey::new("app", "0.1.0")],
+    };
+
+    let mut calls = Vec::new();
+    for _ in 0..2 {
+        let completion = fixture
+            .tool
+            .complete_split(&probe, &holder_move(), heal.clone(), &[])
+            .await?;
+        let SplitCompletion::Refused(Some(short)) = completion else {
+            eyre::bail!("the coalition is refused for its partner's pin back");
+        };
+        assert_eq!(fixture.file("Cargo.lock")?, lock("1.0.0", "1.0.0", "1.0.0"));
+        assert_eq!(fixture.file("Cargo.toml")?, MANIFEST);
+        calls.push(fixture.invocations()?);
+
+        // `dep`'s refusal outranks a weaker overshoot on its row.
+        let key = rejection_key(&declared_dep_move());
+        assert_eq!(short.key, key);
+        let mut rejections = PinRejections::from([(
+            key.clone(),
+            RejectionDetail::violation(
+                "would move directly declared dep 1.0.0 to 2.1.0".to_owned(),
+                TargetReach::Overshot,
+            ),
+        )]);
+        short.record(&mut rejections);
+        let detail = rejections
+            .get(&key)
+            .ok_or_else(|| eyre::eyre!("{rejections:?}"))?;
+        assert_eq!(detail.origin, DiagnosticOrigin::Resolver, "{detail:?}");
+        assert!(detail.text.contains("dep = \"^2.1\""), "{detail:?}");
+    }
+    // The repeat resolved the coalition again: it cost as many Cargo calls as the first attempt.
+    assert_eq!(calls[1], 2 * calls[0]);
     Ok(())
 }
 
@@ -889,7 +971,7 @@ async fn a_completion_releasing_a_blocker_is_not_skipped_as_failed() -> eyre::Re
         .tool
         .complete_split(&probe, &holder, heal.clone(), &[])
         .await?;
-    assert!(matches!(kept, SplitCompletion::Refused));
+    assert!(matches!(kept, SplitCompletion::Refused(_)));
     assert_eq!(
         fixture.file("Cargo.lock")?,
         unlock_lock("1.0.0", "0.9.3", "1.0.0")

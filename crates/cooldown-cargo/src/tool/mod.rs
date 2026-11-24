@@ -35,7 +35,8 @@ use crate::edges;
 use crate::index::{CRATES_IO, CratesIoIndex};
 use crate::locked_reads::{LockedReader, LockedReads};
 use crate::lockfile::{
-    CargoLock, DeclaredEndpoints, PlannedNodeMove, SlotKey, SourcedSlotKey, rewrite_planned_nodes,
+    CargoLock, DeclaredEndpoints, LockPackageId, PlannedNodeMove, SlotKey, SourcedSlotKey,
+    rewrite_planned_nodes,
 };
 use crate::manifest;
 use crate::native::native_policy_layer;
@@ -1348,9 +1349,8 @@ enum GroupResolve {
     Refused {
         parties: Vec<ConflictParty>,
         chain: BTreeSet<String>,
-        /// The candidate whose overshoot Cargo refused to pin back to its target, with that
-        /// refusal for its held row, when Cargo explained it.
-        short: Option<RejectionEffect>,
+        /// The candidate whose overshoot Cargo refused to pin back to its target.
+        short: Option<ShortCandidate>,
     },
     /// The resolve broke the acceptance rule.
     Violated {
@@ -1375,14 +1375,21 @@ impl GroupResolve {
     fn refused(error: &CoreError, short: Option<&Change>) -> Self {
         let parties = rejection_parties(error);
         Self::Refused {
-            short: short
-                .zip(summarize_pin_rejection(error))
-                .map(|(change, summary)| RejectionEffect {
-                    key: rejection_key(change),
-                    detail: RejectionDetail::resolver(summary, parties.clone()),
-                }),
+            short: short.map(|change| ShortCandidate {
+                key: rejection_key(change),
+                detail: summarize_pin_rejection(error)
+                    .map(|summary| RejectionDetail::resolver(summary, parties.clone())),
+            }),
             chain: rejection_chain(error),
             parties,
+        }
+    }
+
+    /// The candidate a refused pin back left short of its target, when that refused the group.
+    fn short(&self) -> Option<&ShortCandidate> {
+        match self {
+            Self::Refused { short, .. } => short.as_ref(),
+            Self::Resolved(_) | Self::Violated { .. } | Self::Discarded => None,
         }
     }
 
@@ -1403,11 +1410,7 @@ impl GroupResolve {
                     .iter()
                     .any(|change| rejection_key(change) == short.key)
                 {
-                    MemoRejection {
-                        effects: vec![short.clone()],
-                        ..MemoRejection::default()
-                    }
-                    .apply(rejections);
+                    short.record(rejections);
                 }
                 return;
             }
@@ -1445,6 +1448,15 @@ impl GroupResolve {
 impl WidenEvidence {
     fn reached(&self, change: &Change) -> bool {
         reached_after(&self.versions, self.graph.as_ref(), change)
+    }
+
+    /// The `changes` this evidence shows at their exact targets.
+    fn reached_of<'c>(&self, changes: &[&'c Change]) -> Vec<&'c Change> {
+        changes
+            .iter()
+            .copied()
+            .filter(|change| self.reached(change))
+            .collect()
     }
 }
 
@@ -1592,17 +1604,41 @@ fn unreleased_split(heal: SplitHeal) -> UnlockedSplit {
     }
 }
 
-/// What [`CargoTool::pin_overshoots_back`] achieved.
-enum PinBack<'c> {
-    /// No change's own declaration was past its target, so the resolve's graph stands.
-    Unneeded(ResolvedGraph),
-    /// Every overshoot was pinned back to its target, with the graph of the lock the pins left.
-    Landed(ResolvedGraph),
-    /// Cargo refused to pin `change`'s overshoot back, so the pins stopped there.
-    Refused {
-        change: &'c Change,
-        error: CoreError,
-    },
+/// What [`CargoTool::pin_overshoots_back`] left.
+struct PinnedBack<'c> {
+    /// The graph of the lock the pins left, or the resolve's own graph when none landed.
+    graph: ResolvedGraph,
+    /// Whether any pin back ran, landed or refused.
+    ran: bool,
+    /// Cargo's refusal of the last pin back of each change still short of its target, in the
+    /// order of the changes.
+    refused: Vec<(&'c Change, CoreError)>,
+}
+
+/// A candidate a joint resolve left short of its target because Cargo refused to pin its
+/// overshoot back.
+#[derive(Clone)]
+struct ShortCandidate {
+    key: (String, String, String),
+    /// Cargo's refusal for the candidate's held row, when Cargo explained it.
+    detail: Option<RejectionDetail>,
+}
+
+impl ShortCandidate {
+    /// Records Cargo's refusal for the candidate's held row, under the precedence
+    /// [`MemoRejection::apply`] keeps.
+    fn record(&self, rejections: &mut PinRejections) {
+        if let Some(detail) = &self.detail {
+            MemoRejection {
+                effects: vec![RejectionEffect {
+                    key: self.key.clone(),
+                    detail: detail.clone(),
+                }],
+                ..MemoRejection::default()
+            }
+            .apply(rejections);
+        }
+    }
 }
 
 /// What [`CargoTool::complete_split`] achieved.
@@ -1611,8 +1647,9 @@ enum SplitCompletion {
     Landed(Box<WidenEvidence>),
     /// No planned move heals the split, so no resolve was tried.
     Unhealable,
-    /// The healing moves were tried together and did not land.
-    Refused,
+    /// The healing moves were tried together and did not land, with the coalition member Cargo
+    /// refused to pin back to its target when that decided the last attempt.
+    Refused(Option<ShortCandidate>),
 }
 
 /// A split completion's identity within one resolve: the project root, a digest of the project
@@ -2671,15 +2708,9 @@ impl CargoTool {
                 "retrying cargo joint widen without the refused candidates"
             );
         };
-        let reached: Vec<_> = resolved
+        let reached = resolved
             .as_ref()
-            .map(|resolved| {
-                candidates
-                    .iter()
-                    .copied()
-                    .filter(|change| resolved.reached(change))
-                    .collect()
-            })
+            .map(|resolved| resolved.reached_of(&candidates))
             .unwrap_or_default();
         let displaced: Vec<_> = resolved
             .as_ref()
@@ -2712,26 +2743,32 @@ impl CargoTool {
         }
         // Evidence from the full probe cannot authorize A without the failed B's edits.
         // Rebuild the subset from the checkpoint and resolve exactly those edits again.
-        let replayed = self
-            .replay_reached(&probe, &candidates, &reached, &released, culprit_drop)
-            .await?;
-        if let Some(replayed) = replayed
-            && reached.iter().all(|change| replayed.reached(change))
-            && probe
-                .protected
-                .iter()
-                .all(|change| replayed.reached(change))
-        {
-            stats.partial_replays_kept += 1;
-            return Ok(Some(replayed));
-        }
-        stats.partial_replays_discarded += 1;
-        restore_widen_checkpoint(probe.project, probe.journal, &checkpoint)?;
-        Ok(None)
+        let Some(replayed) = self
+            .replay_reached(
+                &probe,
+                &candidates,
+                &reached,
+                &released,
+                culprit_drop,
+                rejections,
+            )
+            .await?
+        else {
+            stats.partial_replays_discarded += 1;
+            restore_widen_checkpoint(probe.project, probe.journal, &checkpoint)?;
+            return Ok(None);
+        };
+        stats.partial_replays_kept += 1;
+        Ok(Some(replayed))
     }
 
     /// Resolves the `reached` subset of a joint probe's `candidates` again from its checkpoint,
     /// releasing the same family save the original nodes of the candidates that fell short.
+    ///
+    /// The replay counts only when it reaches every one of the subset and of the protected
+    /// changes.
+    /// A candidate the replay leaves short of its target because Cargo refused its pin back keeps
+    /// that refusal in `rejections`.
     async fn replay_reached(
         &self,
         probe: &WidenProbe<'_>,
@@ -2739,6 +2776,7 @@ impl CargoTool {
         reached: &[&Change],
         released: &Released,
         culprit_drop: CulpritDrop,
+        rejections: &mut PinRejections,
     ) -> Result<Option<WidenEvidence>> {
         let lock = read_lock(probe.project)?;
         let baseline = ResolveBaseline::capture(&lock, &probe.project.generated_members);
@@ -2754,10 +2792,18 @@ impl CargoTool {
             .filter(|node| role(node) == Role::Free)
             .cloned()
             .collect();
-        Ok(self
+        let outcome = self
             .resolve_widened_group(probe, reached, &replay_released, culprit_drop)
-            .await?
-            .into_evidence())
+            .await?;
+        if let Some(short) = outcome.short() {
+            short.record(rejections);
+        }
+        Ok(outcome.into_evidence().filter(|replayed| {
+            reached
+                .iter()
+                .chain(probe.protected)
+                .all(|change| replayed.reached(change))
+        }))
     }
 
     /// The lockstep family a joint probe of `candidates` releases after a refusal naming
@@ -2869,15 +2915,14 @@ impl CargoTool {
             }
             Err(err) => return Err(err),
         };
-        let graph = match self
+        let pinned = self
             .pin_overshoots_back(probe.scope(), &baseline, candidates, graph)
-            .await?
-        {
-            PinBack::Unneeded(graph) | PinBack::Landed(graph) => graph,
-            PinBack::Refused { change, error } => {
-                return Ok(GroupResolve::refused(&error, Some(change)));
-            }
-        };
+            .await?;
+        // The first candidate still short drops alone, while the rest resolve again without it.
+        if let Some((change, error)) = pinned.refused.first() {
+            return Ok(GroupResolve::refused(error, Some(change)));
+        }
+        let graph = pinned.graph;
         // No follower edit follows this call: the graph and lock describe the retained manifests.
         let lock = read_lock(probe.project)?;
         if seed_has_drive_by(&before, &lock, &moves) {
@@ -2930,6 +2975,7 @@ impl CargoTool {
         let mut coalition = vec![change];
         let mut split = heal;
         let mut tried = Vec::new();
+        let mut refused = None;
         for _ in 0..probe.plan.len() {
             let partners =
                 split_partners(probe.plan, &read_lock(probe.project)?, &split, &coalition);
@@ -2969,6 +3015,16 @@ impl CargoTool {
                     };
                     split = next;
                 }
+                // The refusal reaches the refused member's held row, which a skipped repeat of
+                // the attempt could not report again, so the attempt is not remembered as failed.
+                GroupResolve::Refused {
+                    short: Some(short), ..
+                } => {
+                    restore_widen_checkpoint(probe.project, probe.journal, &checkpoint)?;
+                    tried.pop();
+                    refused = Some(short);
+                    break;
+                }
                 GroupResolve::Resolved(_)
                 | GroupResolve::Refused { .. }
                 | GroupResolve::Discarded => {
@@ -2984,7 +3040,7 @@ impl CargoTool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extend(tried);
-        Ok(SplitCompletion::Refused)
+        Ok(SplitCompletion::Refused(refused))
     }
 
     /// Whether a completion of the same coalition from the same files already failed in this
@@ -3101,8 +3157,12 @@ impl CargoTool {
         let heal = violation.heal();
         let completion = match heal.clone() {
             Some(heal) => self.complete_split(probe, change, heal, &[]).await?,
-            None => SplitCompletion::Refused,
+            None => SplitCompletion::Refused(None),
         };
+        // A refused coalition member keeps Cargo's refusal, below this change's own split.
+        if let SplitCompletion::Refused(Some(short)) = &completion {
+            short.record(rejections);
+        }
         match (completion, heal) {
             (SplitCompletion::Landed(evidence), _) => {
                 return Ok(TentativeWiden::Landed(evidence));
@@ -3114,7 +3174,7 @@ impl CargoTool {
                 stats.heals.push(heal);
             }
             // Any other verdict depends on the plan, which the memo key omits.
-            (SplitCompletion::Unhealable | SplitCompletion::Refused, _) => {
+            (SplitCompletion::Unhealable | SplitCompletion::Refused(_), _) => {
                 stats.memo_disqualified = true;
             }
         }
@@ -3168,15 +3228,13 @@ impl CargoTool {
                         .await?;
                     // A pin back can move another declaration that only this plan authorizes, so
                     // a repaired step's verdict depends on the plan, which the memo key omits.
-                    stats.memo_disqualified |= !matches!(pinned, PinBack::Unneeded(_));
-                    match pinned {
-                        PinBack::Unneeded(graph) | PinBack::Landed(graph) => Some(graph),
-                        PinBack::Refused { error, .. } => {
-                            stats.record_refusal(change, &error, rejections);
-                            restore_widen_checkpoint(probe.project, probe.journal, checkpoint)?;
-                            return Ok(TentativeWiden::Rejected);
-                        }
+                    stats.memo_disqualified |= pinned.ran;
+                    if let Some((_, error)) = pinned.refused.first() {
+                        stats.record_refusal(change, error, rejections);
+                        restore_widen_checkpoint(probe.project, probe.journal, checkpoint)?;
+                        return Ok(TentativeWiden::Rejected);
                     }
+                    Some(pinned.graph)
                 }
                 Err(err) if err.is_tool_spawn_failure() || err.is_local_environment_failure() => {
                     stats.memo_disqualified = true;
@@ -3974,7 +4032,13 @@ impl CargoTool {
             {
                 SplitCompletion::Landed(_) => return Ok(()),
                 SplitCompletion::Unhealable if released.is_empty() => unhealable = Some(heal),
-                SplitCompletion::Unhealable | SplitCompletion::Refused => {}
+                // A coalition member's refusal depends on the plan, which the memo key omits,
+                // and a replay of this pin would not report it again.
+                SplitCompletion::Refused(Some(short)) => {
+                    short.record(rejections);
+                    stats.memo_disqualified = true;
+                }
+                SplitCompletion::Unhealable | SplitCompletion::Refused(None) => {}
             }
         }
         let RefusedPin {
@@ -4377,9 +4441,14 @@ impl CargoTool {
     /// Each pin addresses the copy the change's declaration moved to from the `baseline` the
     /// step started from, which the old version's selector cannot reach once that version stays
     /// behind for another requirer.
-    /// Each selector is read from the lock the earlier pins left, since a pin can move another
-    /// change's copy too.
-    /// The pins stop at the first one Cargo refuses.
+    /// The declaring members are the authored workspace members `graph` names, and each selector
+    /// is read from the lock the previous pin left.
+    ///
+    /// A refusal holds only for the lock Cargo saw: a later pin can move the refused change to its
+    /// target or free it to move, so every change gets its pin in one pass, and a further pass
+    /// retries the changes still past their target only while the previous one reached more
+    /// changes, at most one pass per change.
+    /// A refusal outlives the passes only for a change still short of its target.
     ///
     /// # Errors
     ///
@@ -4391,36 +4460,76 @@ impl CargoTool {
         baseline: &ResolveBaseline,
         changes: &[&'c Change],
         graph: ResolvedGraph,
-    ) -> Result<PinBack<'c>> {
+    ) -> Result<PinnedBack<'c>> {
         let PinScope {
             project,
             journal,
             observer,
             ..
         } = scope;
-        let mut landed = false;
-        for change in changes {
-            journal.validate_project(&project.root)?;
-            let lock = read_lock(project)?;
-            let Some(overshoot) = baseline.overshoot(&lock, &project.generated_members, change)
-            else {
-                continue;
-            };
-            let pinned = self.pin_back(scope, change, &overshoot).await;
-            journal.validate_project(&project.root)?;
-            match pinned {
-                Ok(()) => landed = true,
-                Err(error) if error.is_local_environment_failure() => return Err(error),
-                Err(error) => return Ok(PinBack::Refused { change, error }),
+        // A dependency pin leaves the members' own packages alone.
+        let members: Vec<Vec<LockPackageId>> = changes
+            .iter()
+            .map(|change| {
+                change
+                    .members
+                    .iter()
+                    .filter_map(|member| graph.authored_member(member))
+                    .collect()
+            })
+            .collect();
+        let mut graph = graph;
+        let mut ran = false;
+        let mut refused = BTreeMap::new();
+        let mut reached = reached_changes(changes, &read_lock(project)?, &graph);
+        for _ in 0..changes.len() {
+            let mut landed = false;
+            for (index, (change, members)) in changes.iter().zip(&members).enumerate() {
+                journal.validate_project(&project.root)?;
+                let lock = read_lock(project)?;
+                let Some(overshoot) =
+                    baseline.overshoot(&lock, &project.generated_members, members, change)
+                else {
+                    continue;
+                };
+                ran = true;
+                let pinned = self.pin_back(scope, change, &overshoot).await;
+                journal.validate_project(&project.root)?;
+                match pinned {
+                    Ok(()) => {
+                        landed = true;
+                        refused.remove(&index);
+                    }
+                    Err(error) if error.is_local_environment_failure() => return Err(error),
+                    Err(error) => {
+                        refused.insert(index, error);
+                    }
+                }
+            }
+            if !landed {
+                break;
+            }
+            if let Some(observer) = observer {
+                observer.resolver_started(None);
+            }
+            graph = self.locked_reader().graph(project).await?;
+            let now = reached_changes(changes, &read_lock(project)?, &graph);
+            refused.retain(|index, _| !now.contains(index));
+            let grew = now.is_superset(&reached) && now.len() > reached.len();
+            reached = now;
+            if !grew {
+                break;
             }
         }
-        if !landed {
-            return Ok(PinBack::Unneeded(graph));
-        }
-        if let Some(observer) = observer {
-            observer.resolver_started(None);
-        }
-        Ok(PinBack::Landed(self.locked_reader().graph(project).await?))
+        let refused = refused
+            .into_iter()
+            .filter_map(|(index, error)| Some((*changes.get(index)?, error)))
+            .collect();
+        Ok(PinnedBack {
+            graph,
+            ran,
+            refused,
+        })
     }
 
     /// Pins the crates.io copy of `change`'s crate at `overshoot` to the change's target.
@@ -5246,6 +5355,21 @@ fn reached_after(
         });
     }
     reached(after, change)
+}
+
+/// The indices of the `changes` that `lock` and `graph` show at their exact targets.
+fn reached_changes(
+    changes: &[&Change],
+    lock: &CargoLock,
+    graph: &ResolvedGraph,
+) -> BTreeSet<usize> {
+    let versions = lock.crates_io_locked_versions();
+    changes
+        .iter()
+        .enumerate()
+        .filter(|(_, change)| reached_after(&versions, Some(graph), change))
+        .map(|(index, _)| index)
+        .collect()
 }
 
 #[async_trait]

@@ -380,6 +380,20 @@ impl ResolvedGraph {
             .map(String::as_str)
     }
 
+    /// The lock identity of the authored workspace member `member` names by name and path, or
+    /// `None` when no authored member matches.
+    ///
+    /// A path package outside the workspace can share the member's name, so the name alone does
+    /// not identify the member's lock package.
+    pub(crate) fn authored_member(&self, member: &MemberRef) -> Option<LockPackageId> {
+        self.authored_roots()
+            .filter_map(|root| self.packages.get(root))
+            .find(|info| info.name == member.name && info.path == member.path)
+            .map(|info| {
+                LockPackageId::from_metadata(&info.name, &info.version, info.source.as_deref())
+            })
+    }
+
     /// Resolve a graph node id to its workspace-member `(name, path)`, or `None` for a node that is
     /// not a known package. The shared mapping behind both attribution methods below.
     fn member_of(&self, node: &str) -> Option<MemberRef> {

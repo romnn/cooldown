@@ -58,40 +58,34 @@ impl ResolveBaseline {
     /// The crates.io version that `after` binds `change`'s own declaration at past its target,
     /// on the target's compatibility line.
     ///
-    /// The declaration is a member's binding of the change's `from` node in the baseline.
+    /// The declaration is the binding of the change's `from` node by one of the change's
+    /// `members`, the lock identities of its declaring workspace members.
     /// A member that still binds `from` kept that declaration where it was, and a version the
     /// member already bound in the baseline belongs to another of its declarations.
     pub(super) fn overshoot(
         &self,
         after: &CargoLock,
         generated: &GeneratedMembers,
+        members: &[LockPackageId],
         change: &Change,
     ) -> Option<String> {
         let name = &change.package.name;
         let target = change.to.as_str();
         let from = LockPackageId::new(name, change.from.as_str(), Some(CRATES_IO_SOURCE));
         let declared_after = after.declared_endpoints(generated);
-        let binds = |declared: &DeclaredEndpoints, dependent: &LockPackageId| {
+        let binds = |declared: &DeclaredEndpoints, member: &LockPackageId| {
             declared.contains(&DeclaredEndpoint {
-                dependent: dependent.clone(),
+                dependent: member.clone(),
                 endpoint: from.clone(),
             })
         };
-        self.declared
+        members
             .iter()
-            .map(|declared| &declared.dependent)
-            .filter(|dependent| {
-                change
-                    .members
-                    .iter()
-                    .any(|member| member.name == dependent.name)
-                    && binds(&self.declared, dependent)
-                    && !binds(&declared_after, dependent)
-            })
-            .find_map(|dependent| {
+            .filter(|member| binds(&self.declared, member) && !binds(&declared_after, member))
+            .find_map(|member| {
                 declared_after.iter().find_map(|moved| {
                     let version = &moved.endpoint.version;
-                    (moved.dependent == *dependent
+                    (moved.dependent == *member
                         && moved.endpoint.name == *name
                         && moved.endpoint.source() == Some(CRATES_IO_SOURCE)
                         && !self.declared.contains(moved)
@@ -411,8 +405,8 @@ impl fmt::Display for Violation {
 mod tests {
     use super::{ResolveBaseline, Violation};
     use crate::index::CRATES_IO;
-    use crate::lockfile::{CargoLock, PackageKey};
-    use cooldown_core::{Change, GeneratedMembers, MemberRef, PackageId, UpdateKind, Version};
+    use crate::lockfile::{CargoLock, LockPackageId, PackageKey};
+    use cooldown_core::{Change, GeneratedMembers, PackageId, UpdateKind, Version};
     use indoc::formatdoc;
 
     /// A lock of the authored `app` with `app_dependencies` as its entries, beside the crates.io
@@ -662,34 +656,26 @@ mod tests {
     }
 
     /// The overshoot a step's pin back addresses is where the change's own declaration moved: a
-    /// member that drops its binding of the change's `from` node for a new version past the
-    /// target on the target's line.
+    /// declaring member that drops its binding of the change's `from` node for a new version past
+    /// the target on the target's line.
     #[test]
     fn an_overshoot_is_where_the_changes_own_declaration_moved() {
         let generated = GeneratedMembers::undeclared();
-        let change = Change {
-            members: vec![MemberRef {
-                name: "app".to_owned(),
-                path: ".".to_owned(),
-            }],
-            ..planned("dep", "1.0.0", "2.1.0")
-        };
-        let overshoot = |before: &CargoLock, after: &CargoLock, change: &Change| {
-            ResolveBaseline::capture(before, &generated).overshoot(after, &generated, change)
+        let change = planned("dep", "1.0.0", "2.1.0");
+        let app = [LockPackageId::new("app", "0.1.0", None::<&str>)];
+        let overshoot = |before: &CargoLock, after: &CargoLock, members: &[LockPackageId]| {
+            ResolveBaseline::capture(before, &generated)
+                .overshoot(after, &generated, members, &change)
         };
         let alone = lock(&["dep"], &[("dep", "1.0.0")]);
         let moved = lock(&["dep"], &[("dep", "2.3.0")]);
 
         // The declaration left 1.0.0 for 2.3.0, past the 2.1.0 target on line 2.
-        assert_eq!(overshoot(&alone, &moved, &change), Some("2.3.0".to_owned()));
-        // A step that lands the target, or a change no member of which moved, has none.
+        assert_eq!(overshoot(&alone, &moved, &app), Some("2.3.0".to_owned()));
+        // A step that lands the target, or a change no member of which declares it, has none.
         let exact = lock(&["dep"], &[("dep", "2.1.0")]);
-        assert_eq!(overshoot(&alone, &exact, &change), None);
-        let undeclared = Change {
-            members: Vec::new(),
-            ..change.clone()
-        };
-        assert_eq!(overshoot(&alone, &moved, &undeclared), None);
+        assert_eq!(overshoot(&alone, &exact, &app), None);
+        assert_eq!(overshoot(&alone, &moved, &[]), None);
 
         // `app` keeps a renamed 1.0.0 declaration beside its own `dep` at 2.3.0: while 1.0.0 is
         // still bound the declaration never moved, and the 2.3.0 copy `app` already bound is
@@ -698,7 +684,7 @@ mod tests {
             &["dep 1.0.0", "dep 2.3.0"],
             &[("dep", "1.0.0"), ("dep", "2.3.0")],
         );
-        assert_eq!(overshoot(&both, &both, &change), None);
-        assert_eq!(overshoot(&both, &moved, &change), None);
+        assert_eq!(overshoot(&both, &both, &app), None);
+        assert_eq!(overshoot(&both, &moved, &app), None);
     }
 }
