@@ -30,7 +30,9 @@ pub(crate) fn write_repo_native(
     let path = writable_config_file(&config_dir);
     let mut warnings = Vec::new();
 
-    if PublishAgeSettings::discover(repo_root, env)?.enforcement_disabled()? {
+    let enforcement_disabled =
+        PublishAgeSettings::discover(repo_root, env)?.enforcement_disabled()?;
+    if enforcement_disabled {
         warnings.push(Diagnostic::new(
             DiagnosticKind::Config,
             "cargo's resolver.incompatible-publish-age is `allow`, so a bare cargo command does \
@@ -61,7 +63,10 @@ pub(crate) fn write_repo_native(
         return Ok(SyncReport::Unchanged { path, warnings });
     };
     // The written table names crates.io, which is what makes cargo read crates.io's own variable.
-    warnings.extend(crates_io_env_warning(env, age, &text));
+    // With enforcement off, no age applies, which the warning above already says.
+    if !enforcement_disabled {
+        warnings.extend(crates_io_env_warning(env, age, &text));
+    }
 
     if current_age(&path)? == Some(age) {
         return Ok(SyncReport::Unchanged { path, warnings });

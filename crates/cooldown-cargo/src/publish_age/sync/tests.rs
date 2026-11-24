@@ -234,5 +234,14 @@ fn warns_when_the_crates_io_variable_replaces_the_written_age() -> eyre::Result<
         let report = write_repo_native(&root, &policy(days(7)), &env, true)?;
         assert_eq!(warning_kinds(&report), expected, "{name}={value}");
     }
+
+    // With enforcement off, only that is reported, whatever age the variable sets.
+    let disabled = CargoEnvironment {
+        registry_ages: BTreeMap::from([(CRATES_IO_AGE_ENV.to_owned(), "30 days".to_owned())]),
+        incompatible: Some("allow".to_owned()),
+        ..CargoEnvironment::default()
+    };
+    let report = write_repo_native(&root, &policy(days(7)), &disabled, true)?;
+    assert_eq!(warning_kinds(&report), [DiagnosticKind::Config]);
     Ok(())
 }

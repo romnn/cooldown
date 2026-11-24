@@ -26,6 +26,7 @@ use cooldown_core::{
     ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
+use jiff::Timestamp;
 
 /// The [`ToolId`] for the Python/uv adapter (`"uv"`).
 pub const UV_ID: ToolId = ToolId("uv");
@@ -1071,7 +1072,7 @@ impl ToolWrite for UvTool {
 
 /// The variables that decide whether bare uv applies the `uv.toml` `sync` writes, captured so
 /// tests can supply their own.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct UvEnvironment {
     /// `UV_EXCLUDE_NEWER`, which replaces the default cutoff of every config file.
     exclude_newer: Option<String>,
@@ -1091,26 +1092,32 @@ impl UvEnvironment {
         }
     }
 
-    /// The warnings for variables that keep bare uv from applying the `uv.toml` sync writes,
-    /// whose default cutoff is `default`.
-    ///
-    /// A cutoff in `UV_EXCLUDE_NEWER` is compared as text, since its direction would need uv's
-    /// date and span grammar.
-    fn warnings(&self, default: Option<&str>) -> Vec<Diagnostic> {
+    /// The warnings for variables that keep bare uv from applying the `synced` uv.toml, whose
+    /// default cutoff is `default`, judged at `now`.
+    fn warnings(
+        &self,
+        synced: &Utf8Path,
+        default: Option<&str>,
+        now: Timestamp,
+    ) -> Vec<Diagnostic> {
         let mut warnings = Vec::new();
-        if let (Some(value), Some(default)) = (&self.exclude_newer, default)
-            && value != default
-        {
-            warnings.push(Diagnostic::new(
-                DiagnosticKind::Config,
-                format!(
-                    "UV_EXCLUDE_NEWER = {value:?} replaces the exclude-newer = {default:?} sync \
-                     writes to uv.toml, so bare uv runs in this environment resolve under it"
-                ),
-            ));
+        if let (Some(value), Some(default)) = (&self.exclude_newer, default) {
+            warnings.extend(exclude_newer_warning(value, default, now));
         }
-        // uv reads the variable as a clap boolean.
-        if let Some(value) = &self.no_config
+        // uv reads an explicit config file first and considers `UV_NO_CONFIG` only without one.
+        if let Some(file) = &self.config_file {
+            if !names_file(file, synced) {
+                warnings.push(Diagnostic::new(
+                    DiagnosticKind::Config,
+                    format!(
+                        "UV_CONFIG_FILE = {file:?} has bare uv runs in this environment read that \
+                         file instead of the uv.toml sync writes, so they ignore the cooldown \
+                         settings there"
+                    ),
+                ));
+            }
+        } else if let Some(value) = &self.no_config
+            // uv reads the variable as a clap boolean.
             && ["y", "yes", "t", "true", "on", "1"]
                 .iter()
                 .any(|truthy| value.eq_ignore_ascii_case(truthy))
@@ -1123,16 +1130,64 @@ impl UvEnvironment {
                 ),
             ));
         }
-        if let Some(value) = &self.config_file {
-            warnings.push(Diagnostic::new(
-                DiagnosticKind::Config,
-                format!(
-                    "UV_CONFIG_FILE = {value:?} replaces config discovery, so bare uv runs in this \
-                     environment ignore the cooldown settings sync writes to uv.toml"
-                ),
-            ));
-        }
         warnings
+    }
+}
+
+/// The warning for a `UV_EXCLUDE_NEWER` `value` that replaces the `written` default cutoff,
+/// judged at `now`.
+///
+/// Where both read as a relative span or an RFC 3339 instant, the warning says which way the
+/// cutoff moves.
+/// Anything else, such as a bare date that uv reads in local time, earns a warning that claims
+/// no direction.
+fn exclude_newer_warning(value: &str, written: &str, now: Timestamp) -> Option<Diagnostic> {
+    let (kind, effect) = match (cutoff_at(value, now), cutoff_at(written, now)) {
+        (Some(replaced), Some(synced)) if replaced == synced => return None,
+        (Some(replaced), Some(synced)) if replaced > synced => (
+            DiagnosticKind::Config,
+            " with a later cutoff, so bare uv runs in this environment admit releases younger \
+             than the cooldown",
+        ),
+        (Some(_), Some(_)) => (
+            DiagnosticKind::StricterNative,
+            " with an earlier cutoff, so bare uv runs in this environment hold back releases \
+             cooldown admits",
+        ),
+        _ => (DiagnosticKind::Config, ""),
+    };
+    Some(Diagnostic::new(
+        kind,
+        format!(
+            "UV_EXCLUDE_NEWER = {value:?} replaces the exclude-newer = {written:?} sync writes to \
+             uv.toml{effect}"
+        ),
+    ))
+}
+
+/// The instant before which `cutoff` admits releases at `now`: an RFC 3339 instant as it is, or
+/// a relative span back from `now`.
+fn cutoff_at(cutoff: &str, now: Timestamp) -> Option<Timestamp> {
+    if let Ok(instant) = cutoff.parse::<Timestamp>() {
+        return Some(instant);
+    }
+    let span = cooldown_core::duration::parse_duration(cutoff).ok()?;
+    now.checked_sub(span).ok()
+}
+
+/// Whether the config `file` that `UV_CONFIG_FILE` names is the `synced` uv.toml.
+///
+/// uv resolves a relative path against the directory it runs in, which here is taken to be the
+/// one sync runs in.
+/// Canonical paths see through links, and a file that does not exist yet, as before the first
+/// sync writes it, compares by its absolute path.
+fn names_file(file: &str, synced: &Utf8Path) -> bool {
+    let (Ok(file), Ok(synced)) = (std::path::absolute(file), std::path::absolute(synced)) else {
+        return false;
+    };
+    match (file.canonicalize(), synced.canonicalize()) {
+        (Ok(file), Ok(synced)) => file == synced,
+        _ => file == synced,
     }
 }
 
@@ -1156,7 +1211,7 @@ fn write_uv_toml(
     let package_table = exclude_newer_package_table(&policy.package_windows);
     // A policy that leaves both keys unset gives bare uv nothing to skip.
     let warnings = if default.is_some() || package_table.is_some() {
-        env.warnings(default.as_deref())
+        env.warnings(&path, default.as_deref(), Timestamp::now())
     } else {
         Vec::new()
     };
@@ -2106,8 +2161,10 @@ mod tests {
         Ok(())
     }
 
-    /// Each variable that keeps bare uv from applying the written uv.toml earns a warning, and a
-    /// `UV_EXCLUDE_NEWER` equal to the written cutoff or a false `UV_NO_CONFIG` earns none.
+    /// Each variable that keeps bare uv from applying the written uv.toml earns one warning:
+    /// a `UV_EXCLUDE_NEWER` that reads as a span or an instant says which way it moves the
+    /// cutoff, and an explicit `UV_CONFIG_FILE` decides alone over `UV_NO_CONFIG`, silent when it
+    /// names the synced file.
     #[test]
     fn write_uv_toml_warns_about_variables_that_override_it() -> eyre::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -2123,36 +2180,60 @@ mod tests {
             withheld_exemptions: Vec::new(),
             package_windows: std::collections::BTreeMap::new(),
         };
-        let warned = |env: UvEnvironment| -> eyre::Result<Vec<String>> {
+        let warned = |env: UvEnvironment| -> eyre::Result<Vec<(DiagnosticKind, String)>> {
             match write_uv_toml(&root, &policy, &env, true)? {
                 SyncReport::Written { warnings, .. } => Ok(warnings
                     .into_iter()
-                    .map(|warning| warning.message)
+                    .map(|warning| (warning.kind, warning.message))
                     .collect()),
                 other => Err(eyre::eyre!("unexpected sync report {other:?}")),
             }
         };
+        let exclude_newer = |value: &str| UvEnvironment {
+            exclude_newer: Some(value.to_string()),
+            ..UvEnvironment::default()
+        };
 
-        let overriding = warned(UvEnvironment {
-            exclude_newer: Some("1 day".to_string()),
-            no_config: Some("TRUE".to_string()),
-            config_file: Some("other.toml".to_string()),
-        })?;
-        let variables: Vec<&str> = overriding
-            .iter()
-            .filter_map(|message| message.split_once(' ').map(|(variable, _)| variable))
-            .collect();
-        assert_eq!(
-            variables,
-            ["UV_EXCLUDE_NEWER", "UV_NO_CONFIG", "UV_CONFIG_FILE"]
+        // Cutoffs compared by meaning against the written "7 days"
+        for (value, expected) in [
+            ("1 day", Some(DiagnosticKind::Config)),
+            ("30 days", Some(DiagnosticKind::StricterNative)),
+            ("2000-01-01T00:00:00Z", Some(DiagnosticKind::StricterNative)),
+            ("P7D", None),
+        ] {
+            let kinds: Vec<DiagnosticKind> = warned(exclude_newer(value))?
+                .into_iter()
+                .map(|(kind, _)| kind)
+                .collect();
+            assert_eq!(kinds, Vec::from_iter(expected), "{value}");
+        }
+        // A bare date claims no direction.
+        let bare_date = warned(exclude_newer("2026-01-01"))?;
+        assert_eq!(bare_date.len(), 1);
+        assert!(
+            bare_date[0].1.ends_with("sync writes to uv.toml"),
+            "{bare_date:?}"
         );
 
-        let agreeing = warned(UvEnvironment {
-            exclude_newer: Some("7 days".to_string()),
-            no_config: Some("off".to_string()),
-            config_file: None,
-        })?;
-        assert_eq!(agreeing, [] as [String; 0]);
+        // Config file selection
+        let config_file = |file: &str, no_config: &str| UvEnvironment {
+            config_file: Some(file.to_string()),
+            no_config: Some(no_config.to_string()),
+            ..UvEnvironment::default()
+        };
+        assert_eq!(
+            warned(config_file(root.join("uv.toml").as_str(), "true"))?,
+            []
+        );
+        let other = warned(config_file("other.toml", "true"))?;
+        assert_eq!(other.len(), 1, "{other:?}");
+        assert!(other[0].1.starts_with("UV_CONFIG_FILE"), "{other:?}");
+        let no_config = |value: &str| UvEnvironment {
+            no_config: Some(value.to_string()),
+            ..UvEnvironment::default()
+        };
+        assert_eq!(warned(no_config("TRUE"))?.len(), 1);
+        assert_eq!(warned(no_config("off"))?, []);
         Ok(())
     }
 

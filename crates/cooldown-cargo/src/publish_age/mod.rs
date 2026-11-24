@@ -294,30 +294,27 @@ const SECONDS_PER_UNIT: [(&str, i64); 6] = [
     ("hour", 60 * 60),
     ("day", 24 * 60 * 60),
     ("week", 7 * 24 * 60 * 60),
-    // Cargo counts a month as 30 days.
-    ("month", 30 * 24 * 60 * 60),
+    // Cargo counts a month as the average Gregorian month, 30.436875 days.
+    ("month", 2_629_746),
 ];
 
 /// Parses an age in cargo's grammar: `N seconds/minutes/hours/days/weeks/months`.
 ///
-/// The space is optional, the unit may be singular or plural, and a bare `0` means no age.
-/// Cargo rejects any other spelling, such as `14d` or an ISO-8601 span, so this does too.
+/// One space may separate the number from the unit, the unit may be singular or plural, and
+/// exactly `0` means no age.
+/// Cargo rejects any other spelling, such as `14d`, an ISO-8601 span or surrounding whitespace,
+/// so this does too.
 pub(crate) fn parse_age(raw: &str) -> Result<SignedDuration, String> {
     const EXPECTED: &str = "expected \"N seconds/minutes/hours/days/weeks/months\"";
-    let trimmed = raw.trim();
-    let split = trimmed
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(trimmed.len());
-    let (number, unit) = trimmed.split_at(split);
-    let count: i64 = number.parse().map_err(|_| EXPECTED.to_owned())?;
-    let unit = unit.trim();
-    if unit.is_empty() {
-        return if count == 0 {
-            Ok(SignedDuration::ZERO)
-        } else {
-            Err(EXPECTED.to_owned())
-        };
+    if raw == "0" {
+        return Ok(SignedDuration::ZERO);
     }
+    let split = raw
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| EXPECTED.to_owned())?;
+    let (number, unit) = raw.split_at(split);
+    let count: i64 = number.parse().map_err(|_| EXPECTED.to_owned())?;
+    let unit = unit.strip_prefix(' ').unwrap_or(unit);
     let singular = unit.strip_suffix('s').unwrap_or(unit);
     let (_, seconds) = SECONDS_PER_UNIT
         .iter()
@@ -331,7 +328,8 @@ pub(crate) fn parse_age(raw: &str) -> Result<SignedDuration, String> {
 
 /// Spells `age` in cargo's grammar using the largest unit that divides it exactly.
 ///
-/// Months are never used, because cargo's 30-day month would silently round a calendar reading.
+/// Months are never used, because a reader would take cargo's average month of 30.436875 days
+/// for a calendar month.
 /// Returns `None` for a negative or sub-second age, which cargo cannot express.
 pub(crate) fn render_age(age: SignedDuration) -> Option<String> {
     if age.is_negative() || age.subsec_nanos() != 0 {

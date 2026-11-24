@@ -9,11 +9,11 @@
 //! only when the lock proves pnpm resolved it from there too.
 
 use crate::exclusions::{
-    MatchSemantics, Persisted, exempts, persisted_rules, prune_exact_members, set_exact_permission,
-    version_identity,
+    MatchSemantics, Persisted, configured_rules, exempts, persisted_rules, prune_exact_members,
+    set_exact_permission, version_identity,
 };
 use crate::lock::{LockOrigin, NameVersion};
-use crate::native::{EmptyList, NativeAge, render_yaml_block_list};
+use crate::native::{ConfigStringList, EmptyList, NativeAge, render_yaml_block_list};
 use crate::npmrc::{RegistryOverrides, advisory_identity};
 use camino::Utf8Path;
 use cooldown_core::{
@@ -421,7 +421,9 @@ pub(crate) fn assess(input: AssessmentInput<'_>) -> Result<NativeAssessment> {
             .or_default()
             .insert(version.to_string());
     }
-    let exclusions = NativeAge::parse(native.text, native.path)?.exclusions;
+    let exclusions = NativeAge::parse(native.text, native.path)?
+        .exclusions
+        .unwrap_or_default();
     let evidence = ExemptionEvidence {
         locked,
         mirrored: None,
@@ -505,6 +507,48 @@ pub(crate) fn configures_pnpmfile(listing: &str) -> bool {
             _ => false,
         }
     })
+}
+
+/// pnpm's effective release-age settings, as one `config list --json` prints them.
+pub(crate) struct EffectiveGate {
+    /// The window, or `None` when no configuration sets one and pnpm's built-in default applies.
+    pub(crate) minutes: Option<i64>,
+    /// The exclusion rules, as pnpm reads them, or `None` when the listing has none, so pnpm
+    /// applies none.
+    pub(crate) rules: Option<Vec<String>>,
+    /// Whether `minimumReleaseAgeStrict` is `false`, which lets pnpm pick a young version where no
+    /// mature one satisfies the request.
+    pub(crate) relaxed: bool,
+}
+
+impl EffectiveGate {
+    /// Reads the settings from `listing`, under pnpm 11's spelling or pnpm 10's.
+    ///
+    /// Returns `None` when the listing or one of the settings cannot be read.
+    pub(crate) fn from_listing(listing: &str) -> Option<Self> {
+        let serde_json::Value::Object(config) = serde_json::from_str(listing).ok()? else {
+            return None;
+        };
+        let mut gate = EffectiveGate {
+            minutes: None,
+            rules: None,
+            relaxed: false,
+        };
+        for (key, value) in config {
+            match key.replace('-', "").to_ascii_lowercase().as_str() {
+                "minimumreleaseage" => gate.minutes = serde_json::from_value(value).ok()?,
+                "minimumreleaseageexclude" => {
+                    let rules: Option<ConfigStringList> = serde_json::from_value(value).ok()?;
+                    gate.rules = rules.map(configured_rules);
+                }
+                "minimumreleaseagestrict" => {
+                    gate.relaxed = value == serde_json::Value::Bool(false);
+                }
+                _ => {}
+            }
+        }
+        Some(gate)
+    }
 }
 
 /// Whether pnpm loads the pnpmfile of the configuration dependency `name` as a plugin's, as
@@ -1111,5 +1155,23 @@ mod tests {
         assert!(!evidence.young("lodash", "4.17.21", days(14)));
         assert!(!evidence.young("lodash", "4.17.20", days(1)));
         assert!(!evidence.young("left-pad", "1.3.0", days(1)));
+    }
+
+    /// pnpm 11 lists the gate in camel case and pnpm 10 in kebab case, and both read the same.
+    #[test]
+    fn effective_gate_reads_both_spellings() {
+        for listing in [
+            r#"{"minimumReleaseAge":60,"minimumReleaseAgeExclude":["a"],"minimumReleaseAgeStrict":false}"#,
+            r#"{"minimum-release-age":60,"minimum-release-age-exclude":["a"],"minimum-release-age-strict":false}"#,
+        ] {
+            let gate = EffectiveGate::from_listing(listing).expect("a readable listing");
+            assert_eq!(gate.minutes, Some(60), "{listing}");
+            assert_eq!(
+                gate.rules.as_deref(),
+                Some(&["a".to_string()][..]),
+                "{listing}"
+            );
+            assert!(gate.relaxed, "{listing}");
+        }
     }
 }

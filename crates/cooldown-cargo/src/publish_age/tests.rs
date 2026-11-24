@@ -67,11 +67,15 @@ fn parse_age_accepts_cargo_spellings() {
     assert_eq!(parse_age("90 minutes"), Ok(SignedDuration::from_mins(90)));
     assert_eq!(parse_age("5 seconds"), Ok(SignedDuration::from_secs(5)));
 
-    // Cargo's month is exactly 30 days.
-    assert_eq!(parse_age("1 month"), Ok(days(30)));
+    // Cargo's month is the average Gregorian month.
+    assert_eq!(
+        parse_age("1 month"),
+        Ok(SignedDuration::from_secs(2_629_746))
+    );
 
-    // A bare zero disables the age.
+    // Exactly `0` disables the age.
     assert_eq!(parse_age("0"), Ok(SignedDuration::ZERO));
+    assert_eq!(parse_age("0 days"), Ok(SignedDuration::ZERO));
 }
 
 #[test]
@@ -85,6 +89,10 @@ fn parse_age_rejects_what_cargo_rejects() {
         "7",
         "1 fortnight",
         "-3 days",
+        "1 day ",
+        " 1 day",
+        "1  day",
+        " 0",
     ] {
         assert!(parse_age(raw).is_err(), "{raw:?} must be rejected");
     }
