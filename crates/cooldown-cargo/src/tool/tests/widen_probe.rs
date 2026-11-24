@@ -1951,8 +1951,8 @@ impl OvershootCase {
     }
 }
 
-/// The lock where `app` binds `pkg000` 0.9.0 under a renamed declaration and `pkg000` at `app`,
-/// and the crates.io `holder` binds `pkg000` at `holder`.
+/// The lock where `app` binds `helper` 1.0.0, `pkg000` 0.9.0 under a renamed declaration and
+/// `pkg000` at `app`, and the crates.io `holder` binds `pkg000` at `holder`.
 fn overshoot_lock(app: &str, holder: &str) -> String {
     let crates_io = crate::lockfile::CRATES_IO_SOURCE;
     let mut versions = vec!["0.9.0", app, holder];
@@ -1964,7 +1964,12 @@ fn overshoot_lock(app: &str, holder: &str) -> String {
         [[package]]
         name = "app"
         version = "0.1.0"
-        dependencies = ["holder", "pkg000 0.9.0", "pkg000 {app}"]
+        dependencies = ["helper", "holder", "pkg000 0.9.0", "pkg000 {app}"]
+
+        [[package]]
+        name = "helper"
+        version = "1.0.0"
+        source = "{crates_io}"
 
         [[package]]
         name = "holder"
@@ -2003,9 +2008,10 @@ fn overshoot_metadata(project: &Project, app: &str) -> serde_json::Value {
     })
 }
 
-/// Runs the per-change widen of the fixture's only change.
+/// Runs the per-change widen of the fixture's only change under `plan`.
 async fn widen_alone(
     fixture: &WidenFixture,
+    plan: &[Change],
     journal: &ProjectMutationJournal,
     rejections: &mut PinRejections,
     stats: &mut MemoStats,
@@ -2016,7 +2022,7 @@ async fn widen_alone(
         .tentative_widen_logged(
             WidenProbe {
                 project: &fixture.project,
-                plan: &fixture.changes,
+                plan,
                 rewrite: RewriteMode::Auto,
                 candidates: &[candidate],
                 protected: &[],
@@ -2046,6 +2052,7 @@ async fn a_widen_overshooting_its_target_lands_once_pinned_back() -> eyre::Resul
 
     let outcome = widen_alone(
         &fixture,
+        &fixture.changes,
         &journal,
         &mut PinRejections::new(),
         &mut MemoStats::default(),
@@ -2081,55 +2088,66 @@ async fn a_widen_overshooting_its_target_lands_once_pinned_back() -> eyre::Resul
 }
 
 /// A widen whose pinned-back target still forks a declared crate stays held with the split it
-/// would cause, which outranks Cargo's refusal of the precise pin, cold and replayed.
+/// would cause, which outranks Cargo's refusal of the precise pin.
+///
+/// The pin back also moves `app`'s `helper` binding, which only a plan carrying `helper`'s move
+/// authorizes, so the verdict depends on the plan and a later attempt under another plan judges
+/// the step again instead of replaying it.
 #[tokio::test]
-async fn a_pinned_back_target_that_splits_stays_held_cold_and_replayed() -> eyre::Result<()> {
+async fn a_pinned_back_split_is_judged_again_under_another_plan() -> eyre::Result<()> {
     let fixture = OvershootCase::NEW_LINE.fixture()?;
+    let landed = fixture.project.root.join("landed.lock");
+    let moved_helper = std::fs::read_to_string(&landed)?.replace(
+        "name = \"helper\"\nversion = \"1.0.0\"",
+        "name = \"helper\"\nversion = \"1.1.0\"",
+    );
+    std::fs::write(&landed, moved_helper)?;
+    let helper = Change {
+        members: fixture.changes[0].members.clone(),
+        ..change("helper", "1.0.0", "1.1.0", false)
+    };
+    let with_helper = [fixture.changes[0].clone(), helper];
     let journal = fixture.journal().await?;
     let manifest = std::fs::read_to_string(&fixture.project.manifest)?;
     let key = rejection_key(&fixture.changes[0]);
+    let mut stats = MemoStats::default();
 
-    // Cold: the pin back lands the target beside the line 1 `holder` retains.
-    let mut cold = PinRejections::new();
-    let mut cold_memo = MemoStats::default();
-    let outcome = widen_alone(&fixture, &journal, &mut cold, &mut cold_memo).await?;
-    assert!(matches!(outcome, TentativeWiden::Rejected));
-    assert!(
-        fixture
-            .invocations()?
-            .iter()
-            .any(|arguments| arguments.contains("#pkg000@2.1.0 --precise 2.0.0"))
-    );
-    assert_eq!(
-        std::fs::read_to_string(&fixture.project.manifest)?,
-        manifest
-    );
-    assert_eq!(
-        std::fs::read_to_string(fixture.project.root.join("Cargo.lock"))?,
-        overshoot_lock("1.0.0", "1.0.0")
-    );
-    let detail = cold
-        .get(&key)
-        .ok_or_else(|| eyre::eyre!("the held candidate keeps its rejection: {cold:?}"))?;
-    assert_eq!(detail.origin, DiagnosticOrigin::Acceptance, "{detail:?}");
-    assert!(
-        detail
-            .text
-            .contains("would resolve direct dependency pkg000 at another incompatible line")
-            && detail.text.contains("holder 1.0.0"),
-        "{detail:?}"
-    );
+    for (plan, reason) in [
+        (
+            &with_helper[..],
+            "would resolve direct dependency pkg000 at another incompatible line",
+        ),
+        (
+            &fixture.changes[..],
+            "would move directly declared helper 1.0.0 to 1.1.0",
+        ),
+    ] {
+        let mut rejections = PinRejections::new();
+        let outcome = widen_alone(&fixture, plan, &journal, &mut rejections, &mut stats).await?;
 
-    // Replayed: no planned move heals the split, so the remembered refusal reports it again
-    // without running Cargo.
-    let calls = fixture.invocations()?.len();
-    let mut replayed = PinRejections::new();
-    let mut replay_memo = MemoStats::default();
-    let outcome = widen_alone(&fixture, &journal, &mut replayed, &mut replay_memo).await?;
-    assert!(matches!(outcome, TentativeWiden::Rejected));
-    assert_eq!(replay_memo.hits, 1);
-    assert_eq!(fixture.invocations()?.len(), calls);
-    assert_eq!(replayed, cold);
+        // The step is restored either way, and held with the first rule this plan breaks.
+        assert!(matches!(outcome, TentativeWiden::Rejected), "{reason}");
+        assert_eq!(
+            std::fs::read_to_string(&fixture.project.manifest)?,
+            manifest
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.project.root.join("Cargo.lock"))?,
+            overshoot_lock("1.0.0", "1.0.0")
+        );
+        let detail = rejections
+            .get(&key)
+            .ok_or_else(|| eyre::eyre!("{reason}: {rejections:?}"))?;
+        assert_eq!(detail.origin, DiagnosticOrigin::Acceptance, "{detail:?}");
+        assert!(detail.text.contains(reason), "{detail:?}");
+    }
+    // Both attempts pinned the overshoot back themselves.
+    let pins_back = fixture
+        .invocations()?
+        .iter()
+        .filter(|arguments| arguments.contains("#pkg000@2.1.0 --precise 2.0.0"))
+        .count();
+    assert_eq!(pins_back, 2);
     Ok(())
 }
 
@@ -2147,7 +2165,14 @@ async fn a_refused_pin_back_is_held_with_its_refusal_and_not_replayed() -> eyre:
     let mut stats = MemoStats::default();
     for attempt in 1..=2 {
         let mut rejections = PinRejections::new();
-        let outcome = widen_alone(&fixture, &journal, &mut rejections, &mut stats).await?;
+        let outcome = widen_alone(
+            &fixture,
+            &fixture.changes,
+            &journal,
+            &mut rejections,
+            &mut stats,
+        )
+        .await?;
 
         assert!(
             matches!(outcome, TentativeWiden::Rejected),
@@ -2174,5 +2199,196 @@ async fn a_refused_pin_back_is_held_with_its_refusal_and_not_replayed() -> eyre:
             .count();
         assert_eq!(pins_back, attempt);
     }
+    Ok(())
+}
+
+/// A joint widen of `pkg000` and `pkg001`, each `1.0.0 → 1.1.0` and declared `~1.0` by `app`,
+/// whose resolve binds both at 1.3.0.
+///
+/// Pinning `pkg000` back also moves `pkg001` to 1.2.0 while `pkg001` is widened, and `pkg001` can
+/// then be pinned back from there, unless a `refuse-pkg001` file makes Cargo refuse that.
+/// Any other pin, such as one of a `pkg001` copy that is gone, is refused.
+fn pair_fixture() -> eyre::Result<WidenFixture> {
+    let mut fixture = WidenFixture::new(
+        2,
+        indoc! {r##"
+            widened() { ! grep -q "$1 = \"~1.0\"" Cargo.toml; }
+            case "$*" in
+              *"#pkg000@1.3.0 --precise 1.1.0"*)
+                if widened pkg001; then
+                  cp first-pinned.lock Cargo.lock
+                else
+                  cp first-landed.lock Cargo.lock
+                fi
+                ;;
+              *"#pkg001@1.2.0 --precise 1.1.0"*)
+                if [ -f refuse-pkg001 ]; then
+                  echo 'error: failed to select a version for the requirement `pkg001 = "^1.2"`' >&2
+                  echo 'required by package `pkg000 v1.1.0`' >&2
+                  exit 101
+                fi
+                cp landed.lock Cargo.lock
+                ;;
+              update*)
+                echo 'error: package ID specification did not match any packages' >&2
+                exit 101
+                ;;
+              *--locked*) ;;
+              *)
+                if widened pkg000 && widened pkg001; then
+                  cp overshot.lock Cargo.lock
+                elif widened pkg000; then
+                  cp first-overshot.lock Cargo.lock
+                fi
+                ;;
+            esac
+            for state in base overshot first-overshot first-pinned first-landed landed; do
+              if cmp -s Cargo.lock "$state.lock"; then cp "$state.json" metadata.json; fi
+            done
+        "##},
+    )?;
+    for planned in &mut fixture.changes {
+        planned.to = Version::new("1.1.0");
+        planned.direct = true;
+        planned.members = vec![MemberRef {
+            name: "app".to_owned(),
+            path: ".".to_owned(),
+        }];
+    }
+    let manifest =
+        std::fs::read_to_string(&fixture.project.manifest)?.replace(" = \"1\"", " = \"~1.0\"");
+    std::fs::write(&fixture.project.manifest, manifest)?;
+    let root = fixture.project.root.clone();
+    for (state, first, second) in [
+        ("base", "1.0.0", "1.0.0"),
+        ("overshot", "1.3.0", "1.3.0"),
+        ("first-overshot", "1.3.0", "1.0.0"),
+        ("first-pinned", "1.1.0", "1.2.0"),
+        ("first-landed", "1.1.0", "1.0.0"),
+        ("landed", "1.1.0", "1.1.0"),
+    ] {
+        std::fs::write(root.join(format!("{state}.lock")), pair_lock(first, second))?;
+        std::fs::write(
+            root.join(format!("{state}.json")),
+            serde_json::to_vec(&pair_metadata(&fixture.project, first, second))?,
+        )?;
+    }
+    std::fs::write(root.join("Cargo.lock"), pair_lock("1.0.0", "1.0.0"))?;
+    Ok(fixture)
+}
+
+/// The lock where `app` binds `pkg000` at `first` and `pkg001` at `second`.
+fn pair_lock(first: &str, second: &str) -> String {
+    let crates_io = crate::lockfile::CRATES_IO_SOURCE;
+    formatdoc! {r#"
+        version = 4
+
+        [[package]]
+        name = "app"
+        version = "0.1.0"
+        dependencies = ["pkg000", "pkg001"]
+
+        [[package]]
+        name = "pkg000"
+        version = "{first}"
+        source = "{crates_io}"
+
+        [[package]]
+        name = "pkg001"
+        version = "{second}"
+        source = "{crates_io}"
+    "#}
+}
+
+/// The member graph of [`pair_lock`].
+fn pair_metadata(project: &Project, first: &str, second: &str) -> serde_json::Value {
+    let crates_io = crate::lockfile::CRATES_IO_SOURCE;
+    serde_json::json!({
+        "packages": [
+            {"id": "app", "name": "app", "version": "0.1.0", "manifest_path": project.manifest},
+            {"id": "first", "name": "pkg000", "version": first, "source": crates_io},
+            {"id": "second", "name": "pkg001", "version": second, "source": crates_io}
+        ],
+        "workspace_members": ["app"], "workspace_root": project.root,
+        "resolve": {"nodes": [
+            {"id": "app", "deps": [
+                {"name": "pkg000", "pkg": "first"}, {"name": "pkg001", "pkg": "second"}
+            ]},
+            {"id": "first", "deps": []}, {"id": "second", "deps": []}
+        ]}
+    })
+}
+
+/// A joint widen pins each overshoot back from the copy the earlier pins left, so a pin that
+/// moves another candidate's copy is followed by that copy's own pin, and both land exactly.
+#[tokio::test]
+async fn a_joint_pin_back_follows_a_copy_an_earlier_pin_moved() -> eyre::Result<()> {
+    let fixture = pair_fixture()?;
+    let journal = fixture.journal().await?;
+
+    let evidence = fixture
+        .probe(&journal, &mut WholeGraphStats::default())
+        .await?
+        .ok_or_else(|| eyre::eyre!("the joint widen lands: {:?}", fixture.invocations()))?;
+
+    assert!(
+        fixture
+            .changes
+            .iter()
+            .all(|change| evidence.reached(change))
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.project.root.join("Cargo.lock"))?,
+        pair_lock("1.1.0", "1.1.0")
+    );
+    // `pkg001` is pinned from 1.2.0, where the `pkg000` pin moved it, not from the 1.3.0 the
+    // resolve had bound.
+    let invocations = fixture.invocations()?;
+    assert!(
+        invocations
+            .iter()
+            .any(|arguments| arguments.contains("#pkg001@1.2.0 --precise 1.1.0")),
+        "{invocations:?}"
+    );
+    assert!(
+        !invocations
+            .iter()
+            .any(|arguments| arguments.contains("#pkg001@1.3.0")),
+        "{invocations:?}"
+    );
+    Ok(())
+}
+
+/// A joint pin back Cargo refuses refuses the group with that refusal attached to the candidate
+/// it left short: the candidate keeps Cargo's reason, and the group resolves again without it.
+#[tokio::test]
+async fn a_refused_joint_pin_back_holds_its_candidate_with_the_refusal() -> eyre::Result<()> {
+    let fixture = pair_fixture()?;
+    std::fs::write(fixture.project.root.join("refuse-pkg001"), "")?;
+    let journal = fixture.journal().await?;
+    let mut rejections = PinRejections::new();
+
+    let evidence = fixture
+        .probe_recording(
+            &journal,
+            CulpritDrop::First,
+            &mut rejections,
+            &mut WholeGraphStats::default(),
+        )
+        .await?
+        .ok_or_else(|| eyre::eyre!("the rest of the group lands: {:?}", fixture.invocations()))?;
+
+    // `pkg000` lands alone at its target, and `pkg001` stays at its original version.
+    assert!(evidence.reached(&fixture.changes[0]));
+    assert_eq!(
+        std::fs::read_to_string(fixture.project.root.join("Cargo.lock"))?,
+        pair_lock("1.1.0", "1.0.0")
+    );
+    // The held `pkg001` reports why Cargo refused its exact target.
+    let detail = rejections
+        .get(&rejection_key(&fixture.changes[1]))
+        .ok_or_else(|| eyre::eyre!("the short candidate keeps a reason: {rejections:?}"))?;
+    assert_eq!(detail.origin, DiagnosticOrigin::Resolver, "{detail:?}");
+    assert!(detail.text.contains("pkg001 = \"^1.2\""), "{detail:?}");
     Ok(())
 }

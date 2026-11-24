@@ -414,11 +414,18 @@ impl ResolvedGraph {
         let from_major = crate::version::major_key(from);
         let target_major = crate::version::major_key(target);
         for member in members {
-            let Some(dependencies) = self.member_dependencies(member) else {
+            let Some(root) = self.roots.iter().find(|root| {
+                self.packages
+                    .get(*root)
+                    .is_some_and(|info| info.name == member.name && info.path == member.path)
+            }) else {
+                return false;
+            };
+            let Some(dep_ids) = self.edges.get(root) else {
                 return false;
             };
             let mut reached = false;
-            for info in dependencies {
+            for info in dep_ids.iter().filter_map(|id| self.packages.get(id)) {
                 if info.name != crate_name || !info.is_crates_io() {
                     continue;
                 }
@@ -444,34 +451,6 @@ impl ResolvedGraph {
         }
 
         true
-    }
-
-    /// The crates.io versions of `crate_name` that `members` depend on directly.
-    #[must_use]
-    pub fn direct_crates_io_versions(
-        &self,
-        members: &[MemberRef],
-        crate_name: &str,
-    ) -> BTreeSet<&str> {
-        members
-            .iter()
-            .filter_map(|member| self.member_dependencies(member))
-            .flatten()
-            .filter(|info| info.name == crate_name && info.is_crates_io())
-            .map(|info| info.version.as_str())
-            .collect()
-    }
-
-    /// The packages `member` depends on directly, or `None` when the graph has no such member or
-    /// no resolve node for it.
-    fn member_dependencies(&self, member: &MemberRef) -> Option<impl Iterator<Item = &PkgInfo>> {
-        let root = self.roots.iter().find(|root| {
-            self.packages
-                .get(*root)
-                .is_some_and(|info| info.name == member.name && info.path == member.path)
-        })?;
-        let dependencies = self.edges.get(root)?;
-        Some(dependencies.iter().filter_map(|id| self.packages.get(id)))
     }
 
     /// The authored workspace member crates that directly depend on `id` — the source packages a

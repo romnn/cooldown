@@ -743,22 +743,6 @@ fn current_selector(lock: &CargoLock, change: &Change) -> Option<String> {
     None
 }
 
-/// The crates.io version of `change`'s crate that its declaring members bind past its target on
-/// the target's compatibility line, which a resolve of the widened requirement can land.
-///
-/// Cargo keeps at most one version of a crate from one source on a compatibility line, so the
-/// members bind at most one such version.
-fn overshot_copy<'g>(graph: &'g ResolvedGraph, change: &Change) -> Option<&'g str> {
-    let target = change.to.as_str();
-    graph
-        .direct_crates_io_versions(&change.members, &change.package.name)
-        .into_iter()
-        .find(|version| {
-            compatibility_line(version) == compatibility_line(target)
-                && version::compare(version, target).is_gt()
-        })
-}
-
 /// The paired version-slot changes that `applied` does not already report, as sorted collateral
 /// rows.
 ///
@@ -1302,9 +1286,9 @@ impl CulpritDrop {
     /// The `candidates` a probe retries without after `outcome` refused or violated the group,
     /// or `None` when it drops none or all of them and the probe stops.
     ///
-    /// Every candidate a violation names is recorded with that violation either way: a probe that
-    /// stops still decided the hold, and the candidate's own attempt may not run again to explain
-    /// it.
+    /// Every candidate a violation names is recorded with that violation either way, and so is
+    /// the candidate a refused pin back left short with Cargo's refusal: a probe that stops still
+    /// decided the hold, and the candidate's own attempt may not run again to explain it.
     fn retry_without<'c>(
         self,
         outcome: &GroupResolve,
@@ -1322,7 +1306,15 @@ impl CulpritDrop {
     /// The `candidates` a probe retries without after `outcome` refused or violated the group.
     fn dropped<'c>(self, outcome: &GroupResolve, candidates: &[&'c Change]) -> Vec<&'c Change> {
         match outcome {
-            GroupResolve::Refused { parties, chain } => {
+            // Only the candidate a refused pin back left short missed its target there.
+            GroupResolve::Refused {
+                short: Some(short), ..
+            } => candidates
+                .iter()
+                .copied()
+                .filter(|change| rejection_key(change) == short.key)
+                .collect(),
+            GroupResolve::Refused { parties, chain, .. } => {
                 refused_candidates(candidates, parties, chain)
             }
             // A violation that names the planned crates whose own moves broke the rule retries
@@ -1356,6 +1348,9 @@ enum GroupResolve {
     Refused {
         parties: Vec<ConflictParty>,
         chain: BTreeSet<String>,
+        /// The candidate whose overshoot Cargo refused to pin back to its target, with that
+        /// refusal for its held row, when Cargo explained it.
+        short: Option<RejectionEffect>,
     },
     /// The resolve broke the acceptance rule.
     Violated {
@@ -1375,16 +1370,48 @@ enum GroupResolve {
 }
 
 impl GroupResolve {
-    /// Records each of the `dropped` candidates' rejection as the violation that names it.
+    /// Cargo's refusal `error` of a step of the group, which left `short`, when given, short of
+    /// its target.
+    fn refused(error: &CoreError, short: Option<&Change>) -> Self {
+        let parties = rejection_parties(error);
+        Self::Refused {
+            short: short
+                .zip(summarize_pin_rejection(error))
+                .map(|(change, summary)| RejectionEffect {
+                    key: rejection_key(change),
+                    detail: RejectionDetail::resolver(summary, parties.clone()),
+                }),
+            chain: rejection_chain(error),
+            parties,
+        }
+    }
+
+    /// Records each of the `dropped` candidates' rejection as the violation that names it, or as
+    /// Cargo's refusal of its pin back.
     ///
     /// Under `--fast` one resolve drops the culprits of several violations, so each dropped
     /// candidate is blamed with its own violation, not the resolve's first.
     fn blame(&self, dropped: &[&Change], rejections: &mut PinRejections) {
-        let Self::Violated {
-            culprits, landed, ..
-        } = self
-        else {
-            return;
+        let (culprits, landed) = match self {
+            Self::Violated {
+                culprits, landed, ..
+            } => (culprits, landed),
+            Self::Refused {
+                short: Some(short), ..
+            } => {
+                if dropped
+                    .iter()
+                    .any(|change| rejection_key(change) == short.key)
+                {
+                    MemoRejection {
+                        effects: vec![short.clone()],
+                        ..MemoRejection::default()
+                    }
+                    .apply(rejections);
+                }
+                return;
+            }
+            Self::Resolved(_) | Self::Refused { .. } | Self::Discarded => return,
         };
         MemoRejection {
             effects: dropped
@@ -1565,12 +1592,17 @@ fn unreleased_split(heal: SplitHeal) -> UnlockedSplit {
     }
 }
 
-/// What [`CargoTool::pin_overshoots_back`] left.
-struct PinnedBack {
-    /// The graph of the lock the pins left.
-    graph: ResolvedGraph,
-    /// Cargo's refusal of each pin that did not land.
-    refusals: Vec<CoreError>,
+/// What [`CargoTool::pin_overshoots_back`] achieved.
+enum PinBack<'c> {
+    /// No change's own declaration was past its target, so the resolve's graph stands.
+    Unneeded(ResolvedGraph),
+    /// Every overshoot was pinned back to its target, with the graph of the lock the pins left.
+    Landed(ResolvedGraph),
+    /// Cargo refused to pin `change`'s overshoot back, so the pins stopped there.
+    Refused {
+        change: &'c Change,
+        error: CoreError,
+    },
 }
 
 /// What [`CargoTool::complete_split`] achieved.
@@ -2822,10 +2854,7 @@ impl CargoTool {
             match unlocked {
                 Ok(()) => {}
                 Err(err) if seed_resolver_rejection(&err) => {
-                    return Ok(GroupResolve::Refused {
-                        parties: rejection_parties(&err),
-                        chain: rejection_chain(&err),
-                    });
+                    return Ok(GroupResolve::refused(&err, None));
                 }
                 Err(err) => return Err(err),
             }
@@ -2836,19 +2865,19 @@ impl CargoTool {
         let graph = match resolved {
             Ok(graph) => graph,
             Err(err) if seed_resolver_rejection(&err) => {
-                return Ok(GroupResolve::Refused {
-                    parties: rejection_parties(&err),
-                    chain: rejection_chain(&err),
-                });
+                return Ok(GroupResolve::refused(&err, None));
             }
             Err(err) => return Err(err),
         };
-        // A candidate whose pin back Cargo refuses stays past its target, which the checks below
-        // refuse.
-        let graph = self
-            .pin_overshoots_back(probe.scope(), candidates, graph)
+        let graph = match self
+            .pin_overshoots_back(probe.scope(), &baseline, candidates, graph)
             .await?
-            .graph;
+        {
+            PinBack::Unneeded(graph) | PinBack::Landed(graph) => graph,
+            PinBack::Refused { change, error } => {
+                return Ok(GroupResolve::refused(&error, Some(change)));
+            }
+        };
         // No follower edit follows this call: the graph and lock describe the retained manifests.
         let lock = read_lock(probe.project)?;
         if seed_has_drive_by(&before, &lock, &moves) {
@@ -3135,12 +3164,19 @@ impl CargoTool {
                 // it started from.
                 Ok(graph) => {
                     let pinned = self
-                        .pin_overshoots_back(probe.scope(), &[change], graph)
+                        .pin_overshoots_back(probe.scope(), &baseline, &[change], graph)
                         .await?;
-                    for refusal in &pinned.refusals {
-                        stats.record_refusal(change, refusal, rejections);
+                    // A pin back can move another declaration that only this plan authorizes, so
+                    // a repaired step's verdict depends on the plan, which the memo key omits.
+                    stats.memo_disqualified |= !matches!(pinned, PinBack::Unneeded(_));
+                    match pinned {
+                        PinBack::Unneeded(graph) | PinBack::Landed(graph) => Some(graph),
+                        PinBack::Refused { error, .. } => {
+                            stats.record_refusal(change, &error, rejections);
+                            restore_widen_checkpoint(probe.project, probe.journal, checkpoint)?;
+                            return Ok(TentativeWiden::Rejected);
+                        }
                     }
-                    Some(pinned.graph)
                 }
                 Err(err) if err.is_tool_spawn_failure() || err.is_local_environment_failure() => {
                     stats.memo_disqualified = true;
@@ -4332,58 +4368,59 @@ impl CargoTool {
         self.pin_back(scope, change, &overshoot).await
     }
 
-    /// Pins every one of `changes` whose declaring members `graph` shows bound past its target,
-    /// on the target's compatibility line, back to that target.
+    /// Pins every one of `changes` whose own declaration a resolve bound past its target, on the
+    /// target's compatibility line, back to that target.
     ///
     /// A widened requirement admits the newest release on the target's line, which a resolve
     /// lands where Cargo refused to pin the old version because another requirer still matches
     /// it.
-    /// Each pin addresses the copy the change's own declaration binds, which the old version's
-    /// selector cannot reach once that version stays behind for another requirer.
-    /// A pin Cargo refuses leaves its change past the target, and the step's own checks judge
-    /// the result.
+    /// Each pin addresses the copy the change's declaration moved to from the `baseline` the
+    /// step started from, which the old version's selector cannot reach once that version stays
+    /// behind for another requirer.
+    /// Each selector is read from the lock the earlier pins left, since a pin can move another
+    /// change's copy too.
+    /// The pins stop at the first one Cargo refuses.
     ///
     /// # Errors
     ///
     /// Returns a local environment failure of a pin, a refusal of the journal to validate the
     /// project, or the failure of the locked read of the pinned lock.
-    async fn pin_overshoots_back(
+    async fn pin_overshoots_back<'c>(
         &self,
         scope: PinScope<'_>,
-        changes: &[&Change],
+        baseline: &ResolveBaseline,
+        changes: &[&'c Change],
         graph: ResolvedGraph,
-    ) -> Result<PinnedBack> {
+    ) -> Result<PinBack<'c>> {
         let PinScope {
             project,
             journal,
             observer,
             ..
         } = scope;
-        let mut refusals = Vec::new();
         let mut landed = false;
         for change in changes {
-            let Some(overshoot) = overshot_copy(&graph, change) else {
+            journal.validate_project(&project.root)?;
+            let lock = read_lock(project)?;
+            let Some(overshoot) = baseline.overshoot(&lock, &project.generated_members, change)
+            else {
                 continue;
             };
-            journal.validate_project(&project.root)?;
-            let pinned = self.pin_back(scope, change, overshoot).await;
+            let pinned = self.pin_back(scope, change, &overshoot).await;
             journal.validate_project(&project.root)?;
             match pinned {
                 Ok(()) => landed = true,
-                Err(err) if err.is_local_environment_failure() => return Err(err),
-                Err(err) => refusals.push(err),
+                Err(error) if error.is_local_environment_failure() => return Err(error),
+                Err(error) => return Ok(PinBack::Refused { change, error }),
             }
         }
         if !landed {
-            return Ok(PinnedBack { graph, refusals });
+            return Ok(PinBack::Unneeded(graph));
         }
         if let Some(observer) = observer {
             observer.resolver_started(None);
         }
-        Ok(PinnedBack {
-            graph: self.locked_reader().graph(project).await?,
-            refusals,
-        })
+        Ok(PinBack::Landed(self.locked_reader().graph(project).await?))
     }
 
     /// Pins the crates.io copy of `change`'s crate at `overshoot` to the change's target.
