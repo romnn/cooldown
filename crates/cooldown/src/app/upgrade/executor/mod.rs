@@ -3279,10 +3279,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             return outcome;
         }
         let plan = self.batch_plan(&changes, state, search);
-        let primary = changes
-            .first()
-            .map(|change| change.package.name.clone())
-            .unwrap_or_default();
         self.ctx
             .progress
             .phase(format!("applying {} planned changes", changes.len()));
@@ -3292,10 +3288,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .await
         {
             Ok(prepared) => prepared,
+            // Nothing ran, so the failure is every change's own, the row each one settles on.
             Err(error) => {
-                outcome
-                    .errors
-                    .push(self.project_diag(&error, Some(&primary)));
+                self.add_change_errors(&mut outcome, &error, &changes);
                 return outcome;
             }
         };

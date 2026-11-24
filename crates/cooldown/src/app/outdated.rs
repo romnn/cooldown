@@ -883,8 +883,8 @@ fn take_copy(
 /// `exempt`; a refused move blocks the row at that move's target, and a failure for the copy
 /// makes the row an `error`.
 /// A row with a matured target is `blocked` when the dry run decided nothing about its copy,
-/// because `upgrade` never moves it, and an `error` when the pass settled no copy at all
-/// (`unsettled` is then the failure that stopped it).
+/// because `upgrade` never moves it; that row, and a held one, is an `error` when the pass
+/// settled no copy at all (`unsettled` is then the failure that stopped it).
 /// Every other row keeps its own verdict.
 fn settle(
     item: &mut OutdatedItem,
@@ -900,7 +900,8 @@ fn settle(
             .is_some_and(|target| *target != dep.current);
     let outcome = match outcome {
         Some(outcome) => outcome,
-        None if actionable => unsettled.clone(),
+        // A held row is one a follower replan can try once its holder moves.
+        None if actionable || verdict.status == Status::Held => unsettled.clone(),
         None => return,
     };
     let (to, security) = match outcome {
@@ -1216,13 +1217,12 @@ mod tests {
         }
     }
 
-    /// A pass that settled no copy fails only the rows whose matured target it was to confirm.
+    /// A pass that settled no copy fails the rows it could have moved: one with a matured
+    /// target and a held one, which a follower replan tries once its holder moves.
     #[test]
-    fn an_unsettled_pass_fails_only_the_targets_it_left_unconfirmed() {
-        assert_eq!(
-            settled(OutdatedStatus::Adoptable, None).0,
-            OutdatedStatus::Error
-        );
-        assert_eq!(settled(OutdatedStatus::Held, None).0, OutdatedStatus::Held);
+    fn an_unsettled_pass_fails_the_rows_it_could_have_moved() {
+        for status in [OutdatedStatus::Adoptable, OutdatedStatus::Held] {
+            assert_eq!(settled(status, None).0, OutdatedStatus::Error, "{status:?}");
+        }
     }
 }

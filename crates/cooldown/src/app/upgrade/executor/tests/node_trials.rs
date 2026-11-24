@@ -11,14 +11,14 @@ use color_eyre::eyre;
 use cooldown_core::config::builtin_default_layer;
 use cooldown_core::{
     AdvisoryFetch, AdvisoryPolicy, AdvisorySource, AdvisorySourceId, ApplyReport, CandidateScope,
-    Capabilities, Change, CoreError, DepScope, Dependency, FetchContext, GeneratedMembers,
-    GraphHoldEdge, GraphHoldKind, JudgedPin, LockStatus, LockVerifyReport, LockedVersion, MajorKey,
-    MemberRef, NativeAdmissionQuery, NativeAssessment, NativeEdit, NativeGateQuery,
-    NativeGateRefusal, NativePolicyLayer, PackageAdvisories, PackageId, Plan, PolicyLayer,
-    PolicyStack, PreparedMutation, Project, ProjectMarker, ProjectMutationJournal, RawAdvisory,
-    Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs, SkipReason, Skipped,
-    TargetFallback, ToolId, ToolRead, ToolTermination, ToolWrite, UpdateKind, VerifyReport,
-    Version,
+    Capabilities, Change, CoreError, DepScope, Dependency, Diagnostic, FetchContext,
+    GeneratedMembers, GraphHoldEdge, GraphHoldKind, JudgedPin, LockStatus, LockVerifyReport,
+    LockedVersion, MajorKey, MemberRef, NativeAdmissionQuery, NativeAssessment, NativeEdit,
+    NativeGateQuery, NativeGateRefusal, NativePolicyLayer, PackageAdvisories, PackageId, Plan,
+    PolicyLayer, PolicyStack, PreparedMutation, Project, ProjectMarker, ProjectMutationJournal,
+    RawAdvisory, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs, SkipReason,
+    Skipped, TargetFallback, ToolId, ToolRead, ToolTermination, ToolWrite, UpdateKind,
+    VerifyReport, Version,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -2303,6 +2303,8 @@ async fn a_shared_file_the_run_does_not_lease_is_refused() -> eyre::Result<()> {
 
 /// A dry run trials a throwaway copy, so a shared file outside that copy is the real one, and
 /// the trial is refused rather than allowed to write it.
+/// The refusal is the error of the move it stopped, so `outdated` reports it on that row
+/// (#173).
 #[tokio::test]
 async fn a_dry_run_refuses_a_shared_file_outside_its_copy() -> eyre::Result<()> {
     let (_outside, shared, fixture) = refused_safe_with_shared_file(true)?;
@@ -2315,16 +2317,27 @@ async fn a_dry_run_refuses_a_shared_file_outside_its_copy() -> eyre::Result<()> 
         })
         .await;
 
+    let refused = |error: &Diagnostic| error.message.contains("which this run does not hold");
+    assert!(outcome.errors.iter().any(refused), "{:?}", outcome.errors);
     assert!(
         outcome
-            .errors
+            .items
             .iter()
-            .any(|error| error.message.contains("which this run does not hold")),
+            .any(|item| item.name == "safe" && item.error.as_ref().is_some_and(refused)),
         "{:?}",
-        outcome.errors
+        outcome.items
     );
     assert_eq!(fixture.fake.trials(), Vec::<Vec<String>>::new());
     assert_eq!(std::fs::read_to_string(&shared)?, "original");
+
+    let outdated = fixture.workspace.outdated(&RunOpts::default()).await;
+    let row = outdated
+        .items
+        .iter()
+        .find(|item| item.name == "safe")
+        .ok_or_else(|| eyre::eyre!("no safe row: {:?}", outdated.items))?;
+    assert_eq!(row.status, OutdatedStatus::Error, "{row:?}");
+    assert!(row.error.as_ref().is_some_and(refused), "{row:?}");
     Ok(())
 }
 
