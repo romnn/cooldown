@@ -10,7 +10,11 @@ use std::os::unix::fs::PermissionsExt as _;
 /// `dep` into two lines, the way cargo keeps the old line for the requirer left behind.
 /// A precise pin of `dep` 2.0.0 is refused while `app` still declares `dep = "1"`.
 /// Every move of `fresh` is refused, and a seed carrying one fails without naming it.
-/// With an `overshoot` file, a resolve unifying both requirers lands `dep` 2.1.0 instead.
+/// With an `overshoot` file, a resolve unifying both requirers lands `dep` 2.1.0 instead, unless
+/// the lock already binds both at 2.0.0.
+/// Pinning that copy back to 2.0.0 is then refused for `holder`, unless a `repairable` file lets
+/// it land.
+/// A locked read leaves the lock alone, and every read reports the `dep` that `app` binds.
 const SCRIPT: &str = indoc! {r#"
     #!/bin/sh
     set -eu
@@ -22,6 +26,7 @@ const SCRIPT: &str = indoc! {r#"
       selected && /^version = / { gsub(/version = |"/, ""); print; exit }
     ' Cargo.lock)
     command="$1"
+    target=''
     case "$command" in
       metadata)
         if ! grep -A1 '^name = "fresh"$' Cargo.lock | grep -q '^version = "1.0.0"$'; then
@@ -31,7 +36,6 @@ const SCRIPT: &str = indoc! {r#"
         ;;
       update)
         spec=''
-        target=''
         while [ "$#" -gt 0 ]; do
           case "$1" in
             -p) shift; spec="$1" ;;
@@ -53,16 +57,33 @@ const SCRIPT: &str = indoc! {r#"
               echo 'required by package `app v0.1.0 (/repo/app)`' >&2
               exit 101
             fi
+            if [ -f overshoot ] && [ ! -f repairable ] && [ "$holder" = 1.1.0 ]; then
+              echo 'error: failed to select a version for the requirement `dep = "^2.1"`' >&2
+              echo 'required by package `holder v1.1.0`' >&2
+              exit 101
+            fi
             ;;
         esac
         ;;
       *) exit 102 ;;
     esac
     resolved="lock-$holder-$app"
-    if [ "$resolved" = lock-1.1.0-2 ] && [ -f overshoot ]; then resolved=overshot.lock; fi
-    cp "$resolved" Cargo.lock
+    if [ "$resolved" = lock-1.1.0-2 ] && [ -f overshoot ] && [ "$target" != 2.0.0 ] \
+      && ! cmp -s Cargo.lock lock-1.1.0-2; then
+      resolved=overshot.lock
+    fi
+    case "$*" in
+      *--locked*) ;;
+      *) cp "$resolved" Cargo.lock ;;
+    esac
     if [ "$command" = metadata ]; then
-      echo '{"packages": [], "workspace_members": [], "workspace_root": "", "resolve": null}'
+      if cmp -s Cargo.lock overshot.lock; then app_dep=2.1.0; else app_dep="$app.0.0"; fi
+      printf '%s\n' "{\"packages\": [
+        {\"id\": \"app\", \"name\": \"app\", \"version\": \"0.1.0\", \"manifest_path\": \"/repo/Cargo.toml\"},
+        {\"id\": \"dep\", \"name\": \"dep\", \"version\": \"$app_dep\",
+         \"source\": \"registry+https://github.com/rust-lang/crates.io-index\"}],
+        \"workspace_members\": [\"app\"], \"workspace_root\": \"/repo\",
+        \"resolve\": {\"nodes\": [{\"id\": \"app\", \"deps\": [{\"name\": \"dep\", \"pkg\": \"dep\"}]}]}}"
     fi
 "#};
 
@@ -210,6 +231,17 @@ fn dep_move() -> Change {
     change("dep", "1.0.0", "2.0.0", false)
 }
 
+/// [`dep_move`] as `app`'s own declaration, whose reach the member graph decides.
+fn declared_dep_move() -> Change {
+    Change {
+        members: vec![MemberRef {
+            name: "app".to_owned(),
+            path: ".".to_owned(),
+        }],
+        ..dep_move()
+    }
+}
+
 /// A dependency move that switches `holder` to `dep`'s next line lands together with the planned
 /// move of `app`'s own `dep` declaration.
 ///
@@ -343,25 +375,286 @@ async fn a_remembered_split_refusal_stands_only_while_nothing_heals_it() -> eyre
 }
 
 /// A healing step that overshoots a partner's exact target is restored instead of kept.
+///
+/// `holder` 1.1.0 holds `dep` past the target, so Cargo refuses to pin `app`'s copy back.
+/// Both rows keep the split their own steps cause, which outranks that refusal, and a second
+/// resolve of the same files and plan reports the same rows.
 #[tokio::test]
 async fn a_split_completion_missing_a_target_is_restored() -> eyre::Result<()> {
     let fixture = SplitFixture::new()?;
     std::fs::write(fixture.directory.path().join("overshoot"), "")?;
-    let plan = SplitFixture::plan(vec![dep_move(), holder_move()], RewriteMode::Auto);
+    let plan = SplitFixture::plan(vec![declared_dep_move(), holder_move()], RewriteMode::Auto);
+
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let journal = fixture
+            .tool
+            .mutation_journal(&fixture.project, &plan)
+            .await?;
+        let rejections = fixture
+            .tool
+            .whole_graph_resolve(&fixture.project, &plan, &journal, None)
+            .await?;
+
+        // Neither move lands, so the project is exactly as before.
+        assert_eq!(fixture.file("Cargo.lock")?, lock("1.0.0", "1.0.0", "1.0.0"));
+        assert_eq!(fixture.file("Cargo.toml")?, MANIFEST);
+        journal.restore()?;
+        runs.push(rejections);
+    }
+    for planned in [declared_dep_move(), holder_move()] {
+        let detail = runs[0]
+            .get(&rejection_key(&planned))
+            .ok_or_else(|| eyre::eyre!("{runs:?}"))?;
+        assert_eq!(detail.origin, DiagnosticOrigin::Acceptance, "{detail:?}");
+        assert!(
+            detail
+                .text
+                .contains("would resolve direct dependency dep at another incompatible line"),
+            "{detail:?}"
+        );
+    }
+    assert_eq!(runs[0], runs[1]);
+    // The overshot copy was tried at its target.
+    assert!(
+        fixture
+            .file("invocations")?
+            .contains("#dep@2.1.0 --precise 2.0.0")
+    );
+    Ok(())
+}
+
+/// The fake `cargo` of a completion that grows over two coalitions: `holder` 1.1.0 requires
+/// `dep` 2 and `other` `^2.1`, while `app` declares `dep` and `other` at line 1.
+///
+/// Moving `holder` with `dep` still splits `other`, and adding `other`'s move resolves it at
+/// 2.1.0, past its 2.0.0 target, where Cargo refuses to pin it back.
+/// A locked read leaves the lock alone, and every read reports the copies `app` binds.
+const TWO_ROUND_SCRIPT: &str = indoc! {r##"
+    #!/bin/sh
+    set -eu
+    printf '%s\n' "$*" >> invocations
+    if grep -q 'dep = "2' Cargo.toml; then dep=2.0.0; else dep=1.0.0; fi
+    holder=$(awk '
+      /^\[\[package\]\]/ { selected = 0 }
+      $0 == "name = \"holder\"" { selected = 1 }
+      selected && /^version = / { gsub(/version = |"/, ""); print; exit }
+    ' Cargo.lock)
+    if ! grep -q 'other = "2' Cargo.toml; then
+      other=1.0.0
+    elif [ "$holder" = 1.1.0 ]; then
+      other=2.1.0
+    else
+      other=2.0.0
+    fi
+    case "$*" in
+      *"#other@2.1.0 --precise 2.0.0"*)
+        echo 'error: failed to select a version for the requirement `other = "^2.1"`' >&2
+        echo 'required by package `holder v1.1.0`' >&2
+        exit 101
+        ;;
+      update*) exit 102 ;;
+      *--locked*) ;;
+      *) cp "lock-$holder-$dep-$other" Cargo.lock ;;
+    esac
+    printf '%s\n' "{\"packages\": [
+      {\"id\": \"app\", \"name\": \"app\", \"version\": \"0.1.0\", \"manifest_path\": \"/repo/Cargo.toml\"},
+      {\"id\": \"dep\", \"name\": \"dep\", \"version\": \"$dep\",
+       \"source\": \"registry+https://github.com/rust-lang/crates.io-index\"},
+      {\"id\": \"other\", \"name\": \"other\", \"version\": \"$other\",
+       \"source\": \"registry+https://github.com/rust-lang/crates.io-index\"}],
+      \"workspace_members\": [\"app\"], \"workspace_root\": \"/repo\",
+      \"resolve\": {\"nodes\": [{\"id\": \"app\", \"deps\": [
+        {\"name\": \"dep\", \"pkg\": \"dep\"}, {\"name\": \"other\", \"pkg\": \"other\"}]}]}}"
+"##};
+
+const TWO_ROUND_MANIFEST: &str = indoc! {r#"
+    [package]
+    name = "app"
+    version = "0.1.0"
+    edition = "2024"
+
+    [dependencies]
+    dep = "1"
+    holder = "1"
+    other = "1"
+"#};
+
+/// The lock of [`TWO_ROUND_SCRIPT`]'s state: `holder` at `holder`, which from 1.1.0 on binds `dep`
+/// 2.0.0 and `other` 2.1.0, and `app` binding `dep` at `app_dep` and `other` at `app_other`.
+fn two_round_lock(holder: &str, app_dep: &str, app_other: &str) -> String {
+    let crates_io = "registry+https://github.com/rust-lang/crates.io-index";
+    let (holder_dep, holder_other) = if holder == "1.1.0" {
+        ("2.0.0", "2.1.0")
+    } else {
+        ("1.0.0", "1.0.0")
+    };
+    let binding = |name: &str, version: &str, forked: bool| {
+        if forked {
+            format!("\"{name} {version}\"")
+        } else {
+            format!("\"{name}\"")
+        }
+    };
+    let (dep_forked, other_forked) = (app_dep != holder_dep, app_other != holder_other);
+    let mut content = formatdoc! {r#"
+        version = 4
+
+        [[package]]
+        name = "app"
+        version = "0.1.0"
+        dependencies = [{dep}, "holder", {other}]
+
+        [[package]]
+        name = "holder"
+        version = "{holder}"
+        source = "{crates_io}"
+        dependencies = [{held_dep}, {held_other}]
+    "#,
+        dep = binding("dep", app_dep, dep_forked),
+        other = binding("other", app_other, other_forked),
+        held_dep = binding("dep", holder_dep, dep_forked),
+        held_other = binding("other", holder_other, other_forked),
+    };
+    for (name, versions) in [
+        ("dep", [app_dep, holder_dep]),
+        ("other", [app_other, holder_other]),
+    ] {
+        let mut versions = versions.to_vec();
+        versions.sort_unstable();
+        versions.dedup();
+        for version in versions {
+            content.push_str(&formatdoc! {r#"
+
+                [[package]]
+                name = "{name}"
+                version = "{version}"
+                source = "{crates_io}"
+            "#});
+        }
+    }
+    content
+}
+
+/// A completion that grows over two coalitions and is refused in the second for its new partner's
+/// pin back hands that refusal to the partner, for the partner's row to rank against its other
+/// reasons, and restores every file.
+///
+/// None of the coalitions it tried is remembered as failed, so a repeat resolves both again and
+/// reports the same refusal.
+#[tokio::test]
+async fn a_refused_split_completion_hands_the_refusal_to_its_partner() -> eyre::Result<()> {
+    let mut files = vec![
+        ("Cargo.toml".to_owned(), TWO_ROUND_MANIFEST.to_owned()),
+        (
+            "Cargo.lock".to_owned(),
+            two_round_lock("1.0.0", "1.0.0", "1.0.0"),
+        ),
+    ];
+    for holder in ["1.0.0", "1.1.0"] {
+        for dep in ["1.0.0", "2.0.0"] {
+            for other in ["1.0.0", "2.0.0", "2.1.0"] {
+                files.push((
+                    format!("lock-{holder}-{dep}-{other}"),
+                    two_round_lock(holder, dep, other),
+                ));
+            }
+        }
+    }
+    let fixture = SplitFixture::with_files(TWO_ROUND_SCRIPT, &files)?;
+    let other_move = Change {
+        members: declared_dep_move().members,
+        ..change("other", "1.0.0", "2.0.0", false)
+    };
+    let plan = SplitFixture::plan(
+        vec![holder_move(), declared_dep_move(), other_move.clone()],
+        RewriteMode::Auto,
+    );
+    let journal = fixture
+        .tool
+        .mutation_journal(&fixture.project, &plan)
+        .await?;
+    let probe = WidenProbe {
+        project: &fixture.project,
+        plan: &plan.changes,
+        rewrite: RewriteMode::Auto,
+        candidates: &[],
+        protected: &[],
+        followers: &[],
+        journal: &journal,
+        observer: None,
+    };
+    let heal = SplitHeal {
+        name: "dep".to_owned(),
+        retainers: vec![PackageKey::new("app", "0.1.0")],
+    };
+    let resolves = || -> eyre::Result<usize> {
+        Ok(fixture
+            .file("invocations")?
+            .lines()
+            .filter(|invocation| {
+                invocation.starts_with("metadata ") && !invocation.contains("--locked")
+            })
+            .count())
+    };
+
+    let mut calls = Vec::new();
+    for _ in 0..2 {
+        let completion = fixture
+            .tool
+            .complete_split(&probe, &holder_move(), heal.clone(), &[])
+            .await?;
+        let SplitCompletion::Refused(Some(short)) = completion else {
+            eyre::bail!("the completion is refused for its second partner's pin back");
+        };
+        assert_eq!(
+            fixture.file("Cargo.lock")?,
+            two_round_lock("1.0.0", "1.0.0", "1.0.0")
+        );
+        assert_eq!(fixture.file("Cargo.toml")?, TWO_ROUND_MANIFEST);
+        calls.push(resolves()?);
+
+        // `other`'s refusal outranks a weaker overshoot on its row.
+        let key = rejection_key(&other_move);
+        assert_eq!(short.key, key);
+        let mut rejections = PinRejections::from([(
+            key.clone(),
+            RejectionDetail::violation(
+                "would move directly declared other 1.0.0 to 2.1.0".to_owned(),
+                TargetReach::Overshot,
+            ),
+        )]);
+        short.record(&mut rejections);
+        let detail = rejections
+            .get(&key)
+            .ok_or_else(|| eyre::eyre!("{rejections:?}"))?;
+        assert_eq!(detail.origin, DiagnosticOrigin::Resolver, "{detail:?}");
+        assert!(detail.text.contains("other = \"^2.1\""), "{detail:?}");
+    }
+    // The first completion resolved both coalitions, and the repeat resolved both again.
+    assert_eq!(calls, [2, 4]);
+    Ok(())
+}
+
+/// A healing step that overshoots a partner's exact target lands once that partner's copy is
+/// pinned back to it, with every move of the coalition at its exact target.
+#[tokio::test]
+async fn a_split_completion_lands_once_its_overshoot_is_pinned_back() -> eyre::Result<()> {
+    let fixture = SplitFixture::new()?;
+    std::fs::write(fixture.directory.path().join("overshoot"), "")?;
+    std::fs::write(fixture.directory.path().join("repairable"), "")?;
+    let plan = SplitFixture::plan(vec![declared_dep_move(), holder_move()], RewriteMode::Auto);
 
     let rejections = fixture.resolve(&plan).await?;
 
-    // Neither move lands, so the project is exactly as before.
-    assert_eq!(fixture.file("Cargo.lock")?, lock("1.0.0", "1.0.0", "1.0.0"));
-    assert_eq!(fixture.file("Cargo.toml")?, MANIFEST);
-    assert!(
-        rejections.contains_key(&(
-            "holder".to_string(),
-            "1.0.0".to_string(),
-            "1.1.0".to_string(),
-        )),
-        "{rejections:?}"
+    // Both moves landed on one `dep` 2 line at the target, with `app`'s declaration widened.
+    assert_eq!(
+        fixture.file("Cargo.lock")?,
+        lock("1.1.0", "2.0.0", "2.0.0"),
+        "{rejections:?}\n{}",
+        fixture.file("invocations")?
     );
+    assert!(fixture.file("Cargo.toml")?.contains(r#"dep = "2"#));
     Ok(())
 }
 
@@ -827,7 +1120,7 @@ async fn a_completion_releasing_a_blocker_is_not_skipped_as_failed() -> eyre::Re
         .tool
         .complete_split(&probe, &holder, heal.clone(), &[])
         .await?;
-    assert!(matches!(kept, SplitCompletion::Refused));
+    assert!(matches!(kept, SplitCompletion::Refused(_)));
     assert_eq!(
         fixture.file("Cargo.lock")?,
         unlock_lock("1.0.0", "0.9.3", "1.0.0")
