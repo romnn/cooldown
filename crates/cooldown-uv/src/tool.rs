@@ -1184,9 +1184,13 @@ fn cutoff_at(cutoff: &str, now: Timestamp) -> Option<Timestamp> {
     if let Ok(instant) = cutoff.parse::<Timestamp>() {
         return Some(instant);
     }
-    // The shared parser drops a fraction of a second that uv keeps, so a span with a fraction is
-    // left unread rather than compared inexactly.
-    if cutoff.contains('.') {
+    // The shared parser drops the sub-second units that uv keeps, so a span with any is left
+    // unread rather than compared inexactly.
+    let precise: jiff::Span = cutoff.trim().parse().ok()?;
+    if precise.get_milliseconds() != 0
+        || precise.get_microseconds() != 0
+        || precise.get_nanoseconds() != 0
+    {
         return None;
     }
     let span = cooldown_core::duration::parse_duration(cutoff).ok()?;
@@ -2214,6 +2218,7 @@ mod tests {
             ("2000-01-01T00:00:00Z", Some(DiagnosticKind::StricterNative)),
             ("P7D", None),
             ("P7DT0.5S", Some(DiagnosticKind::Config)),
+            ("7d 500ms", Some(DiagnosticKind::Config)),
         ] {
             let kinds: Vec<DiagnosticKind> = warned(exclude_newer(value))?
                 .into_iter()

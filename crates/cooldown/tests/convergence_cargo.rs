@@ -3510,7 +3510,8 @@ fn cargo_min_publish_age_is_native_policy() {
     assert!(outdated.ok(), "{:?}", outdated.error_messages());
     assert_eq!(
         outdated_window(&outdated, "pest_stack_guard"),
-        Some((3000.0, "native".to_owned())),
+        // Cargo's month is 2,629,746 seconds, so 100 months are 3043.69 days.
+        Some((3043.69, "native".to_owned())),
         "cargo's 100-month age must govern the window"
     );
 
