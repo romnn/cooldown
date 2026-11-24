@@ -3288,9 +3288,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .await
         {
             Ok(prepared) => prepared,
-            // Nothing ran, so the failure is every change's own, the row each one settles on.
+            // Nothing ran, so the failure is the project's rather than any one change's, and it
+            // settles every copy the pass tried and left undecided.
             Err(error) => {
-                self.add_change_errors(&mut outcome, &error, &changes);
+                outcome.errors.push(self.project_diag(&error, None));
                 return outcome;
             }
         };

@@ -2303,8 +2303,8 @@ async fn a_shared_file_the_run_does_not_lease_is_refused() -> eyre::Result<()> {
 
 /// A dry run trials a throwaway copy, so a shared file outside that copy is the real one, and
 /// the trial is refused rather than allowed to write it.
-/// The refusal is the error of the move it stopped, so `outdated` reports it on that row
-/// (#173).
+/// Nothing ran, so the refusal is the project's error rather than one package's, and `outdated`
+/// reports it on the row whose move it stopped (#173).
 #[tokio::test]
 async fn a_dry_run_refuses_a_shared_file_outside_its_copy() -> eyre::Result<()> {
     let (_outside, shared, fixture) = refused_safe_with_shared_file(true)?;
@@ -2318,14 +2318,11 @@ async fn a_dry_run_refuses_a_shared_file_outside_its_copy() -> eyre::Result<()> 
         .await;
 
     let refused = |error: &Diagnostic| error.message.contains("which this run does not hold");
-    assert!(outcome.errors.iter().any(refused), "{:?}", outcome.errors);
+    let refusals: Vec<&Diagnostic> = outcome.errors.iter().filter(|e| refused(e)).collect();
     assert!(
-        outcome
-            .items
-            .iter()
-            .any(|item| item.name == "safe" && item.error.as_ref().is_some_and(refused)),
+        !refusals.is_empty() && refusals.iter().all(|error| error.package.is_none()),
         "{:?}",
-        outcome.items
+        outcome.errors
     );
     assert_eq!(fixture.fake.trials(), Vec::<Vec<String>>::new());
     assert_eq!(std::fs::read_to_string(&shared)?, "original");
