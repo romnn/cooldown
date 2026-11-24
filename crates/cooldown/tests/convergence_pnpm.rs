@@ -3324,7 +3324,8 @@ const PEER_HELD_IN_LINE_SEED: &str = "2024-02-10T00:00:00Z";
 /// A `--major` run whose cross-major target is peer-held still takes the matured in-line move a
 /// `--no-major` run takes (issue #11): the lock moves along the v8 line, the in-line move is its
 /// own applied row, and the eslint 9 row stays peer-held with the dependent named.
-/// `outdated --major` agrees, reporting the major blocked.
+/// `outdated --major` agrees, reporting the in-line move `upgrade` lands as eslint's adoptable
+/// target (#173).
 #[test]
 fn upgrade_major_takes_the_in_line_move_beside_a_peer_held_major() {
     skip_if_missing!("pnpm");
@@ -3406,7 +3407,7 @@ fn upgrade_major_takes_the_in_line_move_beside_a_peer_held_major() {
         "the hold still names the peer-declaring dependent"
     );
 
-    // `outdated --major` predicts the same hold for the cross-major target.
+    // `outdated --major` reports what that run lands: the in-line move, not the held major.
     let outdated = outdated_fixture.cooldown_json(&[
         "outdated",
         "--major",
@@ -3417,15 +3418,20 @@ fn upgrade_major_takes_the_in_line_move_beside_a_peer_held_major() {
     ]);
     assert!(outdated.ok(), "outdated should succeed");
     assert!(
-        outdated.outdated_with_status("blocked").contains("eslint"),
-        "eslint's major must be blocked, got blocked={:?}, adoptable={:?}",
+        outdated
+            .outdated_with_status("adoptable")
+            .contains("eslint"),
+        "eslint's in-line move must be adoptable, got blocked={:?}, adoptable={:?}",
         outdated.outdated_with_status("blocked"),
         outdated.outdated_with_status("adoptable")
     );
     assert_eq!(
-        outdated.item_field_str("eslint", "blockedBy").as_deref(),
-        Some("@typescript-eslint/eslint-plugin")
+        outdated
+            .item_field_str("eslint", "adoptableTarget")
+            .as_deref(),
+        Some(in_line.as_str())
     );
+    assert_eq!(outdated.item_field_str("eslint", "blockedBy"), None);
 }
 
 /// Seed cutoff for the ceiling-held lockstep pair: react 18.3.1 is the newest react/react-dom

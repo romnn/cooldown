@@ -151,11 +151,14 @@ pub enum OutdatedStatus {
     UpToDate,
     /// A newer version exists and has matured past its window.
     Adoptable,
-    /// A newer version has matured past its window but the whole-graph upgrade resolve cannot land
-    /// it — a mutually-exclusive requirement holds it out of the graph. The matured version still
-    /// appears as [`adoptable_target`](OutdatedItem::adoptable_target); the blocker (when one can be
-    /// named) appears as [`blocked_by`](OutdatedItem::blocked_by). `upgrade` reports the same
-    /// dependency as held, so the two commands agree.
+    /// A newer version has matured past its window, but `upgrade` does not land it.
+    ///
+    /// Either the whole-graph upgrade resolve holds it out of the graph, or `upgrade` does not move
+    /// the dependency on its own.
+    /// The matured version still appears as [`adoptable_target`](OutdatedItem::adoptable_target),
+    /// the blocker (when one can be named) as [`blocked_by`](OutdatedItem::blocked_by), and why as
+    /// [`blocked_reason`](OutdatedItem::blocked_reason).
+    /// `upgrade` reports the same dependency as held or leaves it alone, so the two commands agree.
     Blocked,
     /// A newer version exists but is younger than its window.
     InCooldown,
@@ -240,7 +243,10 @@ pub struct OutdatedItem {
     pub cooldown_version: Option<String>,
     /// The verdict for this dependency.
     pub status: OutdatedStatus,
-    /// The newest version that has matured past its window, if any.
+    /// The matured version the row offers, if any.
+    ///
+    /// For an `adoptable` or `exempt` row it is the version `upgrade --dry-run` lands, which can
+    /// be older than the newest matured one; for any other row it is the newest matured version.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub adoptable_target: Option<String>,
     /// When `status` is [`OutdatedStatus::Blocked`], the package whose requirement holds the matured
@@ -248,10 +254,12 @@ pub struct OutdatedItem {
     /// named. Omitted for every other status.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_by: Option<String>,
-    /// When `status` is [`OutdatedStatus::Blocked`], the reason the upgrade resolve gave for holding
-    /// the target — the same message its skip row carries (a partial landing and its remedy, a
-    /// workspace split and the flag that converges it, a refused duplicate copy) — so the row
-    /// explains itself without a full `upgrade --dry-run`. Omitted for every other status.
+    /// When `status` is [`OutdatedStatus::Blocked`], why `upgrade` does not land the target: the
+    /// message the upgrade resolve's skip row carries (a partial landing and its remedy, a
+    /// workspace split and the flag that converges it, a refused duplicate copy), or that `upgrade`
+    /// does not move the dependency on its own.
+    /// The row explains itself without a full `upgrade --dry-run`.
+    /// Omitted for every other status.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
     /// Why a held dependency cannot move automatically.
@@ -319,8 +327,8 @@ pub struct OutdatedSummary {
     pub skipped_stale_projects: usize,
     /// The number with status [`OutdatedStatus::Adoptable`].
     pub adoptable: usize,
-    /// The number with status [`OutdatedStatus::Blocked`] — matured but held out of the graph by a
-    /// conflicting requirement, so `upgrade` cannot land it.
+    /// The number with status [`OutdatedStatus::Blocked`] — matured, but `upgrade` does not land
+    /// it.
     pub blocked: usize,
     /// The number with status [`OutdatedStatus::InCooldown`].
     pub in_cooldown: usize,

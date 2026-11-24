@@ -2,9 +2,8 @@
 //! retries the highest adoptable target on the current major line through the same rollback and
 //! replay the lower-line fallback uses.
 
-use crate::app::upgrade::PreviewEvidence;
 use crate::app::{
-    AdapterSet, Baseline, Exit, ProjectCtx, ProjectProgress, RunOpts, TransitiveGate, Workspace,
+    AdapterSet, Baseline, Exit, OutdatedStatus, ProjectCtx, RunOpts, TransitiveGate, Workspace,
 };
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -21,7 +20,7 @@ use cooldown_core::{
     TargetFallback, ToolId, ToolRead, ToolTermination, ToolWrite, UpdateKind, VerifyReport,
     Version,
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 const NODE: ToolId = ToolId("fakenode");
@@ -1688,88 +1687,49 @@ async fn a_failed_current_line_trial_with_a_restore_conflict_stops_without_a_rep
     Ok(())
 }
 
-/// A preview that bypasses planning selects the same in-line target as a planned run, even
-/// though the companion's initial landing floats the held package off the version it moves
-/// from.
+/// The in-line target is selected from the graph the planner read, even though the companion's
+/// initial landing floats the held package off the version it moves from.
 #[tokio::test]
-async fn warm_and_cold_caches_select_the_same_current_line_target() -> eyre::Result<()> {
-    let script = || Script {
-        holds: vec![peer_held_dom()],
-        float: Some(Float {
-            trigger: "safe",
-            floated: "dom",
-            from: "1.0.0",
-            to: "1.0.1",
-        }),
-        ..Script::default()
-    };
-    let initial = [("dom", "1.0.0"), ("safe", "1.0.0")];
-
-    // Warm: the planner caches the alternative.
-    let planned = fixture(
-        dom_and_safe(TargetFallback::CurrentLine, script(), true),
-        &initial,
-    )?;
-    let upgrade = planned.workspace.upgrade(&major()).await;
-    assert!(upgrade.errors.is_empty(), "{:?}", upgrade.errors);
-    assert_eq!(locked(&planned, "dom")?.as_deref(), Some("1.1.0"));
-
-    // Cold: the preview receives preselected targets.
-    let previewed = fixture(
-        dom_and_safe(TargetFallback::CurrentLine, script(), true),
-        &initial,
-    )?;
-    let context = previewed
-        .workspace
-        .projects()
-        .first()
-        .ok_or_else(|| eyre::eyre!("fixture project"))?;
-    let change = |name: &str, to: &str, kind| Change {
-        package: package(name),
-        from: Version::new("1.0.0"),
-        to: Version::new(to),
-        kind,
-        downgrade: false,
-        direct: true,
-        members: Vec::new(),
-    };
-    let preview = previewed
-        .workspace
-        .preview_project_upgrade(
-            context,
-            &major(),
-            &ProjectProgress::default(),
-            vec![
-                change("dom", "2.0.0", UpdateKind::Major),
-                change("safe", "1.1.0", UpdateKind::Minor),
-            ],
-            PreviewEvidence {
-                manifest_only: HashSet::default(),
-                advisories: None,
-                excluded_members: Vec::new(),
+async fn a_floated_held_major_still_selects_its_current_line_target() -> eyre::Result<()> {
+    let fixture = fixture(
+        dom_and_safe(
+            TargetFallback::CurrentLine,
+            Script {
+                holds: vec![peer_held_dom()],
+                float: Some(Float {
+                    trigger: "safe",
+                    floated: "dom",
+                    from: "1.0.0",
+                    to: "1.0.1",
+                }),
+                ..Script::default()
             },
-        )
-        .await;
-    assert!(preview.errors.is_empty(), "{:?}", preview.errors);
-
-    // Both select the in-line target from the pre-lock graph and run the same trials.
-    let expected = sorted(vec![
-        applied("dom", "1.0.0", "1.1.0"),
-        skipped(
-            "dom",
-            "1.0.0",
-            "2.0.0",
-            SkipReason::PeerHeld,
-            "plugin@1.0.0 peer-requires dom@^1.0.0",
+            true,
         ),
-        applied("safe", "1.0.0", "1.1.0"),
-    ]);
-    assert_eq!(rows(&upgrade.items), expected);
-    assert_eq!(rows(&preview.items), expected);
-    let trials = planned.fake.trials();
-    assert_eq!(previewed.fake.trials(), trials);
+        &[("dom", "1.0.0"), ("safe", "1.0.0")],
+    )?;
+
+    let upgrade = fixture.workspace.upgrade(&major()).await;
+
+    assert!(upgrade.errors.is_empty(), "{:?}", upgrade.errors);
+    assert_eq!(locked(&fixture, "dom")?.as_deref(), Some("1.1.0"));
+    assert_eq!(
+        rows(&upgrade.items),
+        sorted(vec![
+            applied("dom", "1.0.0", "1.1.0"),
+            skipped(
+                "dom",
+                "1.0.0",
+                "2.0.0",
+                SkipReason::PeerHeld,
+                "plugin@1.0.0 peer-requires dom@^1.0.0",
+            ),
+            applied("safe", "1.0.0", "1.1.0"),
+        ])
+    );
     // The initial trial really moved the held `dom` off `1.0.0`, so evidence read from the
     // trial graph would find no dependency to move from; later trials pin `dom` and never float.
+    let trials = fixture.fake.trials();
     let floated = |trial: &Vec<String>| trial.iter().any(|entry| entry == "float:dom@1.0.1");
     assert!(trials.first().is_some_and(floated), "{trials:?}");
     assert!(!trials.iter().skip(1).any(floated), "{trials:?}");
@@ -1826,12 +1786,30 @@ fn strict_major() -> RunOpts {
     }
 }
 
+/// The status and target `outdated --major` reports for `name`.
+async fn outdated_verdict(
+    fixture: &NodeFixture,
+    name: &str,
+) -> eyre::Result<(OutdatedStatus, Option<String>)> {
+    let outdated = fixture.workspace.outdated(&major()).await;
+    let item = outdated
+        .items
+        .iter()
+        .find(|item| item.name == name)
+        .ok_or_else(|| eyre::eyre!("no {name} row: {:?}", outdated.items))?;
+    Ok((item.status, item.adoptable_target.clone()))
+}
+
 /// A rejected major that a retried sibling floats onto its own target in every declaring member
 /// is reported as that landing alone: no held row beside it, so neither the skip count nor
 /// `outdated` nor `--strict` reads a target the lock now holds as held.
 #[tokio::test]
 async fn a_major_landed_as_collateral_is_not_also_reported_held() -> eyre::Result<()> {
     let fixture = collateral_major_fixture(None)?;
+    assert_eq!(
+        outdated_verdict(&fixture, "c").await?,
+        (OutdatedStatus::Adoptable, Some("2.0.0".to_string()))
+    );
 
     let outcome = fixture.workspace.upgrade(&strict_major()).await;
 
@@ -1866,10 +1844,15 @@ async fn a_major_landed_as_collateral_is_not_also_reported_held() -> eyre::Resul
 }
 
 /// A collateral move that leaves one declaring member on the old version has not landed the
-/// planned change, so its hold is kept beside the partial landing.
+/// planned change, so its hold is kept beside the partial landing, and `outdated` reports the
+/// declared row blocked rather than adoptable for every member.
 #[tokio::test]
 async fn a_major_landed_in_only_some_members_keeps_its_hold() -> eyre::Result<()> {
     let fixture = collateral_major_fixture(Some("api"))?;
+    assert_eq!(
+        outdated_verdict(&fixture, "c").await?,
+        (OutdatedStatus::Blocked, Some("2.0.0".to_string()))
+    );
 
     let outcome = fixture.workspace.upgrade(&strict_major()).await;
 

@@ -1239,7 +1239,7 @@ pub struct ApplyReport {
     /// The generated manifests ([`Project::generated_members`]) whose projected requirements
     /// this apply rewrote to follow the moves it landed, project-root-relative. A fact rather
     /// than a warning: only the caller knows whether the mutation is kept (a real run) or thrown
-    /// away (a dry run, `outdated`'s policy preview), so it phrases the regeneration note in the
+    /// away (a dry run, `outdated`'s included), so it phrases the regeneration note in the
     /// run's mood.
     pub followed_manifests: Vec<Utf8PathBuf>,
     /// Skipped changes the adapter attests it would skip again in a plan made of exactly the

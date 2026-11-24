@@ -1475,12 +1475,17 @@ async fn outdated_splits_adoptable_and_in_cooldown() {
             ), // fresh
         ],
     );
+    // The locked releases let `outdated`'s `upgrade` dry run judge the graph it starts from.
+    let locked = HashMap::from([
+        ("a".to_string(), release_named(&releases["a"], "v1.0.0")),
+        ("b".to_string(), release_named(&releases["b"], "v2.0.0")),
+    ]);
     let fake = FakeEco {
         direct: vec![dep("a", "v1.0.0", true), dep("b", "v2.0.0", true)],
         transitive: vec![],
         fresh_transitive: None,
         releases,
-        locked: HashMap::new(),
+        locked,
         inject_fresh_on_apply: false,
         collateral_on_apply: Vec::new(),
         edge_rebinds_on_apply: Vec::new(),
@@ -1544,6 +1549,11 @@ async fn outdated_countdown_tracks_latest_or_soonest_maturing() {
             ), // cooling, the newest
         ],
     );
+    // The locked release lets `outdated`'s `upgrade` dry run judge the graph it starts from.
+    let locked = HashMap::from([(
+        "ruff".to_string(),
+        release_named(&releases["ruff"], "0.15.15"),
+    )]);
     let make = || {
         workspace(
             fake(
@@ -1551,7 +1561,7 @@ async fn outdated_countdown_tracks_latest_or_soonest_maturing() {
                 vec![dep("ruff", "0.15.15", true)],
                 vec![],
                 releases.clone(),
-                HashMap::new(),
+                locked.clone(),
             ),
             Baseline::default(),
         )

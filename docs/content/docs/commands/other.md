@@ -41,13 +41,12 @@ shows what `outdated` shows — the current and adoptable versions, the status (
 nor the adoptable version (`latest 5.1.0,`), and the candidate's age against its window — and a
 blocked verdict is followed by `reason:`, the sentence `upgrade` prints for that row (a partial
 landing and the importer it left behind, a workspace split and the flag that converges it, a
-refused duplicate copy and its requirer). The verdict runs the same evaluation and upgrade-policy
-verification `outdated` runs — the package manager's resolver against a throwaway copy of the
-project, never the project itself — scoped to the one package, so it answers in seconds where a
-whole-graph `upgrade --dry-run` takes minutes. Because the package is judged on its own, a hold
-that only arises between two candidates of one batch (a conflict the whole-graph resolve settles
-by holding one of them) shows in `outdated` and `upgrade` but not here. Under `--offline` the
-verification is skipped and the run says so; the verdict is then the per-package one. `declared
+refused duplicate copy and its requirer). The verdict is the row `outdated --transitive` reports
+for the package, from the same `upgrade --dry-run` over the project's whole plan — the package
+manager's resolver against a throwaway copy of the project, never the project itself — since what
+lands for one package can depend on every other move in the batch. It therefore takes as long as
+`upgrade --dry-run` on that project; `--package` narrows the plan as it does for `upgrade`. Under
+`--offline` the dry run is skipped and the run says so; the verdict is then the per-package one. `declared
 by:` lists every workspace member's declaration — the declared range, the version that member's
 own lock entry resolves to, and the manifest fields naming it (`[peerDependencies]` is how a
 peer-only declaration shows), one line per distinct range when a member declares the package in

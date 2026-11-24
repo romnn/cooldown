@@ -378,7 +378,7 @@ planned major is held or rejected (`peer_held`, `multi_version_held`, `pin_held`
 conflict, a transitive it would drag into cooldown), `upgrade --major` still tries the newest
 matured release on the current major line in the same run, the release `--no-major` would take.
 That move is reported as its own applied row beside the held major row, which keeps its reason,
-and `outdated --major` reports the major `blocked`. A package held as `not_eligible` has no
+and `outdated --major` reports the in-line release as the row's adoptable target. A package held as `not_eligible` has no
 editable requirement to move, so it is not retried; a `pin_held` major is, since the pin can admit
 the in-line release. The retry is bounded and best effort: one attempt with
 every such in-line move on top of what already landed, then one per package when there are

@@ -18,7 +18,7 @@ pub struct ExplainOutcome {
     pub meta: ExplainMeta,
     /// Each layer-and-rule step that contributed to (or was shadowed in) the derivation.
     pub steps: Vec<ExplainStep>,
-    /// Non-fatal diagnostics the verdict's evaluation raised (a yanked pin, a preview note).
+    /// Non-fatal diagnostics the verdict's evaluation raised (a yanked pin, a dry-run note).
     pub warnings: Vec<Diagnostic>,
     /// Errors the verdict's evaluation raised; the window trace stands regardless, so they do not
     /// change the exit.
@@ -96,11 +96,11 @@ impl<'a> ExplainService<'a> {
             warnings: mut context_warnings,
         } = self.dependency_context(pctx, pkg).await?;
         // The decision itself, after the read guard is released: the verdict runs `outdated`'s
-        // evaluation for this one package, whose upgrade-policy preview takes its own guard.
+        // evaluation for this one package, whose `upgrade` dry run takes its own guard.
         let mut verdict = self
             .ws
             .package_verdict(pctx, self.opts, pkg, &progress)
-            .await?;
+            .await;
         context_warnings.append(&mut verdict.warnings);
         let q = ResolveQuery {
             tool: pctx.tool,

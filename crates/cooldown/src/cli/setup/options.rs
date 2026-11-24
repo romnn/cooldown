@@ -170,7 +170,7 @@ pub(super) fn resolve_invocation(
             strict: merged.strict.unwrap_or(false),
             build: merged.build.unwrap_or(false),
             // Only `upgrade` has a search to shorten; a `[global] fast = true` must not reach
-            // `outdated`'s policy preview.
+            // `outdated`'s dry run.
             fast: command.shortens_search() && merged.fast.unwrap_or(false),
             dry_run: merged.dry_run.unwrap_or(false),
             offline: merged.offline.unwrap_or(false),
@@ -427,7 +427,7 @@ mod tests {
 
     /// `fast` is off by default, follows the config, and yields to an explicit `--fast` or
     /// `--no-fast`; only `upgrade` honors it, so a `[global] fast = true` leaves `outdated`'s
-    /// policy preview exhaustive.
+    /// dry run exhaustive.
     #[test]
     fn fast_is_an_upgrade_option_the_cli_overrides() -> eyre::Result<()> {
         let unset = CommandConfig::default();

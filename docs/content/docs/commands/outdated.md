@@ -20,12 +20,23 @@ cooldown outdated
 | **Package** | The dependency name. |
 | **Used by** | The workspace member(s) that declare it (`first (+N others)` when several do). On npm a member is credited only with the copy its own lookup in the lock's install tree reaches, so a copy of the name nested under another dependency is transitive. |
 | **Current** | The version currently locked. |
-| **Adoptable** | The newest version that has already cleared its cooldown — blank (`—`) if nothing new has matured. |
+| **Adoptable** | The version that has cleared its cooldown and that `upgrade` lands — which can be older than the newest matured one (see [Agreeing with `upgrade`](#agreeing-with-upgrade)) — blank (`—`) if nothing new has matured. |
 | **Latest** | The newest version that exists, cooled down or not. |
 | **Cooldown** | `age/window` for the relevant candidate — how old it is versus the window it must clear. A shortened advisory window appends `(security GHSA-…)`; a stricter clamp appends `(≥source)`. |
 | **Status** | `adoptable`, `blocked`, `in cooldown`, `exempt`, `held`, or `up-to-date`; held rows show the reason, and a blocked row names its blocker (`blocked by eslint-config-next`) when the resolve named one. Every blocked row carries the full reason the upgrade resolve gave — a partial landing and its remedy, a workspace split and the flag that converges it, a refused duplicate copy — as `blockedReason` in `--json` and, under `--why`, below the table; the sentences are too wide for the column itself. With the [advisory feed]({{< relref "../configuration/advisories.md" >}}) enabled, a candidate that fixes an advisory affecting the current pin is annotated `⚠ fixes GHSA-… (high)`. |
 
-The summary line at the bottom counts the **whole resolved graph** (direct + transitive), even though the table shows only direct dependencies by default. Its `held` figure counts the rows whose status is `held` (exact pins, commit pins, declared bounds, ceilings); the `warning [held]` lines under the table are a different thing — a too-fresh dependency the verification preview's reconcile left in place — while a second copy the preview's resolve added is a `duplicate_copy` warning and an excluded importer's copy that moved is an `excluded_moved` warning, neither of them `held`.
+The summary line at the bottom counts the **whole resolved graph** (direct + transitive), even though the table shows only direct dependencies by default. Its `held` figure counts the rows whose status is `held` (exact pins, commit pins, declared bounds, ceilings); the `warning [held]` lines under the table are a different thing — a too-fresh dependency the `upgrade` dry run's reconcile left in place — while a second copy the dry run's resolve added is a `duplicate_copy` warning and an excluded importer's copy that moved is an `excluded_moved` warning, neither of them `held`.
+
+## Agreeing with `upgrade`
+
+Every row says what [`upgrade --dry-run`]({{< relref "upgrade.md" >}}) does with that dependency, because `outdated` runs that same dry run on each project — the package manager's resolver against a throwaway copy, never the project itself — and reads its rows off the result:
+
+- **`adoptable`** — the dry run lands the row's copy, and **Adoptable** shows the version it lands. That can be lower than the newest matured version: an older release on the same line when the newest cannot land, or the newest one on the current major beside a major that stays held.
+- **`blocked`** — the dry run holds the row's matured target, and the row carries its reason. A matured version `upgrade` never moves on its own is `blocked` too — an indirect dependency that only moves along with the packages requiring it — with the reason `upgrade does not move it on its own: it follows the packages that require it`.
+- **`error`** — the dry run failed before it settled the row; the row carries the failure.
+- **`exempt`** rows stay `exempt` at the version the dry run lands, and read `blocked` like any other row when it holds them; **`held`** rows keep their status.
+
+The dry run plans what `upgrade` plans — the whole resolved graph where `upgrade` works it — so `--transitive` only decides which rows the table lists. That makes `outdated` as slow as `upgrade --dry-run` on the same project. The two agree given the same effective flags; mind that `outdated` defaults to `--major` and `upgrade` does not. Under `--offline` there is no dry run, since it needs the registry: the rows are the per-package verdicts, and a warning says how many adoptable rows went unverified.
 
 ## What it shows by default
 
@@ -59,7 +70,8 @@ Two npm-family safeguards refine what counts as adoptable:
 
 - **Peer contracts block infeasible majors.** A matured cross-major target that a still-present
   dependent's recorded peer range excludes (`fumadocs-mdx` peer-requires `fumadocs-core@^16` while
-  the target is `17.0.0`) is reported `blocked by fumadocs-mdx` instead of `adoptable` — pnpm's
+  the target is `17.0.0`) is reported `blocked by fumadocs-mdx` instead of `adoptable`, unless a
+  matured release on the current major lands instead, which the row then reports — pnpm's
   resolver only warns on that break, and npm, which rejects it by default, commits it under
   relaxed enforcement such as `legacy-peer-deps`. The way forward is to upgrade the
   dependent — or, when the dependent is a *workspace-local* package (a `workspace:*` package,
