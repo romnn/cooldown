@@ -5060,6 +5060,12 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         }
     }
 
+    /// Every package is an `npm` package to cooldown's policy, including one a scoped or private
+    /// registry serves.
+    fn policy_registry(&self) -> Option<&'static str> {
+        Some(NPM)
+    }
+
     fn requires_sync_admission_evaluation(&self, _project: &Project) -> bool {
         L::NATIVE_MIN_AGE_FILE.is_some()
     }

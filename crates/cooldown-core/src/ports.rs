@@ -1429,6 +1429,22 @@ pub trait ToolWrite: Send + Sync {
         false
     }
 
+    /// The policy registry every dependency this adapter age-evaluates carries, such as
+    /// `crates.io` for Cargo.
+    ///
+    /// The windows `sync` writes into the native config, and the resolver cutoffs cooldown passes
+    /// to the tool's own commands, are resolved for this registry, so a `[registry."…"]` rule
+    /// reaches them exactly as it reaches cooldown's own gate.
+    /// A rule for any other registry gates none of the adapter's packages, so `sync` does not
+    /// report it.
+    ///
+    /// The default `None` declares no single registry: those windows resolve with no registry,
+    /// and `sync` reports every registry rule field as policy the native config does not carry
+    /// (see [`omitted_native_fields`](crate::omitted_native_fields)).
+    fn policy_registry(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Writes the resolved repo-wide policy into a single repo-level native config file (the `sync`
     /// operation for [`SyncScope::Repo`] adapters, e.g. uv's root `uv.toml`).
     ///

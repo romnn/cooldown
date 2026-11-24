@@ -3,7 +3,7 @@ use crate::config::{builtin_default_layer, parse_config};
 use crate::model::ToolId;
 use crate::{Origin, PolicyContext, PolicyLayer};
 use camino::Utf8Path;
-use indoc::indoc;
+use indoc::{formatdoc, indoc};
 use jiff::{SignedDuration, Timestamp};
 
 const PNPM: ToolId = ToolId("pnpm");
@@ -31,6 +31,16 @@ fn keys(omitted: &[OmittedField]) -> Vec<String> {
         .collect()
 }
 
+/// The registry each tool's writer declares every package it evaluates to carry.
+fn registry_of(target: ToolId) -> Option<&'static str> {
+    match target.as_str() {
+        "pnpm" => Some("npm"),
+        "uv" => Some("pypi"),
+        "cargo" => Some("crates.io"),
+        _ => None,
+    }
+}
+
 /// The fields a project-scoped tool's native config leaves out for the project at `project`.
 fn project_scope(
     layers: &[PolicyLayer],
@@ -42,6 +52,7 @@ fn project_scope(
     let encoding = NativeEncoding {
         default_layers: layers,
         default_project: project,
+        registry: registry_of(target),
         package_windows,
         writer_exemptions: true,
     };
@@ -66,6 +77,7 @@ fn repo_scope(repo: &[PolicyLayer], consumers: &[PolicyContext<'_>]) -> Vec<Omit
     let encoding = NativeEncoding {
         default_layers: repo,
         default_project: Utf8Path::new("."),
+        registry: registry_of(UV),
         package_windows: true,
         writer_exemptions: false,
     };
@@ -196,8 +208,8 @@ fn only_a_package_table_encodes_literal_package_windows() {
 }
 
 /// A rule that cannot gate the tool's packages in the project is skipped: one qualified for
-/// another tool or another project, and a registry rule, since adapters tag every package with a
-/// fixed registry.
+/// another tool or another project, and a rule for a registry other than the one every pnpm
+/// package carries.
 /// `latest` and `allow` are left to the native exemption lists.
 #[test]
 fn rules_that_cannot_gate_the_project_are_skipped() {
@@ -210,7 +222,7 @@ fn rules_that_cannot_gate_the_project_are_skipped() {
         [tool.cargo.package."serde"]
         min-age = "30d"
 
-        [registry."npm"]
+        [registry."crates.io"]
         min-age = { default = "7d", major = "30d" }
 
         [project."libs/*"]
@@ -416,9 +428,19 @@ fn a_freeze_drifting_in_several_windows_names_the_earliest_end() {
 /// The fields a repo-level Cargo file resolved from `repo` leaves out for `consumers`: Cargo has
 /// one registry-wide age and no package table, and the writer takes no exemptions.
 fn cargo_repo_scope(repo: &[PolicyLayer], consumers: &[PolicyContext<'_>]) -> Vec<OmittedField> {
+    cargo_repo_scope_in(repo, consumers, registry_of(CARGO))
+}
+
+/// [`cargo_repo_scope`] for a writer that declares `registry` as its packages' registry.
+fn cargo_repo_scope_in(
+    repo: &[PolicyLayer],
+    consumers: &[PolicyContext<'_>],
+    registry: Option<&str>,
+) -> Vec<OmittedField> {
     let encoding = NativeEncoding {
         default_layers: repo,
         default_project: Utf8Path::new("."),
+        registry,
         package_windows: false,
         writer_exemptions: false,
     };
@@ -592,5 +614,178 @@ fn a_writer_that_takes_exemptions_keeps_a_zero_window_a_window() {
     assert_eq!(
         keys(&project_scope(&layers, ".", PNPM, false)),
         ["repo:cooldown.toml:package=zod default"]
+    );
+}
+
+/// A registry rule for the registry every Cargo package carries gates each of them, so the
+/// written default folds in its window and floor, as it does the bare ones.
+#[test]
+fn the_written_default_encodes_the_tools_registry_fields() {
+    let layers = repo_layers(indoc! {r#"
+        min-age = "14d"
+
+        [registry."crates.io"]
+        min-age = "21d"
+        floor = "30d"
+    "#});
+
+    assert_eq!(
+        keys(&cargo_repo_scope(&layers, &[consumer(".", &layers)])),
+        Vec::<String>::new()
+    );
+}
+
+/// The registry's per-kind windows and its exemption reach no native config, so they are
+/// reported like those of any other rule the written default folds in.
+#[test]
+fn the_registry_per_kind_windows_and_exemption_are_reported() {
+    let layers = repo_layers(indoc! {r#"
+        min-age = "14d"
+
+        [registry."crates.io".min-age]
+        major = "60d"
+    "#});
+
+    assert_eq!(
+        keys(&cargo_repo_scope(&layers, &[consumer(".", &layers)])),
+        ["repo:cooldown.toml:registry=crates.io major"]
+    );
+
+    for exemption in ["latest = true", "min-age = \"0d\""] {
+        let layers = repo_layers(&formatdoc! {r#"
+            min-age = "14d"
+
+            [registry."crates.io"]
+            {exemption}
+        "#});
+        let notices: Vec<String> = cargo_repo_scope(&layers, &[consumer(".", &layers)])
+            .iter()
+            .map(|field| field.notice(CARGO))
+            .collect();
+        assert_eq!(
+            notices,
+            [
+                "the cooldown exemption from `repo:cooldown.toml:registry=crates.io` is not \
+                 represented in cargo's native config, so a bare cargo command does not apply it"
+            ],
+            "{exemption}"
+        );
+    }
+}
+
+/// A rule for a registry no package of the tool carries gates none of them, so it is skipped:
+/// an alternate Cargo registry, whose crates cooldown never age-evaluates, and a crates.io rule
+/// on uv's row.
+#[test]
+fn a_rule_for_another_registry_is_skipped() {
+    let layers = repo_layers(indoc! {r#"
+        min-age = "14d"
+
+        [registry."corp"]
+        min-age = { default = "30d", major = "60d" }
+        floor = "30d"
+
+        [registry."crates.io"]
+        floor = "30d"
+    "#});
+    let consumers = [consumer(".", &layers)];
+
+    assert_eq!(
+        keys(&cargo_repo_scope(&layers, &consumers)),
+        Vec::<String>::new()
+    );
+    assert_eq!(keys(&repo_scope(&layers, &consumers)), Vec::<String>::new());
+}
+
+/// A writer that declares no registry may evaluate packages of any registry, so it cannot fold
+/// a registry rule in and reports each of its gating fields.
+#[test]
+fn an_undeclared_registry_reports_every_registry_rule() {
+    let layers = repo_layers(indoc! {r#"
+        min-age = "14d"
+
+        [registry."crates.io"]
+        min-age = "21d"
+        floor = "30d"
+    "#});
+
+    assert_eq!(
+        keys(&cargo_repo_scope_in(
+            &layers,
+            &[consumer(".", &layers)],
+            None
+        )),
+        [
+            "repo:cooldown.toml:registry=crates.io default",
+            "repo:cooldown.toml:registry=crates.io floor",
+        ]
+    );
+}
+
+/// A registry floor declared only in a nested `cooldown.toml` never reached the repo-level
+/// default, so it is reported although its registry matches.
+#[test]
+fn repo_scope_reports_a_consumer_only_registry_floor() {
+    let repo = repo_layers(r#"min-age = "14d""#);
+    let mut nested = repo.clone();
+    nested.push(layer(
+        indoc! {r#"
+            [registry."crates.io"]
+            floor = "30d"
+        "#},
+        "apps/api/cooldown.toml",
+    ));
+
+    assert_eq!(
+        keys(&cargo_repo_scope(
+            &repo,
+            &[consumer(".", &repo), consumer("apps/api", &nested)]
+        )),
+        ["repo:apps/api/cooldown.toml:registry=crates.io floor"]
+    );
+}
+
+/// A registry floor binds the written default as a bare one does, so a freeze it replaces there
+/// is reported with the floor's end.
+#[test]
+fn a_freeze_under_a_binding_registry_floor_is_reported() {
+    // On 2026-01-15 a 30-day floor cuts off at 2025-12-16, before the freeze.
+    let layers = repo_layers(indoc! {r#"
+        freeze = "2026-01-10T00:00:00Z"
+
+        [registry."crates.io"]
+        floor = "30d"
+    "#});
+
+    let omitted = cargo_repo_scope(&layers, &[consumer(".", &layers)]);
+
+    assert_eq!(keys(&omitted), ["repo:cooldown.toml default"]);
+    assert_eq!(
+        omitted.first().and_then(|field| field.reason),
+        Some(OmissionReason::FreezeUnderFloor {
+            floor: SignedDuration::from_hours(24 * 30),
+            until: "2026-02-09T00:00:00Z".parse().expect("timestamp"),
+        })
+    );
+}
+
+/// uv's package table carries a literal package's window under the `pypi` floor that binds it, so
+/// a freeze that floor replaces there is reported too.
+#[test]
+fn a_package_window_freeze_under_a_registry_floor_is_reported() {
+    let layers = repo_layers(indoc! {r#"
+        [registry.pypi]
+        floor = "30d"
+
+        [package."numpy"]
+        freeze = "2026-01-10T00:00:00Z"
+    "#});
+
+    let omitted = project_scope(&layers, ".", UV, true);
+
+    assert_eq!(keys(&omitted), ["repo:cooldown.toml:package=numpy default"]);
+    std::assert_matches!(
+        omitted.first().and_then(|field| field.reason),
+        Some(OmissionReason::FreezeUnderFloor { .. })
     );
 }

@@ -12,6 +12,7 @@ use jiff::{SignedDuration, Timestamp};
 use std::collections::BTreeMap;
 
 const PNPM: ToolId = ToolId("pnpm");
+const CARGO: ToolId = ToolId("cargo");
 const NPM: ToolId = ToolId("npm");
 
 fn now() -> Timestamp {
@@ -936,7 +937,8 @@ fn the_native_default_keeps_the_project_window_under_every_catch_all_exemption()
         let mut repo_rules = vec![min_age(Selector::Default, 14)];
         repo_rules.extend(rules);
         let layers = stack(vec![repo(repo_rules)]);
-        let resolved = super::native_default_resolution(&layers, PNPM, Utf8Path::new("."), now());
+        let resolved =
+            super::native_default_resolution(&layers, PNPM, Some("npm"), Utf8Path::new("."), now());
         assert_eq!(resolved.effective_spec(now()), days(14), "{layers:?}");
     }
 
@@ -947,7 +949,57 @@ fn the_native_default_keeps_the_project_window_under_every_catch_all_exemption()
         freeze,
         floor(Selector::Default, 0),
     ])]);
-    let resolved = super::native_default_resolution(&layers, PNPM, Utf8Path::new("."), now());
+    let resolved =
+        super::native_default_resolution(&layers, PNPM, Some("npm"), Utf8Path::new("."), now());
     assert!(!resolved.is_exemption(now()));
     assert_eq!(resolved.spec, WindowSpec::Freeze(later));
+}
+
+/// A floor and a window on the tool's registry gate every package the tool evaluates, so the
+/// written default carries them, while a rule for another registry gates none of them and
+/// changes nothing.
+#[test]
+fn the_native_default_carries_the_tools_registry_rules() {
+    let crates_io = || Selector::Registry("crates.io".to_string());
+    let layers = stack(vec![repo(vec![
+        min_age(Selector::Default, 14),
+        floor(crates_io(), 30),
+        floor(Selector::Registry("corp".to_string()), 60),
+    ])]);
+    let resolved = super::native_default_resolution(
+        &layers,
+        CARGO,
+        Some("crates.io"),
+        Utf8Path::new("."),
+        now(),
+    );
+    assert_eq!(resolved.effective_spec(now()), days(30));
+
+    let layers = stack(vec![repo(vec![
+        min_age(Selector::Default, 14),
+        min_age(crates_io(), 21),
+    ])]);
+    let resolved = super::native_default_resolution(
+        &layers,
+        CARGO,
+        Some("crates.io"),
+        Utf8Path::new("."),
+        now(),
+    );
+    assert_eq!(resolved.effective_spec(now()), days(21));
+
+    // An exempt registry falls back to the effective default, which the registry rule still
+    // decides, so the written value is the exemption `sync` reports rather than writes.
+    let layers = stack(vec![repo(vec![
+        min_age(Selector::Default, 14),
+        latest(crates_io()),
+    ])]);
+    let resolved = super::native_default_resolution(
+        &layers,
+        CARGO,
+        Some("crates.io"),
+        Utf8Path::new("."),
+        now(),
+    );
+    assert!(resolved.is_exemption(now()));
 }

@@ -151,8 +151,11 @@ pub fn native_exemptions(
 
 /// Resolves the default window `sync` writes into `target`'s single native field for `project`.
 ///
-/// This is the window cooldown gates a locked pin of an unnamed package with, so a package rule
-/// that matches every name, such as `[package."*"]`, sets it just as the bare `min-age` does.
+/// This is the window cooldown gates a locked pin of an unnamed package from `registry` with, so
+/// a package rule that matches every name, such as `[package."*"]`, sets it just as the bare
+/// `min-age` does, and a [`Selector::Registry`] rule for `registry` applies as it does to every
+/// package the tool evaluates
+/// ([`ToolWrite::policy_registry`](crate::ToolWrite::policy_registry)).
 /// When that window is an exemption ([`ResolvedWindow::is_exemption`], however it is spelled), the
 /// project default `min-age`, which package rules do not change, is used instead: the native field still governs every package whose native exemption
 /// [`native_exemptions`] withholds, so a package rule's `latest` or `allow` must not lift it.
@@ -167,6 +170,7 @@ pub fn native_exemptions(
 pub fn native_default_resolution(
     layers: &[PolicyLayer],
     target: ToolId,
+    registry: Option<&str>,
     project: &Utf8Path,
     now: Timestamp,
 ) -> ResolvedWindow {
@@ -174,7 +178,7 @@ pub fn native_default_resolution(
         let query = ResolveQuery {
             tool: target,
             package: "",
-            registry: None,
+            registry,
             project,
             kind,
         };

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **`sync` writes a registry's window and floor where the native config governs that registry.**
+  With `min-age = "14d"` and `[registry."crates.io"] floor = "30d"`, cooldown gated every crate for
+  30 days, but `sync` left Cargo's `min-publish-age` at `"2 weeks"` and warned about nothing, so a
+  bare `cargo update` admitted crates 14 to 29 days old. Every package of a tool carries one
+  registry to cooldown's policy (`crates.io` for Cargo, `pypi` for uv, `npm` for pnpm and Yarn),
+  so a rule for that registry now reaches the written default and uv's package windows, as well as
+  the cutoffs cooldown passes to uv and pnpm, while its per-kind windows and exemption are reported
+  like any other rule's. A rule for another registry gates none of the tool's packages and is not
+  reported. Closes #169.
 - **`sync` reports an exempt default window instead of leaving a stale cutoff unmentioned.**
   After a switch to `latest = true` or `min-age = "0d"`, the native configs kept the cutoff an
   earlier `sync` wrote, such as `exclude-newer = "7 days"` in `uv.toml` or pnpm's

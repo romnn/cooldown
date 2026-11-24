@@ -291,9 +291,12 @@ fn resolve_advisory_floor(
 /// This feeds a tool's own per-package resolver cutoff (uv's `exclude-newer-package`), so a
 /// package-level `min-age`, `freeze`, `floor`, `latest`, or `allow` reaches the native resolver
 /// instead of only cooldown's gate.
-/// Each name resolves exactly as [`resolve`] resolves a locked pin of that package in `project`
-/// ([`ResolveKind::CurrentPin`], no registry), with any binding floor folded in via
+/// Each name resolves exactly as [`resolve`] resolves a locked pin of that package from
+/// `registry` in `project` ([`ResolveKind::CurrentPin`]), with any binding floor folded in via
 /// [`ResolvedWindow::effective_spec`].
+/// `registry` is the one every package of the tool carries
+/// ([`ToolWrite::policy_registry`](crate::ToolWrite::policy_registry)), so a `[registry."…"]`
+/// floor binds each package window as it binds cooldown's own gate.
 ///
 /// Every literal name is listed, including one whose window equals the project default: an
 /// explicit entry overrides a per-package value the tool may inherit from its own config.
@@ -305,6 +308,7 @@ fn resolve_advisory_floor(
 pub fn package_windows(
     layers: &[PolicyLayer],
     target: crate::model::ToolId,
+    registry: Option<&str>,
     project: &camino::Utf8Path,
     now: Timestamp,
 ) -> std::collections::BTreeMap<String, WindowSpec> {
@@ -325,7 +329,7 @@ pub fn package_windows(
         let query = ResolveQuery {
             tool: target,
             package: name,
-            registry: None,
+            registry,
             project,
             kind: ResolveKind::CurrentPin,
         };
@@ -644,6 +648,8 @@ mod package_window_tests {
     use jiff::{SignedDuration, Timestamp};
 
     const UV: ToolId = ToolId("uv");
+    /// The registry the uv adapter tags every package with.
+    const PYPI: &str = "pypi";
 
     fn days(count: i64) -> WindowSpec {
         WindowSpec::MinAge(SignedDuration::from_hours(24 * count))
@@ -684,7 +690,7 @@ mod package_window_tests {
             .rules
             .push(rule(package("ort", Some(ToolId("cargo"))), Some(days(0))));
 
-        let windows = package_windows(&[layer], UV, Utf8Path::new("."), now());
+        let windows = package_windows(&[layer], UV, Some(PYPI), Utf8Path::new("."), now());
 
         // The exemption and the stricter global rule both reach uv; the cargo-only rule does not.
         assert_eq!(
@@ -710,7 +716,7 @@ mod package_window_tests {
             .rules
             .push(rule(package("httpx", None), Some(days(14))));
 
-        let windows = package_windows(&[layer], UV, Utf8Path::new("."), now());
+        let windows = package_windows(&[layer], UV, Some(PYPI), Utf8Path::new("."), now());
 
         assert_eq!(
             windows.into_iter().collect::<Vec<_>>(),
@@ -739,7 +745,7 @@ mod package_window_tests {
         floored.allow = true;
         repo.rules.push(floored);
 
-        let windows = package_windows(&[global, repo], UV, Utf8Path::new("."), now());
+        let windows = package_windows(&[global, repo], UV, Some(PYPI), Utf8Path::new("."), now());
 
         // The repo default is a higher layer than the global package rule, so it wins.
         assert_eq!(windows.get("outranked"), Some(&days(14)));
@@ -747,5 +753,26 @@ mod package_window_tests {
         assert_eq!(windows.get("allowed"), Some(&WindowSpec::Latest));
         // The global floor survives the repo allow, which is declared in another layer.
         assert_eq!(windows.get("floored"), Some(&days(3)));
+    }
+
+    /// Every uv package is a `pypi` package, so a `pypi` floor binds a named package's shorter
+    /// window just as it binds cooldown's own gate, while a floor for another registry does not.
+    #[test]
+    fn a_floor_of_the_tools_registry_binds_every_package_window() {
+        let mut layer = PolicyLayer::new(Origin::Repo("cooldown.toml".into()));
+        layer.rules.push(rule(Selector::Default, Some(days(14))));
+        let mut pypi = rule(Selector::Registry(PYPI.to_string()), None);
+        pypi.floor = Some(SignedDuration::from_hours(24 * 30));
+        layer.rules.push(pypi);
+        let mut other = rule(Selector::Registry("npm".to_string()), None);
+        other.floor = Some(SignedDuration::from_hours(24 * 60));
+        layer.rules.push(other);
+        layer
+            .rules
+            .push(rule(package("requests", None), Some(days(7))));
+
+        let windows = package_windows(&[layer], UV, Some(PYPI), Utf8Path::new("."), now());
+
+        assert_eq!(windows.get("requests"), Some(&days(30)));
     }
 }
