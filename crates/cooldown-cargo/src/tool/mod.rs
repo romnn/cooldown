@@ -743,6 +743,22 @@ fn current_selector(lock: &CargoLock, change: &Change) -> Option<String> {
     None
 }
 
+/// The crates.io version of `change`'s crate that its declaring members bind past its target on
+/// the target's compatibility line, which a resolve of the widened requirement can land.
+///
+/// Cargo keeps at most one version of a crate from one source on a compatibility line, so the
+/// members bind at most one such version.
+fn overshot_copy<'g>(graph: &'g ResolvedGraph, change: &Change) -> Option<&'g str> {
+    let target = change.to.as_str();
+    graph
+        .direct_crates_io_versions(&change.members, &change.package.name)
+        .into_iter()
+        .find(|version| {
+            compatibility_line(version) == compatibility_line(target)
+                && version::compare(version, target).is_gt()
+        })
+}
+
 /// The paired version-slot changes that `applied` does not already report, as sorted collateral
 /// rows.
 ///
@@ -943,6 +959,23 @@ impl PinBatchStats {
         self.rejection_effects
             .extend(rejection.effects.iter().cloned());
         self.heals.extend(rejection.heals.iter().cloned());
+    }
+
+    /// Records Cargo's refusal `err` of a step for `change`'s held row, and whether the same
+    /// native inputs reproduce it.
+    fn record_refusal(&mut self, change: &Change, err: &CoreError, rejections: &mut PinRejections) {
+        if let Some(summary) = summarize_pin_rejection(err) {
+            let rejection = MemoRejection {
+                effects: vec![RejectionEffect {
+                    key: rejection_key(change),
+                    detail: RejectionDetail::resolver(summary, rejection_parties(err)),
+                }],
+                ..MemoRejection::default()
+            };
+            self.record_effects(&rejection, rejections);
+        }
+        // Reach failure alone is not a resolver rejection eligible for memoization.
+        self.record_rejection(memoizable_resolver_rejection(err));
     }
 }
 
@@ -1530,6 +1563,14 @@ fn unreleased_split(heal: SplitHeal) -> UnlockedSplit {
         heal,
         released: Vec::new(),
     }
+}
+
+/// What [`CargoTool::pin_overshoots_back`] left.
+struct PinnedBack {
+    /// The graph of the lock the pins left.
+    graph: ResolvedGraph,
+    /// Cargo's refusal of each pin that did not land.
+    refusals: Vec<CoreError>,
 }
 
 /// What [`CargoTool::complete_split`] achieved.
@@ -2802,6 +2843,12 @@ impl CargoTool {
             }
             Err(err) => return Err(err),
         };
+        // A candidate whose pin back Cargo refuses stays past its target, which the checks below
+        // refuse.
+        let graph = self
+            .pin_overshoots_back(probe.scope(), candidates, graph)
+            .await?
+            .graph;
         // No follower edit follows this call: the graph and lock describe the retained manifests.
         let lock = read_lock(probe.project)?;
         if seed_has_drive_by(&before, &lock, &moves) {
@@ -3084,26 +3131,23 @@ impl CargoTool {
                 .await;
             probe.journal.validate_project(&probe.project.root)?;
             match resolved {
-                Ok(graph) => Some(graph),
+                // An overshoot is pinned back first, so the step is judged once, against the lock
+                // it started from.
+                Ok(graph) => {
+                    let pinned = self
+                        .pin_overshoots_back(probe.scope(), &[change], graph)
+                        .await?;
+                    for refusal in &pinned.refusals {
+                        stats.record_refusal(change, refusal, rejections);
+                    }
+                    Some(pinned.graph)
+                }
                 Err(err) if err.is_tool_spawn_failure() || err.is_local_environment_failure() => {
                     stats.memo_disqualified = true;
                     return Err(err);
                 }
                 Err(err) => {
-                    if let Some(summary) = summarize_pin_rejection(&err) {
-                        let effect = RejectionEffect {
-                            key: rejection_key(change),
-                            detail: RejectionDetail::resolver(summary, rejection_parties(&err)),
-                        };
-                        MemoRejection {
-                            effects: vec![effect.clone()],
-                            ..MemoRejection::default()
-                        }
-                        .apply(rejections);
-                        stats.rejection_effects.push(effect);
-                    }
-                    // Reach failure alone is not a resolver rejection eligible for memoization.
-                    stats.record_rejection(memoizable_resolver_rejection(&err));
+                    stats.record_refusal(change, &err, rejections);
                     restore_widen_checkpoint(probe.project, probe.journal, checkpoint)?;
                     return Ok(TentativeWiden::Rejected);
                 }
@@ -4277,10 +4321,7 @@ impl CargoTool {
     /// lines, so the step lands exactly or not at all.
     async fn repin_overshoot(&self, scope: PinScope<'_>, change: &Change) -> Result<()> {
         let PinScope {
-            project,
-            journal,
-            observer,
-            ..
+            project, journal, ..
         } = scope;
         journal.validate_project(&project.root)?;
         let Some(overshoot) = current_selector(&read_lock(project)?, change)
@@ -4288,19 +4329,78 @@ impl CargoTool {
         else {
             return Ok(());
         };
+        self.pin_back(scope, change, &overshoot).await
+    }
+
+    /// Pins every one of `changes` whose declaring members `graph` shows bound past its target,
+    /// on the target's compatibility line, back to that target.
+    ///
+    /// A widened requirement admits the newest release on the target's line, which a resolve
+    /// lands where Cargo refused to pin the old version because another requirer still matches
+    /// it.
+    /// Each pin addresses the copy the change's own declaration binds, which the old version's
+    /// selector cannot reach once that version stays behind for another requirer.
+    /// A pin Cargo refuses leaves its change past the target, and the step's own checks judge
+    /// the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local environment failure of a pin, a refusal of the journal to validate the
+    /// project, or the failure of the locked read of the pinned lock.
+    async fn pin_overshoots_back(
+        &self,
+        scope: PinScope<'_>,
+        changes: &[&Change],
+        graph: ResolvedGraph,
+    ) -> Result<PinnedBack> {
+        let PinScope {
+            project,
+            journal,
+            observer,
+            ..
+        } = scope;
+        let mut refusals = Vec::new();
+        let mut landed = false;
+        for change in changes {
+            let Some(overshoot) = overshot_copy(&graph, change) else {
+                continue;
+            };
+            journal.validate_project(&project.root)?;
+            let pinned = self.pin_back(scope, change, overshoot).await;
+            journal.validate_project(&project.root)?;
+            match pinned {
+                Ok(()) => landed = true,
+                Err(err) if err.is_local_environment_failure() => return Err(err),
+                Err(err) => refusals.push(err),
+            }
+        }
+        if !landed {
+            return Ok(PinnedBack { graph, refusals });
+        }
+        if let Some(observer) = observer {
+            observer.resolver_started(None);
+        }
+        Ok(PinnedBack {
+            graph: self.locked_reader().graph(project).await?,
+            refusals,
+        })
+    }
+
+    /// Pins the crates.io copy of `change`'s crate at `overshoot` to the change's target.
+    async fn pin_back(&self, scope: PinScope<'_>, change: &Change, overshoot: &str) -> Result<()> {
         tracing::debug!(
             change = ?rejection_key(change),
             overshoot,
-            "re-pinning a cargo pin that overshot its target"
+            "re-pinning a cargo overshoot to its target"
         );
-        if let Some(observer) = observer {
+        if let Some(observer) = scope.observer {
             observer.resolver_started(Some(change));
         }
-        self.commands(journal)
+        self.commands(scope.journal)
             .update_precise_crates_io(
-                project,
+                scope.project,
                 &change.package.name,
-                &overshoot,
+                overshoot,
                 change.to.as_str(),
             )
             .await

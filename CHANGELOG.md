@@ -48,6 +48,14 @@
   When the pin does survive, the dependency gets a `resolver_conflict` row naming it instead of no
   row, so `upgrade --strict` now fails on it. A workspace member's own exact pin still holds as
   `pin_held`. Closes #165.
+- **A Cargo upgrade that a widened requirement resolves past its target lands at the target.**
+  `bitflags 1.0.4 → 1.1.0` was skipped with ``failed to select a version for the requirement
+  `bitflags = ">=0.9, <1.1"` (required by bridge v0.1.0)``, although it lands. Cargo refused to pin
+  1.0.4 to 1.1.0 because `bridge` still binds 1.0.4, and the resolve of the widened requirement then
+  moved `bridge` to 0.9.1 but bound the app to 1.3.2, past the target. The widen now pins the copy
+  the change's own declaration binds back to its target before judging the step, in a lone widen
+  and in a joint one alike. A target that still splits a declared crate stays held with that split.
+  Closes #166.
 
 ## v0.0.32
 

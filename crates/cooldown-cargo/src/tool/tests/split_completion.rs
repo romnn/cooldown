@@ -10,7 +10,11 @@ use std::os::unix::fs::PermissionsExt as _;
 /// `dep` into two lines, the way cargo keeps the old line for the requirer left behind.
 /// A precise pin of `dep` 2.0.0 is refused while `app` still declares `dep = "1"`.
 /// Every move of `fresh` is refused, and a seed carrying one fails without naming it.
-/// With an `overshoot` file, a resolve unifying both requirers lands `dep` 2.1.0 instead.
+/// With an `overshoot` file, a resolve unifying both requirers lands `dep` 2.1.0 instead, unless
+/// the lock already binds both at 2.0.0.
+/// Pinning that copy back to 2.0.0 is then refused for `holder`, unless a `repairable` file lets
+/// it land.
+/// A locked read leaves the lock alone, and every read reports the `dep` that `app` binds.
 const SCRIPT: &str = indoc! {r#"
     #!/bin/sh
     set -eu
@@ -22,6 +26,7 @@ const SCRIPT: &str = indoc! {r#"
       selected && /^version = / { gsub(/version = |"/, ""); print; exit }
     ' Cargo.lock)
     command="$1"
+    target=''
     case "$command" in
       metadata)
         if ! grep -A1 '^name = "fresh"$' Cargo.lock | grep -q '^version = "1.0.0"$'; then
@@ -31,7 +36,6 @@ const SCRIPT: &str = indoc! {r#"
         ;;
       update)
         spec=''
-        target=''
         while [ "$#" -gt 0 ]; do
           case "$1" in
             -p) shift; spec="$1" ;;
@@ -53,16 +57,33 @@ const SCRIPT: &str = indoc! {r#"
               echo 'required by package `app v0.1.0 (/repo/app)`' >&2
               exit 101
             fi
+            if [ -f overshoot ] && [ ! -f repairable ] && [ "$holder" = 1.1.0 ]; then
+              echo 'error: failed to select a version for the requirement `dep = "^2.1"`' >&2
+              echo 'required by package `holder v1.1.0`' >&2
+              exit 101
+            fi
             ;;
         esac
         ;;
       *) exit 102 ;;
     esac
     resolved="lock-$holder-$app"
-    if [ "$resolved" = lock-1.1.0-2 ] && [ -f overshoot ]; then resolved=overshot.lock; fi
-    cp "$resolved" Cargo.lock
+    if [ "$resolved" = lock-1.1.0-2 ] && [ -f overshoot ] && [ "$target" != 2.0.0 ] \
+      && ! cmp -s Cargo.lock lock-1.1.0-2; then
+      resolved=overshot.lock
+    fi
+    case "$*" in
+      *--locked*) ;;
+      *) cp "$resolved" Cargo.lock ;;
+    esac
     if [ "$command" = metadata ]; then
-      echo '{"packages": [], "workspace_members": [], "workspace_root": "", "resolve": null}'
+      if cmp -s Cargo.lock overshot.lock; then app_dep=2.1.0; else app_dep="$app.0.0"; fi
+      printf '%s\n' "{\"packages\": [
+        {\"id\": \"app\", \"name\": \"app\", \"version\": \"0.1.0\", \"manifest_path\": \"/repo/Cargo.toml\"},
+        {\"id\": \"dep\", \"name\": \"dep\", \"version\": \"$app_dep\",
+         \"source\": \"registry+https://github.com/rust-lang/crates.io-index\"}],
+        \"workspace_members\": [\"app\"], \"workspace_root\": \"/repo\",
+        \"resolve\": {\"nodes\": [{\"id\": \"app\", \"deps\": [{\"name\": \"dep\", \"pkg\": \"dep\"}]}]}}"
     fi
 "#};
 
@@ -210,6 +231,17 @@ fn dep_move() -> Change {
     change("dep", "1.0.0", "2.0.0", false)
 }
 
+/// [`dep_move`] as `app`'s own declaration, whose reach the member graph decides.
+fn declared_dep_move() -> Change {
+    Change {
+        members: vec![MemberRef {
+            name: "app".to_owned(),
+            path: ".".to_owned(),
+        }],
+        ..dep_move()
+    }
+}
+
 /// A dependency move that switches `holder` to `dep`'s next line lands together with the planned
 /// move of `app`'s own `dep` declaration.
 ///
@@ -343,11 +375,13 @@ async fn a_remembered_split_refusal_stands_only_while_nothing_heals_it() -> eyre
 }
 
 /// A healing step that overshoots a partner's exact target is restored instead of kept.
+///
+/// `holder` 1.1.0 holds `dep` past the target, so Cargo refuses to pin `app`'s copy back.
 #[tokio::test]
 async fn a_split_completion_missing_a_target_is_restored() -> eyre::Result<()> {
     let fixture = SplitFixture::new()?;
     std::fs::write(fixture.directory.path().join("overshoot"), "")?;
-    let plan = SplitFixture::plan(vec![dep_move(), holder_move()], RewriteMode::Auto);
+    let plan = SplitFixture::plan(vec![declared_dep_move(), holder_move()], RewriteMode::Auto);
 
     let rejections = fixture.resolve(&plan).await?;
 
@@ -362,6 +396,34 @@ async fn a_split_completion_missing_a_target_is_restored() -> eyre::Result<()> {
         )),
         "{rejections:?}"
     );
+    // The overshot copy was tried at its target.
+    assert!(
+        fixture
+            .file("invocations")?
+            .contains("#dep@2.1.0 --precise 2.0.0")
+    );
+    Ok(())
+}
+
+/// A healing step that overshoots a partner's exact target lands once that partner's copy is
+/// pinned back to it, with every move of the coalition at its exact target.
+#[tokio::test]
+async fn a_split_completion_lands_once_its_overshoot_is_pinned_back() -> eyre::Result<()> {
+    let fixture = SplitFixture::new()?;
+    std::fs::write(fixture.directory.path().join("overshoot"), "")?;
+    std::fs::write(fixture.directory.path().join("repairable"), "")?;
+    let plan = SplitFixture::plan(vec![declared_dep_move(), holder_move()], RewriteMode::Auto);
+
+    let rejections = fixture.resolve(&plan).await?;
+
+    // Both moves landed on one `dep` 2 line at the target, with `app`'s declaration widened.
+    assert_eq!(
+        fixture.file("Cargo.lock")?,
+        lock("1.1.0", "2.0.0", "2.0.0"),
+        "{rejections:?}\n{}",
+        fixture.file("invocations")?
+    );
+    assert!(fixture.file("Cargo.toml")?.contains(r#"dep = "2"#));
     Ok(())
 }
 
