@@ -9,8 +9,8 @@
 //! only a default window it cannot write and settings that keep cargo from enforcing the age.
 
 use super::{
-    CRATES_IO_AGE_KEY, CargoEnvironment, PublishAgeSettings, parse_age, render_age,
-    writable_config_file,
+    CRATES_IO_AGE_ENV, CRATES_IO_AGE_KEY, CargoEnvironment, PublishAgeSettings, parse_age,
+    render_age, writable_config_file,
 };
 use camino::Utf8Path;
 use cooldown_core::{
@@ -60,6 +60,8 @@ pub(crate) fn write_repo_native(
         ));
         return Ok(SyncReport::Unchanged { path, warnings });
     };
+    // The written table names crates.io, which is what makes cargo read crates.io's own variable.
+    warnings.extend(crates_io_env_warning(env, age, &text));
 
     if current_age(&path)? == Some(age) {
         return Ok(SyncReport::Unchanged { path, warnings });
@@ -73,6 +75,37 @@ pub(crate) fn write_repo_native(
         cooldown_toml_util::write_document(&path, &document)?;
     }
     Ok(SyncReport::Written { path, warnings })
+}
+
+/// The warning for a crates.io age in `env` that replaces the `age`, spelled `text`, sync writes.
+fn crates_io_env_warning(
+    env: &CargoEnvironment,
+    age: jiff::SignedDuration,
+    text: &str,
+) -> Option<Diagnostic> {
+    let raw = env.registry_ages.get(CRATES_IO_AGE_ENV)?;
+    let (kind, effect) = match parse_age(raw) {
+        Ok(found) if found == age => return None,
+        Ok(found) if found < age => (
+            DiagnosticKind::Config,
+            "so a bare cargo command admits crates younger than the cooldown".to_owned(),
+        ),
+        Ok(_) => (
+            DiagnosticKind::StricterNative,
+            "so a bare cargo command holds back crates cooldown admits".to_owned(),
+        ),
+        Err(reason) => (
+            DiagnosticKind::Config,
+            format!("and cargo cannot parse it: {reason}"),
+        ),
+    };
+    Some(Diagnostic::new(
+        kind,
+        format!(
+            "{CRATES_IO_AGE_ENV} = {raw:?} replaces the crates.io min-publish-age of {text} sync \
+             writes, {effect}"
+        ),
+    ))
 }
 
 /// Sets `registries.crates-io.min-publish-age`, keeping the formatting of everything else.

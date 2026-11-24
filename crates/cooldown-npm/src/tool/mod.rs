@@ -3372,7 +3372,8 @@ impl<L: NodeLock> NpmTool<L> {
     /// pnpm is asked for its effective window and exclusions in the project itself.
     /// A query that fails is incomplete evidence, so it yields no warning and no failure.
     /// Where `admitted` holds only the versions young under a `bound`, a window longer than it
-    /// may refuse a version the list lacks, so the warning then names none.
+    /// may refuse a version the list lacks, so there is no list to name, and only the longer
+    /// window is reported ([`Self::override_warnings`]).
     async fn overridden_admission_warning(
         &self,
         project: &Project,
@@ -3394,12 +3395,7 @@ impl<L: NodeLock> NpmTool<L> {
         let effective_floor = self.native_floor(project).await.ok()?;
         if bound.is_some_and(|bound| effective_floor.is_some_and(|floor| floor.longer_than(bound)))
         {
-            return Some(Diagnostic::new(
-                DiagnosticKind::StricterNative,
-                "a higher-precedence setting, such as an environment variable, a CLI flag or a \
-                 pnpmfile, sets a longer minimumReleaseAge than pnpm-workspace.yaml here, so a \
-                 bare pnpm install may refuse versions cooldown admits",
-            ));
+            return None;
         }
         let effective_rules = self.effective_minimum_age_exclusions(project).await.ok()?;
         let overridden = crate::admissions::overridden_admissions(
@@ -3426,6 +3422,93 @@ impl<L: NodeLock> NpmTool<L> {
                 ),
             )
         })
+    }
+
+    /// The warnings for settings above the settings file that keep bare pnpm here from applying
+    /// the `minutes` window and the exclusions of `written`, the file text sync writes.
+    ///
+    /// pnpm 11 lets a variable such as `pnpm_config_minimum_release_age` replace a workspace
+    /// setting, while pnpm 10 lets the file win, so pnpm's own effective values decide.
+    /// `queried` is the file text pnpm reads now, which differs from `written` only in a dry run
+    /// that would change the file: a setting counts as overridden only where pnpm's value differs
+    /// from what `queried` sets, and then where it differs from what `written` sets.
+    /// A query that fails, or a setting `queried` leaves unset, yields no warning.
+    /// `minimumReleaseAgeStrict` is reported whenever pnpm reads it as false, since sync never
+    /// writes it.
+    async fn override_warnings(
+        &self,
+        project: &Project,
+        queried: &str,
+        written: &str,
+        minutes: i64,
+    ) -> Vec<Diagnostic> {
+        let mut warnings = Vec::new();
+        let (Some(queried), Some(written)) = (FileGate::parse(queried), FileGate::parse(written))
+        else {
+            return warnings;
+        };
+        if let Some(file) = queried.minutes
+            && let Ok(Some(effective)) = self
+                .configured_value::<Option<i64>>(project, "minimumReleaseAge")
+                .await
+            && effective != file
+            && effective != minutes
+        {
+            let (kind, comparison, effect) = if effective < minutes {
+                (
+                    DiagnosticKind::Config,
+                    "below",
+                    "admits releases younger than the cooldown",
+                )
+            } else {
+                (
+                    DiagnosticKind::StricterNative,
+                    "above",
+                    "may refuse versions cooldown admits",
+                )
+            };
+            warnings.push(Diagnostic::new(
+                kind,
+                format!(
+                    "pnpm's effective minimumReleaseAge here is {effective} minutes, {comparison} \
+                     the {minutes} sync writes to pnpm-workspace.yaml, as a setting above the \
+                     file such as pnpm_config_minimum_release_age overrides it, so a bare pnpm \
+                     install {effect}"
+                ),
+            ));
+        }
+        if let (Some(file), Some(written)) = (queried.exclusions, written.exclusions)
+            && let Ok(Some(effective)) = self
+                .configured_value::<Option<ConfigStringList>>(project, "minimumReleaseAgeExclude")
+                .await
+        {
+            let effective = crate::exclusions::configured_rules(effective);
+            if effective != crate::exclusions::configured_rules(file)
+                && effective != crate::exclusions::configured_rules(written)
+            {
+                warnings.push(Diagnostic::new(
+                    DiagnosticKind::Config,
+                    format!(
+                        "pnpm's effective minimumReleaseAgeExclude here is {effective:?}, not the \
+                         list sync writes to pnpm-workspace.yaml, as a setting above the file \
+                         such as pnpm_config_minimum_release_age_exclude overrides it, so a bare \
+                         pnpm install exempts other packages than cooldown does"
+                    ),
+                ));
+            }
+        }
+        if let Ok(Some(false)) = self
+            .configured_value::<Option<bool>>(project, "minimumReleaseAgeStrict")
+            .await
+        {
+            warnings.push(Diagnostic::new(
+                DiagnosticKind::Config,
+                "pnpm's effective minimumReleaseAgeStrict here is false, so a bare pnpm install \
+                 picks a release younger than minimumReleaseAge wherever no mature version \
+                 satisfies the request",
+            ));
+        }
+        warnings
     }
 
     /// The directory `project`'s native backstop verifies under, created on its first probe.
@@ -5386,6 +5469,15 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         if changed && !dry_run {
             crate::native::write_settings(&path, &rendered)?;
         }
+        let queried = if changed && dry_run {
+            &original
+        } else {
+            &rendered
+        };
+        warnings.extend(
+            self.override_warnings(project, queried, &rendered, minutes)
+                .await,
+        );
         if complete
             && !dry_run
             && let Some(admitted) = &policy.admitted_versions
@@ -5400,6 +5492,26 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         } else {
             SyncReport::Unchanged { path, warnings }
         })
+    }
+}
+
+/// The release-age settings a pnpm settings file sets itself, each `None` where the file leaves
+/// it to pnpm's other configuration.
+#[derive(serde::Deserialize, Default)]
+struct FileGate {
+    #[serde(rename = "minimumReleaseAge")]
+    minutes: Option<i64>,
+    #[serde(rename = "minimumReleaseAgeExclude")]
+    exclusions: Option<ConfigStringList>,
+}
+
+impl FileGate {
+    /// The settings in `content`, or `None` when it is no settings file pnpm reads.
+    fn parse(content: &str) -> Option<Self> {
+        if content.trim().is_empty() {
+            return Some(Self::default());
+        }
+        serde_saphyr::from_str(content).ok()
     }
 }
 
@@ -6980,7 +7092,13 @@ packages:
                 true,
             )
             .await?;
-        assert!(sync_warnings(&report).is_empty(), "{report:?}");
+        // The file sets seven days, so pnpm's fourteen prove a setting above it.
+        assert!(
+            sync_warnings(&report).iter().all(|warning| warning
+                .message
+                .starts_with("pnpm's effective minimumReleaseAge here is 20160 minutes")),
+            "{report:?}"
+        );
         tool.write_native(
             &pnpm_sync_project(&full_root),
             &ten_day_pin_policy(false),
@@ -7082,15 +7200,15 @@ packages:
     }
 
     /// When pnpm's window grows past the bound between the write and the override check after
-    /// it, the bounded list cannot name every version the longer window refuses, so the warning
-    /// says that a bare install may refuse admitted versions without naming any.
+    /// it, the bounded list cannot name every version the longer window refuses, so only the
+    /// longer window is reported, naming no version.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_bounded_override_warning_names_no_version_past_the_bound() -> eyre::Result<()> {
         let (_dir, root) = sync_tempdir()?;
         // pnpm's window is the written seven days at the write and fourteen days after it.
         let config_get = r#"case "$*" in
-                    *minimumReleaseAgeExclude*) echo '[]'; exit 0 ;;
+                    *minimumReleaseAgeExclude*) echo '["young@1.0.0"]'; exit 0 ;;
                   esac
                   if [ -f "$0.asked" ]; then echo 20160; else touch "$0.asked"; echo 10080; fi
                   exit 0"#;
@@ -7105,9 +7223,10 @@ packages:
         assert_eq!(
             warnings,
             [
-                "a higher-precedence setting, such as an environment variable, a CLI flag or a \
-              pnpmfile, sets a longer minimumReleaseAge than pnpm-workspace.yaml here, so a bare \
-              pnpm install may refuse versions cooldown admits"
+                "pnpm's effective minimumReleaseAge here is 20160 minutes, above the 10080 sync \
+                 writes to pnpm-workspace.yaml, as a setting above the file such as \
+                 pnpm_config_minimum_release_age overrides it, so a bare pnpm install may refuse \
+                 versions cooldown admits"
             ]
         );
         Ok(())
@@ -7658,6 +7777,101 @@ packages:
                 .any(|warning| warning.message.contains("next@16.4.6")),
             "{report:?}"
         );
+        Ok(())
+    }
+
+    /// pnpm 11 lets variables such as `pnpm_config_minimum_release_age` replace the window and
+    /// the list sync writes, so a real write whose pnpm then reports a zero window, another list
+    /// and a non-strict gate earns one warning for each.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_native_warns_about_settings_that_override_the_written_gate() -> eyre::Result<()>
+    {
+        let (_dir, root) = sync_tempdir()?;
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            indoc! {"
+                packages: []
+                minimumReleaseAgeExclude: []
+            "},
+        )?;
+        let (_cache, tool) = pnpm_sync_tool_scripted(
+            &root,
+            &[],
+            r#"echo '{"registry":"https://registry.npmjs.org/"}'; exit 0"#,
+            r#"case "$*" in
+                    *minimumReleaseAgeExclude*) echo '["other"]' ;;
+                    *minimumReleaseAgeStrict*) echo false ;;
+                    *) echo 0 ;;
+                  esac
+                  exit 0"#,
+        )?;
+
+        let report = tool
+            .write_native(
+                &pnpm_sync_project(&root),
+                &pnpm_sync_policy(&[], Some(&[])),
+                false,
+            )
+            .await?;
+
+        let warnings = sync_warnings(&report);
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.kind == DiagnosticKind::Config),
+            "{warnings:?}"
+        );
+        let settings: Vec<&str> = warnings
+            .iter()
+            .filter_map(|warning| warning.message.strip_prefix("pnpm's effective "))
+            .filter_map(|rest| rest.split_once(" here is ").map(|(setting, _)| setting))
+            .collect();
+        assert_eq!(
+            settings,
+            [
+                "minimumReleaseAge",
+                "minimumReleaseAgeExclude",
+                "minimumReleaseAgeStrict"
+            ],
+            "{warnings:?}"
+        );
+        Ok(())
+    }
+
+    /// A dry run that would change the file leaves pnpm reading the old one, so only a window
+    /// that differs from the old file's proves a setting above it: pnpm reporting the old seven
+    /// days earns no warning, while a zero it reports does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dry_run_warns_only_about_an_override_the_old_file_proves() -> eyre::Result<()> {
+        for (reported, warned) in [(10080, false), (0, true)] {
+            let (_dir, root) = sync_tempdir()?;
+            std::fs::write(
+                root.join("pnpm-workspace.yaml"),
+                indoc! {"
+                    packages: []
+                    minimumReleaseAge: 10080
+                "},
+            )?;
+            let (_cache, tool) = pnpm_sync_tool_scripted(
+                &root,
+                &[],
+                r#"echo '{"registry":"https://registry.npmjs.org/"}'; exit 0"#,
+                &format!("echo {reported}; exit 0"),
+            )?;
+
+            let report = tool
+                .write_native(
+                    &pnpm_sync_project(&root),
+                    &pnpm_sync_policy(&[], Some(&[])),
+                    true,
+                )
+                .await?;
+
+            std::assert_matches!(report, SyncReport::Written { .. });
+            assert_eq!(!sync_warnings(&report).is_empty(), warned, "{report:?}");
+        }
         Ok(())
     }
 

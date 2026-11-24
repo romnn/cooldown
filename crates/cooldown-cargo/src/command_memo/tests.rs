@@ -597,7 +597,10 @@ fn time_and_download_dependent_resolution_is_not_stable() -> eyre::Result<()> {
     };
     let config = |text: &str| std::fs::write(project.join(".cargo/config.toml"), text);
     let crates_io_env = |value: &str| CargoEnvironment {
-        registry_ages: vec![value.to_owned()],
+        registry_ages: std::collections::BTreeMap::from([(
+            "CARGO_REGISTRIES_CRATES_IO_MIN_PUBLISH_AGE".to_owned(),
+            value.to_owned(),
+        )]),
         ..bare.clone()
     };
 

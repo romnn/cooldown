@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **`sync` warns when an environment variable keeps a tool from applying the window it wrote.**
+  `sync` reported the native window `written` while a shell or CI job still overrode it, so a bare
+  `uv lock` under `UV_EXCLUDE_NEWER="1 day"` admitted releases a 7-day sync was meant to hold back.
+  uv now warns when `UV_EXCLUDE_NEWER` differs from the written `exclude-newer`, and when
+  `UV_NO_CONFIG` or `UV_CONFIG_FILE` keeps bare uv from reading the synced `uv.toml`. pnpm warns when
+  its effective `minimumReleaseAge` or `minimumReleaseAgeExclude` differs from what `sync` wrote, as
+  pnpm 11's `pnpm_config_minimum_release_age` variables make it, saying whether the window is
+  shorter or longer, and when `minimumReleaseAgeStrict` is `false`. Cargo reads crates.io's own age
+  only as `CARGO_REGISTRIES_crates-io_MIN_PUBLISH_AGE`, spelled with the registry's literal name and
+  only once a config table names the registry; cooldown now reads that variable for the native
+  policy it imports and the cargo commands it runs, and `sync` warns when it replaces the written
+  age. Closes #172.
 - **`sync` writes a registry's window and floor where the native config governs that registry.**
   With `min-age = "14d"` and `[registry."crates.io"] floor = "30d"`, cooldown gated every crate for
   30 days, but `sync` left Cargo's `min-publish-age` at `"2 weeks"` and warned about nothing, so a

@@ -18,12 +18,12 @@ use cooldown_adapter_util::{
     RegistryVersionClassifier, build_registry_releases, verify_current_report,
 };
 use cooldown_core::{
-    ApplyReport, ArtifactScope, Capabilities, Change, DepScope, Dependency, FetchContext,
-    LockVerifyReport, MemberRef, NativePolicyLayer, PackageId, PackageRegistry, Plan,
-    PreparedMutation, Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release,
-    ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs, ResolvedPolicy, Result,
-    RewriteMode, SkipReason, Skipped, SyncReport, SyncScope, ToolId, ToolRead, ToolWrite,
-    UpdateKind, VerifyReport, Version,
+    ApplyReport, ArtifactScope, Capabilities, Change, DepScope, Dependency, Diagnostic,
+    DiagnosticKind, FetchContext, LockVerifyReport, MemberRef, NativePolicyLayer, PackageId,
+    PackageRegistry, Plan, PreparedMutation, Project, ProjectMarker, ProjectMutationJournal,
+    RawRelease, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs,
+    ResolvedPolicy, Result, RewriteMode, SkipReason, Skipped, SyncReport, SyncScope, ToolId,
+    ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 
@@ -229,7 +229,6 @@ impl ToolRead for UvTool {
                 "APPDATA",
                 "PROGRAMDATA",
                 "UV_EXCLUDE_NEWER",
-                "UV_EXCLUDE_NEWER_PACKAGE",
                 "UV_NO_CONFIG",
                 "UV_PYTHON",
             ],
@@ -1066,38 +1065,117 @@ impl ToolWrite for UvTool {
         policy: &ResolvedPolicy,
         dry_run: bool,
     ) -> Result<SyncReport> {
-        let path = repo_root.join("uv.toml");
-        // A `uv.toml` is a flat config file, so the keys are the top-level `exclude-newer` and
-        // `exclude-newer-package` — not the `[tool.uv]`-nested form a `pyproject.toml` uses.
-        // A `Latest`/zero default excludes nothing, so there is no default cutoff to write; the
-        // per-package table is still owned, since a stricter package window needs it all the same.
-        let default = policy
-            .default_window
-            .as_ref()
-            .and_then(cooldown_core::window_exclude_newer);
-        let mut written = match default {
-            Some(value) => {
-                cooldown_toml_util::set_toml_string(&path, &["exclude-newer"], &value, dry_run)?
-            }
-            None => false,
-        };
-        written |= cooldown_toml_util::set_toml_value(
-            &path,
-            &["exclude-newer-package"],
-            exclude_newer_package_table(&policy.package_windows),
-            dry_run,
-        )?;
-        if written {
-            Ok(SyncReport::Written {
-                path,
-                warnings: Vec::new(),
-            })
-        } else {
-            Ok(SyncReport::Unchanged {
-                path,
-                warnings: Vec::new(),
-            })
+        write_uv_toml(repo_root, policy, &UvEnvironment::current(), dry_run)
+    }
+}
+
+/// The variables that decide whether bare uv applies the `uv.toml` `sync` writes, captured so
+/// tests can supply their own.
+#[derive(Debug)]
+struct UvEnvironment {
+    /// `UV_EXCLUDE_NEWER`, which replaces the default cutoff of every config file.
+    exclude_newer: Option<String>,
+    /// `UV_NO_CONFIG`, which turns config file discovery off when true.
+    no_config: Option<String>,
+    /// `UV_CONFIG_FILE`, which reads the file it names instead of the discovered ones.
+    config_file: Option<String>,
+}
+
+impl UvEnvironment {
+    /// Captures the environment of the running process.
+    fn current() -> Self {
+        Self {
+            exclude_newer: std::env::var("UV_EXCLUDE_NEWER").ok(),
+            no_config: std::env::var("UV_NO_CONFIG").ok(),
+            config_file: std::env::var("UV_CONFIG_FILE").ok(),
         }
+    }
+
+    /// The warnings for variables that keep bare uv from applying the `uv.toml` sync writes,
+    /// whose default cutoff is `default`.
+    ///
+    /// A cutoff in `UV_EXCLUDE_NEWER` is compared as text, since its direction would need uv's
+    /// date and span grammar.
+    fn warnings(&self, default: Option<&str>) -> Vec<Diagnostic> {
+        let mut warnings = Vec::new();
+        if let (Some(value), Some(default)) = (&self.exclude_newer, default)
+            && value != default
+        {
+            warnings.push(Diagnostic::new(
+                DiagnosticKind::Config,
+                format!(
+                    "UV_EXCLUDE_NEWER = {value:?} replaces the exclude-newer = {default:?} sync \
+                     writes to uv.toml, so bare uv runs in this environment resolve under it"
+                ),
+            ));
+        }
+        // uv reads the variable as a clap boolean.
+        if let Some(value) = &self.no_config
+            && ["y", "yes", "t", "true", "on", "1"]
+                .iter()
+                .any(|truthy| value.eq_ignore_ascii_case(truthy))
+        {
+            warnings.push(Diagnostic::new(
+                DiagnosticKind::Config,
+                format!(
+                    "UV_NO_CONFIG = {value:?} turns off config discovery, so bare uv runs in this \
+                     environment ignore the cooldown settings sync writes to uv.toml"
+                ),
+            ));
+        }
+        if let Some(value) = &self.config_file {
+            warnings.push(Diagnostic::new(
+                DiagnosticKind::Config,
+                format!(
+                    "UV_CONFIG_FILE = {value:?} replaces config discovery, so bare uv runs in this \
+                     environment ignore the cooldown settings sync writes to uv.toml"
+                ),
+            ));
+        }
+        warnings
+    }
+}
+
+/// Writes `policy` into the repo root's `uv.toml`, as [`ToolWrite::write_repo_native`] does,
+/// warning about the variables in `env` that keep bare uv from applying it.
+fn write_uv_toml(
+    repo_root: &Utf8Path,
+    policy: &ResolvedPolicy,
+    env: &UvEnvironment,
+    dry_run: bool,
+) -> Result<SyncReport> {
+    let path = repo_root.join("uv.toml");
+    // A `uv.toml` is a flat config file, so the keys are the top-level `exclude-newer` and
+    // `exclude-newer-package` — not the `[tool.uv]`-nested form a `pyproject.toml` uses.
+    // A `Latest`/zero default excludes nothing, so there is no default cutoff to write; the
+    // per-package table is still owned, since a stricter package window needs it all the same.
+    let default = policy
+        .default_window
+        .as_ref()
+        .and_then(cooldown_core::window_exclude_newer);
+    let package_table = exclude_newer_package_table(&policy.package_windows);
+    // A policy that leaves both keys unset gives bare uv nothing to skip.
+    let warnings = if default.is_some() || package_table.is_some() {
+        env.warnings(default.as_deref())
+    } else {
+        Vec::new()
+    };
+    let mut written = match &default {
+        Some(value) => {
+            cooldown_toml_util::set_toml_string(&path, &["exclude-newer"], value, dry_run)?
+        }
+        None => false,
+    };
+    written |= cooldown_toml_util::set_toml_value(
+        &path,
+        &["exclude-newer-package"],
+        package_table,
+        dry_run,
+    )?;
+    if written {
+        Ok(SyncReport::Written { path, warnings })
+    } else {
+        Ok(SyncReport::Unchanged { path, warnings })
     }
 }
 
@@ -2025,6 +2103,56 @@ mod tests {
             std::fs::read_to_string(root.join("uv.toml"))?,
             "exclude-newer-package = { numpy = \"30 days\" }\n"
         );
+        Ok(())
+    }
+
+    /// Each variable that keeps bare uv from applying the written uv.toml earns a warning, and a
+    /// `UV_EXCLUDE_NEWER` equal to the written cutoff or a false `UV_NO_CONFIG` earns none.
+    #[test]
+    fn write_uv_toml_warns_about_variables_that_override_it() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let policy = ResolvedPolicy {
+            admission_bound: None,
+            admitted_versions: Some(Vec::new()),
+            default_window: Some(cooldown_core::WindowSpec::MinAge(
+                jiff::SignedDuration::from_hours(24 * 7),
+            )),
+            exempt_packages: Vec::new(),
+            withheld_exemptions: Vec::new(),
+            package_windows: std::collections::BTreeMap::new(),
+        };
+        let warned = |env: UvEnvironment| -> eyre::Result<Vec<String>> {
+            match write_uv_toml(&root, &policy, &env, true)? {
+                SyncReport::Written { warnings, .. } => Ok(warnings
+                    .into_iter()
+                    .map(|warning| warning.message)
+                    .collect()),
+                other => Err(eyre::eyre!("unexpected sync report {other:?}")),
+            }
+        };
+
+        let overriding = warned(UvEnvironment {
+            exclude_newer: Some("1 day".to_string()),
+            no_config: Some("TRUE".to_string()),
+            config_file: Some("other.toml".to_string()),
+        })?;
+        let variables: Vec<&str> = overriding
+            .iter()
+            .filter_map(|message| message.split_once(' ').map(|(variable, _)| variable))
+            .collect();
+        assert_eq!(
+            variables,
+            ["UV_EXCLUDE_NEWER", "UV_NO_CONFIG", "UV_CONFIG_FILE"]
+        );
+
+        let agreeing = warned(UvEnvironment {
+            exclude_newer: Some("7 days".to_string()),
+            no_config: Some("off".to_string()),
+            config_file: None,
+        })?;
+        assert_eq!(agreeing, [] as [String; 0]);
         Ok(())
     }
 
