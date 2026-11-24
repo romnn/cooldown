@@ -900,3 +900,54 @@ fn the_glob_proof_is_sound_against_resolve_under_pattern_ranking() {
         assert!(unproven > 100, "only {unproven} proofs of {glob} failed");
     }
 }
+
+/// A zero `min-age` on exactly `*` is the catch-all exemption `[package."*"] latest = true`
+/// spells, so pnpm's list takes it alike, while a named zero window stays a window.
+#[test]
+fn a_catch_all_zero_window_is_exempt_like_latest() {
+    for rule in [
+        min_age(package("*"), 0),
+        latest(package("*")),
+        allow(package("*")),
+    ] {
+        let layers = stack(vec![repo(vec![
+            min_age(Selector::Default, 14),
+            rule.clone(),
+        ])]);
+        assert_eq!(exemptions(&layers), exempt(&["*"]), "{rule:?}");
+    }
+
+    let named = stack(vec![repo(vec![min_age(package("zod"), 0)])]);
+    assert_eq!(exemptions(&named), NativeExemptions::default());
+}
+
+/// The default `sync` writes falls back to the project window for every spelling of a `*`
+/// exemption, a zero floor included, while a freeze a zero floor folds into a zero age stays the
+/// freeze it is.
+#[test]
+fn the_native_default_keeps_the_project_window_under_every_catch_all_exemption() {
+    let spellings = [
+        vec![min_age(package("*"), 0)],
+        vec![latest(package("*"))],
+        vec![allow(package("*"))],
+        vec![latest(package("*")), floor(Selector::Default, 0)],
+    ];
+    for rules in spellings {
+        let mut repo_rules = vec![min_age(Selector::Default, 14)];
+        repo_rules.extend(rules);
+        let layers = stack(vec![repo(repo_rules)]);
+        let resolved = super::native_default_resolution(&layers, PNPM, Utf8Path::new("."), now());
+        assert_eq!(resolved.effective_spec(now()), days(14), "{layers:?}");
+    }
+
+    let later = now() + SignedDuration::from_hours(24 * 30);
+    let freeze = window(package("*"), ByKind::scalar(WindowSpec::Freeze(later)));
+    let layers = stack(vec![repo(vec![
+        min_age(Selector::Default, 14),
+        freeze,
+        floor(Selector::Default, 0),
+    ])]);
+    let resolved = super::native_default_resolution(&layers, PNPM, Utf8Path::new("."), now());
+    assert!(!resolved.is_exemption(now()));
+    assert_eq!(resolved.spec, WindowSpec::Freeze(later));
+}

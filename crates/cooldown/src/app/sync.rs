@@ -503,7 +503,8 @@ impl Workspace {
 }
 
 /// The default window `sync` bakes into a tool's single native field for `project`: the
-/// effective spec of [`native_default_resolution`], with any binding floor folded in.
+/// effective spec of [`native_default_resolution`], with any binding floor folded in, or
+/// [`WindowSpec::Latest`] for an exemption however it is spelled.
 ///
 /// Per-kind windows and the windows of packages a rule names do not fit the single field;
 /// [`omitted_native_fields`] reports each one the native config does not carry otherwise.
@@ -513,7 +514,12 @@ fn native_default_window(
     project: &Utf8Path,
     now: jiff::Timestamp,
 ) -> WindowSpec {
-    native_default_resolution(layers, tool, project, now).effective_spec(now)
+    let resolution = native_default_resolution(layers, tool, project, now);
+    if resolution.is_exemption(now) {
+        WindowSpec::Latest
+    } else {
+        resolution.effective_spec(now)
+    }
 }
 
 /// One [`DiagnosticKind::Config`] notice per gating policy field in `contexts` that `tool`'s
@@ -1717,6 +1723,38 @@ mod tests {
                     allow = ["*"]
                 "#},
                 "14d",
+            ),
+            (
+                indoc::indoc! {r#"
+                    min-age = "14d"
+
+                    [package."*"]
+                    min-age = "0d"
+                "#},
+                "14d",
+            ),
+            (
+                indoc::indoc! {r#"
+                    min-age = "14d"
+                    floor = "0d"
+
+                    [package."*"]
+                    latest = true
+                "#},
+                "14d",
+            ),
+            (r#"min-age = "0d""#, "latest"),
+            ("latest = true", "latest"),
+            // A future freeze a zero floor folds into a zero age is no exemption: the writer gets
+            // the age, which it cannot spell, and leaves its setting with its own warning.
+            (
+                indoc::indoc! {r#"
+                    floor = "0d"
+
+                    [package."*"]
+                    freeze = "2099-01-01T00:00:00Z"
+                "#},
+                "0d",
             ),
             (
                 indoc::indoc! {r#"

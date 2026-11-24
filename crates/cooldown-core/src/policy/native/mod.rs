@@ -60,7 +60,8 @@ pub struct NativeExemptions {
 /// package-wide native exemptions and those withheld.
 ///
 /// A candidate is every [`Selector::Package`] rule, unqualified or qualified for `target`, that
-/// sets `allow` or a [`WindowSpec::Latest`] window of any kind.
+/// sets `allow` or a [`WindowSpec::Latest`] window of any kind, and the rule for exactly `*` that
+/// sets a zero `default`, the same exemption spelled as the default window.
 /// The candidates are collected from every context.
 ///
 /// A candidate is exempt only when, in **every** context, each of its packages resolves to
@@ -152,8 +153,8 @@ pub fn native_exemptions(
 ///
 /// This is the window cooldown gates a locked pin of an unnamed package with, so a package rule
 /// that matches every name, such as `[package."*"]`, sets it just as the bare `min-age` does.
-/// When that window is an exemption, the project default `min-age`, which package rules do not
-/// change, is used instead: the native field still governs every package whose native exemption
+/// When that window is an exemption ([`ResolvedWindow::is_exemption`], however it is spelled), the
+/// project default `min-age`, which package rules do not change, is used instead: the native field still governs every package whose native exemption
 /// [`native_exemptions`] withholds, so a package rule's `latest` or `allow` must not lift it.
 /// The two windows are never compared by today's cutoffs, since a rolling age and an absolute
 /// freeze trade places as time passes while the persisted value stays.
@@ -182,7 +183,7 @@ pub fn native_default_resolution(
     // The empty name stands for a package no rule names: only a glob matching the empty name,
     // such as `*`, applies to it.
     let unnamed = window(ResolveKind::CurrentPin);
-    if unnamed.effective_spec(now) == WindowSpec::Latest {
+    if unnamed.is_exemption(now) {
         window(ResolveKind::EffectiveDefault)
     } else {
         unnamed
@@ -206,7 +207,15 @@ fn candidate_glob(rule: &Rule, target: ToolId) -> Option<&PatternGlob> {
     .into_iter()
     .flatten()
     .any(|spec| *spec == WindowSpec::Latest);
-    (rule.allow || latest).then_some(glob)
+    // A zero default on exactly `*` is the default window's exemption, so it takes the same
+    // native path as `[package."*"] latest = true`; a named zero window stays a window.
+    let catch_all_zero = glob.raw() == "*"
+        && rule
+            .window
+            .default
+            .as_ref()
+            .is_some_and(WindowSpec::is_exemption);
+    (rule.allow || latest || catch_all_zero).then_some(glob)
 }
 
 fn proven_in(
@@ -277,12 +286,11 @@ struct RelevantRule<'a> {
 /// What every relevant rule for one window field implies about the field's pick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FieldOutcome {
-    /// Every package picks a [`WindowSpec::Latest`] value for the field.
+    /// Every package picks an exemption ([`WindowSpec::is_exemption`]) for the field.
     Latest,
-    /// A package picks either a [`WindowSpec::Latest`] value or nothing, falling through to the
-    /// bare default.
+    /// A package picks either an exemption or nothing, falling through to the bare default.
     LatestOrUnset,
-    /// Some package may pick a window that is not [`WindowSpec::Latest`].
+    /// Some package may pick a window that is not an exemption.
     Unproven,
 }
 
@@ -371,8 +379,8 @@ fn allow_proven(rules: &[RelevantRule<'_>]) -> bool {
         })
 }
 
-/// Whether every window field picks [`WindowSpec::Latest`] for every package, with no floor that
-/// may match one.
+/// Whether every window field picks an exemption ([`WindowSpec::is_exemption`]) for every
+/// package, with no floor that may match one.
 ///
 /// A per-kind field that no rule sets falls through to the bare default in [`resolve`], so it
 /// passes when the default does.
@@ -414,7 +422,7 @@ fn field_outcome(
         .iter()
         .filter(|relevant| threshold.is_none_or(|threshold| relevant.rank >= threshold))
         .filter_map(|relevant| extract(&relevant.rule.window))
-        .all(|spec| *spec == WindowSpec::Latest);
+        .all(WindowSpec::is_exemption);
     match (threshold, contenders_latest) {
         (_, false) => FieldOutcome::Unproven,
         (Some(_), true) => FieldOutcome::Latest,

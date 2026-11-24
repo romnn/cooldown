@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **`sync` reports an exempt default window instead of leaving a stale cutoff unmentioned.**
+  After a switch to `latest = true` or `min-age = "0d"`, the native configs kept the cutoff an
+  earlier `sync` wrote, such as `exclude-newer = "7 days"` in `uv.toml` or pnpm's
+  `minimumReleaseAge`, and `sync` reported them `unchanged` without a word, or for Cargo with a
+  misleading reason. `sync` still leaves the setting as it is, since removing it can expose a broader
+  cutoff configured elsewhere, but now reports for every tool that the exemption is not represented,
+  and shows both spellings as `latest`. The catch-all spellings also agree: `[package."*"]
+  min-age = "0d"` now keeps the bare `min-age` in the written default and goes to pnpm's exemption
+  list like `[package."*"] latest = true` and `allow = ["*"]`, and for Cargo and uv all three are
+  reported as an exemption the file does not carry. Closes #164.
 - **Compact traces record each member list and policy resolution once.** A compact trace of a large
   monorepo repeated a Cargo dependency's member list, up to 41 KB, in every `evaluation`, and wrote
   the same `policy_resolved` record hundreds of times, so it decompressed to 4.3 GB. Each distinct
