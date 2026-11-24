@@ -387,8 +387,8 @@ pub struct Dependency {
     /// releases exist; `evaluate` then reports it [`Status::Held`]. `None` means unbounded above (the
     /// common case — most deps can move up). A direct manifest pin is captured by
     /// [`pinned`](Self::pinned) instead; this field is for the *transitive* ceiling the graph imposes.
-    /// Upgrade planning may discount attributed caps whose requirers all have eligible co-planned
-    /// successors, leaving the resolver to validate their new requirements together.
+    /// Upgrade planning disregards an attributed cap on a declared dependency, since the batch can
+    /// move or drop its requirers, and leaves a pin that survives to the resolver's trial.
     ///
     /// Invariant every adapter upholds: when set, this equals [`current`](Self::current) — an exact
     /// `==`/`=` pin forces the dependency to resolve to exactly that version, so an *active* ceiling is
@@ -432,8 +432,8 @@ pub struct Dependency {
 /// floor is conditioned on the very resolution being fixed — so the planner discounts those edges
 /// and plans the whole co-moving family; a hold from a compliant requirer is genuine and is
 /// reported with the requirer's name and requirement.
-/// Upgrade planning also discounts ceilings when every imposing requirer has an eligible
-/// successor in the same batch, while preserving authored pins and holds outside the batch.
+/// Upgrade planning also disregards the ceilings on a declared dependency, leaving a pin that
+/// survives the batch to the resolver's trial, while authored pins keep holding.
 /// Adapters that cannot attribute constraints leave [`Dependency::hold_edges`] empty, which
 /// disables discounting and preserves the collapsed behavior.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]

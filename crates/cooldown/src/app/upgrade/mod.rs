@@ -15,8 +15,8 @@
 mod executor;
 mod run_staled;
 
-pub(super) use self::executor::target_package_for;
 use self::executor::{PlanMode, ProjectRunStatus, ProjectUpgradeExecutor};
+pub(super) use self::executor::{target_package_for, upgrade_view};
 use self::run_staled::{CurrentAtStart, ProjectPass, TurnLock, refresh_gate};
 use super::advisories::ProjectAdvisories;
 use super::lanes::LaneAccess;

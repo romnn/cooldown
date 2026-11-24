@@ -38,6 +38,16 @@
   a resolve in cooldown's staged copy whose `Cargo.lock` is unchanged, now runs once more, and only
   a second crash fails; its error says cargo `was killed by signal 11 after printing` its output.
   Closes #158.
+- **A Cargo dependency another crate pins exactly moves with the batch that drops that pin.** A
+  project declaring `wasm-bindgen` and `wasm-bindgen-shared` at 0.2.104 never upgraded either:
+  `wasm-bindgen-backend` 0.2.104 pins `wasm-bindgen-shared = "=0.2.104"`, so planning held
+  `wasm-bindgen-shared` back, and `wasm-bindgen` 0.2.105, which drops the backend, was skipped as
+  `would move directly declared wasm-bindgen-shared 0.2.104 to 0.2.105`. A direct dependency is
+  now planned whatever a third-party `=` requirement says, and `upgrade`, `outdated` and `explain`
+  leave it to Cargo's resolve whether the pin survives; here both crates move to 0.2.105 together.
+  When the pin does survive, the dependency gets a `resolver_conflict` row naming it instead of no
+  row, so `upgrade --strict` now fails on it. A workspace member's own exact pin still holds as
+  `pin_held`. Closes #165.
 
 ## v0.0.32
 
