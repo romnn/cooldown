@@ -49,8 +49,9 @@ pub(crate) fn write_repo_native(
         _ => None,
     };
     let Some((age, text)) = rendered else {
-        // A freeze date, or the zero or sub-second age a floor folds one into, has no spelling in
-        // cargo's grammar, so the existing setting stays as it is.
+        // A freeze date or a sub-second age has no spelling in cargo's grammar, and writing the
+        // zero age a floor folds a future freeze into would drop the freeze, so the existing
+        // setting stays as it is.
         warnings.push(Diagnostic::new(
             DiagnosticKind::StricterNative,
             "cargo's min-publish-age is a rolling age in whole seconds, so sync leaves it as it is \
