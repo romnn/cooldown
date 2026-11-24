@@ -26,6 +26,13 @@ pub struct NativeEncoding<'a> {
     /// The project path the written default window was resolved for, which
     /// [`Selector::Project`] rules match: the project's own path, or `.` for a repo-level file.
     pub default_project: &'a Utf8Path,
+    /// The registry the written windows were resolved for, which every package the tool's
+    /// policy evaluates carries ([`ToolWrite::policy_registry`](crate::ToolWrite::policy_registry)).
+    ///
+    /// A [`Selector::Registry`] rule for it gates every such package, and one for any other
+    /// registry gates none.
+    /// `None` declares no single registry, so a registry rule may gate any of them.
+    pub registry: Option<&'a str>,
     /// Whether the native config carries the window of each package a literal package selector
     /// names, as uv's `exclude-newer-package` does.
     pub package_windows: bool,
@@ -190,6 +197,7 @@ impl OmittedField {
 ///
 /// - [`Selector::Default`] or [`Selector::Tool`] for `target`;
 /// - a [`Selector::Project`] matching [`NativeEncoding::default_project`];
+/// - a [`Selector::Registry`] for [`NativeEncoding::registry`];
 /// - a [`Selector::Package`] whose pattern is exactly `*`;
 /// - a literal [`Selector::Package`], when [`NativeEncoding::package_windows`] is set.
 ///
@@ -203,7 +211,8 @@ impl OmittedField {
 /// nested `cooldown.toml`.
 /// A rule that cannot apply in a context, qualified for another tool or for another project, is
 /// skipped there.
-/// Registry rules are never reported, since adapters tag every package with a fixed registry.
+/// So is a registry rule for a registry other than [`NativeEncoding::registry`], which gates none
+/// of the tool's packages; without a declared registry, every registry rule is reported.
 /// Nor is a [`Origin::Native`] layer, the tool's own config read back: the tool applies it by
 /// itself, whether it is the file `sync` writes or a consumer's nearer config that shadows it.
 ///
@@ -233,6 +242,7 @@ impl OmittedField {
 /// let encoding = NativeEncoding {
 ///     default_layers: &layers,
 ///     default_project: project,
+///     registry: Some("npm"),
 ///     package_windows: false,
 ///     writer_exemptions: true,
 /// };
@@ -274,7 +284,7 @@ pub fn omitted_native_fields(
                 .iter()
                 .any(|default| default.origin == layer.origin);
             for rule in &layer.rules {
-                if !applies(&rule.selector, target, context.project) {
+                if !applies(&rule.selector, target, encoding.registry, context.project) {
                     continue;
                 }
                 for field in gating_fields(rule, encoding) {
@@ -318,12 +328,20 @@ pub fn omitted_native_fields(
     omitted
 }
 
-/// Whether a rule with `selector` can gate a package of `target` in the project at `project`.
-fn applies(selector: &Selector, target: ToolId, project: &Utf8Path) -> bool {
+/// Whether a rule with `selector` can gate a package of `target` in the project at `project`,
+/// when every such package carries `registry`, or may carry any registry for `None`.
+fn applies(
+    selector: &Selector,
+    target: ToolId,
+    registry: Option<&str>,
+    project: &Utf8Path,
+) -> bool {
     match selector {
         Selector::Default => true,
         Selector::Tool(tool) => *tool == target,
-        Selector::Registry(_) => false,
+        Selector::Registry(rule_registry) => {
+            registry.is_none_or(|registry| registry == rule_registry)
+        }
         Selector::Project(glob) => glob.is_match(project.as_str()),
         Selector::Package { tool, .. } => tool.is_none_or(|tool| tool == target),
     }
@@ -335,7 +353,7 @@ fn folded_in(selector: &Selector, target: ToolId, encoding: &NativeEncoding<'_>)
     match selector {
         Selector::Default => true,
         Selector::Tool(tool) => *tool == target,
-        Selector::Registry(_) => false,
+        Selector::Registry(registry) => encoding.registry == Some(registry.as_str()),
         Selector::Project(glob) => glob.is_match(encoding.default_project.as_str()),
         Selector::Package { glob, .. } => {
             glob.raw() == "*" || (encoding.package_windows && glob.is_literal())
@@ -422,6 +440,7 @@ fn freeze_drifts(
     let mut windows = vec![native_default_resolution(
         encoding.default_layers,
         target,
+        encoding.registry,
         encoding.default_project,
         now,
     )];
@@ -444,7 +463,7 @@ fn freeze_drifts(
             let query = ResolveQuery {
                 tool: target,
                 package: name,
-                registry: None,
+                registry: encoding.registry,
                 project: encoding.default_project,
                 kind: ResolveKind::CurrentPin,
             };

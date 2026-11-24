@@ -6,7 +6,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::config::{builtin_default_layer, layer_from_fields};
 use cooldown_core::{
     CoreError, GeneratedMembers, Origin, PolicyLayer, PolicyStack, Project, ResolveKind,
-    ResolveQuery, SyncScope, ToolId, normalize_native, package_windows, resolve,
+    ResolveQuery, SyncScope, ToolId, ToolWrite, normalize_native, package_windows, resolve,
     window_exclude_newer,
 };
 use jiff::Timestamp;
@@ -231,10 +231,17 @@ async fn assemble_ctx(
     // except a glob matching the empty name such as `*` (per-kind windows are not
     // expressible as one resolver cutoff; per-package windows travel separately, below), and the
     // effective duration (`now - cutoff`) folds in any floor.
+    // It and the per-package windows resolve for the registry every package of the tool carries,
+    // the same one `sync` writes for, so a bare `uv lock` under the synced config records the
+    // cutoffs cooldown's own lock check passes.
+    let registry = assembly
+        .adapters
+        .writer(tool)
+        .and_then(ToolWrite::policy_registry);
     let query = ResolveQuery {
         tool,
         package: "",
-        registry: None,
+        registry,
         project: &rel_path,
         kind: ResolveKind::CurrentPin,
     };
@@ -257,7 +264,8 @@ async fn assemble_ctx(
         window_exclude_newer(&effective).or_else(|| Some(assembly.now.to_string()));
     // The per-package windows travel beside the default, so a package-level exemption or stricter
     // window reaches a per-package resolver cutoff (uv's `--exclude-newer-package`) too.
-    project.exclude_newer_package = package_windows(&layers, tool, &rel_path, assembly.now);
+    project.exclude_newer_package =
+        package_windows(&layers, tool, registry, &rel_path, assembly.now);
 
     Ok(ProjectCtx {
         tool,

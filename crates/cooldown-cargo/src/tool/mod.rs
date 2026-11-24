@@ -5380,6 +5380,11 @@ impl ToolWrite for CargoTool {
         SyncScope::Repo
     }
 
+    /// Crates of every other registry are skipped before age evaluation.
+    fn policy_registry(&self) -> Option<&'static str> {
+        Some(CRATES_IO)
+    }
+
     async fn write_repo_native(
         &self,
         repo_root: &Utf8Path,

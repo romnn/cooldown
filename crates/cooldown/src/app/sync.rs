@@ -295,23 +295,20 @@ impl Workspace {
         warnings: &mut Vec<Diagnostic>,
     ) -> SyncItem {
         let project = pctx.rel_path.to_string();
-        let window = native_default_window(&pctx.policy.layers, tool, &pctx.rel_path, self.now());
+        let encoding = NativeEncoding {
+            default_layers: &pctx.policy.layers,
+            default_project: &pctx.rel_path,
+            registry: writer.policy_registry(),
+            package_windows: writer.native_package_windows(),
+            // The exemptions reach the writer below, which writes or reports each one.
+            writer_exemptions: true,
+        };
+        let window = native_default_window(&encoding, tool, self.now());
         let context = PolicyContext {
             layers: &pctx.policy.layers,
             project: &pctx.rel_path,
         };
-        let notices = omitted_policy_notices(
-            &[context],
-            tool,
-            &NativeEncoding {
-                default_layers: &pctx.policy.layers,
-                default_project: &pctx.rel_path,
-                package_windows: writer.native_package_windows(),
-                // The exemptions reach the writer below, which writes or reports each one.
-                writer_exemptions: true,
-            },
-            self.now(),
-        );
+        let notices = omitted_policy_notices(&[context], tool, &encoding, self.now());
         // Bake the `latest`/`allow` package selectors that exempt every release into the native
         // per-package exemption list alongside the default window, so a cooldown-exempt package is
         // exempt natively too.
@@ -413,8 +410,15 @@ impl Workspace {
         // independent of any single project's layers.
         // The `.` project keeps it to the bare default window — the only thing a single native
         // field can carry.
-        let window =
-            native_default_window(self.repo_layers(tool), tool, Utf8Path::new("."), self.now());
+        let encoding = NativeEncoding {
+            default_layers: self.repo_layers(tool),
+            default_project: Utf8Path::new("."),
+            registry: writer.policy_registry(),
+            package_windows: writer.native_package_windows(),
+            // A repo-level file carries no package-wide exemption (see `ResolvedPolicy`).
+            writer_exemptions: false,
+        };
+        let window = native_default_window(&encoding, tool, self.now());
         // Every project that reads the repo-level file is a consumer whose policy it must carry,
         // including a project whose nearer `cooldown.toml` the repo-root default never saw.
         let consumers: Vec<PolicyContext<'_>> = projects
@@ -424,18 +428,7 @@ impl Workspace {
                 project: &project.rel_path,
             })
             .collect();
-        let notices = omitted_policy_notices(
-            &consumers,
-            tool,
-            &NativeEncoding {
-                default_layers: self.repo_layers(tool),
-                default_project: Utf8Path::new("."),
-                package_windows: writer.native_package_windows(),
-                // A repo-level file carries no package-wide exemption (see `ResolvedPolicy`).
-                writer_exemptions: false,
-            },
-            self.now(),
-        );
+        let notices = omitted_policy_notices(&consumers, tool, &encoding, self.now());
         let policy = ResolvedPolicy {
             admission_bound: None,
             admitted_versions: Some(Vec::new()),
@@ -443,9 +436,10 @@ impl Workspace {
             exempt_packages: Vec::new(),
             withheld_exemptions: Vec::new(),
             package_windows: cooldown_core::package_windows(
-                self.repo_layers(tool),
+                encoding.default_layers,
                 tool,
-                Utf8Path::new("."),
+                encoding.registry,
+                encoding.default_project,
                 self.now(),
             ),
         };
@@ -502,19 +496,24 @@ impl Workspace {
     }
 }
 
-/// The default window `sync` bakes into a tool's single native field for `project`: the
-/// effective spec of [`native_default_resolution`], with any binding floor folded in, or
-/// [`WindowSpec::Latest`] for an exemption however it is spelled.
+/// The default window `sync` bakes into a tool's single native field, resolved as `encoding`
+/// declares: the effective spec of [`native_default_resolution`], with any binding floor folded
+/// in, or [`WindowSpec::Latest`] for an exemption however it is spelled.
 ///
 /// Per-kind windows and the windows of packages a rule names do not fit the single field;
 /// [`omitted_native_fields`] reports each one the native config does not carry otherwise.
 fn native_default_window(
-    layers: &[cooldown_core::PolicyLayer],
+    encoding: &NativeEncoding<'_>,
     tool: ToolId,
-    project: &Utf8Path,
     now: jiff::Timestamp,
 ) -> WindowSpec {
-    let resolution = native_default_resolution(layers, tool, project, now);
+    let resolution = native_default_resolution(
+        encoding.default_layers,
+        tool,
+        encoding.registry,
+        encoding.default_project,
+        now,
+    );
     if resolution.is_exemption(now) {
         WindowSpec::Latest
     } else {

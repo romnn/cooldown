@@ -313,4 +313,132 @@ mod tests {
 
         assert_eq!(scan_root_for(&workdir, Utf8Path::new("/")), workdir);
     }
+
+    /// Prepares `command` (`check`, `sync`, …) for the repository at `root` as the CLI would,
+    /// without the global config.
+    async fn prepare(
+        root: &Utf8Path,
+        command: &str,
+        setup: SetupCommand,
+    ) -> color_eyre::eyre::Result<PreparedRun> {
+        use crate::cli::args::{Cli, CliOverrides};
+        use clap::FromArgMatches as _;
+
+        let matches = Cli::command().try_get_matches_from([
+            "cooldown",
+            "--dir",
+            root.as_str(),
+            "--no-global",
+            command,
+        ])?;
+        let cli = Cli::from_arg_matches(&matches)?;
+        let overrides = CliOverrides::from_matches(&matches);
+        Ok(prepare_run(&cli.global, &overrides, setup).await?)
+    }
+
+    /// Every uv package is a `pypi` package, so a `pypi` floor binds the resolver cutoffs cooldown
+    /// passes to uv, the default and a named package's shorter window alike, just as it binds the
+    /// windows `sync` writes.
+    /// A bare `uv lock` under the synced config then records the cutoffs cooldown's own lock check
+    /// passes.
+    #[tokio::test]
+    async fn a_registry_floor_binds_the_resolver_cutoffs() -> color_eyre::eyre::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = utf8(tempdir.path());
+        std::fs::create_dir(root.join(".git"))?;
+        std::fs::write(
+            root.join("pyproject.toml"),
+            indoc::indoc! {r#"
+                [project]
+                name = "app"
+                version = "0.1.0"
+            "#},
+        )?;
+        std::fs::write(root.join("uv.lock"), "version = 1\n")?;
+        std::fs::write(
+            root.join("cooldown.toml"),
+            indoc::indoc! {r#"
+                min-age = "14d"
+
+                [registry.pypi]
+                floor = "30d"
+
+                [package.requests]
+                min-age = "7d"
+            "#},
+        )?;
+
+        let prepared = prepare(&root, "check", SetupCommand::Check).await?;
+
+        let [project] = prepared.ws.projects() else {
+            color_eyre::eyre::bail!("expected one uv project");
+        };
+        assert_eq!(project.project.exclude_newer.as_deref(), Some("30 days"));
+        assert_eq!(
+            project.project.exclude_newer_package.get("requests"),
+            Some(&cooldown_core::WindowSpec::MinAge(
+                jiff::SignedDuration::from_hours(24 * 30)
+            ))
+        );
+        Ok(())
+    }
+
+    /// The issue's policy: Cargo's native age governs exactly crates.io, whose every release
+    /// cooldown gates for the registry's 30-day floor, so `sync` writes 30 days rather than the
+    /// bare 14 and has nothing left to report.
+    #[tokio::test]
+    async fn cargo_sync_writes_the_crates_io_floor() -> color_eyre::eyre::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = utf8(tempdir.path());
+        std::fs::create_dir(root.join(".git"))?;
+        std::fs::create_dir(root.join("src"))?;
+        std::fs::write(root.join("src/lib.rs"), "")?;
+        std::fs::write(
+            root.join("Cargo.toml"),
+            indoc::indoc! {r#"
+                [package]
+                name = "app"
+                version = "0.1.0"
+                edition = "2021"
+            "#},
+        )?;
+        std::fs::write(
+            root.join("Cargo.lock"),
+            indoc::indoc! {r#"
+                version = 4
+
+                [[package]]
+                name = "app"
+                version = "0.1.0"
+            "#},
+        )?;
+        std::fs::write(
+            root.join("cooldown.toml"),
+            indoc::indoc! {r#"
+                min-age = "14d"
+
+                [registry."crates.io"]
+                floor = "30d"
+            "#},
+        )?;
+        let prepared = prepare(&root, "sync", SetupCommand::Sync).await?;
+
+        let out = prepared.ws.sync(&prepared.opts).await;
+
+        assert_eq!(out.summary.written, 1, "{:?}", out.items);
+        let config = std::fs::read_to_string(root.join(".cargo/config.toml"))?;
+        assert!(
+            config.contains(r#"min-publish-age = "30 days""#),
+            "unexpected cargo config after sync:\n{config}"
+        );
+        // The floor is written, so no notice calls it unrepresented.
+        assert!(
+            out.warnings
+                .iter()
+                .all(|warning| !warning.message.contains("registry=crates.io")),
+            "{:?}",
+            out.warnings
+        );
+        Ok(())
+    }
 }

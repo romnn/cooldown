@@ -768,6 +768,11 @@ impl ToolWrite for YarnTool {
         SyncScope::Project
     }
 
+    /// Both backends tag every package `npm`.
+    fn policy_registry(&self) -> Option<&'static str> {
+        Some(crate::registry::NPM)
+    }
+
     async fn write_repo_native(
         &self,
         repo_root: &Utf8Path,

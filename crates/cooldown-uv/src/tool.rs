@@ -1055,6 +1055,11 @@ impl ToolWrite for UvTool {
         true
     }
 
+    /// Every package is a `pypi` package to cooldown's policy, whichever index serves it.
+    fn policy_registry(&self) -> Option<&'static str> {
+        Some(PYPI)
+    }
+
     async fn write_repo_native(
         &self,
         repo_root: &Utf8Path,
