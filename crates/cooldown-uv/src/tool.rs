@@ -27,6 +27,7 @@ use cooldown_core::{
 };
 use cooldown_registry::SharedHttp;
 use jiff::Timestamp;
+use std::path::Path;
 
 /// The [`ToolId`] for the Python/uv adapter (`"uv"`).
 pub const UV_ID: ToolId = ToolId("uv");
@@ -1106,7 +1107,19 @@ impl UvEnvironment {
         }
         // uv reads an explicit config file first and considers `UV_NO_CONFIG` only without one.
         if let Some(file) = &self.config_file {
-            if !names_file(file, synced) {
+            // uv resolves a relative path against its own working directory, which
+            // `UV_WORKING_DIR` or the directory uv runs in decides, so only an absolute path can
+            // be shown to name the synced file.
+            if !Path::new(file).is_absolute() {
+                warnings.push(Diagnostic::new(
+                    DiagnosticKind::Config,
+                    format!(
+                        "UV_CONFIG_FILE = {file:?} is resolved against uv's working directory, so \
+                         bare uv runs in this environment may read another file than the uv.toml \
+                         sync writes at the repo root"
+                    ),
+                ));
+            } else if !names_file(Path::new(file), synced) {
                 warnings.push(Diagnostic::new(
                     DiagnosticKind::Config,
                     format!(
@@ -1171,23 +1184,23 @@ fn cutoff_at(cutoff: &str, now: Timestamp) -> Option<Timestamp> {
     if let Ok(instant) = cutoff.parse::<Timestamp>() {
         return Some(instant);
     }
+    // The shared parser drops a fraction of a second that uv keeps, so a span with a fraction is
+    // left unread rather than compared inexactly.
+    if cutoff.contains('.') {
+        return None;
+    }
     let span = cooldown_core::duration::parse_duration(cutoff).ok()?;
     now.checked_sub(span).ok()
 }
 
-/// Whether the config `file` that `UV_CONFIG_FILE` names is the `synced` uv.toml.
+/// Whether the absolute config `file` that `UV_CONFIG_FILE` names is the `synced` uv.toml.
 ///
-/// uv resolves a relative path against the directory it runs in, which here is taken to be the
-/// one sync runs in.
 /// Canonical paths see through links, and a file that does not exist yet, as before the first
-/// sync writes it, compares by its absolute path.
-fn names_file(file: &str, synced: &Utf8Path) -> bool {
-    let (Ok(file), Ok(synced)) = (std::path::absolute(file), std::path::absolute(synced)) else {
-        return false;
-    };
+/// sync writes it, compares as spelled.
+fn names_file(file: &Path, synced: &Utf8Path) -> bool {
     match (file.canonicalize(), synced.canonicalize()) {
         (Ok(file), Ok(synced)) => file == synced,
-        _ => file == synced,
+        _ => file == synced.as_std_path(),
     }
 }
 
@@ -2163,8 +2176,8 @@ mod tests {
 
     /// Each variable that keeps bare uv from applying the written uv.toml earns one warning:
     /// a `UV_EXCLUDE_NEWER` that reads as a span or an instant says which way it moves the
-    /// cutoff, and an explicit `UV_CONFIG_FILE` decides alone over `UV_NO_CONFIG`, silent when it
-    /// names the synced file.
+    /// cutoff, and an explicit `UV_CONFIG_FILE` decides alone over `UV_NO_CONFIG`, silent only
+    /// when an absolute path names the synced file.
     #[test]
     fn write_uv_toml_warns_about_variables_that_override_it() -> eyre::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -2200,6 +2213,7 @@ mod tests {
             ("30 days", Some(DiagnosticKind::StricterNative)),
             ("2000-01-01T00:00:00Z", Some(DiagnosticKind::StricterNative)),
             ("P7D", None),
+            ("P7DT0.5S", Some(DiagnosticKind::Config)),
         ] {
             let kinds: Vec<DiagnosticKind> = warned(exclude_newer(value))?
                 .into_iter()
@@ -2225,9 +2239,11 @@ mod tests {
             warned(config_file(root.join("uv.toml").as_str(), "true"))?,
             []
         );
-        let other = warned(config_file("other.toml", "true"))?;
-        assert_eq!(other.len(), 1, "{other:?}");
-        assert!(other[0].1.starts_with("UV_CONFIG_FILE"), "{other:?}");
+        for file in ["uv.toml", root.join("other.toml").as_str()] {
+            let other = warned(config_file(file, "true"))?;
+            assert_eq!(other.len(), 1, "{other:?}");
+            assert!(other[0].1.starts_with("UV_CONFIG_FILE"), "{other:?}");
+        }
         let no_config = |value: &str| UvEnvironment {
             no_config: Some(value.to_string()),
             ..UvEnvironment::default()

@@ -6,6 +6,7 @@
 //! over their lock format — they share the npm registry and version model and
 //! differ only in how their lock is parsed and how their CLI re-pins a dependency.
 
+use crate::admissions::Listed;
 use crate::apply::landing::{
     CandidateLanding, CandidateRunner, LandingPlan, OwnedStep, absolute_cutoff_from_project,
     candidate_landing, holds_exact_pins, restore_after_owned_step, target_in_declared_range,
@@ -3392,11 +3393,16 @@ impl<L: NodeLock> NpmTool<L> {
         if crate::admissions::match_semantics(&version) != MatchSemantics::FirstMatch {
             return None;
         }
-        let effective_floor = crate::admissions::NativeFloor::new(
-            effective
-                .minutes
-                .unwrap_or_else(|| crate::admissions::builtin_minimum_release_age(&version)),
-        );
+        let effective_floor = crate::admissions::NativeFloor::new(match effective.minutes {
+            Listed::Set(minutes) => minutes,
+            Listed::Unset => crate::admissions::builtin_minimum_release_age(&version),
+            Listed::Unreadable => return None,
+        });
+        let effective_rules: &[String] = match &effective.rules {
+            Listed::Set(rules) => rules,
+            Listed::Unset => &[],
+            Listed::Unreadable => return None,
+        };
         if bound.is_some_and(|bound| effective_floor.is_some_and(|floor| floor.longer_than(bound)))
         {
             return None;
@@ -3406,7 +3412,7 @@ impl<L: NodeLock> NpmTool<L> {
             written,
             crate::admissions::NativeGate {
                 floor: effective_floor,
-                rules: effective.rules.as_deref().unwrap_or_default(),
+                rules: effective_rules,
             },
         );
         (!overridden.is_empty()).then(|| {
@@ -5448,22 +5454,28 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
     }
 }
 
-/// The settings file as pnpm reads it now (`queried`) and as sync writes it (`written`), which
-/// differ only when the write is `pending`, in a dry run that would change the file.
+/// The settings file as sync writes it, and as it is now when a pending write leaves pnpm
+/// reading the current file, in a dry run that would change it.
 struct FileGates {
-    queried: NativeAge,
     written: NativeAge,
-    pending: bool,
+    current: Option<NativeAge>,
 }
 
 impl FileGates {
-    /// Reads the `original` text of the file at `path` and the `rendered` text sync writes.
+    /// Reads the `rendered` text sync writes to the file at `path`, and its `original` text only
+    /// when the write is `pending`.
     fn parse(original: &str, rendered: &str, pending: bool, path: &Utf8Path) -> Result<Self> {
         Ok(FileGates {
-            queried: NativeAge::parse(if pending { original } else { rendered }, path)?,
             written: NativeAge::parse(rendered, path)?,
-            pending,
+            current: pending
+                .then(|| NativeAge::parse(original, path))
+                .transpose()?,
         })
+    }
+
+    /// The file pnpm reads now.
+    fn queried(&self) -> &NativeAge {
+        self.current.as_ref().unwrap_or(&self.written)
     }
 }
 
@@ -5478,7 +5490,7 @@ impl FileGates {
 /// An exclusion list carries past the write when it overrides the queried file's list, or when
 /// neither file sets one, so it is inherited either way.
 /// A listing without a list where the queried file sets one shows no override, since pnpm would
-/// report the file's list at least.
+/// report the file's list at least, and a setting listed unreadably shows none either.
 /// A differing list need not exempt other packages, so the warning says only that it differs.
 /// `minimumReleaseAgeStrict` is reported whenever pnpm reads it as false, since sync never
 /// writes it.
@@ -5490,12 +5502,12 @@ fn override_warnings(
 ) -> Vec<Diagnostic> {
     let mut warnings = Vec::new();
     // Before a pending write, pnpm's values describe the current file only.
-    let observed = if files.pending {
+    let observed = if files.current.is_some() {
         "currently applies"
     } else {
         "applies"
     };
-    if let (Some(file), Some(applied)) = (files.queried.minutes, effective.minutes)
+    if let (Some(file), Listed::Set(applied)) = (files.queried().minutes, effective.minutes)
         && applied != file
         && applied != minutes
     {
@@ -5522,12 +5534,15 @@ fn override_warnings(
         ));
     }
     let file_sets_list = files.written.exclusions.is_some();
-    let carries = match (&files.queried.exclusions, &effective.rules) {
-        (Some(file), Some(rules)) => *rules != crate::exclusions::configured_rules(file.clone()),
-        (Some(_), None) => false,
+    let rules: &[String] = match &effective.rules {
+        Listed::Set(rules) => rules,
+        Listed::Unset | Listed::Unreadable => &[],
+    };
+    let carries = match (&files.queried().exclusions, &effective.rules) {
+        (_, Listed::Unreadable) | (Some(_), Listed::Unset) => false,
+        (Some(file), Listed::Set(_)) => rules != crate::exclusions::configured_rules(file.clone()),
         (None, _) => !file_sets_list,
     };
-    let rules = effective.rules.as_deref().unwrap_or_default();
     if carries && rules != intended {
         let source = if file_sets_list {
             "as a setting above the file such as pnpm_config_minimum_release_age_exclude \
@@ -7906,6 +7921,45 @@ packages:
             r#"pnpm applies a minimumReleaseAgeExclude of ["other"] here, which differs from the []"#
         ));
         assert!(messages[2].starts_with("pnpm applies minimumReleaseAgeStrict = false here"));
+        Ok(())
+    }
+
+    /// A window the listing reports unreadably, such as the fractional minutes pnpm 11 accepts,
+    /// leaves the other settings judged: an overridden list still earns its warning.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_native_judges_the_list_beside_an_unreadable_window() -> eyre::Result<()> {
+        let (_dir, root) = sync_tempdir()?;
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            indoc! {"
+                packages: []
+                minimumReleaseAgeExclude: []
+            "},
+        )?;
+        let (_cache, tool) = pnpm_sync_tool_scripted(
+            &root,
+            &[],
+            r#"echo '{"minimumReleaseAge":0.5,"minimumReleaseAgeExclude":["other"]}'; exit 0"#,
+            "echo 'undefined'; exit 0",
+        )?;
+
+        let report = tool
+            .write_native(
+                &pnpm_sync_project(&root),
+                &pnpm_sync_policy(&[], Some(&[])),
+                false,
+            )
+            .await?;
+
+        let warnings = sync_warnings(&report);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0]
+                .message
+                .starts_with(r#"pnpm applies a minimumReleaseAgeExclude of ["other"] here"#),
+            "{warnings:?}"
+        );
         Ok(())
     }
 
