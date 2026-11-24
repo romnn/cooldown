@@ -6,6 +6,7 @@
 //! over their lock format — they share the npm registry and version model and
 //! differ only in how their lock is parsed and how their CLI re-pins a dependency.
 
+use crate::admissions::Listed;
 use crate::apply::landing::{
     CandidateLanding, CandidateRunner, LandingPlan, OwnedStep, absolute_cutoff_from_project,
     candidate_landing, holds_exact_pins, restore_after_owned_step, target_in_declared_range,
@@ -3365,18 +3366,21 @@ impl<L: NodeLock> NpmTool<L> {
         Ok(Some(exemptions))
     }
 
-    /// The warning for the `admitted` versions that the settings file at `path` admits on its own
-    /// but bare pnpm on this machine still refuses, because a setting above the file overrides
-    /// its window or its exclusions.
+    /// The warning for the `admitted` versions that the `written` gate of the settings file
+    /// admits on its own but bare pnpm on this machine still refuses, because a setting above
+    /// the file overrides its window or its exclusions, as the `effective` gate pnpm reports
+    /// shows.
     ///
-    /// pnpm is asked for its effective window and exclusions in the project itself.
-    /// A query that fails is incomplete evidence, so it yields no warning and no failure.
+    /// A manager version that cannot be read is incomplete evidence, so it yields no warning and
+    /// no failure.
     /// Where `admitted` holds only the versions young under a `bound`, a window longer than it
-    /// may refuse a version the list lacks, so the warning then names none.
+    /// may refuse a version the list lacks, so there is no list to name, and only the longer
+    /// window is reported ([`override_warnings`]).
     async fn overridden_admission_warning(
         &self,
         project: &Project,
-        path: &Utf8Path,
+        written: crate::admissions::NativeGate<'_>,
+        effective: &crate::admissions::EffectiveGate,
         admitted: &[cooldown_core::AdmittedVersion],
         bound: Option<jiff::SignedDuration>,
     ) -> Option<Diagnostic> {
@@ -3389,30 +3393,26 @@ impl<L: NodeLock> NpmTool<L> {
         if crate::admissions::match_semantics(&version) != MatchSemantics::FirstMatch {
             return None;
         }
-        let written = NativeAge::read(path).ok()?;
-        let written_rules = crate::exclusions::configured_rules(written.exclusions);
-        let effective_floor = self.native_floor(project).await.ok()?;
+        let effective_floor = crate::admissions::NativeFloor::new(match effective.minutes {
+            Listed::Set(minutes) => minutes,
+            Listed::Unset => crate::admissions::builtin_minimum_release_age(&version),
+            Listed::Unreadable => return None,
+        });
+        let effective_rules: &[String] = match &effective.rules {
+            Listed::Set(rules) => rules,
+            Listed::Unset => &[],
+            Listed::Unreadable => return None,
+        };
         if bound.is_some_and(|bound| effective_floor.is_some_and(|floor| floor.longer_than(bound)))
         {
-            return Some(Diagnostic::new(
-                DiagnosticKind::StricterNative,
-                "a higher-precedence setting, such as an environment variable, a CLI flag or a \
-                 pnpmfile, sets a longer minimumReleaseAge than pnpm-workspace.yaml here, so a \
-                 bare pnpm install may refuse versions cooldown admits",
-            ));
+            return None;
         }
-        let effective_rules = self.effective_minimum_age_exclusions(project).await.ok()?;
         let overridden = crate::admissions::overridden_admissions(
             admitted,
-            crate::admissions::NativeGate {
-                floor: written
-                    .minutes
-                    .and_then(crate::admissions::NativeFloor::new),
-                rules: &written_rules,
-            },
+            written,
             crate::admissions::NativeGate {
                 floor: effective_floor,
-                rules: &effective_rules,
+                rules: effective_rules,
             },
         );
         (!overridden.is_empty()).then(|| {
@@ -3426,6 +3426,50 @@ impl<L: NodeLock> NpmTool<L> {
                 ),
             )
         })
+    }
+
+    /// The warnings for settings above the settings file that keep bare pnpm here from applying
+    /// the `minutes` window and the `intended` exclusions sync writes, judged by one fresh read
+    /// of pnpm's effective gate ([`override_warnings`]).
+    ///
+    /// A read that fails leaves the gate unverified, so it claims nothing either way.
+    /// With `judge_admissions`, after a real write whose evidence is complete, the versions
+    /// `policy` admits are also checked one by one ([`Self::overridden_admission_warning`]).
+    async fn effective_gate_warnings(
+        &self,
+        project: &Project,
+        files: &FileGates,
+        minutes: i64,
+        intended: &[String],
+        policy: &ResolvedPolicy,
+        judge_admissions: bool,
+    ) -> Vec<Diagnostic> {
+        let Some(effective) = self
+            .probe_effective_config(&project.root)
+            .await
+            .and_then(|listing| crate::admissions::EffectiveGate::from_listing(&listing))
+        else {
+            return Vec::new();
+        };
+        let mut warnings = override_warnings(files, minutes, intended, &effective);
+        if judge_admissions
+            && let Some(admitted) = &policy.admitted_versions
+            && let Some(warning) = self
+                .overridden_admission_warning(
+                    project,
+                    crate::admissions::NativeGate {
+                        floor: crate::admissions::NativeFloor::new(minutes),
+                        rules: intended,
+                    },
+                    &effective,
+                    admitted,
+                    policy.admission_bound,
+                )
+                .await
+        {
+            warnings.push(warning);
+        }
+        warnings
     }
 
     /// The directory `project`'s native backstop verifies under, created on its first probe.
@@ -5117,6 +5161,7 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         };
         let packages = native
             .exclusions
+            .unwrap_or_default()
             .into_vec()
             .iter()
             .filter_map(|entry| exact_exclusion(entry).map(|(name, _)| name.to_string()))
@@ -5166,6 +5211,7 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
             .unwrap_or_default();
         let configured = NativeAge::parse(&native_text, native)?
             .exclusions
+            .unwrap_or_default()
             .into_vec();
         let semantics = self.match_semantics(project, &configured).await;
         crate::admissions::assess(crate::admissions::AssessmentInput {
@@ -5331,6 +5377,7 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         // Policy-exempt names and admitted young versions must also pass pnpm's rolling age gate.
         let existing: Vec<String> = NativeAge::read(&path)?
             .exclusions
+            .unwrap_or_default()
             .into_vec()
             .into_iter()
             .filter(|entry| exact_exclusion(entry).is_some())
@@ -5386,21 +5433,144 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         if changed && !dry_run {
             crate::native::write_settings(&path, &rendered)?;
         }
-        if complete
-            && !dry_run
-            && let Some(admitted) = &policy.admitted_versions
-            && let Some(warning) = self
-                .overridden_admission_warning(project, &path, admitted, policy.admission_bound)
-                .await
-        {
-            warnings.push(warning);
-        }
+        let files = FileGates::parse(&original, &rendered, changed && dry_run, &path)?;
+        let judge_admissions = complete && !dry_run;
+        warnings.extend(
+            self.effective_gate_warnings(
+                project,
+                &files,
+                minutes,
+                &exclusions,
+                policy,
+                judge_admissions,
+            )
+            .await,
+        );
         Ok(if changed {
             SyncReport::Written { path, warnings }
         } else {
             SyncReport::Unchanged { path, warnings }
         })
     }
+}
+
+/// The settings file as sync writes it, and as it is now when a pending write leaves pnpm
+/// reading the current file, in a dry run that would change it.
+struct FileGates {
+    written: NativeAge,
+    current: Option<NativeAge>,
+}
+
+impl FileGates {
+    /// Reads the `rendered` text sync writes to the file at `path`, and its `original` text only
+    /// when the write is `pending`.
+    fn parse(original: &str, rendered: &str, pending: bool, path: &Utf8Path) -> Result<Self> {
+        Ok(FileGates {
+            written: NativeAge::parse(rendered, path)?,
+            current: pending
+                .then(|| NativeAge::parse(original, path))
+                .transpose()?,
+        })
+    }
+
+    /// The file pnpm reads now.
+    fn queried(&self) -> &NativeAge {
+        self.current.as_ref().unwrap_or(&self.written)
+    }
+}
+
+/// The warnings for settings outside the settings file that keep bare pnpm here from applying
+/// the `minutes` window and the `intended` exclusions sync writes, as the `effective` gate pnpm
+/// reports for the [`FileGates::queried`] file shows.
+///
+/// pnpm 11 lets a variable such as `pnpm_config_minimum_release_age` replace a workspace setting,
+/// while pnpm 10 lets the file win, so pnpm's own effective values decide.
+/// A window counts as overridden only where pnpm's differs from the one the queried file sets,
+/// which holds after the write too, and is then judged against `minutes`.
+/// An exclusion list carries past the write when it overrides the queried file's list, or when
+/// neither file sets one, so it is inherited either way.
+/// A listing without a list where the queried file sets one shows no override, since pnpm would
+/// report the file's list at least, and a setting listed unreadably shows none either.
+/// A differing list need not exempt other packages, so the warning says only that it differs.
+/// `minimumReleaseAgeStrict` is reported whenever pnpm reads it as false, since sync never
+/// writes it.
+fn override_warnings(
+    files: &FileGates,
+    minutes: i64,
+    intended: &[String],
+    effective: &crate::admissions::EffectiveGate,
+) -> Vec<Diagnostic> {
+    let mut warnings = Vec::new();
+    // Before a pending write, pnpm's values describe the current file only.
+    let observed = if files.current.is_some() {
+        "currently applies"
+    } else {
+        "applies"
+    };
+    if let (Some(file), Listed::Set(applied)) = (files.queried().minutes, effective.minutes)
+        && applied != file
+        && applied != minutes
+    {
+        let (kind, comparison, effect) = if applied < minutes {
+            (
+                DiagnosticKind::Config,
+                "below",
+                "admits releases younger than the cooldown",
+            )
+        } else {
+            (
+                DiagnosticKind::StricterNative,
+                "above",
+                "may refuse versions cooldown admits",
+            )
+        };
+        warnings.push(Diagnostic::new(
+            kind,
+            format!(
+                "pnpm {observed} a minimumReleaseAge of {applied} minutes here, {comparison} the \
+                 {minutes} sync writes to pnpm-workspace.yaml, as a setting above the file such \
+                 as pnpm_config_minimum_release_age overrides it, so a bare pnpm install {effect}"
+            ),
+        ));
+    }
+    let file_sets_list = files.written.exclusions.is_some();
+    let rules: &[String] = match &effective.rules {
+        Listed::Set(rules) => rules,
+        Listed::Unset | Listed::Unreadable => &[],
+    };
+    let carries = match (&files.queried().exclusions, &effective.rules) {
+        (_, Listed::Unreadable) | (Some(_), Listed::Unset) => false,
+        (Some(file), Listed::Set(_)) => rules != crate::exclusions::configured_rules(file.clone()),
+        (None, _) => !file_sets_list,
+    };
+    if carries && rules != intended {
+        let source = if file_sets_list {
+            "as a setting above the file such as pnpm_config_minimum_release_age_exclude \
+             overrides it"
+        } else {
+            "inherited from a setting outside the file such as \
+             pnpm_config_minimum_release_age_exclude, since pnpm-workspace.yaml sets no list"
+        };
+        warnings.push(Diagnostic::new(
+            DiagnosticKind::Config,
+            format!(
+                "pnpm {observed} a minimumReleaseAgeExclude of {rules:?} here, which differs from \
+                 the {intended:?} sync intends, {source}, so a bare pnpm install may exempt other \
+                 packages than cooldown does"
+            ),
+        ));
+    }
+    if effective.relaxed {
+        warnings.push(Diagnostic::new(
+            DiagnosticKind::Config,
+            format!(
+                "pnpm {observed} minimumReleaseAgeStrict = false here, so a bare pnpm install \
+                 picks a release younger than minimumReleaseAge wherever no mature version \
+                 satisfies the request"
+            ),
+        ));
+    }
+    warnings
 }
 
 /// Whether one of pnpm's default pnpmfiles, `.pnpmfile.mjs` or `.pnpmfile.cjs`, may exist
@@ -6592,7 +6762,7 @@ packages:
         let written = NativeAge::read(&path)?;
         assert_eq!(written.minutes, Some(20160));
         assert_eq!(
-            written.exclusions.into_vec(),
+            written.exclusions.unwrap_or_default().into_vec(),
             vec!["@corp/*", "new-glob", "corp-pkg@2.0.1||1.2.2", "gone@1.0.0",]
         );
         std::assert_matches!(
@@ -6871,6 +7041,7 @@ packages:
         assert_eq!(
             NativeAge::parse(&bounded_yaml, Utf8Path::new("pnpm-workspace.yaml"))?
                 .exclusions
+                .unwrap_or_default()
                 .into_vec(),
             ["listed@1.0.0", "refused@1.0.0", "next@15.0.0"]
         );
@@ -6900,6 +7071,20 @@ packages:
         root: &Utf8Path,
         config_get: &str,
     ) -> eyre::Result<(tempfile::TempDir, NpmTool<Pnpm>)> {
+        bound_fixture_listing(
+            root,
+            r#"echo '{"registry":"https://registry.npmjs.org/"}'; exit 0"#,
+            config_get,
+        )
+    }
+
+    /// Like [`bound_fixture`], with the shell `routing` answering every `config list`.
+    #[cfg(unix)]
+    fn bound_fixture_listing(
+        root: &Utf8Path,
+        routing: &str,
+        config_get: &str,
+    ) -> eyre::Result<(tempfile::TempDir, NpmTool<Pnpm>)> {
         std::fs::write(
             root.join("pnpm-workspace.yaml"),
             indoc! {r#"
@@ -6912,7 +7097,7 @@ packages:
         pnpm_sync_tool_scripted(
             root,
             &[("foo", "1.0.0"), ("young", "1.0.0"), ("stale", "1.0.0")],
-            r#"echo '{"registry":"https://registry.npmjs.org/"}'; exit 0"#,
+            routing,
             config_get,
         )
     }
@@ -6951,7 +7136,10 @@ packages:
         report: &SyncReport,
     ) -> eyre::Result<(Vec<String>, Vec<String>)> {
         Ok((
-            NativeAge::read(path)?.exclusions.into_vec(),
+            NativeAge::read(path)?
+                .exclusions
+                .unwrap_or_default()
+                .into_vec(),
             sync_warnings(report)
                 .iter()
                 .map(|warning| warning.message.clone())
@@ -6988,7 +7176,10 @@ packages:
         )
         .await?;
         assert_eq!(
-            NativeAge::read(&path)?.exclusions.into_vec(),
+            NativeAge::read(&path)?
+                .exclusions
+                .unwrap_or_default()
+                .into_vec(),
             ["foo@1.0.0", "young@1.0.0"]
         );
 
@@ -7082,19 +7273,19 @@ packages:
     }
 
     /// When pnpm's window grows past the bound between the write and the override check after
-    /// it, the bounded list cannot name every version the longer window refuses, so the warning
-    /// says that a bare install may refuse admitted versions without naming any.
+    /// it, the bounded list cannot name every version the longer window refuses, so only the
+    /// longer window is reported, naming no version.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_bounded_override_warning_names_no_version_past_the_bound() -> eyre::Result<()> {
         let (_dir, root) = sync_tempdir()?;
-        // pnpm's window is the written seven days at the write and fourteen days after it.
-        let config_get = r#"case "$*" in
-                    *minimumReleaseAgeExclude*) echo '[]'; exit 0 ;;
-                  esac
-                  if [ -f "$0.asked" ]; then echo 20160; else touch "$0.asked"; echo 10080; fi
-                  exit 0"#;
-        let (_cache, tool) = bound_fixture(&root, config_get)?;
+        // pnpm's window is the written seven days at the write and fourteen days in the listing
+        // after it.
+        let (_cache, tool) = bound_fixture_listing(
+            &root,
+            r#"echo '{"registry":"https://registry.npmjs.org/","minimumReleaseAge":20160,"minimumReleaseAgeExclude":["young@1.0.0"]}'; exit 0"#,
+            "echo 10080; exit 0",
+        )?;
 
         let report = tool
             .write_native(&pnpm_sync_project(&root), &ten_day_pin_policy(true), false)
@@ -7105,9 +7296,10 @@ packages:
         assert_eq!(
             warnings,
             [
-                "a higher-precedence setting, such as an environment variable, a CLI flag or a \
-              pnpmfile, sets a longer minimumReleaseAge than pnpm-workspace.yaml here, so a bare \
-              pnpm install may refuse versions cooldown admits"
+                "pnpm applies a minimumReleaseAge of 20160 minutes here, above the 10080 sync \
+                 writes to pnpm-workspace.yaml, as a setting above the file such as \
+                 pnpm_config_minimum_release_age overrides it, so a bare pnpm install may refuse \
+                 versions cooldown admits"
             ]
         );
         Ok(())
@@ -7277,7 +7469,10 @@ packages:
         let report = tool.write_native(&project, &policy, false).await?;
 
         assert_eq!(
-            NativeAge::read(&path)?.exclusions.into_vec(),
+            NativeAge::read(&path)?
+                .exclusions
+                .unwrap_or_default()
+                .into_vec(),
             ["kept@1.0.0", "gone@1.0.0"]
         );
         assert!(
@@ -7335,7 +7530,10 @@ packages:
             };
             tool.write_native(&project, &policy, false).await?;
             assert_eq!(
-                NativeAge::read(&path)?.exclusions.into_vec(),
+                NativeAge::read(&path)?
+                    .exclusions
+                    .unwrap_or_default()
+                    .into_vec(),
                 kept,
                 "pnpmfile {pnpmfile}"
             );
@@ -7348,7 +7546,10 @@ packages:
             tool.write_native(&project, &moved, false).await?;
             let expected: &[&str] = if pnpmfile { &[] } else { &["pin@2.0.0"] };
             assert_eq!(
-                NativeAge::read(&path)?.exclusions.into_vec(),
+                NativeAge::read(&path)?
+                    .exclusions
+                    .unwrap_or_default()
+                    .into_vec(),
                 expected,
                 "pnpmfile {pnpmfile}"
             );
@@ -7485,13 +7686,20 @@ packages:
         let assessed = match assessment.edit {
             Some(edit) => NativeAge::parse(&String::from_utf8(edit.contents)?, &path)?
                 .exclusions
+                .unwrap_or_default()
                 .into_vec(),
-            None => NativeAge::read(&path)?.exclusions.into_vec(),
+            None => NativeAge::read(&path)?
+                .exclusions
+                .unwrap_or_default()
+                .into_vec(),
         };
 
         tool.write_native(&project, &pnpm_sync_policy(&[], Some(admitted)), false)
             .await?;
-        let synced = NativeAge::read(&path)?.exclusions.into_vec();
+        let synced = NativeAge::read(&path)?
+            .exclusions
+            .unwrap_or_default()
+            .into_vec();
         Ok((synced, assessed))
     }
 
@@ -7553,7 +7761,7 @@ packages:
             assert_eq!(written.minutes, Some(window_days * 24 * 60));
             let expected: &[&str] = if granted { &["next@16.4.6"] } else { &[] };
             assert_eq!(
-                written.exclusions.into_vec(),
+                written.exclusions.unwrap_or_default().into_vec(),
                 expected,
                 "{window_days}-day window"
             );
@@ -7583,7 +7791,7 @@ packages:
         let (_cache, tool) = pnpm_sync_tool_routed(
             &root,
             &[("aged", "1.0.0")],
-            r#"echo '{"registry":"https://registry.npmjs.org/"}'; exit 0 ;;
+            r#"echo '{"registry":"https://registry.npmjs.org/","minimumReleaseAge":43200}'; exit 0 ;;
                   *"config get minimumReleaseAge "*|*"config get minimumReleaseAge") echo 43200; exit 0"#,
         )?;
         let project = pnpm_sync_project(&root);
@@ -7651,13 +7859,190 @@ packages:
 
         let written = NativeAge::read(&path)?;
         assert_eq!(written.minutes, Some(10080));
-        assert_eq!(written.exclusions.into_vec(), ["next@16.4.6"]);
+        assert_eq!(
+            written.exclusions.unwrap_or_default().into_vec(),
+            ["next@16.4.6"]
+        );
         assert!(
             !sync_warnings(&report)
                 .iter()
                 .any(|warning| warning.message.contains("next@16.4.6")),
             "{report:?}"
         );
+        Ok(())
+    }
+
+    /// pnpm 11 lets variables such as `pnpm_config_minimum_release_age` replace the window and
+    /// the list sync writes, so a real write whose pnpm then lists a zero window, another list
+    /// and a non-strict gate earns one warning for each.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_native_warns_about_settings_that_override_the_written_gate() -> eyre::Result<()>
+    {
+        let (_dir, root) = sync_tempdir()?;
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            indoc! {"
+                packages: []
+                minimumReleaseAgeExclude: []
+            "},
+        )?;
+        let (_cache, tool) = pnpm_sync_tool_scripted(
+            &root,
+            &[],
+            r#"echo '{"minimumReleaseAge":0,"minimumReleaseAgeExclude":["other"],"minimumReleaseAgeStrict":false}'; exit 0"#,
+            "echo 'undefined'; exit 0",
+        )?;
+
+        let report = tool
+            .write_native(
+                &pnpm_sync_project(&root),
+                &pnpm_sync_policy(&[], Some(&[])),
+                false,
+            )
+            .await?;
+
+        let warnings = sync_warnings(&report);
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.kind == DiagnosticKind::Config),
+            "{warnings:?}"
+        );
+        let messages: Vec<&str> = warnings
+            .iter()
+            .map(|warning| warning.message.as_str())
+            .collect();
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert!(
+            messages[0].starts_with("pnpm applies a minimumReleaseAge of 0 minutes here, below")
+        );
+        assert!(messages[1].starts_with(
+            r#"pnpm applies a minimumReleaseAgeExclude of ["other"] here, which differs from the []"#
+        ));
+        assert!(messages[2].starts_with("pnpm applies minimumReleaseAgeStrict = false here"));
+        Ok(())
+    }
+
+    /// A window the listing reports unreadably, such as the fractional minutes pnpm 11 accepts,
+    /// leaves the other settings judged: an overridden list still earns its warning.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_native_judges_the_list_beside_an_unreadable_window() -> eyre::Result<()> {
+        let (_dir, root) = sync_tempdir()?;
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            indoc! {"
+                packages: []
+                minimumReleaseAgeExclude: []
+            "},
+        )?;
+        let (_cache, tool) = pnpm_sync_tool_scripted(
+            &root,
+            &[],
+            r#"echo '{"minimumReleaseAge":0.5,"minimumReleaseAgeExclude":["other"]}'; exit 0"#,
+            "echo 'undefined'; exit 0",
+        )?;
+
+        let report = tool
+            .write_native(
+                &pnpm_sync_project(&root),
+                &pnpm_sync_policy(&[], Some(&[])),
+                false,
+            )
+            .await?;
+
+        let warnings = sync_warnings(&report);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0]
+                .message
+                .starts_with(r#"pnpm applies a minimumReleaseAgeExclude of ["other"] here"#),
+            "{warnings:?}"
+        );
+        Ok(())
+    }
+
+    /// A workspace whose file sets no exclusion list still has pnpm apply the one a variable
+    /// such as `PNPM_CONFIG_MINIMUM_RELEASE_AGE_EXCLUDE` sets, which sync reports as inherited.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_native_warns_about_an_inherited_exclusion_list() -> eyre::Result<()> {
+        let (_dir, root) = sync_tempdir()?;
+        std::fs::write(root.join("pnpm-workspace.yaml"), "packages: []\n")?;
+        let (_cache, tool) = pnpm_sync_tool_scripted(
+            &root,
+            &[],
+            r#"echo '{"minimumReleaseAge":20160,"minimumReleaseAgeExclude":["foo"]}'; exit 0"#,
+            "echo 'undefined'; exit 0",
+        )?;
+
+        let report = tool
+            .write_native(
+                &pnpm_sync_project(&root),
+                &pnpm_sync_policy(&[], Some(&[])),
+                false,
+            )
+            .await?;
+
+        assert!(
+            NativeAge::read(&root.join("pnpm-workspace.yaml"))?
+                .exclusions
+                .is_none()
+        );
+        let warnings = sync_warnings(&report);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0]
+                .message
+                .contains(r#"of ["foo"] here, which differs from the []"#)
+                && warnings[0].message.contains("inherited"),
+            "{warnings:?}"
+        );
+        Ok(())
+    }
+
+    /// A dry run that would change the file leaves pnpm reading the current one, so only a
+    /// window that differs from the current file's proves a setting above it: pnpm listing the
+    /// current seven days earns no warning, while a zero it lists earns one describing it as
+    /// what pnpm currently applies.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dry_run_warns_only_about_an_override_the_old_file_proves() -> eyre::Result<()> {
+        for (listed, warned) in [(10080, false), (0, true)] {
+            let (_dir, root) = sync_tempdir()?;
+            std::fs::write(
+                root.join("pnpm-workspace.yaml"),
+                indoc! {"
+                    packages: []
+                    minimumReleaseAge: 10080
+                "},
+            )?;
+            let (_cache, tool) = pnpm_sync_tool_scripted(
+                &root,
+                &[],
+                &format!(r#"echo '{{"minimumReleaseAge":{listed}}}'; exit 0"#),
+                "echo 'undefined'; exit 0",
+            )?;
+
+            let report = tool
+                .write_native(
+                    &pnpm_sync_project(&root),
+                    &pnpm_sync_policy(&[], Some(&[])),
+                    true,
+                )
+                .await?;
+
+            std::assert_matches!(report, SyncReport::Written { .. });
+            let warnings = sync_warnings(&report);
+            assert_eq!(!warnings.is_empty(), warned, "{warnings:?}");
+            assert!(
+                warnings
+                    .iter()
+                    .all(|warning| warning.message.starts_with("pnpm currently applies")),
+                "{warnings:?}"
+            );
+        }
         Ok(())
     }
 
@@ -7718,7 +8103,10 @@ packages:
             .await?;
 
         assert_eq!(
-            NativeAge::read(&path)?.exclusions.into_vec(),
+            NativeAge::read(&path)?
+                .exclusions
+                .unwrap_or_default()
+                .into_vec(),
             ["kept@1.0.0", "gone@1.0.0"]
         );
         assert!(
@@ -7752,7 +8140,10 @@ packages:
         assert!(std::fs::symlink_metadata(&link)?.file_type().is_symlink());
         let written = NativeAge::read(&target)?;
         assert_eq!(written.minutes, Some(20160));
-        assert_eq!(written.exclusions.into_vec(), ["@types/*"]);
+        assert_eq!(
+            written.exclusions.unwrap_or_default().into_vec(),
+            ["@types/*"]
+        );
         Ok(())
     }
 
@@ -7883,7 +8274,10 @@ packages:
         std::assert_matches!(written, SyncReport::Written { .. });
         assert_eq!(omitted_selectors(&written), omitted);
         assert_eq!(
-            NativeAge::read(&path)?.exclusions.into_vec(),
+            NativeAge::read(&path)?
+                .exclusions
+                .unwrap_or_default()
+                .into_vec(),
             [
                 "*-plugin",
                 "@types/*-utils",
@@ -7924,7 +8318,10 @@ packages:
         std::assert_matches!(report, SyncReport::Written { .. });
         assert_eq!(omitted_selectors(&report), ["**", "@types/{node,react}"]);
         assert_eq!(
-            NativeAge::read(&path)?.exclusions.into_vec(),
+            NativeAge::read(&path)?
+                .exclusions
+                .unwrap_or_default()
+                .into_vec(),
             ["*-plugin", "@types/node@22.0.0"]
         );
         Ok(())
@@ -7993,7 +8390,10 @@ packages:
             SyncReport::Unchanged { .. }
         );
         assert_eq!(
-            NativeAge::read(&path)?.exclusions.into_vec(),
+            NativeAge::read(&path)?
+                .exclusions
+                .unwrap_or_default()
+                .into_vec(),
             ["react-dom@19.0.0"]
         );
 
@@ -8288,7 +8688,10 @@ packages:
         std::assert_matches!(written, SyncReport::Written { .. });
         assert_eq!(omitted_selectors(&written), ["@corp/*"]);
         assert_eq!(
-            NativeAge::read(&path)?.exclusions.into_vec(),
+            NativeAge::read(&path)?
+                .exclusions
+                .unwrap_or_default()
+                .into_vec(),
             ["@corp/ui@1.0.0||2.0.0"]
         );
         let again = tool.write_native(&project, &policy, false).await?;
@@ -8329,7 +8732,10 @@ packages:
         let report = tool.write_native(&project, &policy, false).await?;
 
         assert_eq!(
-            NativeAge::read(&path)?.exclusions.into_vec(),
+            NativeAge::read(&path)?
+                .exclusions
+                .unwrap_or_default()
+                .into_vec(),
             ["young@1.0.0"]
         );
         // Only the young version left out is worth a warning, since pnpm keeps refusing it.
@@ -8368,7 +8774,10 @@ packages:
         std::assert_matches!(written, SyncReport::Written { .. });
         assert_eq!(omitted_selectors(&written), ["@corp/*"]);
         assert_eq!(
-            NativeAge::read(&path)?.exclusions.into_vec(),
+            NativeAge::read(&path)?
+                .exclusions
+                .unwrap_or_default()
+                .into_vec(),
             ["@corp/ui@1.0.0"]
         );
         Ok(())
@@ -8476,7 +8885,13 @@ packages:
 
         std::assert_matches!(pruned, SyncReport::Written { .. });
         assert_eq!(omitted_selectors(&pruned), ["@corp/*", "react-?om"]);
-        assert_eq!(NativeAge::read(&path)?.exclusions.into_vec(), ["*-plugin"]);
+        assert_eq!(
+            NativeAge::read(&path)?
+                .exclusions
+                .unwrap_or_default()
+                .into_vec(),
+            ["*-plugin"]
+        );
         Ok(())
     }
 
@@ -8598,11 +9013,17 @@ packages:
                   - "@corp/*"
             "#},
         )?;
-        let before = NativeAge::read(&path)?.exclusions.into_vec();
+        let before = NativeAge::read(&path)?
+            .exclusions
+            .unwrap_or_default()
+            .into_vec();
 
         tool.write_native(&project, &policy, false).await?;
 
-        let after = NativeAge::read(&path)?.exclusions.into_vec();
+        let after = NativeAge::read(&path)?
+            .exclusions
+            .unwrap_or_default()
+            .into_vec();
         assert_eq!(
             after,
             ["foo@v1.0.0", "foo@2.0.0", "bar@1.0.0 || 2.0.0", "baz@1.0.0"]
@@ -8634,7 +9055,13 @@ packages:
 
         let written = tool.write_native(&project, &policy, false).await?;
         assert_eq!(omitted_selectors(&written), ["@corp/*", "react-?om"]);
-        assert_eq!(NativeAge::read(&path)?.exclusions.into_vec(), ["*-plugin"]);
+        assert_eq!(
+            NativeAge::read(&path)?
+                .exclusions
+                .unwrap_or_default()
+                .into_vec(),
+            ["*-plugin"]
+        );
         Ok(())
     }
 
@@ -12502,6 +12929,7 @@ mod whole_graph_tests {
         assert_eq!(
             NativeAge::read(&root.join("pnpm-workspace.yaml"))?
                 .exclusions
+                .unwrap_or_default()
                 .into_vec(),
             rules.persisted,
             "direct={direct}: {native}"
@@ -12871,6 +13299,7 @@ mod whole_graph_tests {
                     &root.join("pnpm-workspace.yaml"),
                 )?
                 .exclusions
+                .unwrap_or_default()
                 .into_vec(),
                 None => rules.iter().map(ToString::to_string).collect(),
             };

@@ -577,7 +577,7 @@ fn stable_resolution(dir: &Utf8Path, env: &CargoEnvironment, crates_io_age: Opti
     ages.extend(
         // The command line's crates.io age does not override `CARGO_REGISTRIES_CRATES_IO_*`
         // safely: the variable also names a registry called `crates_io`.
-        env.registry_ages.iter().cloned(),
+        env.registry_ages.values().cloned(),
     );
     for path in env.config_files(dir) {
         let Some(config) = std::fs::read_to_string(&path)

@@ -1,5 +1,5 @@
 use super::write_repo_native;
-use crate::publish_age::CargoEnvironment;
+use crate::publish_age::{CRATES_IO_AGE_ENV, CargoEnvironment};
 use camino::Utf8PathBuf;
 use color_eyre::eyre;
 use cooldown_core::{DiagnosticKind, ResolvedPolicy, SyncReport, WindowSpec};
@@ -206,5 +206,42 @@ fn a_package_window_adds_no_adapter_warning() -> eyre::Result<()> {
 
     assert_eq!(warning_kinds(&report), []);
     std::assert_matches!(report, SyncReport::Written { .. });
+    Ok(())
+}
+
+/// The written table names crates.io, so cargo then reads crates.io's own variable under its
+/// literal name, and one that replaces the written age earns a warning saying which way it moves
+/// the gate.
+#[test]
+fn warns_when_the_crates_io_variable_replaces_the_written_age() -> eyre::Result<()> {
+    let (_directory, root) = repo()?;
+    let uppercase = "CARGO_REGISTRIES_CRATES_IO_MIN_PUBLISH_AGE";
+    for (name, value, expected) in [
+        (CRATES_IO_AGE_ENV, "0", vec![DiagnosticKind::Config]),
+        (
+            CRATES_IO_AGE_ENV,
+            "30 days",
+            vec![DiagnosticKind::StricterNative],
+        ),
+        (CRATES_IO_AGE_ENV, "7days", vec![]),
+        (CRATES_IO_AGE_ENV, "soon", vec![DiagnosticKind::Config]),
+        (uppercase, "0", vec![]),
+    ] {
+        let env = CargoEnvironment {
+            registry_ages: BTreeMap::from([(name.to_owned(), value.to_owned())]),
+            ..CargoEnvironment::default()
+        };
+        let report = write_repo_native(&root, &policy(days(7)), &env, true)?;
+        assert_eq!(warning_kinds(&report), expected, "{name}={value}");
+    }
+
+    // With enforcement off, only that is reported, whatever age the variable sets.
+    let disabled = CargoEnvironment {
+        registry_ages: BTreeMap::from([(CRATES_IO_AGE_ENV.to_owned(), "30 days".to_owned())]),
+        incompatible: Some("allow".to_owned()),
+        ..CargoEnvironment::default()
+    };
+    let report = write_repo_native(&root, &policy(days(7)), &disabled, true)?;
+    assert_eq!(warning_kinds(&report), [DiagnosticKind::Config]);
     Ok(())
 }

@@ -54,7 +54,7 @@ pub(crate) fn prune_exclusions(
     empty: EmptyList,
     dry_run: bool,
 ) -> Result<bool> {
-    let rules = match NativeAge::read(path)?.exclusions {
+    let rules = match NativeAge::read(path)?.exclusions.unwrap_or_default() {
         ConfigStringList::One(scalar) if scalar.contains("${") => return Ok(false),
         configured => configured_rules(configured),
     };
@@ -87,12 +87,14 @@ impl Default for ConfigStringList {
     }
 }
 
+/// The release-age settings a pnpm settings file sets itself, each `None` where the file leaves
+/// it to pnpm's other configuration.
 #[derive(serde::Deserialize, Default)]
 pub(crate) struct NativeAge {
     #[serde(rename = "minimumReleaseAge")]
     pub(crate) minutes: Option<i64>,
-    #[serde(rename = "minimumReleaseAgeExclude", default)]
-    pub(crate) exclusions: ConfigStringList,
+    #[serde(rename = "minimumReleaseAgeExclude")]
+    pub(crate) exclusions: Option<ConfigStringList>,
 }
 
 impl NativeAge {
@@ -759,7 +761,10 @@ mod tests {
             "minimumReleaseAge: 20160\nminimumReleaseAgeExclude: []\n"
         );
         assert_eq!(
-            NativeAge::read(&path)?.exclusions.into_vec(),
+            NativeAge::read(&path)?
+                .exclusions
+                .unwrap_or_default()
+                .into_vec(),
             [] as [String; 0]
         );
 
@@ -910,7 +915,10 @@ mod tests {
             minimumReleaseAge: 20160
         "#};
         assert_eq!(
-            NativeAge::parse(original, path)?.exclusions.into_vec(),
+            NativeAge::parse(original, path)?
+                .exclusions
+                .unwrap_or_default()
+                .into_vec(),
             ["a", "b@1.0.0"]
         );
 
@@ -932,7 +940,7 @@ mod tests {
             "#}
         );
         let after = NativeAge::parse(&rendered, path)?;
-        assert_eq!(after.exclusions.into_vec(), ["c@2.0.0"]);
+        assert_eq!(after.exclusions.unwrap_or_default().into_vec(), ["c@2.0.0"]);
         assert_eq!(after.minutes, Some(20160));
 
         // The same items read back unchanged, so the indentless list is not rewritten.

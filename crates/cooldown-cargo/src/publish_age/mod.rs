@@ -18,12 +18,20 @@ pub(crate) use sync::write_repo_native;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::CoreError;
 use jiff::SignedDuration;
+use std::collections::BTreeMap;
 
 /// The process environment variable cargo reads for `registry.global-min-publish-age`.
 const GLOBAL_AGE_ENV: &str = "CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE";
 
 /// The process environment variable cargo reads for `resolver.incompatible-publish-age`.
 const INCOMPATIBLE_ENV: &str = "CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE";
+
+/// The process environment variable cargo reads for `registries.crates-io.min-publish-age`.
+///
+/// Cargo builds a registry's variable from the registry name exactly as the config spells it, so
+/// the documented `CARGO_REGISTRIES_CRATES_IO_MIN_PUBLISH_AGE` never reaches crates.io.
+/// It reads the variable only for a registry that a config `[registries.<name>]` table names.
+pub(crate) const CRATES_IO_AGE_ENV: &str = "CARGO_REGISTRIES_crates-io_MIN_PUBLISH_AGE";
 
 /// The config key that sets crates.io's own publish age, which beats the global one.
 pub(crate) const CRATES_IO_AGE_KEY: [&str; 3] = ["registries", "crates-io", "min-publish-age"];
@@ -40,8 +48,8 @@ pub(crate) struct CargoEnvironment {
     pub(crate) global_age: Option<String>,
     /// The raw `CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE`.
     pub(crate) incompatible: Option<String>,
-    /// The raw value of every `CARGO_REGISTRIES_<NAME>_MIN_PUBLISH_AGE`.
-    pub(crate) registry_ages: Vec<String>,
+    /// The raw value of every `CARGO_REGISTRIES_<name>_MIN_PUBLISH_AGE`, by variable name.
+    pub(crate) registry_ages: BTreeMap<String, String>,
     /// The raw `CARGO_NET_OFFLINE`.
     pub(crate) offline: Option<String>,
 }
@@ -64,10 +72,11 @@ impl CargoEnvironment {
         let (prefix, suffix) = REGISTRY_AGE_ENV;
         let registry_ages = std::env::vars_os()
             .filter_map(|(name, value)| {
-                name.to_str()?.strip_prefix(prefix)?.strip_suffix(suffix)?;
+                let name = name.into_string().ok()?;
+                name.strip_prefix(prefix)?.strip_suffix(suffix)?;
                 // A value that is not Unicode is no age cargo parses either, and stays configured
                 // so that a caller treating it as unparsable fails safe.
-                Some(value.to_string_lossy().into_owned())
+                Some((name, value.to_string_lossy().into_owned()))
             })
             .collect();
         Self {
@@ -106,15 +115,15 @@ impl CargoEnvironment {
 pub(crate) enum AgeSource {
     /// A cargo config file.
     File(Utf8PathBuf),
-    /// The `CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE` environment variable.
-    Env,
+    /// The named environment variable.
+    Env(&'static str),
 }
 
 impl std::fmt::Display for AgeSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AgeSource::File(path) => write!(f, "{path}"),
-            AgeSource::Env => f.write_str(GLOBAL_AGE_ENV),
+            AgeSource::Env(name) => f.write_str(name),
         }
     }
 }
@@ -147,9 +156,11 @@ impl PublishAgeSettings {
     /// Cargo merges the active config file of every ancestor's `.cargo/` directory, nearest first,
     /// then the Cargo home's, which always ranks last even when it is also an ancestor.
     /// A directory's active file is `config` when that exists, and `config.toml` otherwise.
-    /// The environment then overrides the file value of the same key.
+    /// The environment then overrides the file value of the same key, crates.io's own age only
+    /// where a file names the registry ([`CRATES_IO_AGE_ENV`]).
     pub(crate) fn discover(dir: &Utf8Path, env: &CargoEnvironment) -> Result<Self, CoreError> {
         let mut settings = Self::default();
+        let mut crates_io_named = false;
         for path in env.config_files(dir) {
             let content = std::fs::read_to_string(&path)
                 .map_err(|err| CoreError::Filesystem(format!("{path}: {err}")))?;
@@ -164,18 +175,39 @@ impl PublishAgeSettings {
             )?;
             fill(&mut settings.global_age, &value, &GLOBAL_AGE_KEY, &path)?;
             fill(&mut settings.incompatible, &value, &INCOMPATIBLE_KEY, &path)?;
+            let [registries, crates_io, _] = CRATES_IO_AGE_KEY;
+            crates_io_named |= value
+                .get(registries)
+                .and_then(|table| table.get(crates_io))
+                .is_some();
         }
-        if let Some(value) = &env.global_age {
-            settings.global_age = Some(Setting {
-                value: value.clone(),
-                source: AgeSource::Env,
-            });
-        }
-        if let Some(value) = &env.incompatible {
-            settings.incompatible = Some(Setting {
-                value: value.clone(),
-                source: AgeSource::Env,
-            });
+        let crates_io_env = env
+            .registry_ages
+            .get(CRATES_IO_AGE_ENV)
+            .filter(|_| crates_io_named);
+        for (slot, value, name) in [
+            (
+                &mut settings.crates_io_age,
+                crates_io_env,
+                CRATES_IO_AGE_ENV,
+            ),
+            (
+                &mut settings.global_age,
+                env.global_age.as_ref(),
+                GLOBAL_AGE_ENV,
+            ),
+            (
+                &mut settings.incompatible,
+                env.incompatible.as_ref(),
+                INCOMPATIBLE_ENV,
+            ),
+        ] {
+            if let Some(value) = value {
+                *slot = Some(Setting {
+                    value: value.clone(),
+                    source: AgeSource::Env(name),
+                });
+            }
         }
         Ok(settings)
     }
@@ -262,30 +294,27 @@ const SECONDS_PER_UNIT: [(&str, i64); 6] = [
     ("hour", 60 * 60),
     ("day", 24 * 60 * 60),
     ("week", 7 * 24 * 60 * 60),
-    // Cargo counts a month as 30 days.
-    ("month", 30 * 24 * 60 * 60),
+    // Cargo counts a month as the average Gregorian month, 30.436875 days.
+    ("month", 2_629_746),
 ];
 
 /// Parses an age in cargo's grammar: `N seconds/minutes/hours/days/weeks/months`.
 ///
-/// The space is optional, the unit may be singular or plural, and a bare `0` means no age.
-/// Cargo rejects any other spelling, such as `14d` or an ISO-8601 span, so this does too.
+/// One space may separate the number from the unit, the unit may be singular or plural, and
+/// exactly `0` means no age.
+/// Cargo rejects any other spelling, such as `14d`, an ISO-8601 span or surrounding whitespace,
+/// so this does too.
 pub(crate) fn parse_age(raw: &str) -> Result<SignedDuration, String> {
     const EXPECTED: &str = "expected \"N seconds/minutes/hours/days/weeks/months\"";
-    let trimmed = raw.trim();
-    let split = trimmed
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(trimmed.len());
-    let (number, unit) = trimmed.split_at(split);
-    let count: i64 = number.parse().map_err(|_| EXPECTED.to_owned())?;
-    let unit = unit.trim();
-    if unit.is_empty() {
-        return if count == 0 {
-            Ok(SignedDuration::ZERO)
-        } else {
-            Err(EXPECTED.to_owned())
-        };
+    if raw == "0" {
+        return Ok(SignedDuration::ZERO);
     }
+    let split = raw
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| EXPECTED.to_owned())?;
+    let (number, unit) = raw.split_at(split);
+    let count: i64 = number.parse().map_err(|_| EXPECTED.to_owned())?;
+    let unit = unit.strip_prefix(' ').unwrap_or(unit);
     let singular = unit.strip_suffix('s').unwrap_or(unit);
     let (_, seconds) = SECONDS_PER_UNIT
         .iter()
@@ -299,7 +328,8 @@ pub(crate) fn parse_age(raw: &str) -> Result<SignedDuration, String> {
 
 /// Spells `age` in cargo's grammar using the largest unit that divides it exactly.
 ///
-/// Months are never used, because cargo's 30-day month would silently round a calendar reading.
+/// Months are never used, because a reader would take cargo's average month of 30.436875 days
+/// for a calendar month.
 /// Returns `None` for a negative or sub-second age, which cargo cannot express.
 pub(crate) fn render_age(age: SignedDuration) -> Option<String> {
     if age.is_negative() || age.subsec_nanos() != 0 {

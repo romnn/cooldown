@@ -1,6 +1,6 @@
 use super::{
-    AgeSource, CargoEnvironment, EffectiveAge, PublishAgeSettings, parse_age, render_age,
-    writable_config_file,
+    AgeSource, CRATES_IO_AGE_ENV, CargoEnvironment, EffectiveAge, PublishAgeSettings, parse_age,
+    render_age, writable_config_file,
 };
 use camino::{Utf8Path, Utf8PathBuf};
 use color_eyre::eyre;
@@ -67,11 +67,15 @@ fn parse_age_accepts_cargo_spellings() {
     assert_eq!(parse_age("90 minutes"), Ok(SignedDuration::from_mins(90)));
     assert_eq!(parse_age("5 seconds"), Ok(SignedDuration::from_secs(5)));
 
-    // Cargo's month is exactly 30 days.
-    assert_eq!(parse_age("1 month"), Ok(days(30)));
+    // Cargo's month is the average Gregorian month.
+    assert_eq!(
+        parse_age("1 month"),
+        Ok(SignedDuration::from_secs(2_629_746))
+    );
 
-    // A bare zero disables the age.
+    // Exactly `0` disables the age.
     assert_eq!(parse_age("0"), Ok(SignedDuration::ZERO));
+    assert_eq!(parse_age("0 days"), Ok(SignedDuration::ZERO));
 }
 
 #[test]
@@ -85,6 +89,10 @@ fn parse_age_rejects_what_cargo_rejects() {
         "7",
         "1 fortnight",
         "-3 days",
+        "1 day ",
+        " 1 day",
+        "1  day",
+        " 0",
     ] {
         assert!(parse_age(raw).is_err(), "{raw:?} must be rejected");
     }
@@ -291,7 +299,7 @@ fn env_global_age_overrides_the_file_global_age_only() -> eyre::Result<()> {
         effective(&tree.root, &env)?,
         Some(EffectiveAge {
             age: days(2),
-            source: AgeSource::Env,
+            source: AgeSource::Env(super::GLOBAL_AGE_ENV),
         })
     );
 
@@ -303,6 +311,55 @@ fn env_global_age_overrides_the_file_global_age_only() -> eyre::Result<()> {
     assert_eq!(
         effective(&tree.root, &env)?.map(|found| found.age),
         Some(days(30))
+    );
+    Ok(())
+}
+
+/// Cargo reads crates.io's own variable only under the registry's literal name, and only once a
+/// config table names the registry; it then beats every file age.
+#[test]
+fn crates_io_variable_needs_its_literal_name_and_a_registry_table() -> eyre::Result<()> {
+    let tree = Tree::new()?;
+    let env = |name: &str| CargoEnvironment {
+        registry_ages: std::collections::BTreeMap::from([(name.to_owned(), "0".to_owned())]),
+        ..bare_env()
+    };
+    tree.write(
+        ".cargo/config.toml",
+        indoc::indoc! {r#"
+            [registry]
+            global-min-publish-age = "3 days"
+        "#},
+    )?;
+    assert_eq!(
+        effective(&tree.root, &env(CRATES_IO_AGE_ENV))?.map(|found| found.age),
+        Some(days(3))
+    );
+
+    tree.write(
+        ".cargo/config.toml",
+        indoc::indoc! {r#"
+            [registry]
+            global-min-publish-age = "3 days"
+
+            [registries.crates-io]
+        "#},
+    )?;
+    assert_eq!(
+        effective(&tree.root, &env(CRATES_IO_AGE_ENV))?,
+        Some(EffectiveAge {
+            age: SignedDuration::ZERO,
+            source: AgeSource::Env(CRATES_IO_AGE_ENV),
+        })
+    );
+    // The uppercase spelling names a registry called `CRATES_IO`, not crates.io.
+    assert_eq!(
+        effective(
+            &tree.root,
+            &env("CARGO_REGISTRIES_CRATES_IO_MIN_PUBLISH_AGE")
+        )?
+        .map(|found| found.age),
+        Some(days(3))
     );
     Ok(())
 }
