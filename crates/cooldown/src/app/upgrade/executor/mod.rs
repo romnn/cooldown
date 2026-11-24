@@ -663,7 +663,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         {
             return;
         }
-        let graph = self.scoped_deps(GraphRead::Replan).await;
+        let graph = self.final_graph().await;
         let UpgradeAccum {
             facts,
             items,
@@ -673,6 +673,29 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         if let Some(copies) = facts.as_mut().and_then(|facts| facts.copies.as_mut()) {
             outcome::settle(copies, &self.provenance, items, errors, graph.as_deref());
         }
+    }
+
+    /// The whole graph the pass left, with its build-backend requirements, or `None` after
+    /// recording why it could not be read.
+    ///
+    /// The planning scope stays out of this read: a move can land under a name `--package`
+    /// filters out, such as a Go module's next major path, while each copy's own declaration
+    /// still decides whose bindings count.
+    async fn final_graph(&mut self) -> Option<Vec<Dependency>> {
+        let project = &self.ctx.pctx.project;
+        let mut deps = match self.ctx.reader.dependencies(project, DepScope::Graph).await {
+            Ok(deps) => deps,
+            Err(error) => {
+                self.record_project_error(&error, None);
+                return None;
+            }
+        };
+        // A build backend has no lock entry, so only its manifest shows a raised floor; without
+        // it such a move reads as not landed.
+        if let Ok(constraints) = self.ctx.reader.manifest_constraints(project).await {
+            deps.extend(constraints);
+        }
+        Some(deps)
     }
 
     async fn run_inner(&mut self) -> ProjectRunStatus {
@@ -2500,7 +2523,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             let Judged { releases, verdict } = match result {
                 Ok(judged) => judged,
                 Err(error) => {
-                    self.record_project_error(error, Some(&dep.package.name));
+                    let diagnostic = self.project_diag(error, Some(&dep.package.name));
+                    if let Some(origin) = self.origin_of(dep, copy) {
+                        self.provenance.failed(origin, diagnostic.clone());
+                    }
+                    self.acc.errors.push(diagnostic);
                     continue;
                 }
             };
@@ -2601,25 +2628,28 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         }
     }
 
-    /// Traces `change`, and the fallbacks it may be retried at, to the first-plan copy of `dep`
-    /// it moves, when `outdated`'s dry run collects what the pass settled.
+    /// The first-plan copy that `dep`, at index `copy` in the plan reading it, is, when
+    /// `outdated`'s dry run collects what the pass settled.
     ///
-    /// `copy` is `dep`'s index in the plan reading it, which a follower replan maps back to the
-    /// first plan's.
-    fn trace_tried(&mut self, change: &Change, dep: &Dependency, copy: usize) {
-        let Some(facts) = &self.acc.facts else {
-            return;
-        };
-        let origin = match &facts.copies {
+    /// A follower replan's copy is the first plan's with the same declaration, if the first plan
+    /// read one.
+    fn origin_of(&self, dep: &Dependency, copy: usize) -> Option<usize> {
+        match &self.acc.facts.as_ref()?.copies {
             None => Some(copy),
             Some(first) => first.iter().position(|planned| {
                 let first = &planned.fact.dependency;
                 first.package == dep.package
                     && first.current == dep.current
                     && first.direct == dep.direct
+                    && first.members == dep.members
             }),
-        };
-        let Some(origin) = origin else {
+        }
+    }
+
+    /// Traces `change`, and the fallbacks it may be retried at, to the first-plan copy of `dep`
+    /// it moves (see [`origin_of`](Self::origin_of)).
+    fn trace_tried(&mut self, change: &Change, dep: &Dependency, copy: usize) {
+        let Some(origin) = self.origin_of(dep, copy) else {
             return;
         };
         self.provenance.tried(change, origin, &dep.package);

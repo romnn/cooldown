@@ -234,13 +234,14 @@ impl<'a> OutdatedRunner<'a> {
         let judged = self.judge(pctx, &read, deps, planned).await;
 
         let project_label = read.project_label.as_str();
-        for (
-            FetchedRelease {
-                dependency: dep,
-                result,
-            },
+        for PlannedCopy {
+            fact:
+                FetchedRelease {
+                    dependency: dep,
+                    result,
+                },
             outcome,
-        ) in judged
+        } in judged
         {
             let item = match result {
                 Ok(judged) => {
@@ -251,8 +252,7 @@ impl<'a> OutdatedRunner<'a> {
                     }
                     let mut item = self.outdated_item(pctx, project_label, &dep, &judged);
                     if dry_run.is_some() {
-                        let outcome = outcome.unwrap_or_else(|| unsettled.clone());
-                        settle(&mut item, &dep, &judged.verdict, outcome);
+                        settle(&mut item, &dep, &judged.verdict, outcome, &unsettled);
                     }
                     item
                 }
@@ -388,7 +388,8 @@ impl<'a> OutdatedRunner<'a> {
         }
     }
 
-    /// Every dependency with the releases and upgrade verdict its row reports.
+    /// Every dependency with the releases and upgrade verdict its row reports, and what the dry
+    /// run settled for its copy.
     ///
     /// A dependency the dry run's plan read keeps the plan's own evaluation (`planned`), so the
     /// row and the plan judge one fetch with one advisory snapshot.
@@ -400,7 +401,7 @@ impl<'a> OutdatedRunner<'a> {
         read: &ReadProjectCtx<'_>,
         deps: Vec<Dependency>,
         planned: Vec<PlannedCopy>,
-    ) -> Vec<(FetchedRelease<Judged>, Option<CopyOutcome>)> {
+    ) -> Vec<PlannedCopy> {
         let mut plan = PlannedCopies::new();
         for copy in planned {
             let dep = &copy.fact.dependency;
@@ -412,20 +413,14 @@ impl<'a> OutdatedRunner<'a> {
         let mut unjudged = Vec::new();
         for dep in deps {
             match take_copy(&mut plan, &dep, |copy| copy.fact.result.is_ok()) {
-                Some(PlannedCopy {
-                    fact:
-                        FetchedRelease {
-                            result: Ok(fact), ..
-                        },
-                    outcome,
-                }) => judged.push((
-                    FetchedRelease {
+                Some(PlannedCopy { fact, outcome }) => judged.push(PlannedCopy {
+                    fact: FetchedRelease {
                         dependency: dep,
-                        result: Ok(fact),
+                        result: fact.result,
                     },
                     outcome,
-                )),
-                _ => unjudged.push(dep),
+                }),
+                None => unjudged.push(dep),
             }
         }
         if unjudged.is_empty() {
@@ -464,7 +459,10 @@ impl<'a> OutdatedRunner<'a> {
                 ),
                 releases,
             });
-            judged.push((FetchedRelease { dependency, result }, outcome));
+            judged.push(PlannedCopy {
+                fact: FetchedRelease { dependency, result },
+                outcome,
+            });
         }
         judged
     }
@@ -839,8 +837,8 @@ fn summarize(items: &[OutdatedItem]) -> OutdatedSummary {
 type PlannedCopies = HashMap<(PackageId, Version, bool), Vec<PlannedCopy>>;
 
 /// Takes the copies the dry run's first plan read, each with what the pass settled for it, and
-/// the outcome of a row no copy settles: the failure that stopped a pass which settled none, such
-/// as one that failed before planning.
+/// the failure that stopped a pass which settled none, such as one that failed before planning,
+/// for the rows it left unconfirmed.
 fn take_settlement(dry_run: Option<&mut UpgradeAccum>) -> (Vec<PlannedCopy>, CopyOutcome) {
     let Some(pass) = dry_run else {
         return (Vec::new(), CopyOutcome::Undecided);
@@ -878,21 +876,33 @@ fn take_copy(
     Some(copies.swap_remove(at))
 }
 
-/// Settles `item`, judged `verdict`, on what the `upgrade` dry run did with its copy, so the row's
-/// verdict and target are `upgrade`'s.
+/// Settles `item`, judged `verdict`, on what the `upgrade` dry run did with its copy
+/// (`outcome`), so the row's verdict and target are `upgrade`'s.
 ///
 /// A landing is the row's target, whatever its own verdict, and an exempt row that lands stays
-/// `exempt`; a refused move blocks the row at that move's target.
-/// A failure makes a row with a matured target, or a held one, an `error`, and a row the dry run
-/// decided nothing about is `blocked` when it has a matured target, because `upgrade` never moves
-/// it.
+/// `exempt`; a refused move blocks the row at that move's target, and a failure for the copy
+/// makes the row an `error`.
+/// A row with a matured target is `blocked` when the dry run decided nothing about its copy,
+/// because `upgrade` never moves it, and an `error` when the pass settled no copy at all
+/// (`unsettled` is then the failure that stopped it).
 /// Every other row keeps its own verdict.
-fn settle(item: &mut OutdatedItem, dep: &Dependency, verdict: &Verdict, outcome: CopyOutcome) {
+fn settle(
+    item: &mut OutdatedItem,
+    dep: &Dependency,
+    verdict: &Verdict,
+    outcome: Option<CopyOutcome>,
+    unsettled: &CopyOutcome,
+) {
     let actionable = matches!(verdict.status, Status::Adoptable | Status::Exempt)
         && verdict
             .adoptable_target
             .as_ref()
             .is_some_and(|target| *target != dep.current);
+    let outcome = match outcome {
+        Some(outcome) => outcome,
+        None if actionable => unsettled.clone(),
+        None => return,
+    };
     let (to, security) = match outcome {
         CopyOutcome::Landed { to, security } => {
             if item.status != OutdatedStatus::Exempt {
@@ -908,8 +918,7 @@ fn settle(item: &mut OutdatedItem, dep: &Dependency, verdict: &Verdict, outcome:
             item.blocked_reason = Some(skip.message);
             (to, security)
         }
-        // A held row is one a follower replan can try once its holder moves.
-        CopyOutcome::Failed(error) if actionable || verdict.status == Status::Held => {
+        CopyOutcome::Failed(error) => {
             item.status = OutdatedStatus::Error;
             item.held_by = None;
             item.adoptable_target = None;
@@ -921,7 +930,7 @@ fn settle(item: &mut OutdatedItem, dep: &Dependency, verdict: &Verdict, outcome:
             item.blocked_reason = Some(FOLLOWS_REQUIRERS.to_string());
             return;
         }
-        CopyOutcome::Failed(_) | CopyOutcome::Undecided => return,
+        CopyOutcome::Undecided => return,
     };
     item.adoptable_target = Some(to);
     // The security note describes the version the row now reports.
@@ -1058,11 +1067,11 @@ mod tests {
         }
     }
 
-    /// Settles a row of `status` with the matured target `1.4.0` on `outcome`, and reads back
-    /// its status, target, reason, and security version.
+    /// Settles a row of `status` with the matured target `1.4.0` on `outcome`, where a pass that
+    /// settled no copy failed, and reads back its status, target, reason, and security version.
     fn settled(
         status: OutdatedStatus,
-        outcome: CopyOutcome,
+        outcome: impl Into<Option<CopyOutcome>>,
     ) -> (
         OutdatedStatus,
         Option<String>,
@@ -1076,7 +1085,6 @@ mod tests {
             status: match status {
                 OutdatedStatus::Exempt => Status::Exempt,
                 OutdatedStatus::Held => Status::Held,
-                OutdatedStatus::InCooldown => Status::InCooldown,
                 _ => Status::Adoptable,
             },
             adoptable_target: Some(Version::new("1.4.0")),
@@ -1098,7 +1106,8 @@ mod tests {
             pinned: false,
             hold_edges: Vec::new(),
         };
-        settle(&mut item, &dep, &verdict, outcome);
+        let unsettled = CopyOutcome::Failed(Diagnostic::new(DiagnosticKind::ToolFailed, "crashed"));
+        settle(&mut item, &dep, &verdict, outcome.into(), &unsettled);
         (
             item.status,
             item.adoptable_target,
@@ -1109,8 +1118,8 @@ mod tests {
     }
 
     /// Each outcome the dry run settled maps onto the row: a landing or a refusal reports its own
-    /// version and security evidence, a failure changes only a row with a matured target or a
-    /// held one, and an undecided copy only a row with a matured target.
+    /// version and security evidence, a failure makes any row an error, and an undecided copy
+    /// changes only a row with a matured target.
     #[test]
     fn settle_maps_each_outcome_onto_the_row() {
         let landed = || CopyOutcome::Landed {
@@ -1186,11 +1195,6 @@ mod tests {
                 (OutdatedStatus::Error, None, some("crashed"), some("1.4.0")),
             ),
             (
-                OutdatedStatus::InCooldown,
-                failed(),
-                kept(OutdatedStatus::InCooldown),
-            ),
-            (
                 OutdatedStatus::Adoptable,
                 CopyOutcome::Undecided,
                 (
@@ -1210,5 +1214,15 @@ mod tests {
             let case = format!("{status:?} {outcome:?}");
             assert_eq!(settled(status, outcome), expected, "{case}");
         }
+    }
+
+    /// A pass that settled no copy fails only the rows whose matured target it was to confirm.
+    #[test]
+    fn an_unsettled_pass_fails_only_the_targets_it_left_unconfirmed() {
+        assert_eq!(
+            settled(OutdatedStatus::Adoptable, None).0,
+            OutdatedStatus::Error
+        );
+        assert_eq!(settled(OutdatedStatus::Held, None).0, OutdatedStatus::Held);
     }
 }

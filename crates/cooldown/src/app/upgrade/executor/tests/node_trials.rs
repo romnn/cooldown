@@ -234,8 +234,10 @@ struct FakeNode {
     transitive_advance: bool,
     script: Script,
     releases: BTreeMap<String, Vec<Release>>,
-    /// The packages whose releases the registry cannot serve.
+    /// The packages, or `name@version` copies, whose releases the registry cannot serve.
     unavailable: &'static [&'static str],
+    /// The lock keys whose copy an exact pin holds.
+    pinned: &'static [&'static str],
     advisory_ecosystem: Option<&'static str>,
     /// Each apply's plan as `name@target` entries, kept outside the project because a policy
     /// preview runs in a throwaway copy.
@@ -273,6 +275,7 @@ impl FakeNode {
             script,
             releases: BTreeMap::new(),
             unavailable: &[],
+            pinned: &[],
             advisory_ecosystem: None,
             trials: Mutex::new(Vec::new()),
             shared: None,
@@ -490,6 +493,7 @@ impl ToolRead for FakeNode {
                 .map_or((key.as_str(), None), |(name, member)| (name, Some(member)));
             let name = copy_name(name);
             let mut dep = dependency(name, version);
+            dep.pinned = self.pinned.contains(&key.as_str());
             if dep.direct {
                 let forked = self
                     .script
@@ -572,7 +576,10 @@ impl ReleaseFetcher for FakeNode {
         _fetch: &FetchContext<'_>,
         _candidates: CandidateScope,
     ) -> cooldown_core::Result<Vec<Release>> {
-        if self.unavailable.contains(&dep.package.name.as_str()) {
+        let copy = format!("{}@{}", dep.package.name, dep.current);
+        if self.unavailable.contains(&dep.package.name.as_str())
+            || self.unavailable.contains(&copy.as_str())
+        {
             return Err(CoreError::Transient(
                 format!("the registry cannot serve {}", dep.package.name).into(),
             ));
@@ -1819,13 +1826,15 @@ async fn outdated_verdict(
 
 /// A rejected major that a retried sibling floats onto its own target in every declaring member
 /// is reported as that landing alone: no held row beside it, so neither the skip count nor
-/// `outdated` nor `--strict` reads a target the lock now holds as held.
+/// `--strict` reads a target the lock now holds as held.
+/// `outdated` claims only the copy's own move, though, so with that move rejected it reads the
+/// row as following its requirers rather than as the sibling's collateral landing.
 #[tokio::test]
 async fn a_major_landed_as_collateral_is_not_also_reported_held() -> eyre::Result<()> {
     let fixture = collateral_major_fixture(None)?;
     assert_eq!(
         outdated_verdict(&fixture, "c").await?,
-        (OutdatedStatus::Adoptable, Some("2.0.0".to_string()))
+        (OutdatedStatus::Blocked, Some("2.0.0".to_string()))
     );
 
     let outcome = fixture.workspace.upgrade(&strict_major()).await;
@@ -2003,9 +2012,11 @@ async fn a_fallback_the_replay_refuses_blocks_the_row_there() -> eyre::Result<()
 }
 
 /// A collateral move that lands a declared package in every declaring member, below the target
-/// its own trial was refused, is the version `outdated` reports adoptable (#173).
+/// its own trial was refused, leaves `outdated` reporting that refusal (#173).
+/// Only another package's move carried the copy there, and that row cannot prove the copy's own
+/// bindings moved, so the claim stays with the copy's own move.
 #[tokio::test]
-async fn a_collateral_landing_below_a_refused_target_is_adoptable() -> eyre::Result<()> {
+async fn a_collateral_landing_below_a_refused_target_keeps_the_refusal() -> eyre::Result<()> {
     let fake = FakeNode::new(
         TargetFallback::CurrentLine,
         Script {
@@ -2055,7 +2066,7 @@ async fn a_collateral_landing_below_a_refused_target_is_adoptable() -> eyre::Res
     );
     assert_eq!(
         outdated,
-        (OutdatedStatus::Adoptable, Some("1.1.0".to_string()))
+        (OutdatedStatus::Blocked, Some("1.2.0".to_string()))
     );
     Ok(())
 }
@@ -2104,6 +2115,39 @@ async fn a_failure_for_one_package_never_settles_another() -> eyre::Result<()> {
             .is_some_and(|error| error.message.contains("cannot serve dom")),
         "{dom:?}"
     );
+    Ok(())
+}
+
+/// A release lookup that fails for one copy of a package is that copy's error alone: another
+/// copy of the same package, held by its exact pin, keeps its own verdict (#173).
+#[tokio::test]
+async fn a_failed_lookup_settles_only_its_own_copy() -> eyre::Result<()> {
+    let mut fake = FakeNode::new(TargetFallback::CurrentLine, Script::default()).with_releases(
+        "dom",
+        &[
+            ("1.0.0", false),
+            ("1.1.0", false),
+            ("2.0.0", false),
+            ("2.1.0", false),
+        ],
+    );
+    fake.pinned = &["dom"];
+    fake.unavailable = &["dom@2.0.0"];
+    let fixture = fixture(fake, &[("dom", "1.0.0"), ("dom#2", "2.0.0")])?;
+
+    let outdated = fixture.workspace.outdated(&major()).await;
+
+    let row = |version: &str| {
+        outdated
+            .items
+            .iter()
+            .find(|item| item.name == "dom" && item.current == version)
+            .ok_or_else(|| eyre::eyre!("no dom {version} row: {:?}", outdated.items))
+    };
+    let pinned = row("1.0.0")?;
+    assert_eq!(pinned.status, OutdatedStatus::Held, "{pinned:?}");
+    let unread = row("2.0.0")?;
+    assert_eq!(unread.status, OutdatedStatus::Error, "{unread:?}");
     Ok(())
 }
 

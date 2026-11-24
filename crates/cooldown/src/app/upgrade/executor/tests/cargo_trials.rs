@@ -3262,9 +3262,8 @@ async fn a_landing_a_later_pass_dropped_is_not_adoptable() -> eyre::Result<()> {
     Ok(())
 }
 
-/// A follower replan and a final read that cannot read the graph leave the deferred transitive,
-/// and the requirer's major they could not confirm, to that failure, so `outdated` reports it on
-/// both rows (#173).
+/// A follower replan that cannot read the graph leaves the deferred transitive to that failure,
+/// so `outdated` reports it on that row beside the requirer's landed major (#173).
 /// The transitive carries it even when its row started out held by the pin the major dropped.
 #[tokio::test]
 async fn a_follower_its_replan_cannot_read_carries_the_failure() -> eyre::Result<()> {
@@ -3294,20 +3293,24 @@ async fn a_follower_its_replan_cannot_read_carries_the_failure() -> eyre::Result
 
         let outdated = workspace.outdated(&opts).await;
 
-        for name in ["parent", "child"] {
-            let row = outdated
-                .items
-                .iter()
-                .find(|item| item.name == name)
-                .ok_or_else(|| eyre::eyre!("no {name} row: {:?}", outdated.items))?;
-            assert_eq!(row.status, OutdatedStatus::Error, "{pinned}: {row:?}");
-            assert!(
-                row.error
-                    .as_ref()
-                    .is_some_and(|error| error.message.contains("the manifest cannot be read")),
-                "{pinned}: {row:?}"
-            );
-        }
+        assert_eq!(
+            verdict_of(&outdated, "parent"),
+            (OutdatedStatus::Adoptable, Some("2.0.0".to_string())),
+            "{pinned}"
+        );
+        let child = outdated
+            .items
+            .iter()
+            .find(|item| item.name == "child")
+            .ok_or_else(|| eyre::eyre!("no child row: {:?}", outdated.items))?;
+        assert_eq!(child.status, OutdatedStatus::Error, "{pinned}: {child:?}");
+        assert!(
+            child
+                .error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("the manifest cannot be read")),
+            "{pinned}: {child:?}"
+        );
     }
     Ok(())
 }

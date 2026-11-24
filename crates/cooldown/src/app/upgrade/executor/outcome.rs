@@ -3,7 +3,9 @@
 //!
 //! The pass's rows are events: a planned move, a hold, a lock entry another move carried.
 //! A report row is a claim about state, what the copy's declaring members bind once the pass is
-//! over, so the copies are settled here, where the graph the pass left can prove a landing.
+//! over, so the copies are settled here, where the graph the pass left can confirm a landing.
+//! Only a move the pass made of the copy itself counts: a version the copy reaches as a side
+//! effect of another move is not claimed, since no row proves the copy's own bindings went there.
 
 use super::line_reached;
 use super::planning::Judged;
@@ -39,6 +41,8 @@ pub(super) struct Provenance {
     origin: HashMap<ChangeKey, usize>,
     /// The deferred copies whose follower replan has not read the graph yet.
     awaiting: Vec<usize>,
+    /// The failure each copy met where the pass read it, such as its release lookup.
+    failures: HashMap<usize, Diagnostic>,
 }
 
 impl Provenance {
@@ -50,6 +54,11 @@ impl Provenance {
             self.origin.insert(key.clone().reported_as(own), origin);
         }
         self.origin.insert(key, origin);
+    }
+
+    /// Records that the pass failed for the first-plan copy `origin` where it read it.
+    pub(super) fn failed(&mut self, origin: usize, error: Diagnostic) {
+        self.failures.entry(origin).or_insert(error);
     }
 
     /// Records the copies a follower replan decides once their requirers have settled.
@@ -74,20 +83,14 @@ pub(crate) struct PlannedCopy {
 /// Settles what the pass did with each copy its first plan read, from its rows (`items`), its
 /// errors, and the graph it left (`None` when that read failed).
 ///
-/// That graph is the only proof of a landing, and a copy lands only at the one version it
-/// confirms for the copy among those its rows moved, or meant to move, it to (see
-/// [`copy_landed`]).
-/// A move that reaches only some of a declared copy's members, splits the copy across versions,
-/// or was undone by a later pass therefore never reads as landed.
-///
 /// For each copy the first outcome that holds wins:
 ///
-/// - **Landed** at that one version.
+/// - **Landed** by a move the pass tried for the copy and applied, which that graph still shows
+///   (see [`copy_landed`]): a later pass can undo it.
 /// - **Refused** by the hold of the lowest target a plan tried, whatever the reason.
-/// - **Failed** by the error of such a move, an error naming the package, or the failure that
-///   stopped the pass before it confirmed a move of the copy or decided a copy it tried or
-///   deferred.
-/// - **Undecided** otherwise.
+/// - **Failed** by the error of such a move, the failure the pass met reading the copy, or the
+///   failure that stopped the pass before it decided a copy it tried or deferred.
+/// - **Undecided** otherwise, such as for a copy only another package's move carried.
 pub(super) fn settle(
     copies: &mut [PlannedCopy],
     provenance: &Provenance,
@@ -96,20 +99,9 @@ pub(super) fn settle(
     graph: Option<&[Dependency]>,
 ) {
     let mut traced: HashMap<usize, Vec<&UpgradeItem>> = HashMap::new();
-    let mut by_source: HashMap<(&str, Option<&str>, &str), Vec<&UpgradeItem>> = HashMap::new();
     for item in items.iter().filter(|item| item.edge.is_none()) {
         if let Some(&copy) = provenance.origin.get(&ChangeKey::of_item(item)) {
             traced.entry(copy).or_default().push(item);
-        }
-        if item.applied && !item.downgrade {
-            by_source
-                .entry((
-                    item.name.as_str(),
-                    item.registry.as_deref(),
-                    item.from.as_str(),
-                ))
-                .or_default()
-                .push(item);
         }
     }
     let tried: HashSet<usize> = provenance.origin.values().copied().collect();
@@ -117,16 +109,16 @@ pub(super) fn settle(
     for (index, copy) in copies.iter_mut().enumerate() {
         let dep = &copy.fact.dependency;
         let rows = traced.get(&index).map(Vec::as_slice).unwrap_or_default();
-        let source = (
-            dep.package.name.as_str(),
-            dep.package.registry.as_deref(),
-            dep.current.as_str(),
-        );
-        let forward = by_source
-            .get(&source)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let landing = graph.and_then(|graph| single_landing(graph, dep, rows, forward));
+        let landing = rows.iter().find(|row| {
+            // A Go move onto another major lands under that major's module path.
+            let destination =
+                PackageId::new(dep.package.tool, row.name.clone(), row.registry.clone());
+            row.applied
+                && !row.downgrade
+                && graph.is_some_and(|graph| {
+                    copy_landed(graph, dep, &destination, &Version::new(row.to.clone()))
+                })
+        });
         let outcome = if let Some(row) = landing {
             CopyOutcome::Landed {
                 to: row.to.clone(),
@@ -138,59 +130,21 @@ pub(super) fn settle(
                 skip: skip.clone(),
                 security: row.security.clone(),
             }
-        } else if let Some(error) = rows.iter().find_map(|row| row.error.as_ref()).or_else(|| {
-            errors
-                .iter()
-                .find(|error| error.package.as_ref() == Some(&dep.package.name))
-        }) {
+        } else if let Some(error) = rows
+            .iter()
+            .find_map(|row| row.error.as_ref())
+            .or_else(|| provenance.failures.get(&index))
+        {
             CopyOutcome::Failed(error.clone())
         } else {
-            // A copy the pass tried or deferred and never settled, or one it moved where the
-            // final read could not confirm the move, is left to the failure that stopped it.
-            let pending = tried.contains(&index)
-                || provenance.awaiting.contains(&index)
-                || (graph.is_none() && !forward.is_empty());
             match failure {
-                Some(failure) if pending => CopyOutcome::Failed(failure.clone()),
+                Some(failure) if tried.contains(&index) || provenance.awaiting.contains(&index) => {
+                    CopyOutcome::Failed(failure.clone())
+                }
                 _ => CopyOutcome::Undecided,
             }
         };
         copy.outcome = Some(outcome);
-    }
-}
-
-/// The one row whose version `graph` confirms for `dep`'s copy among every version its traced
-/// `rows` and the `forward` rows from its version took, or meant to take, it to, or `None` when
-/// it confirms none or several.
-///
-/// Applied rows come first, so a landing reports their evidence.
-fn single_landing<'a>(
-    graph: &[Dependency],
-    dep: &Dependency,
-    rows: &[&'a UpgradeItem],
-    forward: &[&'a UpgradeItem],
-) -> Option<&'a UpgradeItem> {
-    let candidates = rows
-        .iter()
-        .chain(forward)
-        .filter(|row| row.applied)
-        .chain(rows.iter().filter(|row| !row.applied))
-        .copied()
-        .filter(|row| !row.downgrade);
-    let mut landings: Vec<&UpgradeItem> = Vec::new();
-    for row in candidates {
-        let seen = landings.iter().any(|landing| {
-            landing.name == row.name && landing.registry == row.registry && landing.to == row.to
-        });
-        // A Go move onto another major lands under that major's module path.
-        let destination = PackageId::new(dep.package.tool, row.name.clone(), row.registry.clone());
-        if !seen && copy_landed(graph, dep, &destination, &Version::new(row.to.clone())) {
-            landings.push(row);
-        }
-    }
-    match landings.as_slice() {
-        [row] => Some(row),
-        _ => None,
     }
 }
 
@@ -221,7 +175,7 @@ fn nearest_hold<'a>(
 /// A declared copy has moved once every member declaring it binds the destination and no longer
 /// binds the copy, as a uv fork pin can keep a member on both.
 /// A copy no member declares has moved once the destination is in the graph and the copy is
-/// not.
+/// not, which under-claims a Go module `go mod tidy` keeps as another module's requirement.
 fn copy_landed(
     graph: &[Dependency],
     dep: &Dependency,
@@ -380,43 +334,41 @@ mod tests {
             .collect()
     }
 
-    /// A collateral move counts for a declared copy only once every declaring member binds its
-    /// version and no longer binds the copy: a split across two versions, or a member a fork pin
-    /// keeps on both, lands nothing and leaves the tried target's hold.
+    /// A planned move lands a declared copy only once every declaring member binds its target and
+    /// no longer binds the copy: a split across two versions, or a member a fork pin keeps on
+    /// both, lands nothing.
     #[test]
     fn a_declared_copy_lands_only_where_every_member_moved() {
         let dep = node("c", "1.0.0", true, &["web", "api"]);
-        let versions = [("1.0.0", "1"), ("1.0.1", "1"), ("1.2.0", "1")];
+        let facts = || {
+            vec![fact(
+                dep.clone(),
+                &[("1.0.0", "1"), ("1.0.1", "1"), ("1.2.0", "1")],
+            )]
+        };
         let tried = change(&dep, "c", "1.2.0");
         let mut provenance = Provenance::default();
         provenance.tried(&tried, 0, &dep.package);
-        let held = row(&tried, &["web", "api"], true);
+        let rows = [row(&tried, &["web", "api"], false)];
 
-        // A split: each member's edge moved to another version.
+        // A split: `web` ends on another version.
         let split = settled(
-            vec![fact(dep.clone(), &versions)],
+            facts(),
             &provenance,
-            &[
-                collateral(&dep, "1.0.1", &["web"]),
-                collateral(&dep, "1.2.0", &["api"]),
-                held.clone(),
-            ],
+            &rows,
             &[],
             Some(&[
                 node("c", "1.0.1", true, &["web"]),
                 node("c", "1.2.0", true, &["api"]),
             ]),
         );
-        assert!(
-            matches!(split.as_slice(), [CopyOutcome::Refused { to, .. }] if to == "1.2.0"),
-            "{split:?}"
-        );
+        assert_eq!(split, [CopyOutcome::Undecided]);
 
         // A fork pin: `api` reaches `1.2.0` and still binds `1.0.0`.
         let fork = settled(
-            vec![fact(dep.clone(), &versions)],
-            &Provenance::default(),
-            &[collateral(&dep, "1.2.0", &["web", "api"])],
+            facts(),
+            &provenance,
+            &rows,
             &[],
             Some(&[
                 node("c", "1.2.0", true, &["web", "api"]),
@@ -425,110 +377,50 @@ mod tests {
         );
         assert_eq!(fork, [CopyOutcome::Undecided]);
 
-        // Every member moved.
         let moved = settled(
-            vec![fact(dep.clone(), &versions)],
+            facts(),
             &provenance,
-            &[collateral(&dep, "1.2.0", &["web", "api"]), held],
+            &rows,
             &[],
             Some(&[node("c", "1.2.0", true, &["web", "api"])]),
         );
         assert_eq!(moved, [landed("1.2.0")]);
     }
 
-    /// A copy no member declares lands at the version it moved to once the graph holds that
-    /// version and no longer holds the copy, and never while it still does, when its moves
-    /// reached several versions, or when the graph could not be read.
+    /// A planned move lands a copy no member declares only while the graph the pass left holds
+    /// its target and not the copy: a source the graph keeps, or a later pass that dropped the
+    /// package, lands nothing, and a final read that failed leaves the move to that failure.
     #[test]
-    fn an_undeclared_copy_lands_at_one_confirmed_version() {
-        let dep = node("child", "1.0.0", false, &[]);
-        let facts = || {
-            vec![fact(
-                dep.clone(),
-                &[("1.0.0", "1"), ("1.1.0", "1"), ("1.2.0", "1")],
-            )]
-        };
-        let rows = [collateral(&dep, "1.1.0", &[])];
-        let moved = [node("child", "1.1.0", false, &[])];
-        let gone = settled(facts(), &Provenance::default(), &rows, &[], Some(&moved));
-        assert_eq!(gone, [landed("1.1.0")]);
-
-        let kept = [moved[0].clone(), dep.clone()];
-        let kept = settled(facts(), &Provenance::default(), &rows, &[], Some(&kept));
-        assert_eq!(kept, [CopyOutcome::Undecided]);
-
-        let unread = settled(facts(), &Provenance::default(), &rows, &[], None);
-        assert_eq!(unread, [CopyOutcome::Undecided]);
-
-        // Two destinations coexist, so neither is the copy's landing.
-        let split = [
-            collateral(&dep, "1.1.0", &[]),
-            collateral(&dep, "1.2.0", &[]),
-        ];
-        let both = [
-            node("child", "1.1.0", false, &[]),
-            node("child", "1.2.0", false, &[]),
-        ];
-        let split = settled(facts(), &Provenance::default(), &split, &[], Some(&both));
-        assert_eq!(split, [CopyOutcome::Undecided]);
-    }
-
-    /// A pnpm split moves one requirer's copy to the planned target and another's elsewhere while
-    /// the settlement holds the planned target, so the copy has not landed and the hold stands.
-    #[test]
-    fn a_pnpm_split_keeps_the_hold() {
-        let dep = node("leaf", "1.0.0", false, &[]);
-        let facts = || {
-            vec![fact(
-                dep.clone(),
-                &[("1.0.0", "1"), ("1.0.1", "1"), ("1.2.0", "1")],
-            )]
-        };
-        let tried = change(&dep, "leaf", "1.2.0");
-        let mut provenance = Provenance::default();
-        provenance.tried(&tried, 0, &dep.package);
-
-        let outcomes = settled(
-            facts(),
-            &provenance,
-            &[row(&tried, &[], true), collateral(&dep, "1.0.1", &[])],
-            &[],
-            Some(&[
-                node("leaf", "1.2.0", false, &[]),
-                node("leaf", "1.0.1", false, &[]),
-            ]),
-        );
-
-        assert!(
-            matches!(outcomes.as_slice(), [CopyOutcome::Refused { to, .. }] if to == "1.2.0"),
-            "{outcomes:?}"
-        );
-    }
-
-    /// A planned move the pass landed counts only while the graph it left still holds the
-    /// target: a later pass that dropped the package undoes it.
-    #[test]
-    fn a_planned_landing_a_later_pass_undid_has_not_landed() {
+    fn an_undeclared_copy_lands_while_the_graph_holds_its_target_alone() {
         let dep = node("t", "1.0.0", false, &[]);
         let facts = || vec![fact(dep.clone(), &[("1.0.0", "1"), ("1.1.0", "1")])];
         let tried = change(&dep, "t", "1.1.0");
         let mut provenance = Provenance::default();
         provenance.tried(&tried, 0, &dep.package);
         let rows = [row(&tried, &[], false)];
+        let moved = node("t", "1.1.0", false, &[]);
+
+        let gone = settled(
+            facts(),
+            &provenance,
+            &rows,
+            &[],
+            Some(std::slice::from_ref(&moved)),
+        );
+        assert_eq!(gone, [landed("1.1.0")]);
 
         let kept = settled(
             facts(),
             &provenance,
             &rows,
             &[],
-            Some(&[node("t", "1.1.0", false, &[])]),
+            Some(&[moved, dep.clone()]),
         );
-        assert_eq!(kept, [landed("1.1.0")]);
+        assert_eq!(kept, [CopyOutcome::Undecided]);
 
         let dropped = settled(facts(), &provenance, &rows, &[], Some(&[]));
         assert_eq!(dropped, [CopyOutcome::Undecided]);
 
-        // A final read that failed leaves the move to that failure.
         let unread = Diagnostic::new(DiagnosticKind::ToolFailed, "the read failed");
         let unconfirmed = settled(
             facts(),
@@ -538,6 +430,53 @@ mod tests {
             None,
         );
         assert_eq!(unconfirmed, [CopyOutcome::Failed(unread)]);
+    }
+
+    /// Another package's move never lands a copy, even where the graph shows the copy moved
+    /// there, because no row proves the copy's own bindings went there: such a copy stays
+    /// undecided, or refused at the target its own move was held.
+    /// A refusal names its target and reason only, so a graph that holds that target, as when
+    /// another copy already sat there, never turns it into a landing.
+    #[test]
+    fn a_move_of_another_package_never_lands_a_copy() {
+        let dep = node("leaf", "1.0.0", false, &[]);
+        let facts = || {
+            vec![fact(
+                dep.clone(),
+                &[("1.0.0", "1"), ("1.0.1", "1"), ("1.2.0", "1")],
+            )]
+        };
+        let carried = settled(
+            facts(),
+            &Provenance::default(),
+            &[collateral(&dep, "1.0.1", &[])],
+            &[],
+            Some(&[node("leaf", "1.0.1", false, &[])]),
+        );
+        assert_eq!(carried, [CopyOutcome::Undecided]);
+
+        let tried = change(&dep, "leaf", "1.2.0");
+        let mut provenance = Provenance::default();
+        provenance.tried(&tried, 0, &dep.package);
+        for rows in [
+            vec![row(&tried, &[], true)],
+            vec![row(&tried, &[], true), collateral(&dep, "1.0.1", &[])],
+        ] {
+            let outcomes = settled(
+                facts(),
+                &provenance,
+                &rows,
+                &[],
+                Some(&[
+                    node("leaf", "1.2.0", false, &[]),
+                    node("leaf", "1.0.1", false, &[]),
+                ]),
+            );
+            assert!(
+                matches!(outcomes.as_slice(), [CopyOutcome::Refused { to, .. }] if to == "1.2.0"),
+                "{outcomes:?}"
+            );
+        }
     }
 
     /// A Go move onto another major is planned under its target's module path and held under
@@ -573,38 +512,39 @@ mod tests {
         );
     }
 
-    /// A failure settles a copy when it names the copy's package, or when it stopped the pass
-    /// before it decided a copy it tried or deferred; another package's failure, and one that
+    /// A failure settles a copy the pass met it reading, or one it stopped before deciding the
+    /// copy it tried or deferred; a failure that only names the copy's package, and one that
     /// left a copy the pass never meant to move, settle nothing.
     #[test]
     fn a_failure_settles_only_the_copies_it_left_undecided() {
         let tried = node("tried", "1.0.0", true, &[]);
         let deferred = node("deferred", "1.0.0", false, &[]);
         let untouched = node("untouched", "1.0.0", true, &[]);
-        let named = node("named", "1.0.0", true, &[]);
+        let unread = node("unread", "1.0.0", true, &[]);
         let versions = [("1.0.0", "1"), ("1.1.0", "1")];
         let facts = || {
             vec![
                 fact(tried.clone(), &versions),
                 fact(deferred.clone(), &versions),
                 fact(untouched.clone(), &versions),
-                fact(named.clone(), &versions),
+                fact(unread.clone(), &versions),
             ]
         };
         let mut provenance = Provenance::default();
         provenance.tried(&change(&tried, "tried", "1.1.0"), 0, &tried.package);
         provenance.await_replan(vec![1]);
-        let stopped = Diagnostic::new(DiagnosticKind::ToolFailed, "the read failed");
         let fetch =
-            Diagnostic::new(DiagnosticKind::ToolFailed, "no metadata").with_package("named");
-        let other =
-            Diagnostic::new(DiagnosticKind::ToolFailed, "no metadata").with_package("elsewhere");
+            Diagnostic::new(DiagnosticKind::ToolFailed, "no metadata").with_package("unread");
+        provenance.failed(3, fetch.clone());
+        let stopped = Diagnostic::new(DiagnosticKind::ToolFailed, "the read failed");
+        let named =
+            Diagnostic::new(DiagnosticKind::ToolFailed, "no metadata").with_package("untouched");
 
         let outcomes = settled(
             facts(),
             &provenance,
             &[],
-            &[stopped.clone(), fetch.clone(), other],
+            &[stopped.clone(), fetch.clone(), named],
             None,
         );
 
