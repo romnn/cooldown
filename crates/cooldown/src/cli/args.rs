@@ -333,6 +333,9 @@ pub(in crate::cli) enum Command {
     #[command(visible_alias = "why")]
     Explain {
         /// The package to explain.
+        // An id of its own: the global `--package` scope shares the field name, and sharing the
+        // id too would scope the run to the explained package.
+        #[arg(id = "explained", value_name = "PACKAGE")]
         package: String,
     },
     /// The fully-resolved config, with the origin of each value.
@@ -1256,6 +1259,19 @@ mod tests {
         let cli = Cli::parse_from(["cooldown", "check", "--json"]);
         std::assert_matches!(cli.command, super::Command::Check { .. });
         assert!(cli.global.json);
+    }
+
+    /// The package `explain` names is its subject, not a `--package` scope: the run still judges
+    /// it among every planned move.
+    #[test]
+    fn the_explained_package_does_not_scope_the_run() {
+        let cli = Cli::parse_from(["cooldown", "explain", "rayon"]);
+        std::assert_matches!(&cli.command, super::Command::Explain { package } if package == "rayon");
+        assert!(cli.global.package.is_empty(), "{:?}", cli.global.package);
+
+        let cli = Cli::parse_from(["cooldown", "explain", "rayon", "--package", "rayon-*"]);
+        std::assert_matches!(&cli.command, super::Command::Explain { package } if package == "rayon");
+        assert_eq!(cli.global.package, ["rayon-*"]);
     }
 
     #[test]
