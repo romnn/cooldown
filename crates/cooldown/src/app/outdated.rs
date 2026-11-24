@@ -2,22 +2,24 @@
 //! candidate set; informational, so per-dep failures never change the exit code.
 
 use super::advisories::AdvisoryPackages;
-use super::change_key::ChangeKey;
 use super::lanes::LaneAccess;
 use super::lock::ProjectAccessWriteGuard;
 use super::read::ReadProjectCtx;
-use super::upgrade::{Judged, UpgradeAccum, target_package_for, upgrade_verdict};
+use super::upgrade::{Judged, PlanFacts, UpgradeAccum, target_package_for, upgrade_verdict};
 use super::{
     Exit, FetchedRelease, LockReportAction, ProjectProgress, RunOpts, Workspace, age_days,
     diag_from_error, lock_report_outcome, render_window, stale_evaluation_skipped,
 };
-use super::{LatestInfo, OutdatedItem, OutdatedStatus, OutdatedSummary, UpgradeItem, Window};
-use cooldown_core::{
-    Change, DepScope, Dependency, Diagnostic, DiagnosticKind, LockVerifyReport, PackageId, Release,
-    ResolveKind, ResolveQuery, Status, UpdateKind, Version, resolve,
+use super::{
+    LatestInfo, OutdatedItem, OutdatedStatus, OutdatedSummary, SkippedInfo, UpgradeItem, Window,
 };
+use cooldown_core::{
+    Change, DepScope, Dependency, Diagnostic, DiagnosticKind, LockVerifyReport, MemberRef,
+    PackageId, Release, ResolveKind, ResolveQuery, Status, Verdict, Version, evaluate, resolve,
+};
+use std::collections::HashMap;
 
-/// Why a row with a matured target is blocked when `upgrade` neither moved nor held its copy: it
+/// Why a row with a matured target is blocked when `upgrade` never tried to move its copy: it
 /// plans no move for it, as for an indirect dependency its tool cannot advance on its own or one
 /// the packages requiring it drop.
 const FOLLOWS_REQUIRERS: &str =
@@ -230,14 +232,21 @@ impl<'a> OutdatedRunner<'a> {
         } else {
             None
         };
-        let planned = dry_run
+        let PlanFacts {
+            judged: planned,
+            tried,
+        } = dry_run
             .as_mut()
-            .map(|pass| std::mem::take(&mut pass.judged))
+            .and_then(|pass| pass.facts.take())
             .unwrap_or_default();
-        let judged = self.judge(pctx, &read, deps, planned).await;
+        let evidence = dry_run
+            .as_ref()
+            .map(|pass| Evidence::new(pass, &tried, planned.is_some()));
+        let judged = self
+            .judge(pctx, &read, deps, planned.unwrap_or_default())
+            .await;
 
         let project_label = read.project_label.as_str();
-        let mut fetch_failures = Vec::new();
         for FetchedRelease {
             dependency: dep,
             result,
@@ -251,36 +260,45 @@ impl<'a> OutdatedRunner<'a> {
                             .push(yanked_warning(pctx, project_label, &dep));
                     }
                     let mut item = self.outdated_item(pctx, project_label, &dep, &judged);
-                    if let Some(pass) = &dry_run {
-                        settle(&mut item, &dep, &judged, pass);
+                    if let Some(evidence) = &evidence {
+                        let outcome = evidence.outcome(&dep, &judged.releases);
+                        settle(&mut item, &dep, &judged.verdict, outcome);
                     }
                     item
                 }
                 Err(error) => {
                     let diag =
                         diag_from_error(&error, pctx.tool, project_label, Some(&dep.package.name));
-                    fetch_failures.push(diag.clone());
                     error_item(pctx, project_label, &dep, diag)
                 }
             };
             self.acc.items.push(item);
         }
 
-        match dry_run {
-            Some(pass) => {
-                // A dry-run failure reaches the report through the rows it left unsettled, which
-                // carry it as their error; beside them it is a note, since it may concern no row.
-                // A fetch the dry run failed as well is already the row's own error.
-                let failures = pass
-                    .errors
-                    .into_iter()
-                    .filter(|error| !fetch_failures.contains(error));
-                for diagnostic in pass.warnings.into_iter().chain(failures) {
-                    push_new(&mut self.acc.warnings, diagnostic);
-                }
-            }
+        match &dry_run {
+            Some(pass) => self.note_dry_run(pass),
             None if self.opts.offline => self.note_offline(pctx),
             None => {}
+        }
+    }
+
+    /// Notes the dry run's warnings, and each of its failures no row carries, such as one for a
+    /// package the report leaves out: a failure reaches the report through the rows it settled.
+    fn note_dry_run(&mut self, pass: &UpgradeAccum) {
+        let carried: Vec<&Diagnostic> = self
+            .acc
+            .items
+            .iter()
+            .filter_map(|item| item.error.as_ref())
+            .collect();
+        let failures = pass
+            .errors
+            .iter()
+            .chain(pass.items.iter().filter_map(|row| row.error.as_ref()))
+            .filter(|error| !carried.contains(error));
+        let notes: Vec<Diagnostic> = pass.warnings.iter().chain(failures).cloned().collect();
+        for diagnostic in notes {
+            push_new(&mut self.acc.warnings, diagnostic);
         }
     }
 
@@ -391,21 +409,24 @@ impl<'a> OutdatedRunner<'a> {
         pctx: &super::ProjectCtx,
         read: &ReadProjectCtx<'_>,
         deps: Vec<Dependency>,
-        mut planned: Vec<FetchedRelease<Judged>>,
+        planned: Vec<FetchedRelease<Judged>>,
     ) -> Vec<FetchedRelease<Judged>> {
+        let mut plan: HashMap<(PackageId, Version, bool), Vec<Judged>> = HashMap::new();
+        for FetchedRelease { dependency, result } in planned {
+            if let Ok(judged) = result {
+                plan.entry((dependency.package, dependency.current, dependency.direct))
+                    .or_default()
+                    .push(judged);
+            }
+        }
         let mut judged = Vec::with_capacity(deps.len());
         let mut unjudged = Vec::new();
         for dep in deps {
-            let found = planned.iter().position(|fact| {
-                fact.result.is_ok()
-                    && fact.dependency.package == dep.package
-                    && fact.dependency.current == dep.current
-                    && fact.dependency.direct == dep.direct
-            });
-            match found {
-                Some(index) => judged.push(FetchedRelease {
+            let key = (dep.package.clone(), dep.current.clone(), dep.direct);
+            match plan.get_mut(&key).and_then(Vec::pop) {
+                Some(fact) => judged.push(FetchedRelease {
                     dependency: dep,
-                    result: planned.swap_remove(index).result,
+                    result: Ok(fact),
                 }),
                 None => unjudged.push(dep),
             }
@@ -642,7 +663,21 @@ impl<'a> OutdatedRunner<'a> {
             .filter(|&version| Some(version) != newest)
             .map(ToString::to_string);
 
-        let latest = verdict.latest.as_ref().map(|lv| {
+        // The planner judges a transitive row within its major, as `upgrade` moves it, while
+        // Latest names the newest version under the run's own major setting.
+        let newest = if dep.direct || !self.opts.allow_major {
+            verdict.latest.clone()
+        } else {
+            evaluate(
+                dep,
+                releases,
+                &pctx.policy.layers,
+                &Workspace::resolve_ctx(pctx, self.opts),
+                self.ws.now(),
+            )
+            .latest
+        };
+        let latest = newest.as_ref().map(|lv| {
             let published = releases
                 .iter()
                 .find(|r| &r.version == lv)
@@ -812,122 +847,196 @@ fn summarize(items: &[OutdatedItem]) -> OutdatedSummary {
     s
 }
 
-/// Settles `item` on what the `upgrade` dry run `pass` did with its dependency's copy, so the
-/// row's verdict and target are `upgrade`'s.
-///
-/// A forward landing of the copy is the row's target, whatever its own verdict; an exempt row
-/// stays `exempt`.
-/// Otherwise a row with a matured target is `blocked` by the hold `upgrade` recorded at that
-/// target, an `error` when the dry run failed before settling it, and else `blocked` because
-/// `upgrade` plans no move for it.
-/// Every other row keeps its own verdict.
-fn settle(item: &mut OutdatedItem, dep: &Dependency, judged: &Judged, pass: &UpgradeAccum) {
-    let Judged { releases, verdict } = judged;
-    let rows = || {
-        pass.items
-            .iter()
-            .filter(|row| row.edge.is_none() && row.from == dep.current.as_str())
-    };
-    let forward = |row: &&UpgradeItem| row.applied && !row.downgrade && row.from != row.to;
-    let target = verdict.adoptable_target.as_ref().filter(|target| {
-        matches!(verdict.status, Status::Adoptable | Status::Exempt) && **target != dep.current
-    });
-    // The target identifies the hold: a `--major` notice or a ceiling can share the source
-    // version with an in-line move.
-    let held = target.and_then(|target| {
-        rows().find_map(|row| {
-            let skipped = row.skipped.as_ref()?;
-            (row.to == target.as_str() && reports_copy(row, dep, releases, false))
-                .then_some((row, skipped))
-        })
-    });
-    // The copy's own move, or else a sibling's that carried it onto its target, which `upgrade`
-    // credits only once the target holds in every declaring member: short of one, it keeps the
-    // target's hold.
-    let landed = rows()
-        .filter(forward)
-        .find(|row| reports_copy(row, dep, releases, false))
-        .or_else(|| {
-            let target = target.filter(|_| held.is_none())?;
-            rows()
-                .filter(forward)
-                .find(|row| row.to == target.as_str() && reports_copy(row, dep, releases, true))
-        });
-    if let Some(landed) = landed {
-        if item.status != OutdatedStatus::Exempt {
-            item.status = OutdatedStatus::Adoptable;
-            item.held_by = None;
+/// What the `upgrade` dry run did with one copy of a dependency.
+#[derive(Clone, Copy)]
+enum Outcome<'a> {
+    /// It moved the copy forward in every member declaring it, by this row.
+    Landed(&'a UpgradeItem),
+    /// A plan tried this row's move of the copy, and the pass held it.
+    Refused(&'a UpgradeItem, &'a SkippedInfo),
+    /// It failed for the copy, or stopped before deciding a move it would have tried.
+    Failed(&'a Diagnostic),
+    /// It never tried to move the copy.
+    Untried,
+}
+
+/// What one project's `upgrade` dry run settled, indexed by the version and registry each move
+/// leaves, so every report row looks its copy up once.
+struct Evidence<'a> {
+    /// The pass's version rows: each move it landed, held, or failed.
+    rows: HashMap<(&'a str, Option<&'a str>), Vec<&'a UpgradeItem>>,
+    /// The changes its plans tried.
+    tried: HashMap<(&'a str, Option<&'a str>), Vec<&'a Change>>,
+    errors: &'a [Diagnostic],
+    /// The last error naming no package, which is the failure that stopped the pass if one did.
+    failure: Option<&'a Diagnostic>,
+    /// Whether a plan ran, so that the pass chose which copies to try.
+    planned: bool,
+}
+
+impl<'a> Evidence<'a> {
+    fn new(pass: &'a UpgradeAccum, tried: &'a [Change], planned: bool) -> Self {
+        let mut rows: HashMap<_, Vec<_>> = HashMap::new();
+        for row in pass.items.iter().filter(|row| row.edge.is_none()) {
+            rows.entry((row.from.as_str(), row.registry.as_deref()))
+                .or_default()
+                .push(row);
         }
-        item.adoptable_target = Some(landed.to.clone());
-        return;
+        let mut by_source: HashMap<_, Vec<_>> = HashMap::new();
+        for change in tried {
+            by_source
+                .entry((change.from.as_str(), change.package.registry.as_deref()))
+                .or_default()
+                .push(change);
+        }
+        Evidence {
+            rows,
+            tried: by_source,
+            errors: &pass.errors,
+            failure: pass
+                .errors
+                .iter()
+                .rev()
+                .find(|error| error.package.is_none()),
+            planned,
+        }
     }
-    if target.is_none() {
-        return;
-    }
-    if let Some((row, skipped)) = held {
-        item.status = OutdatedStatus::Blocked;
-        item.blocked_by = skipped
-            .offending
-            .clone()
-            .filter(|offender| *offender != row.name);
-        item.blocked_reason = Some(skipped.message.clone());
-        return;
-    }
-    let failure = rows()
-        .filter(|row| reports_copy(row, dep, releases, false))
-        .find_map(|row| row.error.clone())
-        .or_else(|| {
-            pass.errors
+
+    /// What the pass did with `dep`'s copy, whose releases are `releases`.
+    fn outcome(&self, dep: &Dependency, releases: &[Release]) -> Outcome<'a> {
+        let source = (dep.current.as_str(), dep.package.registry.as_deref());
+        // A Go move onto another major is named for that major's module path.
+        let moves_copy = |name: &str, to: &str| {
+            name == dep.package.name
+                || name == target_package_for(releases, dep, &Version::new(to)).name
+        };
+        let rows: Vec<&UpgradeItem> = self
+            .rows
+            .get(&source)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|row| moves_copy(&row.name, &row.to))
+            .collect();
+        // A move lands a declared copy once every member declaring it reaches the target: a
+        // planned move names its change's members, and a collateral one the members the graph
+        // after it shows reaching its target.
+        let landed = rows.iter().find(|row| {
+            row.applied
+                && !row.downgrade
+                && (!dep.direct
+                    || dep
+                        .members
+                        .iter()
+                        .all(|member| row.members.contains(member)))
+        });
+        if let Some(row) = landed {
+            return Outcome::Landed(row);
+        }
+        // Holds, failures, and tries are the copy's own when they carry its declaration, as a
+        // direct change's identity includes its members.
+        let own = |direct: bool, members: &[MemberRef]| {
+            direct == dep.direct && (!direct || same_members(members, &dep.members))
+        };
+        let tried: Vec<&Change> = self
+            .tried
+            .get(&source)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|change| {
+                moves_copy(&change.package.name, change.to.as_str())
+                    && own(change.direct, &change.members)
+            })
+            .collect();
+        let own_rows = || rows.iter().filter(|row| own(row.direct, &row.members));
+        // Only a target a plan tried is refused: a `--major` notice or a ceiling's target never
+        // is.
+        // Both are the copy's moves, so the target alone matches them, whichever Go spelling
+        // each uses.
+        let refused = own_rows().find_map(|row| {
+            let skipped = row.skipped.as_ref()?;
+            tried
+                .iter()
+                .any(|change| change.to.as_str() == row.to)
+                .then_some((*row, skipped))
+        });
+        if let Some((row, skipped)) = refused {
+            return Outcome::Refused(row, skipped);
+        }
+        let error = own_rows().find_map(|row| row.error.as_ref()).or_else(|| {
+            self.errors
                 .iter()
                 .find(|error| error.package.as_ref() == Some(&dep.package.name))
-                .or_else(|| pass.errors.first())
-                .cloned()
         });
-    if let Some(error) = failure {
-        item.status = OutdatedStatus::Error;
-        item.adoptable_target = None;
-        item.error = Some(error);
-    } else {
-        item.status = OutdatedStatus::Blocked;
-        item.blocked_reason = Some(FOLLOWS_REQUIRERS.to_string());
+        if let Some(error) = error {
+            return Outcome::Failed(error);
+        }
+        // A failure that stopped the pass left the copies it tried undecided, and every copy
+        // when it stopped before planning.
+        match self.failure {
+            Some(failure) if !tried.is_empty() || !self.planned => Outcome::Failed(failure),
+            _ => Outcome::Untried,
+        }
     }
 }
 
-/// Whether `row` reports a move of `dep`'s own copy: from its current version, under its own name
-/// or the path-major name a Go move to the row's target takes, and from the same declaring
-/// members unless `member_blind`.
+/// Whether `left` and `right` name the same members, in any order.
+fn same_members(left: &[MemberRef], right: &[MemberRef]) -> bool {
+    left.iter().all(|member| right.contains(member))
+        && right.iter().all(|member| left.contains(member))
+}
+
+/// Settles `item`, judged `verdict`, on what the `upgrade` dry run did with its copy, so the row's
+/// verdict and target are `upgrade`'s.
 ///
-/// A held Go cross-path move keeps the name the tree still requires, while a landed one is named
-/// for its target, so either spelling is the copy's.
-fn reports_copy(
-    row: &UpgradeItem,
-    dep: &Dependency,
-    releases: &[Release],
-    member_blind: bool,
-) -> bool {
-    let to = Version::new(row.to.clone());
-    let key = |package: PackageId| {
-        let key = ChangeKey::of(&Change {
-            package,
-            from: dep.current.clone(),
-            to: to.clone(),
-            kind: UpdateKind::Minor,
-            downgrade: false,
-            direct: dep.direct,
-            members: dep.members.clone(),
-        });
-        if member_blind {
-            key.member_blind()
-        } else {
-            key
+/// A landing is the row's target, whatever its own verdict, and an exempt row that lands stays
+/// `exempt`; a hold on a move a plan tried blocks the row at that move's target.
+/// Otherwise a row with a matured target is an `error` when the dry run failed for it, and else
+/// `blocked` because `upgrade` never tries to move it.
+/// Every other row keeps its own verdict.
+fn settle(item: &mut OutdatedItem, dep: &Dependency, verdict: &Verdict, outcome: Outcome<'_>) {
+    let actionable = matches!(verdict.status, Status::Adoptable | Status::Exempt)
+        && verdict
+            .adoptable_target
+            .as_ref()
+            .is_some_and(|target| *target != dep.current);
+    let row = match outcome {
+        Outcome::Landed(row) => {
+            if item.status != OutdatedStatus::Exempt {
+                item.status = OutdatedStatus::Adoptable;
+                item.held_by = None;
+            }
+            row
         }
+        Outcome::Refused(row, skipped) => {
+            item.status = OutdatedStatus::Blocked;
+            item.held_by = None;
+            item.blocked_by = skipped
+                .offending
+                .clone()
+                .filter(|offender| *offender != row.name);
+            item.blocked_reason = Some(skipped.message.clone());
+            row
+        }
+        Outcome::Failed(error) if actionable => {
+            item.status = OutdatedStatus::Error;
+            item.adoptable_target = None;
+            item.error = Some(error.clone());
+            return;
+        }
+        Outcome::Untried if actionable => {
+            item.status = OutdatedStatus::Blocked;
+            item.blocked_reason = Some(FOLLOWS_REQUIRERS.to_string());
+            return;
+        }
+        Outcome::Failed(_) | Outcome::Untried => return,
     };
-    let row_key = if member_blind {
-        ChangeKey::of_item(row).member_blind()
-    } else {
-        ChangeKey::of_item(row)
-    };
-    row_key == key(dep.package.clone()) || row_key == key(target_package_for(releases, dep, &to))
+    item.adoptable_target = Some(row.to.clone());
+    // The security note describes the version the row now reports.
+    if row.security.is_some() {
+        item.security.clone_from(&row.security);
+    }
 }
 
 /// Appends `diagnostic` unless `diagnostics` already holds it: the dry run reads the same project
@@ -940,11 +1049,11 @@ fn push_new(diagnostics: &mut Vec<Diagnostic>, diagnostic: Diagnostic) {
 
 #[cfg(test)]
 mod tests {
-    use super::{FOLLOWS_REQUIRERS, Judged, settle};
+    use super::{Evidence, FOLLOWS_REQUIRERS, settle};
     use crate::app::upgrade::UpgradeAccum;
     use crate::app::{OutdatedItem, OutdatedStatus, SkippedInfo, UpgradeItem, Window};
     use cooldown_core::{
-        Dependency, Diagnostic, DiagnosticKind, MajorKey, MemberRef, PackageId, Release,
+        Change, Dependency, Diagnostic, DiagnosticKind, MajorKey, MemberRef, PackageId, Release,
         ReleaseOrder, ReleaseQuality, SkipReason, Status, ToolId, UpdateKind, Verdict, Version,
     };
 
@@ -1052,6 +1161,13 @@ mod tests {
         }
     }
 
+    fn member(name: &str) -> MemberRef {
+        MemberRef {
+            name: name.to_string(),
+            path: format!("packages/{name}"),
+        }
+    }
+
     fn dependency(item: &OutdatedItem) -> Dependency {
         let tool = if item.tool == "go" { GO } else { UV };
         Dependency {
@@ -1091,6 +1207,30 @@ mod tests {
         }
     }
 
+    /// A collateral move of `item`'s copy to `to`, which the graph after it shows `members`
+    /// reaching.
+    fn collateral(item: &OutdatedItem, to: &str, members: Vec<MemberRef>) -> UpgradeItem {
+        UpgradeItem {
+            direct: false,
+            members,
+            ..row(item, to, None)
+        }
+    }
+
+    /// The change a plan tried for `item`'s copy, to `to`.
+    fn tried(item: &OutdatedItem, to: &str) -> Change {
+        let dep = dependency(item);
+        Change {
+            package: dep.package,
+            from: dep.current,
+            to: Version::new(to),
+            kind: UpdateKind::Minor,
+            downgrade: false,
+            direct: dep.direct,
+            members: dep.members,
+        }
+    }
+
     fn hold(reason: SkipReason, blocker: Option<&str>) -> SkippedInfo {
         SkippedInfo {
             reason,
@@ -1117,32 +1257,44 @@ mod tests {
         }
     }
 
-    /// Settles `item`, judged `status` with its own target, against a dry run that reported
-    /// `rows` and project `errors`.
+    /// What a dry run settled: its rows and errors, the changes its plans tried, and whether it
+    /// stopped before its first plan.
+    #[derive(Default)]
+    struct Pass {
+        rows: Vec<UpgradeItem>,
+        tried: Vec<Change>,
+        errors: Vec<Diagnostic>,
+        unplanned: bool,
+    }
+
+    /// Settles `item`, judged `status` with its own target, against `pass`.
     fn settled(
         mut item: OutdatedItem,
         status: Status,
-        releases: Vec<Release>,
-        rows: Vec<UpgradeItem>,
-        errors: Vec<Diagnostic>,
+        releases: &[Release],
+        pass: Pass,
     ) -> OutdatedItem {
-        let judged = Judged {
-            releases,
-            verdict: Verdict {
-                status,
-                adoptable_target: item.adoptable_target.as_deref().map(Version::new),
-                latest: None,
-                candidates: Vec::new(),
-                held_reason: None,
-            },
+        let verdict = Verdict {
+            status,
+            adoptable_target: item.adoptable_target.as_deref().map(Version::new),
+            latest: None,
+            candidates: Vec::new(),
+            held_reason: None,
         };
-        let pass = UpgradeAccum {
+        let Pass {
+            rows,
+            tried,
+            errors,
+            unplanned,
+        } = pass;
+        let accum = UpgradeAccum {
             items: rows,
             errors,
             ..UpgradeAccum::default()
         };
+        let evidence = Evidence::new(&accum, &tried, !unplanned);
         let dep = dependency(&item);
-        settle(&mut item, &dep, &judged, &pass);
+        settle(&mut item, &dep, &verdict, evidence.outcome(&dep, releases));
         item
     }
 
@@ -1160,7 +1312,15 @@ mod tests {
     fn a_landing_is_the_rows_target() {
         let item = adoptable("parent", "1.0.0", "1.4.0");
         let rows = vec![row(&item, "1.3.0", None)];
-        let fallback = settled(item, Status::Adoptable, Vec::new(), rows, Vec::new());
+        let fallback = settled(
+            item,
+            Status::Adoptable,
+            &[],
+            Pass {
+                rows,
+                ..Pass::default()
+            },
+        );
         assert_eq!(
             verdict(&fallback),
             (OutdatedStatus::Adoptable, Some("1.3.0"), None)
@@ -1175,7 +1335,16 @@ mod tests {
                 Some(hold(SkipReason::PeerHeld, Some("plugin"))),
             ),
         ];
-        let in_line = settled(item, Status::Adoptable, Vec::new(), rows, Vec::new());
+        let in_line = settled(
+            item.clone(),
+            Status::Adoptable,
+            &[],
+            Pass {
+                rows,
+                tried: vec![tried(&item, "9.0.0"), tried(&item, "8.57.0")],
+                ..Pass::default()
+            },
+        );
         assert_eq!(
             verdict(&in_line),
             (OutdatedStatus::Adoptable, Some("8.57.0"), None)
@@ -1183,17 +1352,27 @@ mod tests {
         assert_eq!(in_line.blocked_by, None);
     }
 
-    /// A hold at the row's target blocks it with the blocker and the reason `upgrade` gives; a
-    /// hold at another target, such as a `--major` notice, says nothing about it.
+    /// A hold blocks the row only on a move a plan tried, with the blocker and the reason
+    /// `upgrade` gives, even when the row's own verdict was a hold; a notice such as `--major`'s
+    /// says nothing about it.
     #[test]
-    fn only_a_hold_at_the_target_blocks_the_row() {
+    fn only_a_hold_on_a_tried_move_blocks_the_row() {
         let item = adoptable("typer", "0.25.1", "0.26.7");
         let rows = vec![row(
             &item,
             "0.26.7",
             Some(hold(SkipReason::ResolverConflict, Some("huggingface-hub"))),
         )];
-        let typer = settled(item, Status::Adoptable, Vec::new(), rows, Vec::new());
+        let typer = settled(
+            item.clone(),
+            Status::Adoptable,
+            &[],
+            Pass {
+                rows,
+                tried: vec![tried(&item, "0.26.7")],
+                ..Pass::default()
+            },
+        );
         assert_eq!(
             verdict(&typer),
             (
@@ -1210,13 +1389,49 @@ mod tests {
             "2.0.0",
             Some(hold(SkipReason::NeedsMajor, None)),
         )];
-        let serde = settled(item, Status::Adoptable, Vec::new(), rows, Vec::new());
+        let serde = settled(
+            item,
+            Status::Adoptable,
+            &[],
+            Pass {
+                rows,
+                ..Pass::default()
+            },
+        );
         assert_eq!(
             verdict(&serde),
             (
                 OutdatedStatus::Blocked,
                 Some("1.0.190"),
                 Some(FOLLOWS_REQUIRERS)
+            )
+        );
+
+        // A follower its first plan saw capped is tried once its requirer moved, and refused.
+        let mut item = adoptable("child", "1.0.0", "1.0.0");
+        item.direct = false;
+        item.status = OutdatedStatus::Held;
+        let rows = vec![row(
+            &item,
+            "1.1.0",
+            Some(hold(SkipReason::ResolverConflict, Some("holder"))),
+        )];
+        let follower = settled(
+            item.clone(),
+            Status::Held,
+            &[],
+            Pass {
+                rows,
+                tried: vec![tried(&item, "1.1.0")],
+                ..Pass::default()
+            },
+        );
+        assert_eq!(
+            verdict(&follower),
+            (
+                OutdatedStatus::Blocked,
+                Some("1.1.0"),
+                Some("conflicts with holder")
             )
         );
     }
@@ -1227,123 +1442,125 @@ mod tests {
     fn copies_and_members_settle_apart() {
         let older = adoptable("shared", "1.2.0", "1.4.0");
         let newer = adoptable("shared", "1.3.0", "1.4.0");
-        let rows = vec![
-            row(
-                &older,
-                "1.4.0",
-                Some(hold(SkipReason::ResolverConflict, Some("keeper"))),
-            ),
-            row(&newer, "1.4.0", None),
-        ];
-        let older = settled(
-            older,
-            Status::Adoptable,
-            Vec::new(),
-            rows.clone(),
-            Vec::new(),
-        );
-        let newer = settled(newer, Status::Adoptable, Vec::new(), rows, Vec::new());
-        assert_eq!(older.status, OutdatedStatus::Blocked);
-        assert_eq!(newer.status, OutdatedStatus::Adoptable);
-
-        let member = |name: &str| MemberRef {
-            name: name.to_string(),
-            path: format!("packages/{name}"),
+        let pass = || Pass {
+            rows: vec![
+                row(
+                    &older,
+                    "1.4.0",
+                    Some(hold(SkipReason::ResolverConflict, Some("keeper"))),
+                ),
+                row(&newer, "1.4.0", None),
+            ],
+            tried: vec![tried(&older, "1.4.0"), tried(&newer, "1.4.0")],
+            ..Pass::default()
         };
+        let older_settled = settled(older.clone(), Status::Adoptable, &[], pass());
+        let newer_settled = settled(newer.clone(), Status::Adoptable, &[], pass());
+        assert_eq!(older_settled.status, OutdatedStatus::Blocked);
+        assert_eq!(newer_settled.status, OutdatedStatus::Adoptable);
+
         let mut left = adoptable("serde", "1.0.188", "1.0.190");
         left.members = vec![member("left")];
         let mut right = left.clone();
         right.members = vec![member("right")];
-        let rows = vec![
-            row(
-                &left,
-                "1.0.190",
-                Some(hold(SkipReason::ResolverConflict, Some("legacy"))),
-            ),
-            row(&right, "1.0.190", None),
-        ];
-        let left = settled(
-            left,
-            Status::Adoptable,
-            Vec::new(),
-            rows.clone(),
-            Vec::new(),
-        );
-        let right = settled(right, Status::Adoptable, Vec::new(), rows, Vec::new());
-        assert_eq!(left.status, OutdatedStatus::Blocked);
-        assert_eq!(right.status, OutdatedStatus::Adoptable);
+        let pass = || Pass {
+            rows: vec![
+                row(
+                    &left,
+                    "1.0.190",
+                    Some(hold(SkipReason::ResolverConflict, Some("legacy"))),
+                ),
+                row(&right, "1.0.190", None),
+            ],
+            tried: vec![tried(&left, "1.0.190"), tried(&right, "1.0.190")],
+            ..Pass::default()
+        };
+        let left_settled = settled(left.clone(), Status::Adoptable, &[], pass());
+        let right_settled = settled(right.clone(), Status::Adoptable, &[], pass());
+        assert_eq!(left_settled.status, OutdatedStatus::Blocked);
+        assert_eq!(right_settled.status, OutdatedStatus::Adoptable);
     }
 
-    /// A sibling's move that carries a declared row onto its target lands the row only when
-    /// `upgrade` dropped the target's hold, which it keeps while a declaring member stays behind.
+    /// A collateral move lands a declared row at the version it reaches, its own target or not,
+    /// once the graph after it shows every declaring member there; a member left behind keeps the
+    /// row's tried target held.
     #[test]
-    fn a_collateral_landing_counts_only_in_every_declaring_member() {
+    fn a_collateral_landing_counts_in_every_declaring_member() {
         let mut item = adoptable("c", "1.0.0", "2.0.0");
-        item.members = vec![
-            MemberRef {
-                name: "web".to_string(),
-                path: "web".to_string(),
-            },
-            MemberRef {
-                name: "api".to_string(),
-                path: "api".to_string(),
-            },
-        ];
-        let mut collateral = row(&item, "2.0.0", None);
-        collateral.direct = false;
-        collateral.members = Vec::new();
+        item.members = vec![member("web"), member("api")];
+        let held = || {
+            row(
+                &item,
+                "2.0.0",
+                Some(hold(SkipReason::ResolverConflict, None)),
+            )
+        };
 
-        let everywhere = settled(
+        for landed in ["2.0.0", "1.1.0"] {
+            let everywhere = settled(
+                item.clone(),
+                Status::Adoptable,
+                &[],
+                Pass {
+                    rows: vec![collateral(&item, landed, item.members.clone()), held()],
+                    tried: vec![tried(&item, "2.0.0")],
+                    ..Pass::default()
+                },
+            );
+            assert_eq!(
+                verdict(&everywhere),
+                (OutdatedStatus::Adoptable, Some(landed), None)
+            );
+        }
+
+        let short = settled(
             item.clone(),
             Status::Adoptable,
-            Vec::new(),
-            vec![collateral.clone()],
-            Vec::new(),
+            &[],
+            Pass {
+                rows: vec![collateral(&item, "2.0.0", vec![member("web")]), held()],
+                tried: vec![tried(&item, "2.0.0")],
+                ..Pass::default()
+            },
         );
         assert_eq!(
-            verdict(&everywhere),
-            (OutdatedStatus::Adoptable, Some("2.0.0"), None)
+            verdict(&short),
+            (
+                OutdatedStatus::Blocked,
+                Some("2.0.0"),
+                Some(SkipReason::ResolverConflict.message())
+            )
         );
-
-        let kept = row(
-            &item,
-            "2.0.0",
-            Some(hold(SkipReason::ResolverConflict, None)),
-        );
-        let short = settled(
-            item,
-            Status::Adoptable,
-            Vec::new(),
-            vec![collateral, kept],
-            Vec::new(),
-        );
-        assert_eq!(short.status, OutdatedStatus::Blocked);
     }
 
     /// A held Go cross-path move keeps the path the tree still requires while a landed one is
-    /// named for its target, and either settles the row; a hold at another target does not.
+    /// named for its target, and either settles the row; a hold at a target no plan tried does
+    /// not.
     #[test]
     fn go_cross_path_moves_settle_under_either_spelling() {
         let mut item = adoptable("github.com/foo/bar", "v2.9.0+incompatible", "v3.0.2");
         item.tool = "go".to_string();
         item.registry = None;
-        let releases = || {
-            vec![
-                release("v2.9.0+incompatible", 1, ""),
-                release("v3.0.1", 2, "/v3"),
-                release("v3.0.2", 3, "/v3"),
-            ]
-        };
+        let releases = [
+            release("v2.9.0+incompatible", 1, ""),
+            release("v3.0.1", 2, "/v3"),
+            release("v3.0.2", 3, "/v3"),
+        ];
+        let mut moved = tried(&item, "v3.0.2");
+        moved.package.name = "github.com/foo/bar/v3".to_string();
         let mut landed = row(&item, "v3.0.2", None);
-        landed.name = "github.com/foo/bar/v3".to_string();
-        let moved = settled(
+        landed.name.clone_from(&moved.package.name);
+        let landed = settled(
             item.clone(),
             Status::Adoptable,
-            releases(),
-            vec![landed],
-            Vec::new(),
+            &releases,
+            Pass {
+                rows: vec![landed],
+                tried: vec![moved.clone()],
+                ..Pass::default()
+            },
         );
-        assert_eq!(moved.status, OutdatedStatus::Adoptable);
+        assert_eq!(landed.status, OutdatedStatus::Adoptable);
 
         let self_blamed = Some(hold(
             SkipReason::ResolverConflict,
@@ -1352,9 +1569,12 @@ mod tests {
         let blocked = settled(
             item.clone(),
             Status::Adoptable,
-            releases(),
-            vec![row(&item, "v3.0.2", self_blamed.clone())],
-            Vec::new(),
+            &releases,
+            Pass {
+                rows: vec![row(&item, "v3.0.2", self_blamed.clone())],
+                tried: vec![moved.clone()],
+                ..Pass::default()
+            },
         );
         assert_eq!(blocked.status, OutdatedStatus::Blocked);
         // A row that blames itself names no blocker, yet still carries its reason.
@@ -1364,9 +1584,12 @@ mod tests {
         let elsewhere = settled(
             item.clone(),
             Status::Adoptable,
-            releases(),
-            vec![row(&item, "v3.0.1", self_blamed)],
-            Vec::new(),
+            &releases,
+            Pass {
+                rows: vec![row(&item, "v3.0.1", self_blamed)],
+                tried: vec![moved],
+                ..Pass::default()
+            },
         );
         assert_eq!(elsewhere.blocked_reason.as_deref(), Some(FOLLOWS_REQUIRERS));
     }
@@ -1390,9 +1613,11 @@ mod tests {
             let follower = settled(
                 item.clone(),
                 Status::Adoptable,
-                Vec::new(),
-                rows,
-                Vec::new(),
+                &[],
+                Pass {
+                    rows,
+                    ..Pass::default()
+                },
             );
             assert_eq!(
                 verdict(&follower),
@@ -1405,24 +1630,62 @@ mod tests {
         }
     }
 
-    /// A dry run that failed before settling a row turns it into an error carrying the failure,
-    /// the one naming the package when there is one.
+    /// A row carries only a failure that kept the dry run from settling it: its package's own, or
+    /// the one that stopped the pass before it decided a move it tried or before it planned.
+    /// Another package's failure, or one that stopped the pass after its plan left the row
+    /// untried, does not reach it.
     #[test]
-    fn an_unsettled_row_carries_the_dry_runs_failure() {
-        let unrelated = Diagnostic::new(DiagnosticKind::ToolFailed, "the resolver crashed");
+    fn a_row_carries_only_the_failures_that_kept_it_unsettled() {
+        let stopped = Diagnostic::new(DiagnosticKind::ToolFailed, "the resolver crashed");
         let named =
             Diagnostic::new(DiagnosticKind::ToolFailed, "no metadata").with_package("requests");
         let item = adoptable("requests", "2.34.1", "2.34.2");
-        let failed = settled(
-            item,
-            Status::Adoptable,
-            Vec::new(),
-            Vec::new(),
-            vec![unrelated, named.clone()],
+        let failed = |pass: Pass| settled(item.clone(), Status::Adoptable, &[], pass);
+
+        let own = failed(Pass {
+            errors: vec![stopped.clone(), named.clone()],
+            ..Pass::default()
+        });
+        assert_eq!(own.status, OutdatedStatus::Error);
+        assert_eq!(own.adoptable_target, None);
+        assert_eq!(own.error, Some(named));
+
+        let other = Diagnostic::new(DiagnosticKind::ToolFailed, "no metadata").with_package("a");
+        let unrelated = failed(Pass {
+            errors: vec![other],
+            ..Pass::default()
+        });
+        assert_eq!(
+            verdict(&unrelated),
+            (
+                OutdatedStatus::Blocked,
+                Some("2.34.2"),
+                Some(FOLLOWS_REQUIRERS)
+            )
         );
-        assert_eq!(failed.status, OutdatedStatus::Error);
-        assert_eq!(failed.adoptable_target, None);
-        assert_eq!(failed.error, Some(named));
+
+        let untried = failed(Pass {
+            errors: vec![stopped.clone()],
+            ..Pass::default()
+        });
+        assert_eq!(untried.status, OutdatedStatus::Blocked);
+
+        for pass in [
+            Pass {
+                tried: vec![tried(&item, "2.34.2")],
+                errors: vec![stopped.clone()],
+                ..Pass::default()
+            },
+            Pass {
+                errors: vec![stopped.clone()],
+                unplanned: true,
+                ..Pass::default()
+            },
+        ] {
+            let unsettled = failed(pass);
+            assert_eq!(unsettled.status, OutdatedStatus::Error);
+            assert_eq!(unsettled.error.as_ref(), Some(&stopped));
+        }
     }
 
     /// An exempt row stays `exempt` at the target `upgrade` lands, and a held row keeps its own
@@ -1432,7 +1695,15 @@ mod tests {
         let mut item = adoptable("rayon-core", "1.11.0", "1.13.0");
         item.status = OutdatedStatus::Exempt;
         let rows = vec![row(&item, "1.12.0", None)];
-        let exempt = settled(item, Status::Exempt, Vec::new(), rows, Vec::new());
+        let exempt = settled(
+            item,
+            Status::Exempt,
+            &[],
+            Pass {
+                rows,
+                ..Pass::default()
+            },
+        );
         assert_eq!(
             verdict(&exempt),
             (OutdatedStatus::Exempt, Some("1.12.0"), None)
@@ -1441,10 +1712,45 @@ mod tests {
         let mut item = adoptable("pinned", "1.0.0", "1.2.0");
         item.status = OutdatedStatus::Held;
         let rows = vec![row(&item, "1.2.0", Some(hold(SkipReason::PinHeld, None)))];
-        let pinned = settled(item, Status::Held, Vec::new(), rows, Vec::new());
+        let pinned = settled(
+            item,
+            Status::Held,
+            &[],
+            Pass {
+                rows,
+                ..Pass::default()
+            },
+        );
         assert_eq!(
             verdict(&pinned),
             (OutdatedStatus::Held, Some("1.2.0"), None)
         );
+    }
+
+    /// A landing carries the security evidence of the version it lands, not of the candidate the
+    /// row's own verdict annotated.
+    #[test]
+    fn a_landing_carries_its_own_security_evidence() {
+        let security = |version: &str, fixes: &[&str]| crate::app::SecurityInfo {
+            version: version.to_string(),
+            fixes: fixes.iter().map(ToString::to_string).collect(),
+            severity: cooldown_core::AdvisorySeverity::High,
+            source: cooldown_core::AdvisorySourceId("osv"),
+            applied: false,
+        };
+        let mut item = adoptable("dom", "1.0.0", "2.0.0");
+        item.security = Some(security("2.0.0", &["GHSA-inline", "GHSA-major"]));
+        let mut landed = row(&item, "1.1.0", None);
+        landed.security = Some(security("1.1.0", &["GHSA-inline"]));
+        let settled = settled(
+            item,
+            Status::Adoptable,
+            &[],
+            Pass {
+                rows: vec![landed],
+                ..Pass::default()
+            },
+        );
+        assert_eq!(settled.security, Some(security("1.1.0", &["GHSA-inline"])));
     }
 }

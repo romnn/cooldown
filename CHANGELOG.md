@@ -9,12 +9,13 @@
   moves of a rand 0.7.3 → 0.8 upgrade that `upgrade` applies, judged transitives as if they could
   cross a major, and kept showing a refused target when `upgrade` lands an older fallback. Each
   project's rows now come from the `upgrade --dry-run` pass itself: a row is `adoptable` at the
-  version that pass lands for its copy, including an in-line release beside a held major, and
-  `blocked` with the pass's reason when it holds the target or never moves the dependency on its
-  own; a row the pass failed to settle is an error. `--transitive` still only picks the listed
-  rows, `exempt` and `held` rows keep their status, and `--offline` keeps the per-package
-  verdicts with its warning. `explain` reads its verdict off the same pass over the project's
-  whole plan, so it takes as long as `upgrade --dry-run` there. Closes #173.
+  version that pass lands for its copy in every declaring member, including an in-line release
+  beside a held major or a version another move carries it to, and `blocked` with the pass's
+  reason when it tries a move and holds it or never moves the dependency on its own; a row the
+  pass failed to settle carries that failure, and any other failure is a warning. `--transitive`
+  still only picks the listed rows, and `--offline` keeps the per-package verdicts with its
+  warning. `explain` reads its verdict off the same pass over the project's whole plan, so it
+  takes as long as `upgrade --dry-run` there. Closes #173.
 - **`sync` warns when an environment variable keeps a tool from applying the window it wrote.**
   `sync` reported the native window `written` while a shell or CI job still overrode it, so a bare
   `uv lock` under `UV_EXCLUDE_NEWER="1 day"` admitted releases a 7-day sync was meant to hold back.

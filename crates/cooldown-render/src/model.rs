@@ -245,8 +245,9 @@ pub struct OutdatedItem {
     pub status: OutdatedStatus,
     /// The matured version the row offers, if any.
     ///
-    /// For an `adoptable` or `exempt` row it is the version `upgrade --dry-run` lands, which can
-    /// be older than the newest matured one; for any other row it is the newest matured version.
+    /// For an `adoptable` or `exempt` row it is the version `upgrade --dry-run` lands, and for a
+    /// `blocked` row the version it tried and held; either can differ from the newest matured
+    /// version, which every other row offers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub adoptable_target: Option<String>,
     /// When `status` is [`OutdatedStatus::Blocked`], the package whose requirement holds the matured

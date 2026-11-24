@@ -232,6 +232,8 @@ struct FakeNode {
     transitive_advance: bool,
     script: Script,
     releases: BTreeMap<String, Vec<Release>>,
+    /// The packages whose releases the registry cannot serve.
+    unavailable: &'static [&'static str],
     advisory_ecosystem: Option<&'static str>,
     /// Each apply's plan as `name@target` entries, kept outside the project because a policy
     /// preview runs in a throwaway copy.
@@ -268,6 +270,7 @@ impl FakeNode {
             transitive_advance: false,
             script,
             releases: BTreeMap::new(),
+            unavailable: &[],
             advisory_ecosystem: None,
             trials: Mutex::new(Vec::new()),
             shared: None,
@@ -562,6 +565,11 @@ impl ReleaseFetcher for FakeNode {
         _fetch: &FetchContext<'_>,
         _candidates: CandidateScope,
     ) -> cooldown_core::Result<Vec<Release>> {
+        if self.unavailable.contains(&dep.package.name.as_str()) {
+            return Err(CoreError::Transient(
+                format!("the registry cannot serve {}", dep.package.name).into(),
+            ));
+        }
         Ok(self
             .releases
             .get(&dep.package.name)
@@ -1876,8 +1884,114 @@ async fn a_major_landed_in_only_some_members_keeps_its_hold() -> eyre::Result<()
     Ok(())
 }
 
+/// A collateral move that lands a declared package in every declaring member, below the target
+/// its own trial was refused, is the version `outdated` reports adoptable (#173).
+#[tokio::test]
+async fn a_collateral_landing_below_a_refused_target_is_adoptable() -> eyre::Result<()> {
+    let fake = FakeNode::new(
+        TargetFallback::CurrentLine,
+        Script {
+            holds: vec![Hold {
+                target: "c@1.2.0",
+                reason: SkipReason::ResolverConflict,
+                offending: None,
+                detail: None,
+            }],
+            float: Some(Float {
+                trigger: "a",
+                floated: "c",
+                from: "1.0.0",
+                to: "1.1.0",
+            }),
+            members: &["web", "api"],
+            ..Script::default()
+        },
+    )
+    .with_releases("a", &[("1.0.0", false), ("1.1.0", false)])
+    .with_releases("c", &[("1.0.0", false), ("1.1.0", false), ("1.2.0", false)]);
+    let fixture = fixture(fake, &[("a", "1.0.0"), ("c", "1.0.0")])?;
+
+    let outdated = outdated_verdict(&fixture, "c").await?;
+    let upgrade = fixture
+        .workspace
+        .upgrade(&RunOpts {
+            dry_run: true,
+            ..major()
+        })
+        .await;
+
+    assert!(upgrade.errors.is_empty(), "{:?}", upgrade.errors);
+    assert_eq!(
+        rows(&upgrade.items),
+        sorted(vec![
+            applied("a", "1.0.0", "1.1.0"),
+            applied("c", "1.0.0", "1.1.0"),
+            skipped(
+                "c",
+                "1.0.0",
+                "1.2.0",
+                SkipReason::ResolverConflict,
+                SkipReason::ResolverConflict.message()
+            ),
+        ])
+    );
+    assert_eq!(
+        outdated,
+        (OutdatedStatus::Adoptable, Some("1.1.0".to_string()))
+    );
+    Ok(())
+}
+
+/// On a tool that never plans an indirect dependency, a registry failure for a direct one is
+/// that row's error alone: the indirect row `upgrade` never tries still follows its requirers
+/// (#173).
+#[tokio::test]
+async fn a_failure_for_one_package_never_settles_another() -> eyre::Result<()> {
+    let mut fake = FakeNode::new(TargetFallback::CurrentLine, Script::default())
+        .with_releases("child", &[("1.0.0", false), ("1.1.0", false)])
+        .with_releases("dom", &[("1.0.0", false), ("1.1.0", false)]);
+    // The locked release stays readable, so only the lookup of newer ones fails.
+    fake.unavailable = &["dom"];
+    let fixture = fixture(fake, &[("child", "1.0.0"), ("dom", "1.0.0")])?;
+
+    let outdated = fixture
+        .workspace
+        .outdated(&RunOpts {
+            transitive: true,
+            ..major()
+        })
+        .await;
+
+    let row = |name: &str| {
+        outdated
+            .items
+            .iter()
+            .find(|item| item.name == name)
+            .ok_or_else(|| eyre::eyre!("no {name} row: {:?}", outdated.items))
+    };
+    let child = row("child")?;
+    assert_eq!(child.status, OutdatedStatus::Blocked, "{child:?}");
+    assert!(
+        child
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("follows the packages that require it")),
+        "{child:?}"
+    );
+    let dom = row("dom")?;
+    assert_eq!(dom.status, OutdatedStatus::Error, "{dom:?}");
+    assert!(
+        dom.error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("cannot serve dom")),
+        "{dom:?}"
+    );
+    Ok(())
+}
+
 /// Each row carries the security provenance of its own target: the in-line move fixes only the
-/// advisory it escapes, the held major both.
+/// advisory it escapes, the held major both, and `outdated` reports the in-line landing with
+/// its own.
 #[tokio::test]
 async fn security_provenance_follows_each_target() -> eyre::Result<()> {
     let mut fake = dom_and_safe(
@@ -1890,6 +2004,20 @@ async fn security_provenance_follows_each_target() -> eyre::Result<()> {
     );
     fake.advisory_ecosystem = Some("npm");
     let fixture = fixture(fake, &[("dom", "1.0.0")])?;
+
+    let outdated = fixture.workspace.outdated(&major()).await;
+    let dom = outdated
+        .items
+        .iter()
+        .find(|item| item.name == "dom")
+        .ok_or_else(|| eyre::eyre!("no dom row: {:?}", outdated.items))?;
+    assert_eq!(dom.adoptable_target.as_deref(), Some("1.1.0"));
+    assert_eq!(
+        dom.security
+            .as_ref()
+            .map(|security| (security.version.as_str(), security.fixes.as_slice())),
+        Some(("1.1.0", ["GHSA-inline".to_string()].as_slice()))
+    );
 
     let outcome = fixture.workspace.upgrade(&major()).await;
 

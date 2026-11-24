@@ -24,7 +24,7 @@ use super::{
     UpgradeSummary, Workspace, diag_from_error,
 };
 use cooldown_core::{
-    AcceptedPublication, BaselineViolation, Diagnostic, DiagnosticKind, EdgeBindingAction,
+    AcceptedPublication, BaselineViolation, Change, Diagnostic, DiagnosticKind, EdgeBindingAction,
     IsolatedMutation, IsolatedMutationStrategy, LockStatus, MutationExecution, ToolRead, ToolWrite,
 };
 use std::collections::HashSet;
@@ -69,9 +69,19 @@ pub(super) struct UpgradeAccum {
     /// The versions outside a configured `max-major` this project's passes authorized, which a
     /// later refresh of its lock may keep (see [`run_staled`]).
     pub(super) allowed_crossings: HashSet<BaselineViolation>,
-    /// Every dependency the project's first upgrade plan read, with the releases and verdict it
-    /// was planned from, which `outdated` reports from.
-    pub(super) judged: Vec<FetchedRelease<Judged>>,
+    /// What the project's plans read and tried, which only `outdated`'s dry run collects (see
+    /// [`Workspace::dry_run_upgrade`]).
+    pub(super) facts: Option<PlanFacts>,
+}
+
+/// What one project's upgrade plans read and tried, which `outdated` reports from.
+#[derive(Default)]
+pub(super) struct PlanFacts {
+    /// Every dependency the first plan read, with the releases and verdict it was planned from;
+    /// `None` while no plan has run.
+    pub(super) judged: Option<Vec<FetchedRelease<Judged>>>,
+    /// Every change a plan put to a trial, a follower replan's included.
+    pub(super) tried: Vec<Change>,
 }
 
 /// The read/write adapter pair and shared per-project inputs the upgrade executor needs.
@@ -403,7 +413,8 @@ impl Workspace {
     /// `progress` block: the same planning, trials, and final verification against a throwaway
     /// copy of the project, without a build.
     ///
-    /// `outdated` reports from it, so its rows say what `upgrade` does with each dependency.
+    /// `outdated` reports from it, so its rows say what `upgrade` does with each dependency: the
+    /// pass's own rows and diagnostics, and what its plans read and tried ([`PlanFacts`]).
     pub(super) async fn dry_run_upgrade(
         &self,
         pctx: &super::ProjectCtx,
@@ -418,7 +429,10 @@ impl Workspace {
         let mode = PlanMode::Upgrade {
             transitive: opts.transitive_mode,
         };
-        let mut acc = UpgradeAccum::default();
+        let mut acc = UpgradeAccum {
+            facts: Some(PlanFacts::default()),
+            ..UpgradeAccum::default()
+        };
         self.run_plan_pass(pctx, &opts, mode, progress, &mut acc)
             .await;
         acc
@@ -477,7 +491,10 @@ impl Workspace {
         let mut trial_opts = opts.clone();
         trial_opts.build = false;
         let execution = ProjectExecution::Isolated(trial.mutation_project());
-        let mut project_acc = UpgradeAccum::default();
+        let mut project_acc = UpgradeAccum {
+            facts: acc.facts.take(),
+            ..UpgradeAccum::default()
+        };
         let status = ProjectUpgradeExecutor::new(
             self,
             UpgradeCtx {
@@ -653,7 +670,7 @@ fn merge_upgrade_accum(target: &mut UpgradeAccum, mut source: UpgradeAccum) {
     target.build_ok = combine_build_ok(target.build_ok, source.build_ok);
     target.lock_status = combine_lock_status(target.lock_status, source.lock_status);
     target.allowed_crossings.extend(source.allowed_crossings);
-    target.judged.append(&mut source.judged);
+    target.facts = target.facts.take().or(source.facts);
 }
 
 /// One failed build fails the run; a build that ran and passed is reported only when none
@@ -666,14 +683,14 @@ const fn combine_build_ok(left: Option<bool>, right: Option<bool>) -> Option<boo
     }
 }
 
-/// Folds a trial whose state was discarded into `target`: its errors, and the dependencies its
-/// plan read, which the discard does not change.
+/// Folds a trial whose state was discarded into `target`: its errors, and what its plans read
+/// and tried, which the discard does not change.
 fn merge_discarded_trial(target: &mut UpgradeAccum, source: UpgradeAccum) {
     target.errors.extend(source.errors);
     target
         .errors
         .extend(source.items.into_iter().filter_map(|item| item.error));
-    target.judged.extend(source.judged);
+    target.facts = target.facts.take().or(source.facts);
 }
 
 /// Publishes the trial's accepted state and folds its rows into `acc`.

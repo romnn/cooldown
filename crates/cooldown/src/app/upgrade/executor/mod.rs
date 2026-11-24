@@ -94,8 +94,6 @@ struct PlannedUpgrade {
     changes: Vec<Change>,
     /// The undeclared nodes every requirer of which leaves its line in `changes`.
     deferred: HashSet<(String, String)>,
-    /// Every dependency the plan read, with the releases and verdict it was planned from.
-    judged: Vec<FetchedRelease<Judged>>,
 }
 
 /// Whether the executor moves dependencies *forward* (`upgrade`) or *backward* to a compliant
@@ -1026,12 +1024,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// re-lock produced: downgrade any too-fresh transitive a forward move floated up, so a single
     /// `upgrade` ends gate-clean — no separate `fix` needed.
     async fn run_upgrade(&mut self, deps: Vec<Dependency>, state: &mut TrialState) -> MutationFlow {
-        let PlannedUpgrade {
-            changes,
-            deferred,
-            judged,
-        } = self.plan_upgrade_changes(&deps).await;
-        self.acc.judged = judged;
+        let PlannedUpgrade { changes, deferred } = self.plan_upgrade_changes(&deps).await;
         // Each pass's trials are heap-pinned, so the two passes do not share one stack frame.
         let flow = Box::pin(self.apply_upgrade_changes(changes, state)).await;
         if flow.is_break() || deferred.is_empty() {
@@ -2548,10 +2541,20 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             planned.push(change);
         }
         sort_planned_changes(&mut planned);
+        self.record_plan_facts(&planned, judged);
         PlannedUpgrade {
             changes: planned,
             deferred,
-            judged,
+        }
+    }
+
+    /// Keeps what a plan read and tried for `outdated`, when its dry run collects them.
+    fn record_plan_facts(&mut self, planned: &[Change], judged: Vec<FetchedRelease<Judged>>) {
+        if let Some(facts) = &mut self.acc.facts {
+            facts.tried.extend(planned.iter().cloned());
+            // A follower replan reads the graph the first plan's moves left, while `outdated`
+            // reports the starting one.
+            facts.judged.get_or_insert(judged);
         }
     }
 
