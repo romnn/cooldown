@@ -141,7 +141,7 @@ For pnpm and Yarn, a package rule's `latest` and `allow`, and a `*` rule's `min-
 
 cooldown judges every package of a tool as coming from one registry: `crates.io` for Cargo, `pypi` for uv, and `npm` for pnpm and Yarn, whichever index or scoped registry actually serves it. A `[registry."…"]` rule for that registry therefore gates every package the native config governs, so `sync` writes its window and `floor` like the bare ones: with `min-age = "14d"` and `[registry."crates.io"] floor = "30d"`, Cargo gets `min-publish-age = "30 days"`, and a `[registry.pypi]` floor reaches each of uv's package windows too. Its `major`, `minor` and `patch` windows and its exemption are reported like any other rule's. A rule for any other registry, such as an alternate Cargo registry whose crates cooldown never age-checks, gates none of the tool's packages and is not reported.
 
-One boundary stays outside the report: a native config nearer to a project than the file `sync` writes, such as a nested uv project's own `[tool.uv]` table or a nearer `.cargo` configuration, shadows the written file for that project.
+Two boundaries stay outside the report. A native config nearer to a project than the file `sync` writes, such as a nested uv project's own `[tool.uv]` table or a nearer `.cargo` configuration, shadows the written file for that project. And a setting of one index in the written file itself, such as a uv `[[index]]` with `exclude-newer = false`, overrides the written cutoff for the packages that index serves.
 
 ### pnpm
 
