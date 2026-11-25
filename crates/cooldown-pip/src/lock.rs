@@ -290,8 +290,8 @@ fn parse_requirement_pin(raw: &str) -> Option<RequirementPin<'_>> {
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::LockUnreadable`] if the lock is not TOML, or for a lock
-/// [`poetry_lock_pins`] refuses.
+/// Returns [`CoreError::LockUnreadable`] if the lock is not TOML, lacks the `package` array, or
+/// has a package without a name or version.
 pub fn parse_poetry_lock(content: &str) -> Result<Vec<ResolvedPin>, CoreError> {
     let lock: Table = toml::from_str(content)
         .map_err(|err| CoreError::LockUnreadable(format!("poetry.lock: {err}")))?;
@@ -334,7 +334,8 @@ pub(crate) fn poetry_lock_pins(lock: &Table) -> Result<Vec<ResolvedPin>, CoreErr
 }
 
 /// Returns the normalised set of distributions a Poetry `pyproject.toml` declares directly: every
-/// name in a table of [`poetry_dependency_tables`] or a list of [`requirement_lists`].
+/// name in its Poetry dependency tables (the main, legacy `dev-dependencies`, and every group
+/// table) or its requirement lists (`project.dependencies`, every extra, and every PEP 735 group).
 /// The implicit `python` constraint is excluded.
 #[must_use]
 pub fn parse_poetry_direct(manifest: &str) -> HashSet<String> {
