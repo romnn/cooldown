@@ -107,18 +107,19 @@ enum Horizon {
 /// A throwaway project tree under a temp dir, plus the means to run `cooldown` against it.
 ///
 /// Every fixture also owns a private pnpm cache and store, which every process it starts resolves
-/// through, so concurrent tests never share pnpm's mutable metadata cache.
+/// through, so concurrent tests never share pnpm's mutable metadata cache, and a private Poetry
+/// cache, so the virtualenv Poetry creates for each throwaway project never lands in the user's.
 /// A fixture built with [`Fixture::pnpm`] also starts its cache seeded from a [`PnpmPool`] of the
 /// metadata earlier fixtures fetched.
 pub struct Fixture {
     dir: tempfile::TempDir,
-    /// The fixture's private pnpm cache and store.
+    /// The fixture's private pnpm cache and store, and its private Poetry cache.
     ///
     /// It is a sibling of the project tree rather than inside it, so cooldown's project discovery
     /// never walks into the cache or the store.
     /// It lives in the system temp dir beside the machine-wide pool, so the two can share hard
     /// links.
-    pnpm_home: tempfile::TempDir,
+    tool_home: tempfile::TempDir,
     /// The pool that seeds the private pnpm cache and collects its new entries, for a fixture
     /// that drives pnpm.
     pnpm_pool: Option<PnpmPool>,
@@ -186,13 +187,13 @@ impl Fixture {
             .prefix("cooldown-it-")
             .tempdir()
             .expect("create temp dir");
-        let pnpm_home = tempfile::Builder::new()
-            .prefix("cooldown-it-pnpm-")
+        let tool_home = tempfile::Builder::new()
+            .prefix("cooldown-it-tools-")
             .tempdir()
-            .expect("create pnpm temp dir");
+            .expect("create tool temp dir");
         let fixture = Self {
             dir,
-            pnpm_home,
+            tool_home,
             pnpm_pool,
             tag_independent: false,
             cargo_as_of: None,
@@ -219,26 +220,28 @@ impl Fixture {
 
     /// The pnpm cache directory every process of this fixture uses.
     pub fn pnpm_cache_dir(&self) -> PathBuf {
-        self.pnpm_home.path().join("cache")
+        self.tool_home.path().join("cache")
     }
 
     /// The pnpm store directory every process of this fixture uses.
     pub fn pnpm_store_dir(&self) -> PathBuf {
-        self.pnpm_home.path().join("store")
+        self.tool_home.path().join("store")
     }
 
-    /// The environment that points every pnpm a fixture process starts at the fixture's own cache
-    /// and store.
+    /// The environment that points every pnpm and Poetry a fixture process starts at the fixture's
+    /// own caches.
     ///
     /// Concurrent pnpm processes sharing one metadata cache race on its entries, which surfaces as
     /// `ERR_PNPM_CACHE_MISSING_AFTER_304`, and a damaged entry fails every later test resolving
     /// that package.
     /// pnpm 11 reads its settings from `pnpm_config_*` variables and ignores `npm_config_*` ones.
+    /// Poetry keeps a virtualenv per project in its cache, and every fixture is a new project.
     /// The variables are inert for every other tool, so each fixture sets them whatever it drives.
-    fn pnpm_env(&self) -> [(&'static str, PathBuf); 2] {
+    fn tool_env(&self) -> [(&'static str, PathBuf); 3] {
         [
             ("pnpm_config_cache_dir", self.pnpm_cache_dir()),
             ("pnpm_config_store_dir", self.pnpm_store_dir()),
+            ("POETRY_CACHE_DIR", self.tool_home.path().join("poetry")),
         ]
     }
 
@@ -329,7 +332,7 @@ impl Fixture {
             command
                 .current_dir(self.dir.path())
                 .args(args)
-                .envs(self.pnpm_env());
+                .envs(self.tool_env());
             for (key, value) in &bound {
                 command.env(key, value);
             }
@@ -411,7 +414,7 @@ impl Fixture {
         let output = Command::new(exe)
             .env("COOLDOWN_NO_TRACE", "true")
             .current_dir(self.dir.path())
-            .envs(self.pnpm_env())
+            .envs(self.tool_env())
             .envs(self.run_horizon())
             .envs(envs.iter().copied())
             .args(args)
@@ -436,7 +439,7 @@ impl Fixture {
         command.env("COOLDOWN_NO_TRACE", "true");
         command
             .current_dir(self.dir.path())
-            .envs(self.pnpm_env())
+            .envs(self.tool_env())
             .envs(self.run_horizon())
             .args(args)
             .args(self.tag_independent.then_some("--no-respect-dist-tags"))
