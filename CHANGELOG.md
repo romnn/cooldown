@@ -20,8 +20,7 @@
   direct dependencies rather than transitive ones, while `upgrade` and `fix`, whose `poetry add`
   writes to the main dependencies, hold any package the main dependencies do not declare as
   `not_eligible` instead of adding it there. `upgrade` and `fix` verify the lock they wrote
-  the same way, and `mise.toml` pins Poetry 2.5.1 for the integration tests. A pip `requirements.txt`
-  stays `lock_unknown`. Closes #180.
+  the same way. A pip `requirements.txt` stays `lock_unknown`. Closes #180.
 - **`check` gates Bun projects.** `check` failed every Bun project with `lock_unknown`, which
   `--allow-stale-lock` does not waive, because nothing proved a `bun.lock` current. A stable Bun
   1.4.5 or newer now proves it with `bun install --frozen-lockfile --dry-run --ignore-scripts`, run
