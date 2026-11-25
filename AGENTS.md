@@ -190,3 +190,17 @@ Comments explain *why*, not *what*. No decorative section-banner comments
 it into well-named modules instead. Never remove an existing accurate comment —
 migrations, intricate queries, and domain logic carry intent that the code
 alone does not.
+
+## Architecture decisions
+
+Lasting design decisions are recorded in [`adr/`](adr/). Read the ADRs that govern an area before
+changing it. A change that alters a recorded decision adds a new ADR that supersedes the old one,
+rather than editing the old decision.
+
+## Changelog
+
+A pull request with a user-facing change (a feature, a fix users can notice, a behavior or
+breaking change) adds one bullet under `## Unreleased` in `CHANGELOG.md`: a bold one-line
+statement of what users notice, optionally followed by one short sentence naming the config key,
+command or flag. Lead a breaking change with `**Breaking:**`. CI, tooling, tests, refactors and
+dependency bumps get no entry.
