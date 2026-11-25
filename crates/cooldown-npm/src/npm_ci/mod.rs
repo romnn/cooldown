@@ -413,22 +413,32 @@ fn workspace_patterns(package: &Value) -> Option<&Value> {
 /// Whether the `manifest` of a local package declares what its lock entry `recorded` holds, as
 /// npm records it: an absent field as an empty one, and a name `optionalDependencies` declares
 /// left out of `dependencies`.
+///
+/// Both sides drop such a name, since early npm 7 recorded it in both fields.
 fn same_declarations(manifest: &Value, recorded: &Value) -> bool {
-    let field = |package: &Value, name: &str| {
+    let declared = |package: &Value, field: &str| -> Map<String, Value> {
         package
-            .get(name)
+            .get(field)
             .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .filter(|(name, _)| !shadowed(package, field, name))
+            .map(|(name, spec)| (name.clone(), spec.clone()))
+            .collect()
     };
-    let optional = field(manifest, "optionalDependencies");
-    DECLARATION_FIELDS.iter().all(|name| {
-        let mut declared = field(manifest, name);
-        if *name == "dependencies" {
-            declared.retain(|dependency, _| !optional.contains_key(dependency));
-        }
-        declared == field(recorded, name)
-    })
+    DECLARATION_FIELDS
+        .iter()
+        .all(|field| declared(manifest, field) == declared(recorded, field))
+}
+
+/// Whether npm drops `package`'s declaration of `name` in `field`: a name `optionalDependencies`
+/// declares does not count in `dependencies`.
+fn shadowed(package: &Value, field: &str, name: &str) -> bool {
+    field == "dependencies"
+        && package
+            .get("optionalDependencies")
+            .and_then(|optional| optional.get(name))
+            .is_some()
 }
 
 /// The first `overrides` value that names another source than a registry range, rendered as
@@ -456,7 +466,8 @@ fn non_registry_override(overrides: &Value, manifest: &Value) -> Option<String> 
 }
 
 /// The specifier an override's `$name` reference resolves to: the root `manifest`'s first
-/// non-empty declaration of `name`, in the field order npm's `Edge` looks it up in.
+/// non-empty declaration of `name` that npm keeps, in the field order npm's `Edge` looks it up
+/// in.
 fn referenced_spec<'a>(manifest: &'a Value, name: &str) -> Option<&'a str> {
     [
         "devDependencies",
@@ -465,6 +476,7 @@ fn referenced_spec<'a>(manifest: &'a Value, name: &str) -> Option<&'a str> {
         "peerDependencies",
     ]
     .iter()
+    .filter(|field| !shadowed(manifest, field, name))
     .find_map(|field| {
         manifest
             .get(field)?

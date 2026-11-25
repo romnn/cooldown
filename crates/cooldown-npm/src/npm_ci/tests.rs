@@ -288,6 +288,23 @@ fn declarations_npm_does_not_compare_leave_the_lock_unproven() -> eyre::Result<(
     Ok(())
 }
 
+/// A lock early npm 7 wrote, recording an optional dependency in `dependencies` as well, matches
+/// the manifest that declares it optional alone.
+#[test]
+fn an_optional_dependency_recorded_twice_matches_the_lock() -> eyre::Result<()> {
+    let project = temp_project(&[(
+        "package.json",
+        json!({ "name": "app", "optionalDependencies": { "ms": "2.1.3" } }),
+    )])?;
+    let lock = json!({ "": {
+        "name": "app",
+        "dependencies": { "ms": "2.1.3" },
+        "optionalDependencies": { "ms": "2.1.3" }
+    } });
+    assert_eq!(unproven_by_npm(&project.root, &packages(lock)?), None);
+    Ok(())
+}
+
 /// An empty `workspaces` list, which npm does not record, matches the lock, while the object form
 /// is compared as written.
 #[test]
@@ -388,6 +405,18 @@ fn a_reference_override_qualifies_by_the_declaration_it_names() {
     assert_eq!(override_of("$debug").as_deref(), Some("$debug"));
     // A name the root does not declare
     assert_eq!(override_of("$absent").as_deref(), Some("$absent"));
+
+    // npm drops a `dependencies` entry `optionalDependencies` also declares, so an empty optional
+    // declaration leads on to the peer's tarball rather than back to the range.
+    let shadowed = json!({
+        "dependencies": { "ms": "^2.1.0" },
+        "optionalDependencies": { "ms": "" },
+        "peerDependencies": { "ms": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz" }
+    });
+    assert_eq!(
+        non_registry_override(&json!({ "x": "$ms" }), &shadowed).as_deref(),
+        Some("$ms")
+    );
 
     // A reference to a tarball declaration
     let tarball =
