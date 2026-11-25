@@ -17,6 +17,7 @@ pub mod lock;
 mod manifest;
 mod native;
 pub mod nodecmd;
+mod npm_ci;
 mod npmrc;
 mod patches;
 mod peers;

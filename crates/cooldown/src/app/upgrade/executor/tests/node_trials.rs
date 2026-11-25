@@ -250,6 +250,8 @@ struct FakeNode {
     backstop_saw: Mutex<Option<BackstopView>>,
     /// The lock bytes each apply found.
     apply_saw_lock: Mutex<Vec<Vec<u8>>>,
+    /// Whether the lock probe fails once an apply ran, as npm does offline with a cold cache.
+    probe_fails_after_apply: bool,
 }
 
 /// The project a native backstop judged, and the native list it held.
@@ -283,6 +285,7 @@ impl FakeNode {
             events: Mutex::new(Vec::new()),
             backstop_saw: Mutex::new(None),
             apply_saw_lock: Mutex::new(Vec::new()),
+            probe_fails_after_apply: false,
         }
     }
 
@@ -544,6 +547,13 @@ impl ToolRead for FakeNode {
         &self,
         project: &Project,
     ) -> cooldown_core::Result<LockVerifyReport> {
+        if self.probe_fails_after_apply && self.events().contains(&"apply") {
+            return Err(CoreError::Tool {
+                tool: "fakenode".to_string(),
+                termination: ToolTermination::ExitCode(1),
+                stderr: "npm error code ENOTCACHED".to_string(),
+            });
+        }
         let required = self
             .native
             .as_ref()
@@ -1142,6 +1152,32 @@ async fn held_major_lands_its_current_line_target_beside_the_held_row() -> eyre:
             .all(|trial| trial.iter().any(|target| target == "safe@1.1.0")),
         "{trials:?}"
     );
+    Ok(())
+}
+
+/// A lock probe that fails after a successful apply is reported as the run's error, and the
+/// applied lock stays on disk rather than being rolled back as if the apply had failed.
+#[tokio::test]
+async fn a_lock_probe_failure_after_an_apply_is_reported() -> eyre::Result<()> {
+    let mut fake = FakeNode::new(TargetFallback::CurrentLine, Script::default())
+        .with_releases("safe", &[("1.0.0", false), ("1.1.0", false)]);
+    fake.probe_fails_after_apply = true;
+    let fixture = fixture(fake, &[("safe", "1.0.0")])?;
+
+    let outcome = fixture.workspace.upgrade(&RunOpts::default()).await;
+
+    // The probe's failure fails the run with npm's own error.
+    assert_ne!(outcome.exit, Exit::Ok);
+    assert!(
+        outcome
+            .errors
+            .iter()
+            .any(|error| error.message.contains("ENOTCACHED")),
+        "{:?}",
+        outcome.errors
+    );
+    // The apply's lock is kept.
+    assert_eq!(locked(&fixture, "safe")?.as_deref(), Some("1.1.0"));
     Ok(())
 }
 

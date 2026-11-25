@@ -128,6 +128,13 @@ pub fn range_match(spec: &str, target: &str) -> RangeMatch {
     }
 }
 
+/// Whether `spec` is a version range whose every `||` branch this module can represent, which no
+/// protocol, URL, path, or dist-tag is.
+pub(crate) fn is_range(spec: &str) -> bool {
+    spec.split("||")
+        .all(|branch| npm_requirement(branch).is_some())
+}
+
 /// Whether one `||`-free branch admits `target`, or [`None`] when the branch is not representable
 /// (hyphen ranges, protocols, an empty branch — npm's "match anything" spelling).
 fn branch_admits(branch: &str, target: &Version) -> Option<bool> {

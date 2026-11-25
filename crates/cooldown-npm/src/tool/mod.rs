@@ -135,8 +135,8 @@ fn newest_versions(entries: impl IntoIterator<Item = NameVersion>) -> HashMap<St
 }
 
 /// The root manifest's declared names, the direct set of a lock without per-member attribution
-/// (npm v1, an unsupported `bun.lock`, or a yarn classic lock whose workspace members cannot all
-/// be discovered).
+/// (an unsupported `bun.lock`, or a yarn classic lock whose workspace members cannot all be
+/// discovered).
 struct ManifestDirect<'a> {
     /// Every name the root manifest declares.
     names: HashSet<String>,
@@ -235,7 +235,6 @@ fn pnpm_location_filter(path: &str) -> String {
 /// The guarantee needs per-member resolution evidence: pnpm's importers, npm's v2/v3 install tree,
 /// a supported `bun.lock`'s package keys, or a yarn classic lock's selector keys read through its
 /// workspace manifests.
-/// An npm v1 lock records none, so this guard protects none of its exact pins.
 ///
 /// [`native_policy`]: ToolRead::native_policy
 pub struct NpmTool<L> {
@@ -302,11 +301,7 @@ impl<L: NodeLock> NpmTool<L> {
         if let Some(cached) = cache.get(root) {
             return cached.clone();
         }
-        let args: Vec<String> = ["config", "list", "--json"]
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        let queried = self.cmd.stdout(root, &args).await.ok();
+        let queried = self.probe_effective_config(root).await;
         cache.insert(root.to_owned(), queried.clone());
         queried
     }
@@ -314,12 +309,34 @@ impl<L: NodeLock> NpmTool<L> {
     /// [`Self::effective_config`] for a speculative probe, which reads the manager afresh and
     /// records nothing: the routing the writer proves origins by is read when the writer needs it,
     /// as without the probe, so neither a failed nor an outdated probe can stand in for it.
+    ///
+    /// npm runs with the settings that keep its cache and logs out of the project, as the lock
+    /// probe does, so a project `.npmrc` cannot make the query write there.
+    /// They leave the registry routing the listing reports alone.
     async fn probe_effective_config(&self, root: &Utf8Path) -> Option<String> {
-        let args: Vec<String> = ["config", "list", "--json"]
-            .iter()
-            .map(ToString::to_string)
-            .collect();
+        let args = ["config", "list", "--json"];
+        if L::ID == crate::lock::Npm::ID {
+            let scratch = self.npm_scratch().ok()?;
+            let npm =
+                crate::npm_ci::Isolated::new(&self.cmd, root, &scratch, self.registry.offline());
+            let out = npm.run(&args).await.ok()?;
+            return out
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        let args: Vec<String> = args.iter().map(ToString::to_string).collect();
         self.cmd.stdout(root, &args).await.ok()
+    }
+
+    /// The directory under cooldown's cache that npm keeps its cache and logs in.
+    fn npm_scratch(&self) -> Result<Utf8PathBuf> {
+        Utf8PathBuf::from_path_buf(self.registry.cache_dir().join("npm-verify")).map_err(|path| {
+            CoreError::PathEncoding(format!(
+                "cache directory is not valid UTF-8: {}",
+                path.display()
+            ))
+        })
     }
 
     /// Enables package-document revalidation for version-adopting runs, so the mutable `latest`
@@ -906,6 +923,15 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
     }
 
     async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport> {
+        if L::ID == crate::lock::Npm::ID {
+            return crate::npm_ci::lock_current(
+                &self.cmd,
+                &project.root,
+                &self.npm_scratch()?,
+                self.registry.offline(),
+            )
+            .await;
+        }
         let Some(args) = L::verify_current_args() else {
             return Ok(verify_current_unknown(L::LOCKFILE));
         };
@@ -6159,224 +6185,6 @@ mod tests {
         Ok(())
     }
 
-    /// One dependency row as the alias-ownership tests compare it.
-    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-    struct OwnershipRow {
-        name: String,
-        version: String,
-        direct: bool,
-        declared_bound: Option<String>,
-        members: Vec<String>,
-        pinned: bool,
-    }
-
-    /// The rows of a lone root project's graph and the `name@version` of its direct scope.
-    struct Ownership {
-        graph: Vec<OwnershipRow>,
-        direct: Vec<String>,
-    }
-
-    /// Reads [`Ownership`] from a root project with `manifest` and `package-lock.json` `lock`.
-    async fn npm_ownership(manifest: &str, lock: &str) -> eyre::Result<Ownership> {
-        let dir = tempfile::tempdir()?;
-        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
-            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
-        std::fs::write(root.join("package.json"), manifest)?;
-        std::fs::write(root.join("package-lock.json"), lock)?;
-        let project = Project {
-            root: root.clone(),
-            kind: Npm::ID,
-            manifest: root.join("package.json"),
-            exclude_newer: None,
-            exclude_newer_package: std::collections::BTreeMap::new(),
-            generated_members: cooldown_core::GeneratedMembers::undeclared(),
-        };
-        let mut graph: Vec<OwnershipRow> = tool()
-            .dependencies(&project, DepScope::Graph)
-            .await?
-            .into_iter()
-            .map(|dep| OwnershipRow {
-                name: dep.package.name,
-                version: dep.current.as_str().to_string(),
-                direct: dep.direct,
-                declared_bound: dep.declared_bound,
-                members: dep.members.into_iter().map(|member| member.path).collect(),
-                pinned: dep.pinned,
-            })
-            .collect();
-        graph.sort();
-        let mut direct: Vec<String> = tool()
-            .dependencies(&project, DepScope::Direct)
-            .await?
-            .iter()
-            .map(|dep| format!("{}@{}", dep.package.name, dep.current.as_str()))
-            .collect();
-        direct.sort();
-        Ok(Ownership { graph, direct })
-    }
-
-    /// One root dependency of a v1 fixture: the `version` its lock entry records and the
-    /// specifier its manifest declares.
-    struct V1Entry<'a> {
-        name: &'a str,
-        locked: &'a str,
-        declared: &'a str,
-    }
-
-    /// The manifest and `package-lock.json` (v1) of a root project.
-    struct V1Project {
-        manifest: String,
-        lock: String,
-    }
-
-    /// A root project declaring each of `entries` and locking it in a v1 `dependencies` tree.
-    fn npm_v1_project(entries: &[V1Entry<'_>]) -> V1Project {
-        let manifest_entries: Vec<String> = entries
-            .iter()
-            .map(|V1Entry { name, declared, .. }| format!(r#""{name}": "{declared}""#))
-            .collect();
-        let lock_entries: Vec<String> = entries
-            .iter()
-            .map(|V1Entry { name, locked, .. }| format!(r#""{name}": {{ "version": "{locked}" }}"#))
-            .collect();
-        V1Project {
-            manifest: indoc::formatdoc! {r#"
-                {{ "name": "root", "dependencies": {{ {} }} }}
-            "#, manifest_entries.join(", ")},
-            lock: indoc::formatdoc! {r#"
-                {{ "name": "root", "lockfileVersion": 1, "dependencies": {{ {} }} }}
-            "#, lock_entries.join(", ")},
-        }
-    }
-
-    /// A v1 fixture entry whose manifest declares the same `npm:` or protocol reference its lock
-    /// records.
-    fn v1_verbatim<'a>(name: &'a str, reference: &'a str) -> V1Entry<'a> {
-        V1Entry {
-            name,
-            locked: reference,
-            declared: reference,
-        }
-    }
-
-    /// A v1 alias's target is no copy of the root's own declaration of that name.
-    /// v1 attributes directness by name from the root manifest, so the target must be held out of
-    /// it explicitly: it stays transitive with no bound, while the genuine copy keeps the
-    /// declaration and its bound.
-    /// v1 records no exact-pin evidence, so neither row is pinned even under an exact range.
-    #[tokio::test]
-    async fn a_v1_alias_only_version_gets_no_editable_members() -> eyre::Result<()> {
-        // An exact pin has no explicit upper bound, so only the range is a declared bound.
-        for (other, bound) in [(">=1.0.0 <1.5.0", Some(">=1.0.0 <1.5.0")), ("1.0.0", None)] {
-            let V1Project { manifest, lock } = npm_v1_project(&[
-                v1_verbatim("foo", "npm:other@2.0.0"),
-                V1Entry {
-                    name: "other",
-                    locked: "1.0.0",
-                    declared: other,
-                },
-            ]);
-
-            let Ownership { graph, direct } = npm_ownership(&manifest, &lock).await?;
-
-            assert_eq!(
-                graph,
-                [
-                    OwnershipRow {
-                        name: "other".to_string(),
-                        version: "1.0.0".to_string(),
-                        direct: true,
-                        declared_bound: bound.map(str::to_string),
-                        members: Vec::new(),
-                        pinned: false,
-                    },
-                    OwnershipRow {
-                        name: "other".to_string(),
-                        version: "2.0.0".to_string(),
-                        direct: false,
-                        declared_bound: None,
-                        members: Vec::new(),
-                        pinned: false,
-                    },
-                ],
-                "{other}"
-            );
-            assert_eq!(direct, ["other@1.0.0"], "{other}");
-        }
-        Ok(())
-    }
-
-    /// A genuine registry copy of the alias target's release gives that release back its ordinary
-    /// claim on the root's declaration, whichever side of the alias the lock lists it on.
-    /// A local source of the name gives no such claim, and an alias of its own name is no foreign
-    /// alias at all.
-    #[tokio::test]
-    async fn a_v1_registry_copy_restores_an_alias_targets_classification() -> eyre::Result<()> {
-        // Alias keys sort before and after `other`, so both entry orders are covered.
-        for alias in ["foo", "zzz"] {
-            let V1Project { manifest, lock } = npm_v1_project(&[
-                v1_verbatim(alias, "npm:other@2.0.0"),
-                V1Entry {
-                    name: "other",
-                    locked: "2.0.0",
-                    declared: ">=2.0.0 <3.0.0",
-                },
-            ]);
-
-            let Ownership { graph, direct } = npm_ownership(&manifest, &lock).await?;
-
-            assert_eq!(
-                graph,
-                [OwnershipRow {
-                    name: "other".to_string(),
-                    version: "2.0.0".to_string(),
-                    direct: true,
-                    declared_bound: Some(">=2.0.0 <3.0.0".to_string()),
-                    members: Vec::new(),
-                    pinned: false,
-                }],
-                "{alias}"
-            );
-            assert_eq!(direct, ["other@2.0.0"], "{alias}");
-        }
-
-        // A local source yields no row of its own and leaves the alias target unowned.
-        let V1Project { manifest, lock } = npm_v1_project(&[
-            v1_verbatim("foo", "npm:other@2.0.0"),
-            v1_verbatim("other", "file:packages/other"),
-        ]);
-        let Ownership { graph, direct } = npm_ownership(&manifest, &lock).await?;
-        assert_eq!(
-            graph,
-            [OwnershipRow {
-                name: "other".to_string(),
-                version: "2.0.0".to_string(),
-                direct: false,
-                declared_bound: None,
-                members: Vec::new(),
-                pinned: false,
-            }]
-        );
-        assert_eq!(direct, [] as [String; 0]);
-
-        // An alias of its own name is the ordinary direct dependency.
-        let V1Project { manifest, lock } = npm_v1_project(&[v1_verbatim("foo", "npm:foo@2.0.0")]);
-        let Ownership { graph, direct } = npm_ownership(&manifest, &lock).await?;
-        assert_eq!(
-            graph,
-            [OwnershipRow {
-                name: "foo".to_string(),
-                version: "2.0.0".to_string(),
-                direct: true,
-                declared_bound: None,
-                members: Vec::new(),
-                pinned: false,
-            }]
-        );
-        assert_eq!(direct, ["foo@2.0.0"]);
-        Ok(())
-    }
-
     #[test]
     fn locked_versions_keeps_the_newest_copy_of_a_duplicated_name() {
         let lock = "lockfileVersion: '9.0'\n\npackages:\n\n  foo@1.0.0:\n    resolution: {integrity: sha512-a}\n\n  foo@2.0.0:\n    resolution: {integrity: sha512-b}\n\n  bar@3.1.0:\n    resolution: {integrity: sha512-c}\n";
@@ -9118,45 +8926,6 @@ packages:
         assert!(graph.iter().any(|d| d.package.name == "ms" && !d.direct));
     }
 
-    #[tokio::test]
-    async fn npm_v1_lock_falls_back_to_root_manifest_directness() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 path");
-        std::fs::write(
-            root.join("package.json"),
-            r#"{ "dependencies": { "lodash": "4.17.15" } }"#,
-        )
-        .expect("write manifest");
-        let lock_json = indoc! {r#"
-            {
-                "lockfileVersion": 1,
-                "dependencies": {
-                    "lodash": { "version": "4.17.15" },
-                    "ms": { "version": "2.1.3" }
-                }
-            }"#};
-        std::fs::write(root.join("package-lock.json"), lock_json).expect("write lock");
-        let project = Project {
-            root: root.clone(),
-            kind: Npm::ID,
-            manifest: root.join("package.json"),
-            exclude_newer: None,
-            exclude_newer_package: std::collections::BTreeMap::new(),
-            generated_members: cooldown_core::GeneratedMembers::undeclared(),
-        };
-
-        let direct = tool()
-            .dependencies(&project, DepScope::Direct)
-            .await
-            .expect("direct deps");
-        assert_eq!(direct.len(), 1);
-        assert_eq!(direct[0].package.name, "lodash");
-        assert!(
-            direct[0].members.is_empty(),
-            "v1 locks have no member attribution"
-        );
-    }
-
     /// Advisory identity needs the lock entry's own `resolved` URL to name the public registry:
     /// a private-registry URL or a missing record grants nothing. Only the decline direction is
     /// asserted here — it holds whatever npm configuration the host machine carries, since
@@ -9889,37 +9658,22 @@ packages:
         Ok(())
     }
 
-    /// A lock with a genuine `other` and an alias `foo` installing another release of `other`,
-    /// as a v1 `dependencies` tree or a v3 install tree.
-    fn genuine_and_alias_lock(lockfile_version: u8, genuine: &str, aliased: &str) -> String {
-        if lockfile_version == 1 {
-            indoc::formatdoc! {r#"
-                {{
-                  "name": "root",
-                  "lockfileVersion": 1,
-                  "dependencies": {{
-                    "foo": {{ "version": "npm:other@{aliased}" }},
-                    "other": {{ "version": "{genuine}" }}
-                  }}
-                }}
-            "#}
-        } else {
-            indoc::formatdoc! {r#"
-                {{
-                  "name": "root",
-                  "lockfileVersion": {lockfile_version},
-                  "packages": {{
-                    "": {{ "name": "root" }},
-                    "node_modules/foo": {{ "name": "other", "version": "{aliased}" }},
-                    "node_modules/other": {{ "version": "{genuine}" }}
-                  }}
-                }}
-            "#}
-        }
+    /// A lock with a genuine `other` and an alias `foo` installing another release of `other`.
+    fn genuine_and_alias_lock(genuine: &str, aliased: &str) -> String {
+        indoc::formatdoc! {r#"
+            {{
+              "name": "root",
+              "lockfileVersion": 3,
+              "packages": {{
+                "": {{ "name": "root" }},
+                "node_modules/foo": {{ "name": "other", "version": "{aliased}" }},
+                "node_modules/other": {{ "version": "{genuine}" }}
+              }}
+            }}
+        "#}
     }
 
-    /// A change without declaring members, every change of a v1 lock, is judged on the name's
-    /// newest copy, which must leave out a release only an alias installs.
+    /// A change without declaring members is judged on the name's newest copy, which must leave out a release only an alias installs.
     /// Otherwise an alias at the target proves a move the genuine copy never made, and a newer
     /// alias hides a genuine copy that did land, rolling a successful move back.
     #[test]
@@ -9937,22 +9691,20 @@ packages:
         };
         let mut planned = change("other", "1.0.0", "1.1.0");
         planned.direct = false;
-        for lockfile_version in [1, 3] {
-            let reached = |genuine: &str, aliased: &str| -> eyre::Result<bool> {
-                std::fs::write(
-                    root.join("package-lock.json"),
-                    genuine_and_alias_lock(lockfile_version, genuine, aliased),
-                )?;
-                Ok(exact_target_reached::<Npm>(&project, &planned, None)?)
-            };
+        let reached = |genuine: &str, aliased: &str| -> eyre::Result<bool> {
+            std::fs::write(
+                root.join("package-lock.json"),
+                genuine_and_alias_lock(genuine, aliased),
+            )?;
+            Ok(exact_target_reached::<Npm>(&project, &planned, None)?)
+        };
 
-            // The genuine copy stayed behind while the alias sits at the target.
-            assert!(!reached("1.0.0", "1.1.0")?, "v{lockfile_version}");
-            // The genuine copy landed beneath a newer alias.
-            assert!(reached("1.1.0", "1.2.0")?, "v{lockfile_version}");
-            // A genuine copy of the alias's release makes that release ordinary evidence again.
-            assert!(reached("1.1.0", "1.1.0")?, "v{lockfile_version}");
-        }
+        // The genuine copy stayed behind while the alias sits at the target.
+        assert!(!reached("1.0.0", "1.1.0")?);
+        // The genuine copy landed beneath a newer alias.
+        assert!(reached("1.1.0", "1.2.0")?);
+        // A genuine copy of the alias's release makes that release ordinary evidence again.
+        assert!(reached("1.1.0", "1.1.0")?);
         Ok(())
     }
 
@@ -9964,69 +9716,64 @@ packages:
     #[tokio::test]
     async fn an_alias_only_release_never_lands_through_the_root_declaration() -> eyre::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
-        for lockfile_version in [1, 3] {
-            let dir = tempfile::tempdir()?;
-            let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
-                .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
-            let manifest = indoc! {r#"
-                { "name": "root", "dependencies": { "foo": "npm:other@^1.0.0", "other": "1.0.0" } }
-            "#};
-            let lock = genuine_and_alias_lock(lockfile_version, "1.0.0", "1.2.0");
-            std::fs::write(root.join("package.json"), manifest)?;
-            std::fs::write(root.join("package-lock.json"), &lock)?;
-            // Every invocation is logged, and an install fails, so a landing attempt is visible.
-            let script = root.join("fake-npm.sh");
-            std::fs::write(
-                &script,
-                indoc! {r#"
-                    #!/bin/sh
-                    echo "$*" >> legs.log
-                    echo "unexpected args: $*" >&2; exit 1
-                "#},
-            )?;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
-            let mut tool = tool();
-            tool.cmd = crate::nodecmd::NodeCmd::with_bin(script.as_str());
-            let mut planned = change("other", "1.2.0", "1.1.0");
-            planned.direct = false;
-            planned.downgrade = true;
-            let plan = Plan {
-                changes: vec![planned],
-                rewrite: RewriteMode::Auto,
-                ..Plan::default()
-            };
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let manifest = indoc! {r#"
+            { "name": "root", "dependencies": { "foo": "npm:other@^1.0.0", "other": "1.0.0" } }
+        "#};
+        let lock = genuine_and_alias_lock("1.0.0", "1.2.0");
+        std::fs::write(root.join("package.json"), manifest)?;
+        std::fs::write(root.join("package-lock.json"), &lock)?;
+        // Every invocation is logged, and an install fails, so a landing attempt is visible.
+        let script = root.join("fake-npm.sh");
+        std::fs::write(
+            &script,
+            indoc! {r#"
+                #!/bin/sh
+                echo "$*" >> legs.log
+                echo "unexpected args: $*" >&2; exit 1
+            "#},
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let mut tool = tool();
+        tool.cmd = crate::nodecmd::NodeCmd::with_bin(script.as_str());
+        let mut planned = change("other", "1.2.0", "1.1.0");
+        planned.direct = false;
+        planned.downgrade = true;
+        let plan = Plan {
+            changes: vec![planned],
+            rewrite: RewriteMode::Auto,
+            ..Plan::default()
+        };
 
-            let mutation = PreparedMutation::prepare(&tool, &npm_project(&root), &plan).await?;
-            let report = tool.apply(&mutation).await?;
+        let mutation = PreparedMutation::prepare(&tool, &npm_project(&root), &plan).await?;
+        let report = tool.apply(&mutation).await?;
 
-            // The alias's release is skipped with the reason naming the alias.
-            assert!(report.applied.is_empty(), "v{lockfile_version}: {report:?}");
-            let [skip] = report.skipped.as_slice() else {
-                eyre::bail!("v{lockfile_version}: one skip: {:?}", report.skipped)
-            };
-            assert_eq!(skip.reason, SkipReason::NotEligible, "v{lockfile_version}");
-            assert_eq!(
-                skip.detail.as_deref(),
-                Some(
-                    "other@1.2.0 is installed only through an npm alias, so no declaration of \
-                     other owns it"
-                ),
-                "v{lockfile_version}"
-            );
-            // Neither the root's exact pin nor the lock was touched, and npm never ran an install.
-            assert_eq!(
-                std::fs::read_to_string(root.join("package.json"))?,
-                manifest,
-                "v{lockfile_version}"
-            );
-            assert_eq!(
-                std::fs::read_to_string(root.join("package-lock.json"))?,
-                lock,
-                "v{lockfile_version}"
-            );
-            let legs = std::fs::read_to_string(root.join("legs.log")).unwrap_or_default();
-            assert!(!legs.contains("install"), "v{lockfile_version}: {legs}");
-        }
+        // The alias's release is skipped with the reason naming the alias.
+        assert!(report.applied.is_empty(), "{report:?}");
+        let [skip] = report.skipped.as_slice() else {
+            eyre::bail!("one skip: {:?}", report.skipped)
+        };
+        assert_eq!(skip.reason, SkipReason::NotEligible);
+        assert_eq!(
+            skip.detail.as_deref(),
+            Some(
+                "other@1.2.0 is installed only through an npm alias, so no declaration of \
+                 other owns it"
+            )
+        );
+        // Neither the root's exact pin nor the lock was touched, and npm never ran an install.
+        assert_eq!(
+            std::fs::read_to_string(root.join("package.json"))?,
+            manifest
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("package-lock.json"))?,
+            lock
+        );
+        let legs = std::fs::read_to_string(root.join("legs.log")).unwrap_or_default();
+        assert!(!legs.contains("install"), "{legs}");
         Ok(())
     }
 

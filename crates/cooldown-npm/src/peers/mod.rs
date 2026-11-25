@@ -141,9 +141,8 @@ pub(crate) struct PeerPartition {
 ///   is instance-exact: a declaring member's own nearest-ancestor lookup identifies its direct
 ///   copy, whatever its source ([`direct_dependent_members`]), so a name resolved at several
 ///   versions still gates through the proven-direct instance — and only through it.
-///   Without a physical layout (an npm
-///   v1 lock) the split stays ambiguous and never gates (pnpm's attribution is version-exact and
-///   unaffected);
+///   Without a physical layout the split stays ambiguous and never gates (pnpm's attribution
+///   is version-exact and unaffected);
 /// - on a manager with a whole-graph resolve (pnpm), the dependent must not itself be moving in
 ///   the dependent's own importing context — its target may lift the peer range, and the joint
 ///   resolve settles the pair's peer contexts in one pass.
@@ -1179,7 +1178,7 @@ fn dependent_holds_context(
 ///   The candidates are every member declaring the name ([`declaring_members`]), not only the
 ///   copy's editable owners: a dependent installed from git, a tarball, or a linked workspace
 ///   package still binds its peers wherever a member's lookup reaches it;
-/// - without one (pnpm is version-exact and unaffected; an npm v1 lock records no layout), an
+/// - without one (pnpm is version-exact and unaffected), an
 ///   attribution that is not version-exact cannot single out the direct instance of a name
 ///   resolved at several versions from a nested transitive copy — fail open.
 ///

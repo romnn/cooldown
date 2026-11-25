@@ -492,39 +492,25 @@ fn logging_npm(root: &Utf8Path) -> eyre::Result<NpmTool<Npm>> {
 /// A transitive candidate has no member, so the manifest fallback would rewrite the root's
 /// declaration of the same name, which binds another copy: it is skipped as not eligible before
 /// any manifest is inspected or npm runs.
-/// A direct candidate without members, which a v1 lock plans, still lands through the root.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_transitive_copy_never_lands_through_the_root_declaration() -> eyre::Result<()> {
     let manifest = indoc! {r#"
         { "name": "root", "dependencies": { "other": "^1.0.0", "unrelated": "^1.0.0" } }
     "#};
-    let v1_lock = indoc! {r#"
-        { "name": "root", "lockfileVersion": 1, "dependencies": { "other": { "version": "1.0.0" } } }
-    "#};
-    for lockfile_version in [1, 2, 3] {
-        let lock = if lockfile_version == 1 {
-            v1_lock.to_string()
-        } else {
-            nested_duplicate_lock(lockfile_version, "^1.0.0")
-        };
+    for lockfile_version in [2, 3] {
+        let lock = nested_duplicate_lock(lockfile_version, "^1.0.0");
         let TempProject { _guard, project } =
             npm_project(&[("package.json", manifest), ("package-lock.json", &lock)])?;
         let tool = logging_npm(&project.root)?;
-        let direct = lockfile_version == 1;
-        let (from, to) = if direct {
-            ("1.0.0", "1.0.1")
-        } else {
-            ("2.0.0", "2.0.1")
-        };
         let plan = Plan {
             changes: vec![Change {
                 package: PackageId::new(Npm::ID, "other", Some(NPM.to_string())),
-                from: Version::new(from),
-                to: Version::new(to),
+                from: Version::new("2.0.0"),
+                to: Version::new("2.0.1"),
                 kind: UpdateKind::Patch,
                 downgrade: false,
-                direct,
+                direct: false,
                 members: Vec::new(),
             }],
             rewrite: RewriteMode::Auto,
@@ -539,22 +525,16 @@ async fn a_transitive_copy_never_lands_through_the_root_declaration() -> eyre::R
         let [skip] = report.skipped.as_slice() else {
             eyre::bail!("v{lockfile_version}: one skip: {:?}", report.skipped)
         };
-        if direct {
-            // The legacy candidate reached npm, which left the lock where it was.
-            assert!(legs.contains("install other@1.0.1"), "{legs}");
-            assert_eq!(skip.reason, SkipReason::GraphCeilingHeld);
-        } else {
-            assert_eq!(skip.reason, SkipReason::NotEligible, "v{lockfile_version}");
-            assert_eq!(
-                skip.detail.as_deref(),
-                Some(
-                    "other@2.0.0 is a transitive copy that no member's declaration binds, so no \
-                     manifest edit may move it"
-                ),
-                "v{lockfile_version}"
-            );
-            assert_eq!(legs, "", "v{lockfile_version}: npm never ran");
-        }
+        assert_eq!(skip.reason, SkipReason::NotEligible, "v{lockfile_version}");
+        assert_eq!(
+            skip.detail.as_deref(),
+            Some(
+                "other@2.0.0 is a transitive copy that no member's declaration binds, so no \
+                 manifest edit may move it"
+            ),
+            "v{lockfile_version}"
+        );
+        assert_eq!(legs, "", "v{lockfile_version}: npm never ran");
         assert_eq!(
             std::fs::read_to_string(project.root.join("package.json"))?,
             manifest,
