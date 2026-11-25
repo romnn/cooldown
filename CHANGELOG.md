@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **`check` gates Poetry projects.** `check` failed every Poetry project with `lock_unknown`, which
+  `--allow-stale-lock` does not waive, because nothing proved a `poetry.lock` current. A stable
+  Poetry 2.3 or newer now proves it with `poetry check --lock --no-plugins`, run offline with
+  Poetry's cache outside the project, which stays byte for byte as it was: Poetry's warnings do not
+  fail it, Poetry's refusal of a lock whose content hash no longer matches `pyproject.toml`, or of
+  a missing lock, as its sole error beside nothing but warnings, is `stale_lock`, which
+  `--allow-stale-lock` waives as before, and any other Poetry failure is `tool_failed`. Poetry's
+  content hash covers the declarations, not the resolution, so a URL, git, or path origin, a
+  package source other than PyPI, `project.dynamic`, a project plugin, an unsupported
+  `lock-version`, a lock that lists no packages while `pyproject.toml` declares some, a lock whose
+  generator did not hash `[dependency-groups]` as newer Poetry compares them, a manifest or lock
+  changing during the check, a missing `pyproject.toml` at the project root, and an older or
+  prerelease Poetry leave the lock `lock_unknown` instead, and a `poetry.lock` that is not TOML or
+  lacks its `package` array is `lockfile_unreadable` rather than read as empty. Packages declared
+  in a Poetry group, the legacy development table, an extra, or a PEP 735 dependency group are now
+  direct dependencies rather than transitive ones, while `upgrade` and `fix`, whose `poetry add`
+  writes to the main dependencies, hold any package the main dependencies do not declare as
+  `not_eligible` instead of adding it there. `upgrade` and `fix` verify the lock they wrote
+  the same way, and CI installs Poetry 2.5.1 for the integration tests. A pip `requirements.txt`
+  stays `lock_unknown`. Closes #180.
 - **`check` gates Bun projects.** `check` failed every Bun project with `lock_unknown`, which
   `--allow-stale-lock` does not waive, because nothing proved a `bun.lock` current. A stable Bun
   1.4.5 or newer now proves it with `bun install --frozen-lockfile --dry-run --ignore-scripts`, run

@@ -448,6 +448,7 @@ version = "0.0.32"
 dependencies = [
  "camino",
  "cooldown-core",
+ "dunce",
  "indoc",
  "process-wrap",
  "serde_json",
@@ -616,7 +617,6 @@ dependencies = [
  "cooldown-registry",
  "cooldown-uv",
  "indoc",
- "serde",
  "tempfile",
  "tokio",
  "toml",

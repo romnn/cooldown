@@ -6,17 +6,17 @@
 
 use crate::lock;
 use async_trait::async_trait;
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_adapter_util::{
     Driver, RegistryVersionClassifier, build_registry_releases, skipped_on_apply_error,
     verify_current_unknown,
 };
 use cooldown_core::{
-    ApplyReport, CandidateScope, Capabilities, Change, DepScope, Dependency, FetchContext,
-    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
-    Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher,
-    ReleaseOrder, ReleaseQuality, ResolveInputs, Result, SkipReason, Skipped, ToolId, ToolRead,
-    ToolWrite, UpdateKind, VerifyReport, Version,
+    ApplyReport, CandidateScope, Capabilities, Change, CoreError, DepScope, Dependency,
+    FetchContext, LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan,
+    PreparedMutation, Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release,
+    ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs, Result, SkipReason, Skipped,
+    ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use cooldown_uv::PyPi;
@@ -40,7 +40,11 @@ pub trait PyLayout: Send + Sync + 'static {
     const INSTALLS: bool;
 
     /// Parses the lock + manifest into the resolved [`ResolvedDep`] set.
-    fn parse(lock: &str, manifest: &str) -> Vec<ResolvedDep>;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockUnreadable`] for a lock the layout cannot read.
+    fn parse(lock: &str, manifest: &str) -> Result<Vec<ResolvedDep>>;
 
     /// The driver args that re-pin `name` to `version`.
     fn upgrade_args(name: &str, version: &str) -> Vec<String>;
@@ -87,8 +91,8 @@ impl PyLayout for Pip {
     const BIN: &'static str = "pip";
     const INSTALLS: bool = false;
 
-    fn parse(lock: &str, _manifest: &str) -> Vec<ResolvedDep> {
-        lock::parse_requirements(lock)
+    fn parse(lock: &str, _manifest: &str) -> Result<Vec<ResolvedDep>> {
+        Ok(lock::parse_requirements(lock)
             .into_iter()
             .map(|pin| ResolvedDep {
                 name: pin.name,
@@ -96,7 +100,7 @@ impl PyLayout for Pip {
                 direct: true,
                 pypi: pin.pypi,
             })
-            .collect()
+            .collect())
     }
 
     fn upgrade_args(name: &str, version: &str) -> Vec<String> {
@@ -123,9 +127,9 @@ impl PyLayout for Poetry {
     const BIN: &'static str = "poetry";
     const INSTALLS: bool = true;
 
-    fn parse(lock: &str, manifest: &str) -> Vec<ResolvedDep> {
+    fn parse(lock: &str, manifest: &str) -> Result<Vec<ResolvedDep>> {
         let direct = lock::parse_poetry_direct(manifest);
-        lock::parse_poetry_lock(lock)
+        Ok(lock::parse_poetry_lock(lock)?
             .into_iter()
             .map(|pin| {
                 let is_direct = lock::is_direct(&direct, &pin.name);
@@ -136,7 +140,7 @@ impl PyLayout for Poetry {
                     pypi: pin.pypi,
                 }
             })
-            .collect()
+            .collect())
     }
 
     fn upgrade_args(name: &str, version: &str) -> Vec<String> {
@@ -317,7 +321,7 @@ impl<L: PyLayout> ToolRead for PyTool<L> {
         let manifest = std::fs::read_to_string(&project.manifest).unwrap_or_default();
         let ambient_intact = L::ambient_origin_intact(project);
         let mut deps = Vec::new();
-        for resolved in L::parse(&lock, &manifest) {
+        for resolved in L::parse(&lock, &manifest)? {
             if scope == DepScope::Direct && !resolved.direct {
                 continue;
             }
@@ -370,8 +374,20 @@ impl<L: PyLayout> ToolRead for PyTool<L> {
         Ok(None)
     }
 
-    async fn verify_lock_current(&self, _project: &Project) -> Result<LockVerifyReport> {
-        Ok(verify_current_unknown(L::LOCKFILE))
+    /// Poetry proves its lock with `poetry check --lock`.
+    /// A `requirements.txt` has no native notion of being current, so it stays unknown.
+    async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport> {
+        if L::ID != Poetry::ID {
+            return Ok(verify_current_unknown(L::LOCKFILE));
+        }
+        let scratch = Utf8PathBuf::from_path_buf(self.pypi.cache_dir().join("poetry-verify"))
+            .map_err(|path| {
+                CoreError::PathEncoding(format!(
+                    "cache directory is not valid UTF-8: {}",
+                    path.display()
+                ))
+            })?;
+        crate::poetry_check::lock_current(&self.driver, &project.root, &scratch).await
     }
 }
 
@@ -453,7 +469,21 @@ impl<L: PyLayout> ToolWrite for PyTool<L> {
             return Ok(report);
         }
 
+        // `poetry add` writes to the main dependencies, so a package declared only in a group or
+        // an extra, or not at all, would land there beside the declaration that governs it.
+        let main = lock::parse_poetry_main(&std::fs::read_to_string(&project.manifest)?);
         for change in &plan.changes {
+            if !lock::is_direct(&main, &change.package.name) {
+                report.skipped.push(Skipped {
+                    detail: Some(
+                        "not a main dependency, and `poetry add` would add it to the main \
+                         dependencies"
+                            .to_string(),
+                    ),
+                    ..not_eligible(change)
+                });
+                continue;
+            }
             let args = L::upgrade_args(&change.package.name, change.to.as_str());
             match self.driver.run(&project.root, &args).await {
                 Ok(()) => report.applied.push(change.clone()),
@@ -494,7 +524,6 @@ fn not_eligible(change: &Change) -> Skipped {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use camino::Utf8PathBuf;
     use color_eyre::eyre;
     use indoc::indoc;
 
@@ -770,6 +799,153 @@ mod tests {
         assert!(report.skipped.is_empty());
         let rewritten = std::fs::read_to_string(root.join("requirements.txt"))?;
         assert!(rewritten.contains("requests==2.31.0"));
+        Ok(())
+    }
+
+    /// `poetry add` writes to the main dependencies, so the apply runs it only for a main
+    /// dependency and holds a package declared only in a group as not eligible, without running
+    /// Poetry for it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn poetry_apply_never_adds_a_group_only_package() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let outside = tempfile::tempdir()?;
+        let outside = Utf8PathBuf::from_path_buf(outside.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            root.join("poetry.lock"),
+            indoc! {r#"
+                package = [
+                    { name = "six", version = "1.16.0" },
+                    { name = "pytest", version = "7.4.0" },
+                ]
+            "#},
+        )?;
+        std::fs::write(
+            root.join("pyproject.toml"),
+            indoc! {r#"
+                [project]
+                name = "demo"
+                dependencies = ["six==1.16.0"]
+
+                [tool.poetry.group.test.dependencies]
+                pytest = "7.4.0"
+            "#},
+        )?;
+        let project = Project {
+            root: root.clone(),
+            kind: Poetry::ID,
+            manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        };
+        // A Poetry stand-in that records every invocation outside the project
+        let log = outside.join("invocations.log");
+        let script = pip_config_script(&outside, &format!("echo \"$@\" >> '{log}'"));
+        let cache = tempfile::tempdir()?;
+        let mut tool = PyTool::<Poetry>::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        tool.driver = Driver::from_program(script.as_str());
+        let change = |name: &str, from: &str, to: &str| Change {
+            package: PackageId::new(Poetry::ID, name, Some(PYPI.to_string())),
+            from: Version::new(from),
+            to: Version::new(to),
+            kind: cooldown_core::UpdateKind::Patch,
+            downgrade: false,
+            direct: true,
+            members: Vec::new(),
+        };
+        let plan = Plan {
+            changes: vec![
+                change("pytest", "7.4.0", "7.4.4"),
+                change("six", "1.16.0", "1.17.0"),
+            ],
+            rewrite: cooldown_core::RewriteMode::Auto,
+            ..Plan::default()
+        };
+
+        let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
+        let report = tool.apply(&mutation).await?;
+
+        // The main dependency is added, and the group-only package is held without Poetry
+        let applied: Vec<&str> = report
+            .applied
+            .iter()
+            .map(|change| change.package.name.as_str())
+            .collect();
+        assert_eq!(applied, ["six"]);
+        assert_eq!(report.skipped.len(), 1, "{:?}", report.skipped);
+        let held = &report.skipped[0];
+        assert_eq!(held.change.package.name, "pytest");
+        assert_eq!(held.reason, SkipReason::NotEligible);
+        assert_eq!(std::fs::read_to_string(&log)?, "add six@1.17.0\n");
+        Ok(())
+    }
+
+    /// Every package the manifest declares is direct, whether in a Poetry group, the legacy
+    /// development table, an extra, or a PEP 735 dependency group, while one only the lock holds
+    /// is transitive.
+    #[tokio::test]
+    async fn poetry_reads_every_declared_package_as_direct() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            root.join("poetry.lock"),
+            indoc! {r#"
+                package = [
+                    { name = "six", version = "1.0.0" },
+                    { name = "pytest", version = "1.0.0" },
+                    { name = "black", version = "1.0.0" },
+                    { name = "rich", version = "1.0.0" },
+                    { name = "ruff", version = "1.0.0" },
+                    { name = "urllib3", version = "1.0.0" },
+                ]
+            "#},
+        )?;
+        std::fs::write(
+            root.join("pyproject.toml"),
+            indoc! {r#"
+                [project]
+                name = "demo"
+                dependencies = ["six==1.0.0"]
+
+                [project.optional-dependencies]
+                pretty = ["rich>=1"]
+
+                [dependency-groups]
+                lint = ["ruff", { include-group = "test" }]
+
+                [tool.poetry.group.test.dependencies]
+                pytest = "^1"
+
+                [tool.poetry.dev-dependencies]
+                black = "^1"
+            "#},
+        )?;
+        let project = Project {
+            root: root.clone(),
+            kind: Poetry::ID,
+            manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        };
+        let cache = tempfile::tempdir()?;
+        let tool = PyTool::<Poetry>::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+
+        let direct = tool.dependencies(&project, DepScope::Direct).await?;
+        let mut names: Vec<&str> = direct.iter().map(|dep| dep.package.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["black", "pytest", "rich", "ruff", "six"]);
         Ok(())
     }
 

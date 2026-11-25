@@ -2,7 +2,9 @@
 //! `requirements.txt` (pinned `name==version` lines) and Poetry's `poetry.lock` (a TOML list of
 //! resolved packages), with `pyproject.toml` supplying Poetry's direct-dependency set.
 
+use cooldown_core::CoreError;
 use std::collections::HashSet;
+use toml::{Table, Value};
 
 /// Normalises a distribution name per PEP 503 (lowercase; runs of `_`/`.`/`-` collapse to a single
 /// `-`), so a `pyproject.toml` key matches the name Poetry records in the lock.
@@ -285,69 +287,157 @@ fn parse_requirement_pin(raw: &str) -> Option<RequirementPin<'_>> {
 }
 
 /// Parses the `[[package]]` entries of a `poetry.lock` into resolved [`ResolvedPin`]s.
-#[must_use]
-pub fn parse_poetry_lock(content: &str) -> Vec<ResolvedPin> {
-    #[derive(serde::Deserialize)]
-    struct Lock {
-        #[serde(default)]
-        package: Vec<Package>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Package {
-        name: String,
-        version: String,
-        /// Present exactly when the package did not come from the default PyPI source: a
-        /// `legacy` (custom index), `git`, `directory`, or `url` table.
-        #[serde(default)]
-        source: Option<toml::Value>,
-    }
-    toml::from_str::<Lock>(content)
-        .map(|lock| {
-            lock.package
-                .into_iter()
-                .map(|p| ResolvedPin {
-                    name: p.name,
-                    version: p.version,
-                    pypi: p.source.is_none(),
-                })
-                .collect()
+///
+/// # Errors
+///
+/// Returns [`CoreError::LockUnreadable`] if the lock is not TOML, lacks the `package` array, or
+/// has a package without a name or version.
+pub fn parse_poetry_lock(content: &str) -> Result<Vec<ResolvedPin>, CoreError> {
+    let lock: Table = toml::from_str(content)
+        .map_err(|err| CoreError::LockUnreadable(format!("poetry.lock: {err}")))?;
+    poetry_lock_pins(&lock)
+}
+
+/// Reads the `[[package]]` entries of a parsed `poetry.lock` as resolved [`ResolvedPin`]s.
+///
+/// Poetry writes the `package` array even when it is empty, so a lock without one is refused
+/// rather than read as resolving nothing.
+/// A package records a `source` table exactly when it did not come from the default PyPI source:
+/// a `legacy` (custom index), `git`, `directory`, `file`, or `url` source.
+///
+/// # Errors
+///
+/// Returns [`CoreError::LockUnreadable`] if the lock lacks the `package` array or a package's name
+/// or version.
+pub(crate) fn poetry_lock_pins(lock: &Table) -> Result<Vec<ResolvedPin>, CoreError> {
+    let unreadable = |what: &str| CoreError::LockUnreadable(format!("poetry.lock: {what}"));
+    let packages = lock
+        .get("package")
+        .and_then(Value::as_array)
+        .ok_or_else(|| unreadable("no `package` array"))?;
+    packages
+        .iter()
+        .map(|package| {
+            let field = |key: &str| {
+                package
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| unreadable(&format!("a package has no `{key}` string")))
+            };
+            Ok(ResolvedPin {
+                name: field("name")?.to_string(),
+                version: field("version")?.to_string(),
+                pypi: package.get("source").is_none(),
+            })
         })
+        .collect()
+}
+
+/// Returns the normalised set of distributions a Poetry `pyproject.toml` declares directly: every
+/// name in its Poetry dependency tables (the main, legacy `dev-dependencies`, and every group
+/// table) or its requirement lists (`project.dependencies`, every extra, and every PEP 735 group).
+/// The implicit `python` constraint is excluded.
+#[must_use]
+pub fn parse_poetry_direct(manifest: &str) -> HashSet<String> {
+    toml::from_str::<Table>(manifest)
+        .map(|manifest| poetry_declared(&manifest))
         .unwrap_or_default()
 }
 
-/// Returns the normalised set of distributions a Poetry `pyproject.toml` declares directly, reading
-/// both the classic `[tool.poetry.dependencies]` table and the PEP 621 `[project.dependencies]`
-/// list. The implicit `python` constraint is excluded.
+/// [`parse_poetry_direct`] for a parsed `manifest`.
+pub(crate) fn poetry_declared(manifest: &Table) -> HashSet<String> {
+    declared_names(
+        poetry_dependency_tables(manifest),
+        requirement_lists(manifest),
+    )
+}
+
+/// Returns the normalised set of distributions a Poetry `pyproject.toml` declares among its main
+/// dependencies, `[tool.poetry.dependencies]` and `project.dependencies`, which is where
+/// `poetry add` without `--group` or `--optional` writes.
 #[must_use]
-pub fn parse_poetry_direct(manifest: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
-    let Ok(doc) = toml::from_str::<toml::Value>(manifest) else {
-        return out;
+pub fn parse_poetry_main(manifest: &str) -> HashSet<String> {
+    let Ok(manifest) = toml::from_str::<Table>(manifest) else {
+        return HashSet::new();
     };
-    if let Some(table) = doc
+    let main = manifest
         .get("tool")
-        .and_then(|t| t.get("poetry"))
-        .and_then(|p| p.get("dependencies"))
-        .and_then(toml::Value::as_table)
-    {
-        for key in table.keys() {
-            if key != "python" {
-                out.insert(normalize(key));
-            }
-        }
-    }
-    if let Some(list) = doc
+        .and_then(|tool| tool.get("poetry"))
+        .and_then(|poetry| poetry.get("dependencies"))
+        .and_then(Value::as_table);
+    let requirements = manifest
         .get("project")
-        .and_then(|p| p.get("dependencies"))
-        .and_then(toml::Value::as_array)
-    {
-        for item in list.iter().filter_map(toml::Value::as_str) {
-            if let Some(name) = pep508_name(item) {
-                out.insert(normalize(name));
-            }
-        }
-    }
-    out
+        .and_then(|project| project.get("dependencies"))
+        .and_then(Value::as_array);
+    declared_names(main, requirements)
+}
+
+/// The normalised names that the Poetry dependency `tables` and the PEP 508 requirement `lists`
+/// declare, the implicit `python` constraint aside.
+fn declared_names<'a>(
+    tables: impl IntoIterator<Item = &'a Table>,
+    lists: impl IntoIterator<Item = &'a Vec<Value>>,
+) -> HashSet<String> {
+    let tables = tables
+        .into_iter()
+        .flat_map(|table| table.keys())
+        .filter(|name| *name != "python")
+        .map(String::as_str);
+    let requirements = lists
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(pep508_name);
+    tables.chain(requirements).map(normalize).collect()
+}
+
+/// The Poetry dependency tables of a `pyproject.toml`: the main and the legacy development
+/// dependencies, and every group's.
+pub(crate) fn poetry_dependency_tables(manifest: &Table) -> Vec<&Table> {
+    let Some(poetry) = manifest
+        .get("tool")
+        .and_then(|tool| tool.get("poetry"))
+        .and_then(Value::as_table)
+    else {
+        return Vec::new();
+    };
+    let groups = poetry
+        .get("group")
+        .and_then(Value::as_table)
+        .into_iter()
+        .flat_map(|groups| groups.values())
+        .filter_map(|group| group.get("dependencies"));
+    ["dependencies", "dev-dependencies"]
+        .into_iter()
+        .filter_map(|key| poetry.get(key))
+        .chain(groups)
+        .filter_map(Value::as_table)
+        .collect()
+}
+
+/// The PEP 508 requirement lists of a `pyproject.toml`: `project.dependencies`, every
+/// `project.optional-dependencies` extra, and every PEP 735 dependency group.
+///
+/// A dependency group may also hold `include-group` tables, which name no package.
+pub(crate) fn requirement_lists(manifest: &Table) -> Vec<&Vec<Value>> {
+    let project = manifest.get("project");
+    let extras = project
+        .and_then(|project| project.get("optional-dependencies"))
+        .and_then(Value::as_table)
+        .into_iter()
+        .flat_map(|extras| extras.values());
+    let groups = manifest
+        .get("dependency-groups")
+        .and_then(Value::as_table)
+        .into_iter()
+        .flat_map(|groups| groups.values());
+    project
+        .and_then(|project| project.get("dependencies"))
+        .into_iter()
+        .chain(extras)
+        .chain(groups)
+        .filter_map(Value::as_array)
+        .collect()
 }
 
 /// Extracts the distribution name from a PEP 508 requirement string (`requests[socks]>=2.28` →
@@ -448,7 +538,7 @@ mod tests {
     #[test]
     fn poetry_lock_and_direct() {
         let lock = "[[package]]\nname = \"requests\"\nversion = \"2.28.0\"\n\n[[package]]\nname = \"urllib3\"\nversion = \"1.26.0\"\n";
-        let mut got = parse_poetry_lock(lock);
+        let mut got = parse_poetry_lock(lock).expect("lock");
         got.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(
             got,
@@ -459,5 +549,32 @@ mod tests {
         let direct = parse_poetry_direct(manifest);
         assert!(is_direct(&direct, "requests")); // normalised match
         assert!(!is_direct(&direct, "urllib3"));
+    }
+
+    /// A lock that is not TOML, or that lacks the `package` array Poetry always writes, is an
+    /// error rather than an empty inventory, while an explicit empty array reads as no packages.
+    #[test]
+    fn poetry_lock_reader_refuses_what_poetry_never_writes() {
+        assert!(matches!(
+            parse_poetry_lock("[[package]\n"),
+            Err(CoreError::LockUnreadable(_))
+        ));
+        assert!(matches!(
+            parse_poetry_lock(indoc! {r#"
+                [metadata]
+                lock-version = "2.1"
+            "#}),
+            Err(CoreError::LockUnreadable(_))
+        ));
+        assert_eq!(
+            parse_poetry_lock(indoc! {r#"
+                package = []
+
+                [metadata]
+                lock-version = "2.1"
+            "#})
+            .expect("empty lock"),
+            Vec::new()
+        );
     }
 }

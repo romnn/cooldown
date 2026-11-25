@@ -1,8 +1,7 @@
 use super::config::{Environment, cache_disabled};
 use super::workspace::unproven_by_bun;
 use super::{
-    FROZEN, Verdict, enclosing_workspace, outside, supports_frozen_dry_run, unsupported_feature,
-    verdict,
+    FROZEN, Verdict, enclosing_workspace, supports_frozen_dry_run, unsupported_feature, verdict,
 };
 use camino::{Utf8Path, Utf8PathBuf};
 use color_eyre::eyre;
@@ -20,7 +19,7 @@ impl TempProject {
     /// A project holding `files`, with the root canonical as the probe reads it.
     fn new(files: &[(&str, &str)]) -> eyre::Result<Self> {
         let directory = tempfile::tempdir()?;
-        let root = super::canonical(
+        let root = cooldown_adapter_util::canonical_path(
             Utf8Path::from_path(directory.path())
                 .ok_or_else(|| eyre::eyre!("temporary path is not UTF-8"))?,
         )?;
@@ -358,28 +357,6 @@ fn features_bun_does_not_compare_leave_the_lock_unproven() {
             "{reason:?}"
         );
     }
-}
-
-/// A scratch directory below the project is refused, through a link as well, while one outside it
-/// resolves through its existing ancestors.
-#[test]
-fn the_scratch_directory_must_lie_outside_the_project() -> eyre::Result<()> {
-    let project = TempProject::new(&[])?;
-    let elsewhere = TempProject::new(&[])?;
-    assert_eq!(
-        outside(&project.root, &project.root.join(".cache/bun")),
-        None
-    );
-    let scratch = elsewhere.root.join("cache/bun-verify");
-    assert_eq!(outside(&project.root, &scratch), Some(scratch));
-
-    #[cfg(unix)]
-    {
-        let link = elsewhere.root.join("link");
-        std::os::unix::fs::symlink(&project.root, &link)?;
-        assert_eq!(outside(&project.root, &link.join("cache")), None);
-    }
-    Ok(())
 }
 
 /// A workspace with members `packages/a` and `packages/b` and the lock Bun 1.4.5 wrote for it.

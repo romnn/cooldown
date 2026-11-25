@@ -474,6 +474,7 @@ impl Driver {
         &self,
         dir: &Utf8Path,
         args: &[String],
+        env: &[(&str, &str)],
         kind: InvocationKind,
     ) -> Result<std::process::Output> {
         // `--log-level trace` documents itself as covering subprocess argv; this is the one spawn
@@ -482,6 +483,7 @@ impl Driver {
         let out = observed_output(
             Command::new(resolve_program(&self.bin))
                 .args(args)
+                .envs(env.iter().copied())
                 .current_dir(dir.as_std_path()),
             &self.bin,
             || format!("{} {}", self.bin, args.join(" ")),
@@ -506,15 +508,36 @@ impl Driver {
     /// Returns [`CoreError::ToolSpawn`] if the binary cannot be spawned, or [`CoreError::Tool`] if
     /// it exits non-zero (e.g. an unsatisfiable pin — a resolver conflict).
     pub async fn run(&self, dir: &Utf8Path, args: &[String]) -> Result<()> {
-        let out = self.output(dir, args, InvocationKind::Native).await?;
+        let out = self.output(dir, args, &[], InvocationKind::Native).await?;
         if out.status.success() {
             Ok(())
         } else {
-            Err(CoreError::Tool {
-                tool: self.bin.clone(),
-                termination: ToolTermination::from_exit_status(out.status),
-                stderr: failure_detail(&out),
-            })
+            Err(self.failure(&out))
+        }
+    }
+
+    /// Runs the driver with `env` set on top of the inherited environment and returns its output
+    /// whatever its exit status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ToolSpawn`] if the binary cannot be spawned.
+    pub async fn output_with_env(
+        &self,
+        dir: &Utf8Path,
+        args: &[String],
+        env: &[(&str, &str)],
+    ) -> Result<std::process::Output> {
+        self.output(dir, args, env, InvocationKind::Native).await
+    }
+
+    /// The [`CoreError::Tool`] that reports `out` as this driver's failure.
+    #[must_use]
+    pub fn failure(&self, out: &std::process::Output) -> CoreError {
+        CoreError::Tool {
+            tool: self.bin.clone(),
+            termination: ToolTermination::from_exit_status(out.status),
+            stderr: failure_detail(out),
         }
     }
 
@@ -546,15 +569,11 @@ impl Driver {
         args: &[String],
         kind: InvocationKind,
     ) -> Result<String> {
-        let out = self.output(dir, args, kind).await?;
+        let out = self.output(dir, args, &[], kind).await?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         } else {
-            Err(CoreError::Tool {
-                tool: self.bin.clone(),
-                termination: ToolTermination::from_exit_status(out.status),
-                stderr: failure_detail(&out),
-            })
+            Err(self.failure(&out))
         }
     }
 
@@ -570,7 +589,7 @@ impl Driver {
         args: &[String],
         ok_detail: &str,
     ) -> Result<VerifyReport> {
-        let out = self.output(dir, args, InvocationKind::Native).await?;
+        let out = self.output(dir, args, &[], InvocationKind::Native).await?;
         Ok(VerifyReport {
             ok: out.status.success(),
             detail: if out.status.success() {
