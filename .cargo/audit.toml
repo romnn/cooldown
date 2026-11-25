@@ -1,0 +1,8 @@
+[advisories]
+ignore = [
+  # url 2.5.8: stack overflow in `Url::origin()` on nested `blob:` URLs. No crate here calls
+  # `Url::origin()` or parses `blob:` URLs. The fix, url 2.5.9, was published on 2026-11-20 and
+  # stays inside this repository's own 14-day cooldown until 2026-12-04; bump it then and drop
+  # this entry (#183).
+  "RUSTSEC-2026-0592",
+]
