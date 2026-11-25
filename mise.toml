@@ -30,6 +30,7 @@ java = "26.0.1"
 maven = "3.9.16"
 deno = "2.8.3"
 bun = "1.4.5"
+"pypi:poetry" = "2.5.1"
 swift = "6.3.2"
 
 # Developer tools
