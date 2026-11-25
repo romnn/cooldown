@@ -403,6 +403,11 @@ url = "https://nodejs.org/dist/v26.3.1/node-v26.3.1-darwin-arm64.tar.gz"
 checksum = "sha256:45001b289ebffe7b22260898f3750059183d8246042b88e8ffa4337e65e6763e"
 url = "https://nodejs.org/dist/v26.3.1/node-v26.3.1-win-x64.zip"
 
+[[tools."pipx:poetry"]]
+version = "2.5.1"
+backend = "pipx:poetry"
+specifiers = ["2.5.1"]
+
 [[tools.pnpm]]
 version = "11.8.0"
 backend = "aqua:pnpm/pnpm"
@@ -425,11 +430,6 @@ checksum = "sha256:8cf6951ade777eeb7e4665fdcaefe77942724b217690eb3fa2f0b27c67b43
 url = "https://github.com/pnpm/pnpm/releases/download/v11.8.0/pnpm-win32-x64.zip"
 url_api = "https://api.github.com/repos/pnpm/pnpm/releases/assets/451113107"
 provenance = "github-attestations"
-
-[[tools."pypi:poetry"]]
-version = "2.5.1"
-backend = "pypi:poetry"
-specifiers = ["2.5.1"]
 
 [[tools.python]]
 version = "3.14.6"

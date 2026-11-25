@@ -68,7 +68,7 @@ jobs:
           install: false
           cache: true
           env: false
-      - run: mise install task aqua:nextest-rs/nextest/cargo-nextest uv go node pnpm yarn deno bun python pypi:poetry
+      - run: mise install task aqua:nextest-rs/nextest/cargo-nextest uv go node pnpm yarn deno bun python pipx:poetry
       - name: Resolve Rust toolchain from rust-toolchain.toml
         id: rust
         shell: bash
