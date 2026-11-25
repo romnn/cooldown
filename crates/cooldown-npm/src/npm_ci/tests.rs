@@ -221,8 +221,10 @@ fn recorded_declarations_leave_npm_the_verdict() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Every local package's declarations, the root's workspace patterns, and the set of members
-/// are compared, since npm's own check sees versions alone.
+/// Every local package's declarations and the root's workspace patterns are compared, since
+/// npm's own check sees versions alone, and every local package the lock records must still have
+/// its manifest.
+/// A member newly matched by the patterns is npm's to find.
 #[test]
 fn declarations_npm_does_not_compare_leave_the_lock_unproven() -> eyre::Result<()> {
     let unproven = |path: &str, edit: &dyn Fn(&mut Value)| -> eyre::Result<Option<String>> {
@@ -286,6 +288,25 @@ fn declarations_npm_does_not_compare_leave_the_lock_unproven() -> eyre::Result<(
     Ok(())
 }
 
+/// An empty `workspaces` list, which npm does not record, matches the lock, while the object form
+/// is compared as written.
+#[test]
+fn an_empty_workspaces_list_is_no_workspace_pattern() -> eyre::Result<()> {
+    let unproven = |workspaces: Value| -> eyre::Result<Option<String>> {
+        let project = temp_project(&[(
+            "package.json",
+            json!({ "name": "app", "workspaces": workspaces, "dependencies": { "ms": "2.1.3" } }),
+        )])?;
+        let lock = json!({ "": { "name": "app", "dependencies": { "ms": "2.1.3" } } });
+        Ok(unproven_by_npm(&project.root, &packages(lock)?))
+    };
+
+    assert_eq!(unproven(json!([]))?, None);
+    assert_eq!(unproven(Value::Null)?, None);
+    assert!(unproven(json!({ "packages": [] }))?.is_some());
+    Ok(())
+}
+
 /// A root override naming another source than a registry range, which the lock records nowhere,
 /// leaves the lock unproven, at any depth of the override tree.
 #[test]
@@ -304,15 +325,23 @@ fn a_non_registry_override_leaves_the_lock_unproven() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Versions, ranges, and references to a root declaration are registry overrides; every other
-/// source is not.
+/// Versions, ranges, and references to a root declaration that is a range are registry
+/// overrides; every other source is not.
 #[test]
 fn overrides_qualify_by_their_source() {
-    for registry in ["2.1.3", "^2.1.0", "~1.2", ">=1 <2", "1.x || ^3", "*", "$ms"] {
-        assert_eq!(non_registry_override(&json!(registry)), None, "{registry}");
+    let manifest = json!({});
+    for registry in ["2.1.3", "^2.1.0", "~1.2", ">=1 <2", "1.x || ^3", "*"] {
+        assert_eq!(
+            non_registry_override(&json!(registry), &manifest),
+            None,
+            "{registry}"
+        );
     }
     assert_eq!(
-        non_registry_override(&json!({ "a@1": { ".": "1.0.0", "b": "^2" }, "c": null })),
+        non_registry_override(
+            &json!({ "a@1": { ".": "1.0.0", "b": "^2" }, "c": null }),
+            &manifest
+        ),
         None
     );
     for other in [
@@ -328,14 +357,44 @@ fn overrides_qualify_by_their_source() {
         "",
     ] {
         assert_eq!(
-            non_registry_override(&json!({ "ms": other })).as_deref(),
+            non_registry_override(&json!({ "ms": other }), &manifest).as_deref(),
             Some(other),
             "{other}"
         );
     }
     assert_eq!(
-        non_registry_override(&json!({ "ms": 2 })).as_deref(),
+        non_registry_override(&json!({ "ms": 2 }), &manifest).as_deref(),
         Some("2")
+    );
+}
+
+/// A `$name` override stands for the root's own declaration of `name`, found in npm's field
+/// order, so it is a registry override only when that declaration is a range.
+#[test]
+fn a_reference_override_qualifies_by_the_declaration_it_names() {
+    let manifest = json!({
+        "dependencies": { "ms": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz" },
+        "devDependencies": { "ms": "^2.1.0", "debug": "" },
+        "optionalDependencies": { "debug": "github:debug-js/debug" },
+        "peerDependencies": { "chalk": "^5" }
+    });
+    let override_of =
+        |reference: &str| non_registry_override(&json!({ "x": reference }), &manifest);
+
+    // `devDependencies` wins over `dependencies`, and a peer declaration counts.
+    assert_eq!(override_of("$ms"), None);
+    assert_eq!(override_of("$chalk"), None);
+    // An empty declaration is skipped for the next field, here a git source.
+    assert_eq!(override_of("$debug").as_deref(), Some("$debug"));
+    // A name the root does not declare
+    assert_eq!(override_of("$absent").as_deref(), Some("$absent"));
+
+    // A reference to a tarball declaration
+    let tarball =
+        json!({ "dependencies": { "ms": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz" } });
+    assert_eq!(
+        non_registry_override(&json!({ "ms": "$ms" }), &tarball).as_deref(),
+        Some("$ms")
     );
 }
 
@@ -359,7 +418,7 @@ impl FakeNpm {
             &script,
             formatdoc! {r#"
                 #!/bin/sh
-                echo "$*" >> calls.log
+                echo "$* offline=${{npm_config_offline-unset}} git=${{GIT_ALLOW_PROTOCOL-unset}}" >> calls.log
                 case "$1" in
                   --version) echo "{version}" ;;
                   prefix) {prefix} ;;
@@ -378,7 +437,14 @@ impl FakeNpm {
     }
 
     async fn verify(&self) -> cooldown_core::Result<cooldown_core::LockVerifyReport> {
-        super::lock_current(&self.cmd, &self.project.root, &self.scratch, false).await
+        self.verify_with(false).await
+    }
+
+    async fn verify_with(
+        &self,
+        offline: bool,
+    ) -> cooldown_core::Result<cooldown_core::LockVerifyReport> {
+        super::lock_current(&self.cmd, &self.project.root, &self.scratch, offline).await
     }
 
     /// The commands npm ran, one per line, without the settings every run carries.
@@ -547,6 +613,48 @@ async fn only_npm_refusals_are_stale() -> eyre::Result<()> {
     let npm = FakeNpm::new(&in_sync(), "11.16.0", PWD, not_cached)?;
     let error = npm.verify().await.expect_err("a cold cache is no verdict");
     assert!(matches!(error, CoreError::Tool { .. }), "{error}");
+    Ok(())
+}
+
+/// A lock that appears after the probe found none was never compared with the manifests, so
+/// npm's exit 0 leaves it unknown.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_lock_written_during_the_probe_is_not_current() -> eyre::Result<()> {
+    use cooldown_core::LockStatus;
+
+    let [manifest, (_, lock)] = in_sync();
+    // A concurrent install writes the lock while `npm ci` runs.
+    let written_now = formatdoc! {"
+        cat > {lockfile} <<'EOF'
+        {content}
+        EOF
+    ", lockfile = super::LOCKFILE, content = serde_json::to_string(&lock)?};
+    let npm = FakeNpm::new(&[manifest], "11.16.0", PWD, &written_now)?;
+
+    let report = npm.verify().await?;
+
+    assert_eq!(report.status, LockStatus::Unknown, "{}", report.detail);
+    assert!(npm.project.root.join(super::LOCKFILE).exists());
+    Ok(())
+}
+
+/// An offline run keeps every npm command offline through the flag and the environment, which an
+/// `npm.cmd` helper reads before the flags reach npm, and keeps git off the network.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_offline_probe_keeps_every_npm_offline() -> eyre::Result<()> {
+    let npm = FakeNpm::new(&in_sync(), "11.16.0", PWD, PASS)?;
+
+    npm.verify_with(true).await?;
+
+    let log = std::fs::read_to_string(npm.project.root.join("calls.log"))?;
+    assert_eq!(log.lines().count(), 3, "{log}");
+    assert!(
+        log.lines()
+            .all(|line| line.contains("--offline") && line.ends_with(" offline=true git=")),
+        "{log}"
+    );
     Ok(())
 }
 

@@ -2013,6 +2013,12 @@ fn project_files(root: &std::path::Path) -> std::collections::BTreeMap<String, V
 fn check_gates_an_npm_lock_npm_proves_current() {
     skip_if_missing!("npm");
     let fixture = lock_probe_fixture();
+    // A project `.npmrc` pointing npm's cache and logs into the checkout, which every npm that
+    // `check` runs must override
+    fixture.write(
+        ".npmrc",
+        &format!("{NPMRC}cache=.npm-cache\nlogs-dir=.npm-logs\n"),
+    );
     // An install tree npm would replace on a real `npm ci`, with a file no package owns
     fixture.write("node_modules/sentinel.txt", "left alone\n");
     fixture.write(
@@ -2021,12 +2027,72 @@ fn check_gates_an_npm_lock_npm_proves_current() {
     );
     let before = project_files(fixture.root());
 
-    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE]);
+    // The advisory feed has npm confirm the registry routing too.
+    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE, "--advisories"]);
 
     assert!(check.ok(), "{check:#?}");
     assert_eq!(check.summary_errors(), 0, "{check:#?}");
     assert!(check.summary_checked() > 0, "{check:#?}");
-    assert_eq!(before, project_files(fixture.root()));
+    let after = project_files(fixture.root());
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(before, after);
+}
+
+/// A root manifest whose declarations npm records in another shape than it reads them: an empty
+/// `workspaces` list npm omits, a name in both `dependencies` and `optionalDependencies` npm
+/// records as optional only, and peers, one of them optional.
+const LOCK_SHAPE_PACKAGE_JSON: &str = indoc! {r#"
+    {
+      "name": "cooldown-npm-lock-shape",
+      "version": "0.1.0",
+      "private": true,
+      "workspaces": [],
+      "dependencies": {
+        "ms": "2.1.3",
+        "is-number": "7.0.0"
+      },
+      "optionalDependencies": {
+        "is-number": "7.0.0"
+      },
+      "peerDependencies": {
+        "has-flag": "^4.0.0",
+        "debug": "^4.0.0"
+      },
+      "peerDependenciesMeta": {
+        "debug": { "optional": true }
+      }
+    }
+"#};
+
+/// A lock npm wrote for an unchanged manifest is current whatever shape npm recorded the
+/// manifest's declarations in.
+#[test]
+fn check_reads_an_unchanged_project_current_whatever_npm_recorded() {
+    skip_if_missing!("npm");
+    let fixture = Fixture::new().tag_independent();
+    fixture.write("package.json", LOCK_SHAPE_PACKAGE_JSON);
+    fixture.write(".npmrc", NPMRC);
+    fixture
+        .run_tool(
+            "npm",
+            &[
+                "install",
+                "--package-lock-only",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+            ],
+            &[],
+        )
+        .expect_success();
+
+    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE]);
+
+    assert!(check.ok(), "{check:#?}");
+    assert_eq!(check.summary_errors(), 0, "{check:#?}");
 }
 
 /// An edited manifest is npm's own stale verdict, which `--allow-stale-lock` waives.

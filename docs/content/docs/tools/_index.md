@@ -50,8 +50,9 @@ than current wherever its check does not reach:
   `.npmrc` or `npm_config_workspace`), which narrows `npm ci` to some members;
 - a declaration of the root, a workspace member, or a `file:` package that differs from what the
   lock recorded for it, such as a registry range changed to a tarball URL of the same version;
-- an `overrides` entry that is neither a version range nor a `$` reference, such as an `npm:`
-  alias, a URL, a git source, or a local path, since the lock records no override.
+- an `overrides` entry that is neither a version range nor a `$` reference to a root declaration
+  that is itself a range, such as an `npm:` alias, a URL, a git source, or a local path, since the
+  lock records no override.
 
 `upgrade` and `fix` verify the lock they wrote the same way. npm has no lock-only refresh for
 `check --lock`; re-lock with `npm install`.

@@ -301,11 +301,7 @@ impl<L: NodeLock> NpmTool<L> {
         if let Some(cached) = cache.get(root) {
             return cached.clone();
         }
-        let args: Vec<String> = ["config", "list", "--json"]
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        let queried = self.cmd.stdout(root, &args).await.ok();
+        let queried = self.probe_effective_config(root).await;
         cache.insert(root.to_owned(), queried.clone());
         queried
     }
@@ -313,12 +309,34 @@ impl<L: NodeLock> NpmTool<L> {
     /// [`Self::effective_config`] for a speculative probe, which reads the manager afresh and
     /// records nothing: the routing the writer proves origins by is read when the writer needs it,
     /// as without the probe, so neither a failed nor an outdated probe can stand in for it.
+    ///
+    /// npm runs with the settings that keep its cache and logs out of the project, as the lock
+    /// probe does, so a project `.npmrc` cannot make the query write there.
+    /// They leave the registry routing the listing reports alone.
     async fn probe_effective_config(&self, root: &Utf8Path) -> Option<String> {
-        let args: Vec<String> = ["config", "list", "--json"]
-            .iter()
-            .map(ToString::to_string)
-            .collect();
+        let args = ["config", "list", "--json"];
+        if L::ID == crate::lock::Npm::ID {
+            let scratch = self.npm_scratch().ok()?;
+            let npm =
+                crate::npm_ci::Isolated::new(&self.cmd, root, &scratch, self.registry.offline());
+            let out = npm.run(&args).await.ok()?;
+            return out
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+        let args: Vec<String> = args.iter().map(ToString::to_string).collect();
         self.cmd.stdout(root, &args).await.ok()
+    }
+
+    /// The directory under cooldown's cache that npm keeps its cache and logs in.
+    fn npm_scratch(&self) -> Result<Utf8PathBuf> {
+        Utf8PathBuf::from_path_buf(self.registry.cache_dir().join("npm-verify")).map_err(|path| {
+            CoreError::PathEncoding(format!(
+                "cache directory is not valid UTF-8: {}",
+                path.display()
+            ))
+        })
     }
 
     /// Enables package-document revalidation for version-adopting runs, so the mutable `latest`
@@ -906,17 +924,10 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
 
     async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport> {
         if L::ID == crate::lock::Npm::ID {
-            let scratch = Utf8PathBuf::from_path_buf(self.registry.cache_dir().join("npm-verify"))
-                .map_err(|path| {
-                    CoreError::PathEncoding(format!(
-                        "cache directory is not valid UTF-8: {}",
-                        path.display()
-                    ))
-                })?;
             return crate::npm_ci::lock_current(
                 &self.cmd,
                 &project.root,
-                &scratch,
+                &self.npm_scratch()?,
                 self.registry.offline(),
             )
             .await;

@@ -16,7 +16,7 @@
 //! than the registry, which the lock records nowhere.
 //!
 //! Every npm the probe runs keeps its cache and logs under cooldown's cache directory, outside the
-//! checkout, and stays offline when cooldown does.
+//! checkout, and stays offline when cooldown does ([`Isolated`]).
 
 use crate::nodecmd::{EnvOverride, NodeCmd};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -24,7 +24,6 @@ use cooldown_core::{
     CoreError, LockStatus, LockVerifyReport, Result, ToolTermination, failure_detail,
 };
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
 use std::process::Output;
 
 const LOCKFILE: &str = "package-lock.json";
@@ -35,7 +34,7 @@ const SHRINKWRAP: &str = "npm-shrinkwrap.json";
 /// The oldest npm whose `ci --dry-run` leaves an existing `node_modules` alone.
 const MIN_NPM: semver::Version = semver::Version::new(10, 5, 1);
 
-/// The settings every probe command runs under, pinned so the user's configuration cannot
+/// The output settings every probe command runs under, pinned so the user's configuration cannot
 /// reshape the error report the verdict is read from.
 ///
 /// `workspaces=null` drops a configured `workspaces` switch, while a configured `workspace`
@@ -95,7 +94,7 @@ pub(crate) async fn lock_current(
             "{SHRINKWRAP} exists, and npm verifies it instead of {LOCKFILE}"
         )));
     }
-    let version = npm.run(&["--version"]).await?;
+    let version = npm.run(&pinned(&["--version"])).await?;
     if !version.status.success() {
         return Err(npm.failure(&version));
     }
@@ -107,7 +106,7 @@ pub(crate) async fn lock_current(
             version.trim()
         )));
     }
-    let prefix = npm.run(&["prefix"]).await?;
+    let prefix = npm.run(&pinned(&["prefix"])).await?;
     if !prefix.status.success() {
         if error_code(&failure_detail(&prefix)) == Some("ENOWORKSPACES") {
             return Ok(unknown(
@@ -132,18 +131,20 @@ pub(crate) async fn lock_current(
 
     // Run npm's own verification
     let out = npm
-        .run(&[
+        .run(&pinned(&[
             "ci",
             "--dry-run",
             "--ignore-scripts",
             "--no-audit",
             "--no-fund",
-        ])
+        ]))
         .await?;
     if out.status.success() {
-        return Ok(match unproven {
-            Some(reason) => unknown(&reason),
-            None => LockVerifyReport {
+        return Ok(match (&lock, unproven) {
+            // A lock written after it was read, such as by a concurrent install, was never compared.
+            (None, _) => unknown(&format!("{LOCKFILE} appeared while npm verified it")),
+            (Some(_), Some(reason)) => unknown(&reason),
+            (Some(_), None) => LockVerifyReport {
                 status: LockStatus::Current,
                 detail: format!("{LOCKFILE} is current"),
             },
@@ -161,24 +162,33 @@ pub(crate) async fn lock_current(
     }
 }
 
-/// The npm commands of one probe, run in the project with the settings that keep npm out of the
-/// checkout.
-struct Isolated<'a> {
+/// `args` followed by [`PINNED_FLAGS`].
+fn pinned<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    args.iter().chain(&PINNED_FLAGS).copied().collect()
+}
+
+/// npm run in a project with its cache and logs under cooldown's cache directory, outside the
+/// checkout, and offline when cooldown is, so a project `.npmrc` cannot make it write there.
+pub(crate) struct Isolated<'a> {
     cmd: &'a NodeCmd,
     root: &'a Utf8Path,
     flags: Vec<String>,
-    /// The cache and logs locations again, for an npm whose `npm.cmd` runs a helper before it
-    /// forwards the flags.
+    /// The cache and logs locations and the offline switch again, for an npm whose `npm.cmd` runs
+    /// a helper before it forwards the flags.
     env: Vec<EnvOverride>,
 }
 
 impl<'a> Isolated<'a> {
-    fn new(cmd: &'a NodeCmd, root: &'a Utf8Path, scratch: &Utf8Path, offline: bool) -> Self {
+    /// Runs `cmd` in `root` with its cache and logs under `scratch`.
+    pub(crate) fn new(
+        cmd: &'a NodeCmd,
+        root: &'a Utf8Path,
+        scratch: &Utf8Path,
+        offline: bool,
+    ) -> Self {
         let cache = scratch.join("cache");
         let logs = scratch.join("logs");
-        let mut flags: Vec<String> = PINNED_FLAGS.iter().map(ToString::to_string).collect();
-        flags.push(format!("--cache={cache}"));
-        flags.push(format!("--logs-dir={logs}"));
+        let mut flags = vec![format!("--cache={cache}"), format!("--logs-dir={logs}")];
         let mut env = vec![
             EnvOverride {
                 name: "npm_config_cache",
@@ -191,6 +201,10 @@ impl<'a> Isolated<'a> {
         ];
         if offline {
             flags.push("--offline".to_string());
+            env.push(EnvOverride {
+                name: "npm_config_offline",
+                value: "true".into(),
+            });
             // An empty list allows git no transport, so a git dependency cannot reach the network.
             env.push(EnvOverride {
                 name: "GIT_ALLOW_PROTOCOL",
@@ -206,7 +220,11 @@ impl<'a> Isolated<'a> {
     }
 
     /// Runs npm with `args` and returns its output whatever its exit status.
-    async fn run(&self, args: &[&str]) -> Result<Output> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ToolSpawn`] if npm cannot be spawned.
+    pub(crate) async fn run(&self, args: &[&str]) -> Result<Output> {
         let args: Vec<String> = args
             .iter()
             .map(ToString::to_string)
@@ -348,12 +366,9 @@ fn unproven_by_npm(root: &Utf8Path, packages: &Map<String, Value>) -> Option<Str
         let Some(declared) = read_manifest(&root.join(&manifest)) else {
             return Some(format!("{manifest} cannot be read as JSON"));
         };
-        let patterns_changed = key.is_empty()
-            && declared
-                .get("workspaces")
-                .filter(|patterns| !patterns.is_null())
-                != recorded.get("workspaces");
-        if patterns_changed || declarations(&declared) != declarations(recorded) {
+        let patterns_changed =
+            key.is_empty() && workspace_patterns(&declared) != workspace_patterns(recorded);
+        if patterns_changed || !same_declarations(&declared, recorded) {
             return Some(format!(
                 "{manifest} declares other dependencies than {LOCKFILE} recorded for it; run \
                  `npm install`"
@@ -362,7 +377,11 @@ fn unproven_by_npm(root: &Utf8Path, packages: &Map<String, Value>) -> Option<Str
         // npm reads `overrides` from the root manifest alone.
         let overridden = key
             .is_empty()
-            .then(|| declared.get("overrides").and_then(non_registry_override))
+            .then(|| {
+                declared
+                    .get("overrides")
+                    .and_then(|overrides| non_registry_override(overrides, &declared))
+            })
             .flatten();
         if let Some(spec) = overridden {
             return Some(format!(
@@ -384,46 +403,75 @@ fn read_manifest(path: &Utf8Path) -> Option<Value> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
-/// The install declarations of `package`, a manifest or a lock entry, as npm records them: an
-/// absent field as an empty one, and a name `optionalDependencies` declares left out of
-/// `dependencies`.
-fn declarations(package: &Value) -> BTreeMap<&'static str, BTreeMap<&str, &Value>> {
-    let field = |name: &str| -> BTreeMap<&str, &Value> {
+/// The root's `workspaces` patterns as npm records them, omitted when there are none.
+fn workspace_patterns(package: &Value) -> Option<&Value> {
+    package.get("workspaces").filter(|patterns| {
+        !patterns.is_null() && patterns.as_array().is_none_or(|list| !list.is_empty())
+    })
+}
+
+/// Whether the `manifest` of a local package declares what its lock entry `recorded` holds, as
+/// npm records it: an absent field as an empty one, and a name `optionalDependencies` declares
+/// left out of `dependencies`.
+fn same_declarations(manifest: &Value, recorded: &Value) -> bool {
+    let field = |package: &Value, name: &str| {
         package
             .get(name)
             .and_then(Value::as_object)
-            .map(|declared| {
-                declared
-                    .iter()
-                    .map(|(dependency, spec)| (dependency.as_str(), spec))
-                    .collect()
-            })
+            .cloned()
             .unwrap_or_default()
     };
-    let mut fields: BTreeMap<&'static str, BTreeMap<&str, &Value>> = DECLARATION_FIELDS
-        .iter()
-        .map(|name| (*name, field(name)))
-        .collect();
-    let optional = field("optionalDependencies");
-    if let Some(dependencies) = fields.get_mut("dependencies") {
-        dependencies.retain(|dependency, _| !optional.contains_key(dependency));
-    }
-    fields
+    let optional = field(manifest, "optionalDependencies");
+    DECLARATION_FIELDS.iter().all(|name| {
+        let mut declared = field(manifest, name);
+        if *name == "dependencies" {
+            declared.retain(|dependency, _| !optional.contains_key(dependency));
+        }
+        declared == field(recorded, name)
+    })
 }
 
-/// The first `overrides` value that is neither a version range nor a `$` reference to a root
-/// declaration, rendered as written.
+/// The first `overrides` value that names another source than a registry range, rendered as
+/// written.
 ///
 /// Such an override can change a package's source at the same version, which npm's check of the
 /// lock does not see.
-fn non_registry_override(overrides: &Value) -> Option<String> {
+/// A `$name` reference stands for the root `manifest`'s own declaration of `name`, which must
+/// then be a range itself.
+fn non_registry_override(overrides: &Value, manifest: &Value) -> Option<String> {
     match overrides {
-        Value::String(spec) if spec.starts_with('$') || crate::version::is_range(spec) => None,
-        Value::String(spec) => Some(spec.clone()),
-        Value::Object(nested) => nested.values().find_map(non_registry_override),
+        Value::String(spec) => {
+            let resolved = match spec.strip_prefix('$') {
+                Some(name) => referenced_spec(manifest, name),
+                None => Some(spec.as_str()),
+            };
+            (!resolved.is_some_and(crate::version::is_range)).then(|| spec.clone())
+        }
+        Value::Object(nested) => nested
+            .values()
+            .find_map(|nested| non_registry_override(nested, manifest)),
         Value::Null => None,
         other => Some(other.to_string()),
     }
+}
+
+/// The specifier an override's `$name` reference resolves to: the root `manifest`'s first
+/// non-empty declaration of `name`, in the field order npm's `Edge` looks it up in.
+fn referenced_spec<'a>(manifest: &'a Value, name: &str) -> Option<&'a str> {
+    [
+        "devDependencies",
+        "optionalDependencies",
+        "dependencies",
+        "peerDependencies",
+    ]
+    .iter()
+    .find_map(|field| {
+        manifest
+            .get(field)?
+            .get(name)?
+            .as_str()
+            .filter(|spec| !spec.is_empty())
+    })
 }
 
 #[cfg(test)]
