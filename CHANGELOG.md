@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **`check` gates npm projects.** `check` failed every npm project with `lock_unknown`, which
+  `--allow-stale-lock` does not waive, because nothing proved a `package-lock.json` current. npm
+  10.5.1 and newer now prove it with `npm ci --dry-run --ignore-scripts`, run with npm's cache and
+  logs outside the project, which stays byte for byte as it was: npm's refusal of a lock out of
+  sync with `package.json`, or of a missing lock, is `stale_lock`, which `--allow-stale-lock`
+  waives as before, and any other npm failure is `tool_failed`. npm compares versions only, so a
+  declaration whose source changed at the same version, an `overrides` entry naming an `npm:`
+  alias, a URL, a git source, or a local path, an `npm-shrinkwrap.json`, an enclosing workspace or
+  a configured `workspace` filter, and an npm older than 10.5.1 leave the lock `lock_unknown`
+  instead. `upgrade` and `fix` verify the lock they wrote the same way. A `lockfileVersion` 1 lock,
+  whose nested copies cooldown never read, is now refused with a message to re-lock with npm 7 or
+  newer. The docs list which locks `check` can gate. Closes #177.
 - **`outdated` and `explain` report what `upgrade --dry-run` does.** `outdated` verified its
   adoptable rows with a preview that was not `upgrade`'s own run, so the two disagreed: rayon
   1.7.0 read `blocked — would move directly declared rayon-core` although `upgrade --dry-run`

@@ -575,15 +575,6 @@ fn unattributed_locks_protect_nothing() -> eyre::Result<()> {
         violated::<Bun>(&pins, Some(&bun_v0("4.1.0")), &bun_v0("4.1.2"), &none),
         NO_VIOLATIONS
     );
-    let npm_v1 = |version: &str| {
-        formatdoc! {r#"
-            {{ "lockfileVersion": 1, "dependencies": {{ "chalk": {{ "version": "{version}" }} }} }}
-        "#}
-    };
-    assert_eq!(
-        violated::<Npm>(&pins, Some(&npm_v1("4.1.0")), &npm_v1("4.1.2"), &none),
-        NO_VIOLATIONS
-    );
     Ok(())
 }
 

@@ -29,6 +29,33 @@ bookCollapseSection: false
 | Java (Gradle) | `gradle` | Maven Central | `gradle.lockfile` |
 | Swift | `swift` | GitHub Releases | `Package.resolved` |
 
+npm's `package-lock.json` is read in `lockfileVersion` 2 or 3, which npm 7 and newer write. A
+`lockfileVersion` 1 lock, written by npm 6 and older, records its nested copies only inside a
+`dependencies` tree, so it is reported `lockfile_unreadable` with a message to re-lock with npm 7
+or newer rather than read in part.
+
+`check` asks npm itself whether the lock is current, with npm 10.5.1 or newer, since older
+releases remove `node_modules` despite `--dry-run`: an older npm leaves the lock `lock_unknown`.
+It runs `npm ci --dry-run --ignore-scripts` in the project, which installs nothing, with npm's
+cache and logs kept in cooldown's cache directory, so the project, its `node_modules` included,
+stays byte for byte as it was. npm's refusal of a lock out of sync with `package.json`, or of a
+missing lock, is a stale lock that `--allow-stale-lock` waives, and any other npm failure is
+`tool_failed`. Under `--offline` npm runs offline too: it still proves a current lock from the lock
+alone, but a stale lock whose resolution needs registry metadata npm has not cached is
+`tool_failed` rather than stale. npm compares versions only, so the lock is `lock_unknown` rather
+than current wherever its check does not reach:
+
+- an `npm-shrinkwrap.json` beside the lock, which npm verifies instead;
+- npm resolving the project into an enclosing workspace, or a configured `workspace` filter (in an
+  `.npmrc` or `npm_config_workspace`), which narrows `npm ci` to some members;
+- a declaration of the root, a workspace member, or a `file:` package that differs from what the
+  lock recorded for it, such as a registry range changed to a tarball URL of the same version;
+- an `overrides` entry that is neither a version range nor a `$` reference, such as an `npm:`
+  alias, a URL, a git source, or a local path, since the lock records no override.
+
+`upgrade` and `fix` verify the lock they wrote the same way. npm has no lock-only refresh for
+`check --lock`; re-lock with `npm install`.
+
 Yarn Classic and Yarn Berry share the `yarn` tool, its `[tool.yarn]` config, and `yarn.lock`;
 cooldown tells them apart by the lock itself, since only a Berry lock opens with a `__metadata`
 entry. A Berry lock written by Yarn 2 through 4.18 (lockfile versions 4 to 6 and 8 to 10) is read

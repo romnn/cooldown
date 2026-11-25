@@ -1926,3 +1926,210 @@ fn upgrade_lands_a_sibling_beside_an_aliased_member_pin() {
     assert_eq!(fixture.read_bytes("package.json"), manifest_after);
     assert_eq!(fixture.read_bytes("package-lock.json"), lock_after);
 }
+
+const LOCK_PROBE_PACKAGE_JSON: &str = indoc! {r#"
+    {
+      "name": "cooldown-npm-lock-probe",
+      "version": "0.1.0",
+      "private": true,
+      "dependencies": {
+        "ms": "2.1.3"
+      }
+    }
+"#};
+
+/// A project locking `ms@2.1.3` with an `npm install --package-lock-only` of its own.
+fn lock_probe_fixture() -> Fixture {
+    let fixture = Fixture::new().tag_independent();
+    fixture.write("package.json", LOCK_PROBE_PACKAGE_JSON);
+    fixture.write(".npmrc", NPMRC);
+    fixture
+        .run_tool(
+            "npm",
+            &[
+                "install",
+                "--package-lock-only",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+            ],
+            &[],
+        )
+        .expect_success();
+    fixture
+}
+
+/// Rewrites the root manifest's declaration of `ms` as `spec`.
+fn declare_ms(fixture: &Fixture, spec: &str) {
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fixture.read_bytes("package.json")).expect("manifest parses");
+    manifest
+        .get_mut("dependencies")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("the fixture declares dependencies")
+        .insert(
+            "ms".to_string(),
+            serde_json::Value::String(spec.to_string()),
+        );
+    let body = serde_json::to_string_pretty(&manifest).expect("manifest serializes");
+    fixture.write("package.json", &format!("{body}\n"));
+}
+
+/// Every file of the project outside `.git`, by `/`-separated relative path, with its bytes.
+fn project_files(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        files: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    ) {
+        for entry in std::fs::read_dir(dir).expect("read project directory") {
+            let path = entry.expect("read directory entry").path();
+            if path.file_name().is_some_and(|name| name == ".git") {
+                continue;
+            }
+            if path.is_dir() {
+                walk(root, &path, files);
+            } else {
+                let relative = path.strip_prefix(root).expect("path below the root");
+                let relative: Vec<String> = relative
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                files.insert(
+                    relative.join("/"),
+                    std::fs::read(&path).expect("read project file"),
+                );
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    walk(root, root, &mut files);
+    files
+}
+
+/// npm's own `npm ci --dry-run` proves a current lock, and the project, its `node_modules`
+/// included, stays byte for byte as it was.
+#[test]
+fn check_gates_an_npm_lock_npm_proves_current() {
+    skip_if_missing!("npm");
+    let fixture = lock_probe_fixture();
+    // An install tree npm would replace on a real `npm ci`, with a file no package owns
+    fixture.write("node_modules/sentinel.txt", "left alone\n");
+    fixture.write(
+        "node_modules/ms/package.json",
+        r#"{"name":"ms","version":"2.1.0"}"#,
+    );
+    let before = project_files(fixture.root());
+
+    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE]);
+
+    assert!(check.ok(), "{check:#?}");
+    assert_eq!(check.summary_errors(), 0, "{check:#?}");
+    assert!(check.summary_checked() > 0, "{check:#?}");
+    assert_eq!(before, project_files(fixture.root()));
+}
+
+/// An edited manifest is npm's own stale verdict, which `--allow-stale-lock` waives.
+#[test]
+fn check_reports_an_npm_lock_npm_refuses_as_stale() {
+    skip_if_missing!("npm");
+    let fixture = lock_probe_fixture();
+    declare_ms(&fixture, "2.1.2");
+
+    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE]);
+    assert!(!check.ok(), "{check:#?}");
+    assert_eq!(
+        check.error_kinds(),
+        ["stale_lock".to_string()].into_iter().collect(),
+        "{check:#?}"
+    );
+    assert!(
+        check
+            .error_messages()
+            .iter()
+            .any(|message| message.contains("package-lock.json is stale in ")
+                && message.contains("does not satisfy ms@2.1.2")),
+        "{:?}",
+        check.error_messages()
+    );
+
+    let waived = fixture.cooldown_json(&["check", "--freeze", FREEZE, "--allow-stale-lock"]);
+    assert!(waived.ok(), "{waived:#?}");
+    assert!(waived.warning_kinds().contains("stale_lock"), "{waived:#?}");
+}
+
+/// A declaration moved from the registry to a tarball of the same version passes npm's
+/// version-only check, so the lock is unknown rather than current.
+#[test]
+fn check_refuses_a_same_version_source_change_npm_does_not_see() {
+    skip_if_missing!("npm");
+    let fixture = lock_probe_fixture();
+    declare_ms(&fixture, "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz");
+
+    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE, "--allow-stale-lock"]);
+
+    assert!(!check.ok(), "{check:#?}");
+    assert_eq!(
+        check.error_kinds(),
+        ["lock_unknown".to_string()].into_iter().collect(),
+        "{check:#?}"
+    );
+}
+
+/// A shrinkwrap is what npm verifies instead of the lock cooldown reads, so the lock is unknown.
+#[test]
+fn check_refuses_an_npm_lock_beside_a_shrinkwrap() {
+    skip_if_missing!("npm");
+    let fixture = lock_probe_fixture();
+    fixture.write(
+        "npm-shrinkwrap.json",
+        &String::from_utf8(fixture.read_bytes("package-lock.json")).expect("lock is UTF-8"),
+    );
+
+    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE]);
+
+    assert!(!check.ok(), "{check:#?}");
+    assert_eq!(
+        check.error_kinds(),
+        ["lock_unknown".to_string()].into_iter().collect(),
+        "{check:#?}"
+    );
+}
+
+/// A lockfileVersion 1 lock, whose nested copies the reader would miss, is refused with a
+/// re-lock message even though npm itself still accepts it.
+#[test]
+fn check_refuses_a_lockfile_version_1_lock() {
+    skip_if_missing!("npm");
+    let fixture = lock_probe_fixture();
+    fixture.write(
+        "package-lock.json",
+        indoc! {r#"
+            {
+              "name": "cooldown-npm-lock-probe",
+              "version": "0.1.0",
+              "lockfileVersion": 1,
+              "requires": true,
+              "dependencies": {
+                "ms": {
+                  "version": "2.1.3",
+                  "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
+                  "integrity": "sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA=="
+                }
+              }
+            }
+        "#},
+    );
+
+    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE, "--allow-stale-lock"]);
+
+    assert!(!check.ok(), "{check:#?}");
+    assert!(
+        check
+            .error_messages()
+            .iter()
+            .any(|message| message.contains("lockfileVersion 1; re-lock with npm 7 or newer")),
+        "{:?}",
+        check.error_messages()
+    );
+}

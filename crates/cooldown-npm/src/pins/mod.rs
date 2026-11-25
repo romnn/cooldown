@@ -15,8 +15,8 @@
 //! v2/v3 install tree, the package keys of a `bun.lock` its reader supports, a Yarn classic
 //! lock's selector keys read through the workspace manifests, and a Yarn Berry lock's record of
 //! each workspace joined to the member manifests.
-//! npm v1 locks attribute nothing per member, so their pins are reported [`Observed::Unknown`]
-//! and protected by nothing here; the name's newest copy is never a stand-in, since a transitive
+//! A lock that attributes nothing per member has its pins reported [`Observed::Unknown`] and
+//! protected by nothing here; the name's newest copy is never a stand-in, since a transitive
 //! duplicate beside an unchanged member copy would read as a moved pin.
 //! Neither is a Bun member whose keys the lock does not prove, nor a Bun peer declaration, which
 //! Bun binds by version rather than by key.

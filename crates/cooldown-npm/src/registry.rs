@@ -129,6 +129,11 @@ impl NpmRegistry {
         self.http.cache_dir()
     }
 
+    /// Whether the run is `--offline`, which the package managers cooldown drives must honor too.
+    pub(crate) fn offline(&self) -> bool {
+        self.http.options().offline
+    }
+
     /// The cache TTL for package-document fetches: zero (always revalidate) when
     /// [`Self::with_listing_revalidation`] enabled it, the shared listing TTL otherwise.
     fn listing_ttl(&self) -> std::time::Duration {
