@@ -316,7 +316,7 @@ impl<L: NodeLock> NpmTool<L> {
     async fn probe_effective_config(&self, root: &Utf8Path) -> Option<String> {
         let args = ["config", "list", "--json"];
         if L::ID == crate::lock::Npm::ID {
-            let scratch = self.npm_scratch().ok()?;
+            let scratch = self.verify_scratch("npm-verify").ok()?;
             let npm =
                 crate::npm_ci::Isolated::new(&self.cmd, root, &scratch, self.registry.offline());
             let out = npm.run(&args).await.ok()?;
@@ -329,9 +329,10 @@ impl<L: NodeLock> NpmTool<L> {
         self.cmd.stdout(root, &args).await.ok()
     }
 
-    /// The directory under cooldown's cache that npm keeps its cache and logs in.
-    fn npm_scratch(&self) -> Result<Utf8PathBuf> {
-        Utf8PathBuf::from_path_buf(self.registry.cache_dir().join("npm-verify")).map_err(|path| {
+    /// The directory `name` under cooldown's cache that a lock probe keeps the manager's cache,
+    /// logs, and temporary files in.
+    fn verify_scratch(&self, name: &str) -> Result<Utf8PathBuf> {
+        Utf8PathBuf::from_path_buf(self.registry.cache_dir().join(name)).map_err(|path| {
             CoreError::PathEncoding(format!(
                 "cache directory is not valid UTF-8: {}",
                 path.display()
@@ -927,7 +928,16 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
             return crate::npm_ci::lock_current(
                 &self.cmd,
                 &project.root,
-                &self.npm_scratch()?,
+                &self.verify_scratch("npm-verify")?,
+                self.registry.offline(),
+            )
+            .await;
+        }
+        if L::ID == crate::lock::Bun::ID {
+            return crate::bun_frozen::lock_current(
+                &self.cmd,
+                &project.root,
+                &self.verify_scratch("bun-verify")?,
                 self.registry.offline(),
             )
             .await;

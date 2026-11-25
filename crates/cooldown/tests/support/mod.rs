@@ -1234,6 +1234,34 @@ macro_rules! skip_if_missing {
 /// `Cargo.lock`). Used by [`changed_packages`] to diff two locks without depending on the format.
 pub type PinParser = fn(&[u8]) -> BTreeMap<String, String>;
 
+/// Every file of the project outside `.git`, by `/`-separated relative path, with its bytes.
+pub fn project_files(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).expect("read project directory") {
+            let path = entry.expect("read directory entry").path();
+            if path.file_name().is_some_and(|name| name == ".git") {
+                continue;
+            }
+            if path.is_dir() {
+                walk(root, &path, files);
+            } else {
+                let relative = path.strip_prefix(root).expect("path below the root");
+                let relative: Vec<String> = relative
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                files.insert(
+                    relative.join("/"),
+                    std::fs::read(&path).expect("read project file"),
+                );
+            }
+        }
+    }
+    let mut files = BTreeMap::new();
+    walk(root, root, &mut files);
+    files
+}
+
 /// The set of packages whose pinned version *moved* between two lock files — i.e. present in both
 /// locks at a different version, parsed via the ecosystem's `pins` strategy.
 ///

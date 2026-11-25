@@ -1,0 +1,194 @@
+//! The configuration that could disable Bun's install cache for the probe.
+//!
+//! Bun 1.4.5 writes `node_modules/.cache` into the project when a frozen dry run of a stale lock
+//! runs without its cache, whatever `--cache-dir` or `BUN_INSTALL_CACHE_DIR` say.
+//! The probe therefore refuses to run when any file Bun reads switches the cache off:
+//!
+//! - a bunfig, the global `.bunfig.toml` or the project's `bunfig.toml`, through
+//!   `[install] cache = false` or `[install.cache] disable = true`;
+//! - an npmrc, the project's `.npmrc` or the user's, through `cache=false`.
+//!
+//! Only those settings are read; a bunfig whose cache setting cannot be interpreted, or a file
+//! that cannot be read, leaves the cache unproven too.
+//! Bun loads the project's dotenv files before it picks the user npmrc, so a dotenv file that
+//! sets a variable moving the configuration read here, or `BUN_OPTIONS`, leaves it unproven as
+//! well.
+
+use camino::{Utf8Path, Utf8PathBuf};
+
+/// The variables a project dotenv file must not set, compared without case: those that choose
+/// where Bun reads the user npmrc or global bunfig, and `BUN_OPTIONS`, which can name another
+/// bunfig.
+const DOTENV_VETOES: [&str; 5] = [
+    "NPM_CONFIG_USERCONFIG",
+    "BUN_OPTIONS",
+    "XDG_CONFIG_HOME",
+    "HOME",
+    "USERPROFILE",
+];
+
+/// The process environment that locates Bun's user-level configuration.
+#[derive(Debug, Default)]
+pub(super) struct Environment {
+    /// `XDG_CONFIG_HOME`, only when it is an absolute path.
+    pub(super) xdg_config_home: Option<Utf8PathBuf>,
+    /// The home directory: `HOME` on Unix, `USERPROFILE` on Windows.
+    pub(super) home: Option<Utf8PathBuf>,
+    /// The user npmrc files `NPM_CONFIG_USERCONFIG` and `npm_config_userconfig` name, relative
+    /// ones against the project root.
+    pub(super) userconfig: Vec<Utf8PathBuf>,
+}
+
+impl Environment {
+    pub(super) fn from_process() -> Self {
+        let variable = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(Utf8PathBuf::from)
+        };
+        let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        Environment {
+            xdg_config_home: variable("XDG_CONFIG_HOME").filter(|path| path.is_absolute()),
+            home: variable(home),
+            userconfig: ["NPM_CONFIG_USERCONFIG", "npm_config_userconfig"]
+                .into_iter()
+                .filter_map(variable)
+                .collect(),
+        }
+    }
+
+    /// The global bunfig: `.bunfig.toml` in `XDG_CONFIG_HOME` when it is set, else in the home
+    /// directory, whether or not the file exists.
+    fn global_bunfig(&self) -> Option<Utf8PathBuf> {
+        Some(
+            self.xdg_config_home
+                .as_ref()
+                .or(self.home.as_ref())?
+                .join(".bunfig.toml"),
+        )
+    }
+
+    /// The user npmrc files: the configured ones, else `.npmrc` in `XDG_CONFIG_HOME` when it
+    /// exists there, else in the home directory.
+    fn user_npmrcs(&self, root: &Utf8Path) -> Vec<Utf8PathBuf> {
+        if !self.userconfig.is_empty() {
+            return self.userconfig.iter().map(|path| root.join(path)).collect();
+        }
+        let xdg = self
+            .xdg_config_home
+            .as_ref()
+            .map(|directory| directory.join(".npmrc"))
+            .filter(|path| path.exists());
+        xdg.or_else(|| self.home.as_ref().map(|home| home.join(".npmrc")))
+            .into_iter()
+            .collect()
+    }
+}
+
+/// Why the configuration Bun reads for the project at `root` may disable its install cache, if it
+/// may.
+pub(super) fn cache_disabled(root: &Utf8Path, environment: &Environment) -> Option<String> {
+    let bunfigs = environment
+        .global_bunfig()
+        .into_iter()
+        .chain([root.join("bunfig.toml")]);
+    for path in bunfigs {
+        let reason = match read_optional(&path) {
+            Ok(None) => continue,
+            Ok(Some(text)) => match toml::from_str::<toml::Table>(&text) {
+                Ok(document) => bunfig_cache_veto(&document),
+                Err(_) => Some("cannot be read as TOML"),
+            },
+            Err(_) => Some("cannot be read"),
+        };
+        if let Some(reason) = reason {
+            return Some(format!("{path} {reason}"));
+        }
+    }
+    let npmrcs = std::iter::once(root.join(".npmrc")).chain(environment.user_npmrcs(root));
+    for path in npmrcs {
+        match read_optional(&path) {
+            Ok(Some(text)) if npmrc_disables_cache(&text) => {
+                return Some(format!(
+                    "{path} sets `cache=false`, which disables Bun's cache"
+                ));
+            }
+            Ok(_) => {}
+            Err(_) => return Some(format!("{path} cannot be read")),
+        }
+    }
+    dotenv_veto(root)
+}
+
+/// The file at `path`, or `None` when nothing is there.
+fn read_optional(path: &Utf8Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Why the bunfig `document` disables Bun's install cache or leaves it undetermined, if it does.
+///
+/// `[install] cache` is a directory, a switch, or a table whose `disable` switch turns the cache
+/// off.
+fn bunfig_cache_veto(document: &toml::Table) -> Option<&'static str> {
+    let install = document.get("install")?;
+    let Some(install) = install.as_table() else {
+        return Some("sets `install` to something other than a table");
+    };
+    match install.get("cache") {
+        None | Some(toml::Value::String(_) | toml::Value::Boolean(true)) => None,
+        Some(toml::Value::Boolean(false)) => Some("sets `install.cache = false`"),
+        Some(toml::Value::Table(cache)) => match cache.get("disable") {
+            None | Some(toml::Value::Boolean(false)) => None,
+            Some(toml::Value::Boolean(true)) => Some("sets `install.cache.disable = true`"),
+            Some(_) => Some("sets `install.cache.disable` to something other than a switch"),
+        },
+        Some(_) => Some("sets `install.cache` to something other than a directory or a switch"),
+    }
+}
+
+/// Whether an npmrc's `text` sets `cache=false`.
+fn npmrc_disables_cache(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.split_once('=').is_some_and(|(key, value)| {
+            key.trim() == "cache" && value.trim().trim_matches(['"', '\'']) == "false"
+        })
+    })
+}
+
+/// Why a dotenv file at `root` may move the configuration [`cache_disabled`] reads, if one may.
+///
+/// Every `.env` and `.env.*` file counts, whichever of them Bun loads for the current
+/// `NODE_ENV`.
+fn dotenv_veto(root: &Utf8Path) -> Option<String> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Some(format!("{root} cannot be listed for dotenv files"));
+    };
+    let mut files: Vec<String> = entries
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name == ".env" || name.starts_with(".env."))
+        .collect();
+    files.sort();
+    files.into_iter().find_map(|file| {
+        let Ok(text) = std::fs::read_to_string(root.join(&file)) else {
+            return Some(format!("{file} cannot be read"));
+        };
+        let variable = text.lines().find_map(|line| {
+            let line = line.trim_start();
+            let line = line.strip_prefix("export ").unwrap_or(line);
+            let (key, _) = line.split_once('=')?;
+            let key = key.trim();
+            DOTENV_VETOES
+                .iter()
+                .any(|veto| key.eq_ignore_ascii_case(veto))
+                .then(|| key.to_string())
+        })?;
+        Some(format!(
+            "{file} sets `{variable}`, which moves the configuration that can disable Bun's cache"
+        ))
+    })
+}

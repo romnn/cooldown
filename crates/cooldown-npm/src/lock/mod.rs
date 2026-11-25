@@ -316,7 +316,8 @@ pub trait NodeLock: Send + Sync + 'static {
     ///
     /// `None` means this manager has no supported frozen/check mode wired yet, so `check` must keep
     /// failing closed with an unknown lock-currency result, unless the adapter proves the lock
-    /// another way, as npm's `npm ci --dry-run` probe does.
+    /// another way, as npm's `npm ci --dry-run` and Bun's `bun install --frozen-lockfile --dry-run`
+    /// probes do.
     #[must_use]
     fn verify_current_args() -> Option<Vec<String>> {
         None
@@ -3502,7 +3503,7 @@ fn parse_bun(content: &str) -> Result<Vec<NameVersion>> {
 ///
 /// Bun writes trailing commas, valid JSONC but not JSON, so the body is normalised before the JSON
 /// parser sees it.
-fn decode_bun(content: &str) -> Result<serde_json::Value> {
+pub(crate) fn decode_bun(content: &str) -> Result<serde_json::Value> {
     serde_json::from_str(&strip_trailing_commas(content))
         .map_err(|err| CoreError::Parse(format!("bun.lock: {err}")))
 }
@@ -3926,23 +3927,23 @@ fn bun_binding(
 }
 
 /// The identity a `packages` entry holds: its value's first array element, `name@reference`.
-fn bun_identity(entry: Option<&serde_json::Value>) -> Option<&str> {
+pub(crate) fn bun_identity(entry: Option<&serde_json::Value>) -> Option<&str> {
     entry?.as_array()?.first()?.as_str()
 }
 
 /// The two halves of a package identity, `name@reference`.
-struct BunIdentity<'a> {
+pub(crate) struct BunIdentity<'a> {
     /// The package the key holds, a scope's leading `@` kept.
-    name: &'a str,
+    pub(crate) name: &'a str,
     /// A registry version, or a protocol reference (`workspace:`, `file:`, `link:`, `root:`, a git
     /// or tarball source).
-    reference: &'a str,
+    pub(crate) reference: &'a str,
 }
 
 impl<'a> BunIdentity<'a> {
     /// Splits `identity` at the first `@` after a scope's leading one, since a git reference can
     /// itself contain an `@` (`pkg@git+ssh://git@github.com/…`).
-    fn parse(identity: &'a str) -> Option<Self> {
+    pub(crate) fn parse(identity: &'a str) -> Option<Self> {
         let at = identity.get(1..)?.find('@')? + 1;
         let (name, reference) = identity.split_at_checked(at)?;
         let reference = reference.strip_prefix('@')?;
