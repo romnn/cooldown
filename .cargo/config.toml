@@ -13,3 +13,8 @@ tci = 'nextest run -P ci --no-tests warn --all-targets'
 l = "clippy --all-targets --no-deps"
 lint = "clippy --all-targets --no-deps"
 fixit = "clippy --fix --allow-dirty --allow-staged --all-targets --no-deps"
+
+# Since Rust 1.100 this target leaves libunwind to the C driver through `--unwindlib=libunwind`.
+# The zig driver behind cargo-zigbuild ignores that flag, so the release build links it itself.
+[target.aarch64-pc-windows-gnullvm]
+rustflags = ["-C", "link-arg=-lunwind"]
