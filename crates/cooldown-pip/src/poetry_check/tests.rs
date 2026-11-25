@@ -1,6 +1,6 @@
 use super::{
-    CHANGED, MISSING, Verdict, absent, direct_origin, generator, groups_hashed, supports_check,
-    unproven_by_poetry, verdict,
+    CHANGED, MISSING, Verdict, WARNING_CONTINUATIONS, absent, direct_origin, generator,
+    groups_hashed, readable_format, supports_check, unproven_by_poetry, verdict,
 };
 use camino::Utf8Path;
 use color_eyre::eyre;
@@ -70,35 +70,63 @@ fn only_a_stable_poetry_2_3_or_newer_qualifies() {
     assert!(!supports_check(""));
 }
 
-/// A refusal is stale only as Poetry's sole output after exit 1; anything beside it, any other
-/// exit, or any other output is a failure, while exit 0 passes.
+/// A refusal is stale only as Poetry's sole error after exit 1, beside nothing but the warnings
+/// Poetry prints; another error, unrecognised output, or another exit is a failure, while exit 0
+/// passes with or without warnings.
 #[test]
-fn only_a_standalone_refusal_reads_as_stale() {
+fn only_a_sole_refusal_beside_warnings_reads_as_stale() {
     let exit = ToolTermination::ExitCode;
+    let changed = format!("Error: {CHANGED}\n");
+    let name_warning = "Warning: [project.name] and [tool.poetry.name] are both set. The latter will be ignored.\n";
+    // The version warning continues on a line of its own.
+    let version_warning = format!(
+        "Warning: [project.version] and [tool.poetry.version] are both set. The latter will be \
+         ignored.\n{}\n",
+        WARNING_CONTINUATIONS[0]
+    );
+    // Poetry logs a warning it finds while loading the project ahead of its own `Warning:` line.
+    let dev_warning = "The \"poetry.dev-dependencies\" section is deprecated and will be removed in \
+                       a future version. Use \"poetry.group.dev.dependencies\" instead.";
 
-    // Passed
+    // Passed, with or without warnings
     assert_eq!(verdict(exit(0), "All set!\n", ""), Verdict::Passed);
+    assert_eq!(
+        verdict(exit(0), "", &format!("{name_warning}{version_warning}")),
+        Verdict::Passed
+    );
 
     // The two refusals, standalone, through CRLF and trailing whitespace
+    assert_eq!(verdict(exit(1), "", &changed), Verdict::Changed);
     assert_eq!(
-        verdict(exit(1), "", &format!("{CHANGED}\n")),
+        verdict(exit(1), "\r\n", &format!("Error: {CHANGED}  \r\n")),
         Verdict::Changed
     );
     assert_eq!(
-        verdict(exit(1), "\r\n", &format!("{CHANGED}  \r\n")),
-        Verdict::Changed
-    );
-    assert_eq!(
-        verdict(exit(1), "", &format!("{MISSING}\n")),
+        verdict(exit(1), "", &format!("Error: {MISSING}\n")),
         Verdict::Missing
     );
 
-    // A refusal mixed with a strict-mode warning or an invalid configuration
-    let warned = format!(
-        "{CHANGED}\nWarning: [project.name] and [tool.poetry.name] are both set. The latter will \
-         be ignored.\n"
+    // A refusal beside warnings, a continuation, and a logged warning
+    assert_eq!(
+        verdict(
+            exit(1),
+            "",
+            &format!("{changed}{name_warning}{version_warning}")
+        ),
+        Verdict::Changed
     );
-    assert_eq!(verdict(exit(1), "", &warned), Verdict::Failed);
+    assert_eq!(
+        verdict(
+            exit(1),
+            "",
+            &format!("{dev_warning}\n{changed}Warning: {dev_warning}\n")
+        ),
+        Verdict::Changed
+    );
+
+    // A refusal beside another error, such as a missing README or an invalid configuration
+    let readme = format!("Error: Declared README file does not exist: README.md\n{changed}");
+    assert_eq!(verdict(exit(1), "", &readme), Verdict::Failed);
     let invalid = indoc! {"
 
         The Poetry configuration is invalid:
@@ -107,18 +135,32 @@ fn only_a_standalone_refusal_reads_as_stale() {
     "};
     assert_eq!(verdict(exit(1), "", invalid), Verdict::Failed);
     assert_eq!(
-        verdict(exit(1), "", &format!("{invalid}{CHANGED}\n")),
+        verdict(exit(1), "", &format!("{invalid}{changed}")),
         Verdict::Failed
     );
 
+    // A refusal beside unrecognised output: a stray line, a continuation without its warning, or
+    // a bare line no `Warning:` line repeats
+    for stray in [
+        "plugin output\n".to_string(),
+        format!("{}\n", WARNING_CONTINUATIONS[0]),
+        format!("{dev_warning}\n"),
+    ] {
+        assert_eq!(
+            verdict(exit(1), "", &format!("{changed}{stray}")),
+            Verdict::Failed,
+            "{stray}"
+        );
+    }
+
     // A refusal under another exit, quoted in a longer line, or with nothing printed
-    assert_eq!(verdict(exit(2), "", CHANGED), Verdict::Failed);
+    assert_eq!(verdict(exit(2), "", &changed), Verdict::Failed);
     assert_eq!(
-        verdict(ToolTermination::Signal(9), "", CHANGED),
+        verdict(ToolTermination::Signal(9), "", &changed),
         Verdict::Failed
     );
     assert_eq!(
-        verdict(exit(1), "", &format!("plugin: {CHANGED}")),
+        verdict(exit(1), "", &format!("plugin: Error: {CHANGED}")),
         Verdict::Failed
     );
     assert_eq!(verdict(exit(1), "", ""), Verdict::Failed);
@@ -179,8 +221,8 @@ fn the_generator_is_read_from_the_opening_comment() {
     assert_eq!(generator(&format!("\n{LOCK}")), None);
 }
 
-/// A URL, git, or path origin anywhere in the manifest's declarations, the lock's dependency
-/// edges, or a locked package's source is a direct origin; a registry or named index is not.
+/// A URL, git, or path origin anywhere in the manifest's declarations or the lock's dependency
+/// edges is a direct origin; a registry or named index is not.
 #[test]
 fn direct_origins_are_found_wherever_they_are_declared() {
     let lock = table(LOCK);
@@ -245,23 +287,7 @@ fn direct_origins_are_found_wherever_they_are_declared() {
         assert!(reason.contains("pyproject.toml"), "{reason}");
     }
 
-    // The lock: a package source of each direct kind, and a dependency edge
-    for kind in ["url", "git", "directory", "file"] {
-        let lock = table(&LOCK.replace(
-            "files = []",
-            &format!("files = []\n\n[package.source]\ntype = \"{kind}\"\nurl = \"x\""),
-        ));
-        let reason = direct_origin(&table(MANIFEST), &lock).expect(kind);
-        assert!(
-            reason.contains("poetry.lock") && reason.contains("`six`"),
-            "{reason}"
-        );
-    }
-    let legacy = table(&LOCK.replace(
-        "files = []",
-        "files = []\n\n[package.source]\ntype = \"legacy\"\nurl = \"https://pypi.corp.example/simple\"\nreference = \"corp\"",
-    ));
-    assert_eq!(direct_origin(&table(MANIFEST), &legacy), None);
+    // A dependency edge in the lock
     let edge = table(&LOCK.replace(
         "files = []",
         "files = []\n\n[package.dependencies]\nlocal = { path = \"../local\", develop = true }",
@@ -349,5 +375,200 @@ fn unproven_by_poetry_reads_the_lock_and_the_manifest() -> eyre::Result<()> {
         unproven_by_poetry("[[package]\n", MANIFEST),
         Err(CoreError::LockUnreadable(_))
     ));
+    Ok(())
+}
+
+/// A lock from any source other than PyPI, or a manifest declaring a package source, is unproven,
+/// since cooldown judges each package by PyPI's release.
+#[test]
+fn a_package_source_other_than_pypi_is_unproven() -> eyre::Result<()> {
+    for kind in ["legacy", "url", "git", "directory", "file"] {
+        let lock = LOCK.replace(
+            "files = []",
+            &format!("files = []\n\n[package.source]\ntype = \"{kind}\"\nurl = \"x\""),
+        );
+        let reason = unproven_by_poetry(&lock, MANIFEST)?;
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("`six` from a source other than PyPI")),
+            "{kind}: {reason:?}"
+        );
+    }
+
+    let sourced = format!(
+        "{MANIFEST}\n[[tool.poetry.source]]\nname = \"corp\"\nurl = \"https://pypi.corp.example/simple\"\npriority = \"supplemental\"\n"
+    );
+    let reason = unproven_by_poetry(LOCK, &sourced)?;
+    assert!(
+        reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("[[tool.poetry.source]]")),
+        "{reason:?}"
+    );
+    Ok(())
+}
+
+/// A manifest that requires a plugin is unproven, since a plain Poetry run loads it.
+#[test]
+fn a_required_plugin_is_unproven() -> eyre::Result<()> {
+    let plugged = MANIFEST.replace(
+        "package-mode = false",
+        "package-mode = false\n\n[tool.poetry.requires-plugins]\npoetry-plugin-export = \">=1.8\"",
+    );
+    let reason = unproven_by_poetry(LOCK, &plugged)?;
+    assert!(
+        reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("requires-plugins")),
+        "{reason:?}"
+    );
+    Ok(())
+}
+
+/// Only a `lock-version` from 1 up to but excluding 3, which Poetry's installer reads, is proven;
+/// a missing or other one is unproven even though Poetry's freshness check passes it.
+#[test]
+fn only_a_lock_version_the_installer_reads_is_proven() -> eyre::Result<()> {
+    // The format range
+    for readable in ["1.0", "1.1", "2.0", "2.1", "2.9"] {
+        assert!(readable_format(readable), "{readable}");
+    }
+    for unreadable in ["0.9", "3", "3.0", "banana", ""] {
+        assert!(!readable_format(unreadable), "{unreadable}");
+    }
+
+    // A lock whose format is missing or unsupported
+    for lock in [
+        LOCK.replace("lock-version = \"2.1\"\n", ""),
+        LOCK.replace("lock-version = \"2.1\"", "lock-version = \"3.0\""),
+        LOCK.replace("lock-version = \"2.1\"", "lock-version = 2.1"),
+    ] {
+        let reason = unproven_by_poetry(&lock, MANIFEST)?;
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("lock-version")),
+            "{reason:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A project with a lock and a manifest, and a stand-in for Poetry outside it.
+#[cfg(unix)]
+struct FakePoetry {
+    _project: tempfile::TempDir,
+    _outside: tempfile::TempDir,
+    root: camino::Utf8PathBuf,
+    scratch: camino::Utf8PathBuf,
+    driver: cooldown_adapter_util::Driver,
+}
+
+#[cfg(unix)]
+impl FakePoetry {
+    /// A project holding [`LOCK`] and [`MANIFEST`], checked by a Poetry 2.5.1 stand-in that runs
+    /// `on_check` for `check`.
+    fn new(on_check: &str) -> eyre::Result<Self> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let project = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let utf8 = |path: &std::path::Path| {
+            camino::Utf8PathBuf::from_path_buf(path.to_path_buf())
+                .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))
+        };
+        let root = utf8(project.path())?;
+        let scratch = utf8(outside.path())?.join("poetry-verify");
+        std::fs::write(root.join("poetry.lock"), LOCK)?;
+        std::fs::write(root.join("pyproject.toml"), MANIFEST)?;
+        let script = utf8(outside.path())?.join("poetry");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n--version) echo 'Poetry (version 2.5.1)' ;;\ncheck) {on_check} ;;\nesac\n"
+            ),
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        Ok(FakePoetry {
+            _project: project,
+            _outside: outside,
+            root,
+            scratch,
+            driver: cooldown_adapter_util::Driver::from_program(script.as_str()),
+        })
+    }
+
+    async fn status(&self) -> eyre::Result<(cooldown_core::LockStatus, String)> {
+        let report = super::lock_current(&self.driver, &self.root, &self.scratch).await?;
+        Ok((report.status, report.detail))
+    }
+}
+
+/// The probe judges the bytes Poetry checked: a lock or manifest rewritten while Poetry ran is
+/// unknown rather than current, while untouched files are current.
+#[cfg(unix)]
+#[tokio::test]
+async fn files_changed_while_poetry_ran_are_unproven() -> eyre::Result<()> {
+    use cooldown_core::LockStatus;
+
+    let (status, detail) = FakePoetry::new("echo 'All set!'")?.status().await?;
+    assert_eq!(status, LockStatus::Current, "{detail}");
+
+    for rewrite in [
+        "printf '\\n' >> poetry.lock",
+        "printf '\\n' >> pyproject.toml",
+        "rm poetry.lock",
+    ] {
+        let (status, detail) = FakePoetry::new(&format!("{rewrite}; echo 'All set!'"))?
+            .status()
+            .await?;
+        assert_eq!(status, LockStatus::Unknown, "{rewrite}: {detail}");
+        assert!(detail.contains("changed while Poetry verified"), "{detail}");
+    }
+    Ok(())
+}
+
+/// A project plugin directory, whose plugins a plain Poetry run loads, leaves a passing lock
+/// unknown.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_project_plugin_directory_is_unproven() -> eyre::Result<()> {
+    use cooldown_core::LockStatus;
+
+    let fake = FakePoetry::new("echo 'All set!'")?;
+    std::fs::create_dir_all(fake.root.join(".poetry").join("plugins"))?;
+    let (status, detail) = fake.status().await?;
+    assert_eq!(status, LockStatus::Unknown, "{detail}");
+    assert!(detail.contains(".poetry/plugins"), "{detail}");
+    Ok(())
+}
+
+/// Poetry's stale refusal beside its warnings is stale, and beside another error a tool failure.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_refusal_beside_warnings_is_stale() -> eyre::Result<()> {
+    use cooldown_core::LockStatus;
+
+    let warned = format!(
+        "echo 'Error: {CHANGED}' >&2; echo 'Warning: [project.name] and [tool.poetry.name] are \
+         both set. The latter will be ignored.' >&2; exit 1"
+    );
+    let (status, detail) = FakePoetry::new(&warned)?.status().await?;
+    assert_eq!(status, LockStatus::Stale, "{detail}");
+
+    let errored = format!(
+        "echo 'Error: Declared README file does not exist: README.md' >&2; echo 'Error: \
+         {CHANGED}' >&2; exit 1"
+    );
+    let result = FakePoetry::new(&errored)?.status().await;
+    assert!(
+        matches!(
+            result
+                .as_ref()
+                .map_err(|err| err.downcast_ref::<CoreError>()),
+            Err(Some(CoreError::Tool { .. }))
+        ),
+        "{result:?}"
+    );
     Ok(())
 }

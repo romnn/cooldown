@@ -105,18 +105,45 @@ fn check_reports_a_same_version_source_edit_as_stale() {
     assert!(waived.warning_kinds().contains("stale_lock"), "{waived:#?}");
 }
 
-/// An invalid configuration, and a stale refusal beside a strict-mode warning, are Poetry
-/// failures that `--allow-stale-lock` does not waive.
+/// `[tool.poetry] name` beside `[project] name`, which Poetry warns about without failing.
+fn warned(pyproject: &str) -> String {
+    pyproject.replace(
+        "package-mode = false",
+        "package-mode = false\nname = \"cooldown-poetry-lock-probe\"",
+    )
+}
+
+/// A warning leaves Poetry's verdict alone: a current lock beside it passes, and a stale one is
+/// still Poetry's own stale verdict.
+#[test]
+fn check_reads_poetry_warnings_as_no_failure() {
+    skip_if_missing!("poetry");
+    let fixture = locked_fixture(PYPROJECT);
+    fixture.write("pyproject.toml", &warned(PYPROJECT));
+
+    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE]);
+    assert!(check.ok(), "{check:#?}");
+    assert!(check.summary_checked() > 0, "{check:#?}");
+
+    fixture.write(
+        "pyproject.toml",
+        &warned(&PYPROJECT.replace("six==1.16.0", "six==1.15.0")),
+    );
+    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE]);
+    assert_only_error(&check, "stale_lock");
+}
+
+/// An invalid configuration, and a stale refusal beside another error such as a missing README,
+/// are Poetry failures that `--allow-stale-lock` does not waive.
 #[test]
 fn check_reports_other_poetry_failures_as_tool_errors() {
     skip_if_missing!("poetry");
     let invalid = PYPROJECT.replace("package-mode = false", "package-mode = false\nfoo = 1");
-    // `[tool.poetry] name` beside `[project] name` is a warning, which `--strict` makes fatal.
-    let warned = PYPROJECT.replace("six==1.16.0", "six==1.15.0").replace(
-        "package-mode = false",
-        "package-mode = false\nname = \"cooldown-poetry-lock-probe\"",
+    let unreadable_readme = PYPROJECT.replace("six==1.16.0", "six==1.15.0").replace(
+        "requires-python = \">=3.9\"",
+        "requires-python = \">=3.9\"\nreadme = \"README.md\"",
     );
-    for pyproject in [invalid, warned] {
+    for pyproject in [invalid, unreadable_readme] {
         let fixture = locked_fixture(PYPROJECT);
         fixture.write("pyproject.toml", &pyproject);
 

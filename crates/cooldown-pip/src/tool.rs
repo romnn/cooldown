@@ -788,6 +788,68 @@ mod tests {
         Ok(())
     }
 
+    /// Every package the manifest declares is direct, whether in a Poetry group, the legacy
+    /// development table, an extra, or a PEP 735 dependency group, while one only the lock holds
+    /// is transitive.
+    #[tokio::test]
+    async fn poetry_reads_every_declared_package_as_direct() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            root.join("poetry.lock"),
+            indoc! {r#"
+                package = [
+                    { name = "six", version = "1.0.0" },
+                    { name = "pytest", version = "1.0.0" },
+                    { name = "black", version = "1.0.0" },
+                    { name = "rich", version = "1.0.0" },
+                    { name = "ruff", version = "1.0.0" },
+                    { name = "urllib3", version = "1.0.0" },
+                ]
+            "#},
+        )?;
+        std::fs::write(
+            root.join("pyproject.toml"),
+            indoc! {r#"
+                [project]
+                name = "demo"
+                dependencies = ["six==1.0.0"]
+
+                [project.optional-dependencies]
+                pretty = ["rich>=1"]
+
+                [dependency-groups]
+                lint = ["ruff", { include-group = "test" }]
+
+                [tool.poetry.group.test.dependencies]
+                pytest = "^1"
+
+                [tool.poetry.dev-dependencies]
+                black = "^1"
+            "#},
+        )?;
+        let project = Project {
+            root: root.clone(),
+            kind: Poetry::ID,
+            manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        };
+        let cache = tempfile::tempdir()?;
+        let tool = PyTool::<Poetry>::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+
+        let direct = tool.dependencies(&project, DepScope::Direct).await?;
+        let mut names: Vec<&str> = direct.iter().map(|dep| dep.package.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["black", "pytest", "rich", "ruff", "six"]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn poetry_splits_direct_from_transitive() {
         let dir = tempfile::tempdir().expect("tempdir");

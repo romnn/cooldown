@@ -124,10 +124,12 @@ pub(crate) fn poetry_declares_sources(manifest: &Utf8Path) -> bool {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
         Err(_) => return true,
     };
-    let Ok(value) = toml::from_str::<toml::Value>(&content) else {
-        return true;
-    };
-    value
+    toml::from_str::<toml::Table>(&content).map_or(true, |manifest| declares_sources(&manifest))
+}
+
+/// [`poetry_declares_sources`] for a parsed `manifest`.
+pub(crate) fn declares_sources(manifest: &toml::Table) -> bool {
+    manifest
         .get("tool")
         .and_then(|tool| tool.get("poetry"))
         .is_some_and(|poetry| poetry.get("source").is_some())
