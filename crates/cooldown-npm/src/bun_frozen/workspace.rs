@@ -49,6 +49,11 @@ pub(super) fn unproven_by_bun(root: &Utf8Path, manifest: &Value, lock: &Value) -
         let Some(declared) = super::read_manifest(&root.join(&manifest)) else {
             return Some(format!("{manifest} cannot be read as JSON"));
         };
+        // Bun collects every member's trusted dependencies but skips comparing them in frozen
+        // mode; it ignores a member's `patchedDependencies` altogether.
+        if declared.get("trustedDependencies").is_some() {
+            return Some(format!("{manifest} lists `trustedDependencies`"));
+        }
         if !same_package(&declared, row, true) {
             return Some(relock(&manifest));
         }
@@ -166,7 +171,8 @@ fn same_package(manifest: &Value, row: &Value, member: bool) -> bool {
         .collect();
     text(manifest, "name") == text(row, "name")
         && (!member || text(manifest, "version") == text(row, "version"))
-        && declarations(manifest, optional_peers) == declarations(row, recorded_optional_peers)
+        && declarations(manifest, optional_peers, !member)
+            == declarations(row, recorded_optional_peers, !member)
 }
 
 /// A package's install declarations as `bun.lock` records them.
@@ -181,10 +187,11 @@ struct Declarations {
 
 /// The `package`'s declarations with its `optional_peers`, normalized the way Bun records them.
 ///
-/// A name `optionalDependencies` declares is left out of `dependencies`, and an optional peer
-/// that `peerDependencies` does not declare is recorded as the peer `*`.
+/// An optional peer that `peerDependencies` does not declare is recorded as the peer `*`.
+/// For the `root` alone, a name `optionalDependencies` declares is left out of `dependencies`;
+/// a member's row keeps both declarations.
 /// Both normalizations leave a lock row as it is, so a manifest and its row compare equal.
-fn declarations(package: &Value, optional_peers: BTreeSet<String>) -> Declarations {
+fn declarations(package: &Value, optional_peers: BTreeSet<String>, root: bool) -> Declarations {
     let field = |name: &str| {
         package
             .get(name)
@@ -194,7 +201,9 @@ fn declarations(package: &Value, optional_peers: BTreeSet<String>) -> Declaratio
     };
     let optional_dependencies = field("optionalDependencies");
     let mut dependencies = field("dependencies");
-    dependencies.retain(|name, _| !optional_dependencies.contains_key(name));
+    if root {
+        dependencies.retain(|name, _| !optional_dependencies.contains_key(name));
+    }
     let mut peer_dependencies = field("peerDependencies");
     for name in &optional_peers {
         peer_dependencies

@@ -138,6 +138,7 @@ fn check_refuses_a_disabled_cache_without_touching_the_project() {
     for (file, content) in [
         ("bunfig.toml", "[install.cache]\ndisable = true\n"),
         (".npmrc", "cache=false\n"),
+        (".npmrc", "cache=false # keep Bun's cache off\n"),
     ] {
         let fixture = lock_probe_fixture();
         edit_root_pin(&fixture);

@@ -203,7 +203,7 @@ fn error_header(line: &str) -> Option<ErrorHeader<'_>> {
 }
 
 /// `line` without its ANSI control sequences (`ESC [` parameters, then one final byte).
-fn strip_ansi(line: &str) -> Cow<'_, str> {
+pub(crate) fn strip_ansi(line: &str) -> Cow<'_, str> {
     if !line.contains('\u{1b}') {
         return Cow::Borrowed(line);
     }

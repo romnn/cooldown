@@ -6,25 +6,27 @@
 //!
 //! - a bunfig, the global `.bunfig.toml` or the project's `bunfig.toml`, through
 //!   `[install] cache = false` or `[install.cache] disable = true`;
-//! - an npmrc, the project's `.npmrc` or the user's, through `cache=false`.
+//! - an npmrc, the project's `.npmrc` or the user's, through a `cache` value such as `false`.
 //!
-//! Only those settings are read; a bunfig whose cache setting cannot be interpreted, or a file
+//! Only those settings are read; a cache setting the probe cannot establish as enabled, or a file
 //! that cannot be read, leaves the cache unproven too.
-//! Bun loads the project's dotenv files before it picks the user npmrc, so a dotenv file that
-//! sets a variable moving the configuration read here, or `BUN_OPTIONS`, leaves it unproven as
-//! well.
+//! Bun picks the user npmrc through `NPM_CONFIG_USERCONFIG` after loading the project's dotenv
+//! files, so a dotenv file that may set it leaves the cache unproven as well.
+//! The global bunfig lookup and `BUN_OPTIONS` read the process environment, which the probe
+//! controls.
 
 use camino::{Utf8Path, Utf8PathBuf};
 
-/// The variables a project dotenv file must not set, compared without case: those that choose
-/// where Bun reads the user npmrc or global bunfig, and `BUN_OPTIONS`, which can name another
-/// bunfig.
-const DOTENV_VETOES: [&str; 5] = [
-    "NPM_CONFIG_USERCONFIG",
-    "BUN_OPTIONS",
-    "XDG_CONFIG_HOME",
-    "HOME",
-    "USERPROFILE",
+/// The dotenv files Bun 1.4.5 loads from the project for an install, for any `NODE_ENV`.
+const DOTENV_FILES: [&str; 8] = [
+    ".env.development.local",
+    ".env.production.local",
+    ".env.test.local",
+    ".env.local",
+    ".env.development",
+    ".env.production",
+    ".env.test",
+    ".env",
 ];
 
 /// The process environment that locates Bun's user-level configuration.
@@ -109,9 +111,9 @@ pub(super) fn cache_disabled(root: &Utf8Path, environment: &Environment) -> Opti
     let npmrcs = std::iter::once(root.join(".npmrc")).chain(environment.user_npmrcs(root));
     for path in npmrcs {
         match read_optional(&path) {
-            Ok(Some(text)) if npmrc_disables_cache(&text) => {
+            Ok(Some(text)) if npmrc_may_disable_cache(&text) => {
                 return Some(format!(
-                    "{path} sets `cache=false`, which disables Bun's cache"
+                    "{path} sets a `cache` value that may disable Bun's cache"
                 ));
             }
             Ok(_) => {}
@@ -151,44 +153,58 @@ fn bunfig_cache_veto(document: &toml::Table) -> Option<&'static str> {
     }
 }
 
-/// Whether an npmrc's `text` sets `cache=false`.
-fn npmrc_disables_cache(text: &str) -> bool {
+/// Whether an npmrc's `text` may disable Bun's cache: it has a `cache` key, or a key that could
+/// expand to one, whose value is not established as enabling the cache.
+///
+/// Bun's ini parser ends a value at an unescaped `;` or `#`, drops surrounding quotes, and reads
+/// `false` as the switch that disables the cache, while another word names a cache directory.
+/// An empty value, `null`, or `undefined` is no directory either.
+/// A `${...}` expansion or a backslash escape can spell any of those, so it establishes nothing.
+fn npmrc_may_disable_cache(text: &str) -> bool {
     text.lines().any(|line| {
-        line.split_once('=').is_some_and(|(key, value)| {
-            key.trim() == "cache" && value.trim().trim_matches(['"', '\'']) == "false"
-        })
+        let line = line.trim_start();
+        if line.starts_with([';', '#']) {
+            return false;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return false;
+        };
+        let key = unquote(key.trim());
+        let key = key.strip_suffix("[]").unwrap_or(key);
+        if key != "cache" && !key.contains(['$', '\\']) {
+            return false;
+        }
+        let value = value.split([';', '#']).next().unwrap_or_default();
+        let value = unquote(value.trim());
+        value.is_empty()
+            || value.contains(['$', '\\'])
+            || matches!(value, "false" | "null" | "undefined")
     })
 }
 
-/// Why a dotenv file at `root` may move the configuration [`cache_disabled`] reads, if one may.
+/// Why a dotenv file Bun loads in `root` may choose the user npmrc, if one may.
 ///
-/// Every `.env` and `.env.*` file counts, whichever of them Bun loads for the current
-/// `NODE_ENV`.
+/// Any mention of `NPM_CONFIG_USERCONFIG`, in any case, counts, which covers every assignment
+/// form Bun's dotenv parser accepts.
 fn dotenv_veto(root: &Utf8Path) -> Option<String> {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return Some(format!("{root} cannot be listed for dotenv files"));
-    };
-    let mut files: Vec<String> = entries
-        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-        .filter(|name| name == ".env" || name.starts_with(".env."))
-        .collect();
-    files.sort();
-    files.into_iter().find_map(|file| {
-        let Ok(text) = std::fs::read_to_string(root.join(&file)) else {
-            return Some(format!("{file} cannot be read"));
+    DOTENV_FILES.into_iter().find_map(|file| {
+        let text = match read_optional(&root.join(file)) {
+            Ok(Some(text)) => text,
+            Ok(None) => return None,
+            Err(_) => return Some(format!("{file} cannot be read")),
         };
-        let variable = text.lines().find_map(|line| {
-            let line = line.trim_start();
-            let line = line.strip_prefix("export ").unwrap_or(line);
-            let (key, _) = line.split_once('=')?;
-            let key = key.trim();
-            DOTENV_VETOES
-                .iter()
-                .any(|veto| key.eq_ignore_ascii_case(veto))
-                .then(|| key.to_string())
-        })?;
-        Some(format!(
-            "{file} sets `{variable}`, which moves the configuration that can disable Bun's cache"
-        ))
+        text.to_ascii_lowercase()
+            .contains("npm_config_userconfig")
+            .then(|| {
+                format!("{file} may set `NPM_CONFIG_USERCONFIG`, which chooses the user npmrc")
+            })
     })
+}
+
+/// `text` without one pair of surrounding double or single quotes.
+fn unquote(text: &str) -> &str {
+    ["\"", "'"]
+        .into_iter()
+        .find_map(|quote| text.strip_prefix(quote)?.strip_suffix(quote))
+        .unwrap_or(text)
 }

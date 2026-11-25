@@ -24,6 +24,7 @@ pub use crate::manifest::workspaces::{WorkspaceDialect, WorkspaceManifests};
 pub use bindings::{BindingContext, CopyBinding};
 pub use yarn::{UnattributedName, Unproven, UnprovenDeclaration, YarnBindings};
 
+pub(crate) use pnpm_frozen::strip_ansi;
 pub(crate) use yarn_berry::{
     BerryLock, YarnBerry, berry_workspace_paths, percent_decode, seed as berry_seed,
 };

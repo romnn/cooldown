@@ -73,13 +73,15 @@ is `lock_unknown` rather than current wherever the probe cannot establish what B
 - no readable text `bun.lock`;
 - a configuration that disables Bun's install cache, under which Bun writes into the project:
   `[install] cache = false` or `[install.cache] disable = true` in the project's `bunfig.toml` or
-  the global `.bunfig.toml`, or `cache=false` in the project's or the user's `.npmrc`, and a
-  project `.env` file setting a variable that moves where Bun reads that configuration, such as
-  `NPM_CONFIG_USERCONFIG` or `BUN_OPTIONS`;
+  the global `.bunfig.toml`, or a `cache` value in the project's or the user's `.npmrc` that is
+  not plainly a directory or `true`, such as `cache=false # comment` or `cache=${VAR}`, and a
+  `.env` file Bun loads (`.env`, `.env.local`, `.env.<NODE_ENV>`, `.env.<NODE_ENV>.local`) that
+  mentions `NPM_CONFIG_USERCONFIG`, which chooses the user `.npmrc`;
 - an enclosing directory whose `package.json` declares workspaces, which Bun could run the project
   as a member of;
-- `trustedDependencies` or `patchedDependencies` in the root manifest or the lock, or a local
-  `file:` or `link:` dependency in the lock, whose own manifest Bun does not compare;
+- `trustedDependencies` in any workspace manifest or the lock, or `patchedDependencies` in the
+  root manifest or the lock, since a frozen install compares neither, or a local `file:` or
+  `link:` dependency in the lock, whose own manifest Bun does not compare;
 - a workspace pattern other than a literal path or a path ending in `/*`;
 - workspace members other than those the lock records, such as a new member named like a locked
   registry package, or a member's name, version, or declarations differing from what the lock

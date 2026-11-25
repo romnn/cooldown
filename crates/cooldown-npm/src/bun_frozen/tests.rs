@@ -199,17 +199,42 @@ fn an_npmrc_can_disable_the_cache() -> eyre::Result<()> {
     let plain = |project: &TempProject| environment(project, false);
     let xdg = |project: &TempProject| environment(project, true);
 
-    // The project's `.npmrc`, however the value is spelled
-    for spelling in ["cache=false", " cache = false ", "cache=\"false\""] {
+    // The project's `.npmrc`, with every value Bun may read as no cache, however it is spelled:
+    // after a comment is cut, through quotes, or behind an expansion or escape the probe cannot
+    // resolve
+    for spelling in [
+        "cache=false",
+        " cache = false ",
+        "cache=false # keep it off",
+        "cache=false;off",
+        "cache=\"false\"",
+        "cache='false'",
+        "\"cache\"=false",
+        "cache=${INSTALL_CACHE}",
+        "cache=\\u0066alse",
+        "${CACHE_KEY}=false",
+        "cache=",
+        "cache=null",
+    ] {
         let reason = disabled(&[(".npmrc", spelling)], &plain)?;
         assert!(
             reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("cache=false")),
+                .is_some_and(|reason| reason.contains("`cache` value")),
             "{spelling}: {reason:?}"
         );
     }
-    for other in [";cache=false", "cache=./cache", "cache-max=false"] {
+    // Comments, a cache directory or the enabled switch, and other keys
+    for other in [
+        ";cache=false",
+        "# cache=false",
+        "cache=./cache",
+        "cache=./cache # moved",
+        "cache=true",
+        "cache",
+        "cache-max=false",
+        "//registry.npmjs.org/:_authToken=${NPM_TOKEN}",
+    ] {
         assert_eq!(disabled(&[(".npmrc", other)], &plain)?, None, "{other}");
     }
 
@@ -243,8 +268,11 @@ fn a_dotenv_file_can_move_the_configuration() -> eyre::Result<()> {
     for (file, line) in [
         (".env", "npm_config_userconfig=./user.npmrc"),
         (".env.local", "export NPM_CONFIG_USERCONFIG=./user.npmrc"),
-        (".env.production", "BUN_OPTIONS=--config=other.toml"),
-        (".env", "HOME=/elsewhere"),
+        (".env.production", "NPM_CONFIG_USERCONFIG: ./user.npmrc"),
+        (
+            ".env.test.local",
+            "NPM_CONFIG_USERCONFIG = \"./user.npmrc\"",
+        ),
     ] {
         let reason = disabled(&[(file, line)])?;
         assert!(
@@ -254,9 +282,14 @@ fn a_dotenv_file_can_move_the_configuration() -> eyre::Result<()> {
             "{file}: {reason:?}"
         );
     }
-    // Other variables and files that are no dotenv file
-    assert_eq!(disabled(&[(".env", "FOO=1\n# BUN_OPTIONS=x")])?, None);
-    assert_eq!(disabled(&[(".envrc", "BUN_OPTIONS=x")])?, None);
+    // Variables the process environment governs, and files Bun does not load
+    let unrelated = "BUN_OPTIONS=--config=other.toml\nHOME=/elsewhere\nXDG_CONFIG_HOME=/x";
+    assert_eq!(disabled(&[(".env", unrelated)])?, None);
+    let example = "NPM_CONFIG_USERCONFIG=./user.npmrc";
+    assert_eq!(
+        disabled(&[(".env.example", example), (".envrc", example)])?,
+        None
+    );
     Ok(())
 }
 
@@ -462,6 +495,59 @@ fn edits_bun_does_not_compare_leave_the_lock_unproven() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A member's row keeps a `dependencies` entry that its `optionalDependencies` repeats, so
+/// removing that entry, which Bun's frozen check passes, leaves the lock unproven.
+#[test]
+fn a_members_shadowed_declaration_still_counts() -> eyre::Result<()> {
+    let (project, mut lock) = workspace()?;
+    let both = json!({
+        "name": "a",
+        "version": "1.0.0",
+        "dependencies": { "ms": "2.1.3" },
+        "optionalDependencies": { "ms": "2.1.3" },
+    });
+    project.write_json("packages/a/package.json", &both)?;
+    lock["workspaces"]["packages/a"] = both;
+    assert_eq!(unproven(&project, &lock)?, None);
+
+    project.write_json(
+        "packages/a/package.json",
+        &json!({ "name": "a", "version": "1.0.0", "optionalDependencies": { "ms": "2.1.3" } }),
+    )?;
+    let reason = unproven(&project, &lock)?;
+    assert!(
+        reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("packages/a/package.json differs")),
+        "{reason:?}"
+    );
+    Ok(())
+}
+
+/// Bun's frozen mode does not compare a member's `trustedDependencies`, so a member listing any
+/// leaves the lock unproven.
+#[test]
+fn a_member_trusting_dependencies_leaves_the_lock_unproven() -> eyre::Result<()> {
+    let (project, lock) = workspace()?;
+    project.write_json(
+        "packages/a/package.json",
+        &json!({
+            "name": "a",
+            "version": "1.0.0",
+            "dependencies": { "ms": "^2.1.0" },
+            "trustedDependencies": ["ms"],
+        }),
+    )?;
+    let reason = unproven(&project, &lock)?;
+    assert!(
+        reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("trustedDependencies")),
+        "{reason:?}"
+    );
+    Ok(())
+}
+
 /// A workspace pattern whose membership the probe cannot establish, or a lock member outside the
 /// project, leaves the lock unproven.
 #[test]
@@ -644,6 +730,23 @@ async fn the_verdict_needs_every_qualification() -> eyre::Result<()> {
     let report = bun.verify(false).await?;
     assert_eq!(report.status, LockStatus::Unknown);
     assert!(report.detail.contains("changed while"), "{}", report.detail);
+
+    // A cache or temporary directory that links into the project, which Bun would write through,
+    // whether the link's target exists yet or not
+    for (child, target) in [("cache", ""), ("tmp", "node_modules/.cache")] {
+        let bun = FakeBun::new(&manifest, &lock, "1.4.5", PASS)?;
+        let scratch = bun.scratch.root.join("bun-verify");
+        std::fs::create_dir_all(&scratch)?;
+        std::os::unix::fs::symlink(bun.project.root.join(target), scratch.join(child))?;
+        let report = bun.verify(false).await?;
+        assert_eq!(report.status, LockStatus::Unknown, "{child}");
+        assert!(
+            report.detail.contains("leads into the project"),
+            "{}",
+            report.detail
+        );
+        assert_eq!(bun.calls()?, Vec::<String>::new());
+    }
     Ok(())
 }
 

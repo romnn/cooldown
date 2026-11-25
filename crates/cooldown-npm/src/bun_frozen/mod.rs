@@ -10,14 +10,15 @@
 //! - no configuration Bun reads disables its install cache, since an uncached run writes into the
 //!   project's `node_modules` ([`config`]);
 //! - no enclosing directory declares workspaces, which Bun could run the project as a member of;
-//! - neither the manifest nor the lock carries `trustedDependencies` or `patchedDependencies`,
-//!   and the lock records no local folder or link dependency, whose own manifest can change
-//!   unseen.
+//! - neither the root manifest nor the lock carries `trustedDependencies` or
+//!   `patchedDependencies`, and the lock records no local folder or link dependency, whose own
+//!   manifest can change unseen.
 //!
 //! Bun's frozen check accepts some edits it does not compare, such as a member's version, a
 //! removed member, or a new member named like a locked registry package.
 //! Its exit 0 therefore proves the lock current only when the workspace members and every
-//! member's declarations still match what the lock recorded ([`workspace`]).
+//! member's declarations still match what the lock recorded, and no member lists
+//! `trustedDependencies`, which frozen mode does not compare ([`workspace`]).
 //!
 //! Every Bun the probe runs keeps its cache and temporary files under cooldown's cache directory,
 //! outside the checkout, ignores `BUN_OPTIONS`, and stays offline when cooldown does.
@@ -92,13 +93,18 @@ async fn lock_current_in(
         return Ok(unknown(&reason));
     }
     let unproven = workspace::unproven_by_bun(&canonical, &manifest, &lock);
-    let Some(scratch) = outside(&canonical, scratch) else {
+    // Each directory Bun writes to is qualified itself, since either may be a link into the
+    // project.
+    let (Some(cache), Some(tmp)) = (
+        outside(&canonical, &scratch.join("cache")),
+        outside(&canonical, &scratch.join("tmp")),
+    ) else {
         return Ok(unknown(&format!(
-            "cooldown's cache directory {scratch} lies inside the project, where Bun would write \
+            "cooldown's cache directory {scratch} leads into the project, where Bun would write \
              its cache"
         )));
     };
-    let bun = Isolated::new(cmd, &canonical, &scratch)?;
+    let bun = Isolated::new(cmd, &canonical, &cache, &tmp)?;
 
     // Qualify the executable
     let revision = bun.run(&["--revision"]).await?;
@@ -165,16 +171,14 @@ struct Isolated<'a> {
 }
 
 impl<'a> Isolated<'a> {
-    /// Runs `cmd` in the canonical `root`, creating the cache and temporary directories under
-    /// `scratch`.
+    /// Runs `cmd` in the canonical `root`, creating its `cache` and `tmp` directories, both
+    /// resolved outside the project.
     ///
     /// `BUN_OPTIONS` is cleared because it injects arguments such as `--cwd` or `--config`.
     /// `PWD` names the canonical root because Bun's Unix lookups walk the ancestors of `$PWD`'s
     /// spelling rather than of the working directory.
-    fn new(cmd: &'a NodeCmd, root: &'a Utf8Path, scratch: &Utf8Path) -> Result<Self> {
-        let cache = scratch.join("cache");
-        let tmp = scratch.join("tmp");
-        for directory in [&cache, &tmp] {
+    fn new(cmd: &'a NodeCmd, root: &'a Utf8Path, cache: &Utf8Path, tmp: &Utf8Path) -> Result<Self> {
+        for directory in [cache, tmp] {
             std::fs::create_dir_all(directory)
                 .map_err(|err| CoreError::Filesystem(format!("{directory}: {err}")))?;
         }
@@ -228,17 +232,24 @@ fn canonical(path: &Utf8Path) -> std::io::Result<Utf8PathBuf> {
         .map_err(|path| std::io::Error::other(format!("{} is not valid UTF-8", path.display())))
 }
 
-/// `scratch` resolved through the symbolic links of its existing ancestors, or `None` when it
-/// lies inside the canonical `root` or cannot be resolved.
+/// `directory` resolved through the symbolic links of its existing ancestors, itself included, or
+/// `None` when it lies inside the canonical `root` or cannot be resolved.
 ///
-/// cooldown accepts a cache directory inside the project, and creating the scratch directory
-/// there would itself change the project.
-fn outside(root: &Utf8Path, scratch: &Utf8Path) -> Option<Utf8PathBuf> {
-    let (existing, resolved) = scratch
-        .ancestors()
-        .find_map(|ancestor| Some((ancestor, canonical(ancestor).ok()?)))?;
-    let resolved = resolved.join(scratch.strip_prefix(existing).ok()?);
-    (!resolved.starts_with(root)).then_some(resolved)
+/// cooldown accepts a cache directory inside the project, and creating a directory there would
+/// itself change the project.
+fn outside(root: &Utf8Path, directory: &Utf8Path) -> Option<Utf8PathBuf> {
+    for ancestor in directory.ancestors() {
+        match canonical(ancestor) {
+            Ok(resolved) => {
+                let resolved = resolved.join(directory.strip_prefix(ancestor).ok()?);
+                return (!resolved.starts_with(root)).then_some(resolved);
+            }
+            // An entry that exists without resolving, such as a dangling link, could lead anywhere.
+            Err(_) if std::fs::symlink_metadata(ancestor).is_ok() => return None,
+            Err(_) => {}
+        }
+    }
+    None
 }
 
 /// Whether the Bun that printed `revision` for `--revision` is a stable release no older than
@@ -316,7 +327,10 @@ enum Verdict {
 /// Bun ignores a lock it cannot load and then refuses the frozen install, so its lock-load
 /// diagnostics disqualify both the refusal and a success.
 fn verdict(termination: ToolTermination, stderr: &str) -> Verdict {
-    let lines: Vec<String> = stderr.lines().map(plain).collect();
+    let lines: Vec<String> = stderr
+        .lines()
+        .map(|line| crate::lock::strip_ansi(line).trim().to_string())
+        .collect();
     let errors: Vec<&str> = lines
         .iter()
         .map(String::as_str)
@@ -331,27 +345,6 @@ fn verdict(termination: ToolTermination, stderr: &str) -> Verdict {
         ToolTermination::ExitCode(1) if errors == [FROZEN] && !lock_diagnosed => Verdict::Stale,
         _ => Verdict::Failed,
     }
-}
-
-/// `line` without ANSI escape sequences or surrounding whitespace.
-fn plain(line: &str) -> String {
-    let mut plain = String::with_capacity(line.len());
-    let mut chars = line.chars();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            // A control sequence runs from `ESC [` to its final byte in `@`..=`~`.
-            if chars.next() == Some('[') {
-                for c in chars.by_ref() {
-                    if ('@'..='~').contains(&c) {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        plain.push(c);
-    }
-    plain.trim().to_string()
 }
 
 #[cfg(test)]
