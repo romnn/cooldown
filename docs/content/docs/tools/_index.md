@@ -107,8 +107,8 @@ resolution and that cooldown judges what the lock resolved:
 
 - no `pyproject.toml` at the project root, where Poetry would check an enclosing project instead;
 - `pyproject.toml` or the lock changing while Poetry checks them;
-- a `lock-version` that is missing or outside the formats Poetry's installer reads, 1 up to but
-  excluding 3, which Poetry's check passes but its installer refuses;
+- a `lock-version` that is missing or outside the formats Poetry's installer reads, a stable
+  version from 1 up to but excluding 3, which Poetry's check passes but its installer refuses;
 - a lock that lists no packages while `pyproject.toml` declares some;
 - a URL, git, or path origin, including a `develop = true` path, in a declaration or in the lock's
   dependencies, whose content can change while its declaration stays the same;
@@ -126,7 +126,10 @@ resolution and that cooldown judges what the lock resolved:
 A hand-edited version of a registry package in the lock still passes, since Poetry compares no
 locked version, and cooldown evaluates the version the lock records. Every package
 `pyproject.toml` declares is a direct dependency, whether in `[project]`, an extra, a PEP 735
-dependency group, or a `[tool.poetry]` main, group, or legacy development table. A
+dependency group, or a `[tool.poetry]` main, group, or legacy development table. `upgrade` and
+`fix` move a package with `poetry add`, which writes to the main dependencies, so they hold any
+package that `project.dependencies` and `[tool.poetry.dependencies]` do not declare as
+`not_eligible` rather than add it there. A
 `requirements.txt` has no native notion of being current, so a pip project's lock stays
 `lock_unknown`.
 

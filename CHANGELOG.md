@@ -17,7 +17,9 @@
   prerelease Poetry leave the lock `lock_unknown` instead, and a `poetry.lock` that is not TOML or
   lacks its `package` array is `lockfile_unreadable` rather than read as empty. Packages declared
   in a Poetry group, the legacy development table, an extra, or a PEP 735 dependency group are now
-  direct dependencies rather than transitive ones. `upgrade` and `fix` verify the lock they wrote
+  direct dependencies rather than transitive ones, while `upgrade` and `fix`, whose `poetry add`
+  writes to the main dependencies, hold any package the main dependencies do not declare as
+  `not_eligible` instead of adding it there. `upgrade` and `fix` verify the lock they wrote
   the same way, and CI installs Poetry 2.5.1 for the integration tests. A pip `requirements.txt`
   stays `lock_unknown`. Closes #180.
 - **`check` gates Bun projects.** `check` failed every Bun project with `lock_unknown`, which

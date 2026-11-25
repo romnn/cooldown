@@ -201,3 +201,32 @@ fn check_refuses_a_direct_url_dependency() {
 
     assert_only_error(&check, "lock_unknown");
 }
+
+/// A package declared only in a Poetry group is a direct dependency to `check`, yet `upgrade`
+/// never moves it with `poetry add`, which would add it to the main dependencies.
+#[test]
+fn a_group_only_package_is_direct_but_never_added_to_the_main_dependencies() {
+    skip_if_missing!("poetry");
+    // `pytest` 7.4.4 matured within the major line before the freeze.
+    let pyproject =
+        format!("{PYPROJECT}\n[tool.poetry.group.test.dependencies]\npytest = \"7.4.0\"\n");
+    let fixture = locked_fixture(&pyproject);
+
+    // Direct-only evaluation covers the main and the group dependency alike
+    let check = fixture.cooldown_json(&["check", "--freeze", FREEZE, "--transitive", "hide"]);
+    assert!(check.ok(), "{check:#?}");
+    assert_eq!(check.summary_checked(), 2, "{check:#?}");
+    assert_eq!(check.summary_direct(), 2, "{check:#?}");
+
+    // The upgrade holds the group dependency rather than adding it to the main dependencies
+    let before = project_files(fixture.root());
+    let upgrade = fixture.cooldown_json(&["upgrade", "--freeze", FREEZE]);
+    assert!(
+        upgrade
+            .skipped_reasons_for("pytest")
+            .contains("not_eligible"),
+        "{upgrade:#?}"
+    );
+    assert!(!upgrade.applied_names().contains("pytest"), "{upgrade:#?}");
+    assert_eq!(project_files(fixture.root()), before);
+}

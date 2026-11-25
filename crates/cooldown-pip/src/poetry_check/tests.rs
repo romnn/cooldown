@@ -98,7 +98,7 @@ fn only_a_sole_refusal_beside_warnings_reads_as_stale() {
     // The two refusals, standalone, through CRLF and trailing whitespace
     assert_eq!(verdict(exit(1), "", &changed), Verdict::Changed);
     assert_eq!(
-        verdict(exit(1), "\r\n", &format!("Error: {CHANGED}  \r\n")),
+        verdict(exit(1), "\r\n", &format!("\r\nError: {CHANGED}  \r\n")),
         Verdict::Changed
     );
     assert_eq!(
@@ -152,6 +152,17 @@ fn only_a_sole_refusal_beside_warnings_reads_as_stale() {
             "{stray}"
         );
     }
+
+    // A refusal beside any standard output, even a line that repeats a warning
+    assert_eq!(
+        verdict(
+            exit(1),
+            &format!("{dev_warning}\n"),
+            &format!("{changed}Warning: {dev_warning}\n")
+        ),
+        Verdict::Failed
+    );
+    assert_eq!(verdict(exit(1), "All set!\n", &changed), Verdict::Failed);
 
     // A refusal under another exit, quoted in a longer line, or with nothing printed
     assert_eq!(verdict(exit(2), "", &changed), Verdict::Failed);
@@ -434,7 +445,9 @@ fn only_a_lock_version_the_installer_reads_is_proven() -> eyre::Result<()> {
     for readable in ["1.0", "1.1", "2.0", "2.1", "2.9"] {
         assert!(readable_format(readable), "{readable}");
     }
-    for unreadable in ["0.9", "3", "3.0", "banana", ""] {
+    for unreadable in [
+        "0.9", "3", "3.0", "3.0rc1", "2.1rc1", "2.1.dev0", "banana", "",
+    ] {
         assert!(!readable_format(unreadable), "{unreadable}");
     }
 

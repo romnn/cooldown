@@ -469,7 +469,21 @@ impl<L: PyLayout> ToolWrite for PyTool<L> {
             return Ok(report);
         }
 
+        // `poetry add` writes to the main dependencies, so a package declared only in a group or
+        // an extra, or not at all, would land there beside the declaration that governs it.
+        let main = lock::parse_poetry_main(&std::fs::read_to_string(&project.manifest)?);
         for change in &plan.changes {
+            if !lock::is_direct(&main, &change.package.name) {
+                report.skipped.push(Skipped {
+                    detail: Some(
+                        "not a main dependency, and `poetry add` would add it to the main \
+                         dependencies"
+                            .to_string(),
+                    ),
+                    ..not_eligible(change)
+                });
+                continue;
+            }
             let args = L::upgrade_args(&change.package.name, change.to.as_str());
             match self.driver.run(&project.root, &args).await {
                 Ok(()) => report.applied.push(change.clone()),
@@ -785,6 +799,91 @@ mod tests {
         assert!(report.skipped.is_empty());
         let rewritten = std::fs::read_to_string(root.join("requirements.txt"))?;
         assert!(rewritten.contains("requests==2.31.0"));
+        Ok(())
+    }
+
+    /// `poetry add` writes to the main dependencies, so the apply runs it only for a main
+    /// dependency and holds a package declared only in a group as not eligible, without running
+    /// Poetry for it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn poetry_apply_never_adds_a_group_only_package() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        let outside = tempfile::tempdir()?;
+        let outside = Utf8PathBuf::from_path_buf(outside.path().to_path_buf())
+            .map_err(|path| eyre::eyre!("temporary path is not UTF-8: {}", path.display()))?;
+        std::fs::write(
+            root.join("poetry.lock"),
+            indoc! {r#"
+                package = [
+                    { name = "six", version = "1.16.0" },
+                    { name = "pytest", version = "7.4.0" },
+                ]
+            "#},
+        )?;
+        std::fs::write(
+            root.join("pyproject.toml"),
+            indoc! {r#"
+                [project]
+                name = "demo"
+                dependencies = ["six==1.16.0"]
+
+                [tool.poetry.group.test.dependencies]
+                pytest = "7.4.0"
+            "#},
+        )?;
+        let project = Project {
+            root: root.clone(),
+            kind: Poetry::ID,
+            manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        };
+        // A Poetry stand-in that records every invocation outside the project
+        let log = outside.join("invocations.log");
+        let script = pip_config_script(&outside, &format!("echo \"$@\" >> '{log}'"));
+        let cache = tempfile::tempdir()?;
+        let mut tool = PyTool::<Poetry>::from_http(SharedHttp::new(
+            cache.path(),
+            cooldown_registry::HttpOptions::default(),
+        )?);
+        tool.driver = Driver::from_program(script.as_str());
+        let change = |name: &str, from: &str, to: &str| Change {
+            package: PackageId::new(Poetry::ID, name, Some(PYPI.to_string())),
+            from: Version::new(from),
+            to: Version::new(to),
+            kind: cooldown_core::UpdateKind::Patch,
+            downgrade: false,
+            direct: true,
+            members: Vec::new(),
+        };
+        let plan = Plan {
+            changes: vec![
+                change("pytest", "7.4.0", "7.4.4"),
+                change("six", "1.16.0", "1.17.0"),
+            ],
+            rewrite: cooldown_core::RewriteMode::Auto,
+            ..Plan::default()
+        };
+
+        let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
+        let report = tool.apply(&mutation).await?;
+
+        // The main dependency is added, and the group-only package is held without Poetry
+        let applied: Vec<&str> = report
+            .applied
+            .iter()
+            .map(|change| change.package.name.as_str())
+            .collect();
+        assert_eq!(applied, ["six"]);
+        assert_eq!(report.skipped.len(), 1, "{:?}", report.skipped);
+        let held = &report.skipped[0];
+        assert_eq!(held.change.package.name, "pytest");
+        assert_eq!(held.reason, SkipReason::NotEligible);
+        assert_eq!(std::fs::read_to_string(&log)?, "add six@1.17.0\n");
         Ok(())
     }
 

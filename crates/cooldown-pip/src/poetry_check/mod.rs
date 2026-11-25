@@ -239,19 +239,22 @@ fn verdict(termination: ToolTermination, stdout: &str, stderr: &str) -> Verdict 
     }
 }
 
-/// The message of the one `Error:` line in a check's output, when every other line is a warning
-/// Poetry prints, line endings and trailing whitespace ignored.
+/// The message of the one `Error:` line in a failed check's output, when every other line is a
+/// warning Poetry prints, line endings and trailing whitespace ignored.
 ///
-/// Poetry prints each error as `Error: …` and each warning as `Warning: …`.
+/// Poetry prints each error as `Error: …` and each warning as `Warning: …` on standard error, and
+/// nothing on standard output for a failed check, so any standard output is unrecognised.
 /// A warning about a `[tool.poetry]` field that may be dynamic continues on the next line with one
 /// of the [`WARNING_CONTINUATIONS`].
 /// A warning Poetry finds while it loads the project is also logged as a bare line, which its own
 /// `Warning:` line repeats.
 /// Any other line is unrecognised output, so no error is returned.
-fn sole_error<'a>(stdout: &'a str, stderr: &'a str) -> Option<&'a str> {
-    let lines: Vec<&str> = stdout
+fn sole_error<'a>(stdout: &str, stderr: &'a str) -> Option<&'a str> {
+    if !stdout.trim().is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = stderr
         .lines()
-        .chain(stderr.lines())
         .map(str::trim_end)
         .filter(|line| !line.is_empty())
         .collect();
@@ -362,10 +365,12 @@ fn unproven_by_poetry(lock: &str, manifest: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// Whether Poetry's installer reads a lock of format `lock_version`, which it accepts from 1 up to
-/// but excluding 3, refusing the lock otherwise while its freshness check still passes it.
+/// Whether Poetry's installer reads a lock of format `lock_version`, a stable version it accepts
+/// from 1 up to but excluding 3, refusing the lock otherwise while its freshness check still
+/// passes it.
 fn readable_format(lock_version: &str) -> bool {
     version::parse(lock_version).is_some()
+        && !version::is_prerelease(lock_version)
         && version::compare(lock_version, "1") != Ordering::Less
         && version::compare(lock_version, "3") == Ordering::Less
 }

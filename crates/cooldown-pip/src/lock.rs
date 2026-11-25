@@ -345,12 +345,44 @@ pub fn parse_poetry_direct(manifest: &str) -> HashSet<String> {
 
 /// [`parse_poetry_direct`] for a parsed `manifest`.
 pub(crate) fn poetry_declared(manifest: &Table) -> HashSet<String> {
-    let tables = poetry_dependency_tables(manifest)
+    declared_names(
+        poetry_dependency_tables(manifest),
+        requirement_lists(manifest),
+    )
+}
+
+/// Returns the normalised set of distributions a Poetry `pyproject.toml` declares among its main
+/// dependencies, `[tool.poetry.dependencies]` and `project.dependencies`, which is where
+/// `poetry add` without `--group` or `--optional` writes.
+#[must_use]
+pub fn parse_poetry_main(manifest: &str) -> HashSet<String> {
+    let Ok(manifest) = toml::from_str::<Table>(manifest) else {
+        return HashSet::new();
+    };
+    let main = manifest
+        .get("tool")
+        .and_then(|tool| tool.get("poetry"))
+        .and_then(|poetry| poetry.get("dependencies"))
+        .and_then(Value::as_table);
+    let requirements = manifest
+        .get("project")
+        .and_then(|project| project.get("dependencies"))
+        .and_then(Value::as_array);
+    declared_names(main, requirements)
+}
+
+/// The normalised names that the Poetry dependency `tables` and the PEP 508 requirement `lists`
+/// declare, the implicit `python` constraint aside.
+fn declared_names<'a>(
+    tables: impl IntoIterator<Item = &'a Table>,
+    lists: impl IntoIterator<Item = &'a Vec<Value>>,
+) -> HashSet<String> {
+    let tables = tables
         .into_iter()
         .flat_map(|table| table.keys())
         .filter(|name| *name != "python")
         .map(String::as_str);
-    let requirements = requirement_lists(manifest)
+    let requirements = lists
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
