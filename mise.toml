@@ -8,9 +8,8 @@
 # The Rust toolchain is NOT managed here: it comes from the exact pin in `rust-toolchain.toml`,
 # installed via `dtolnay/rust-toolchain` in CI, so mise's shims never shadow the build compiler
 # (and a bare `cargo +nightly` works for `task unused`/udeps without a MISE_RUST_VERSION hack).
-# The integration-test versions below are each an exact `mise ls-remote <tool>` hit (verified),
-# not an invented tag; the developer/lint tooling (`zig`, `cargo-zigbuild`, …) tracks `latest`,
-# pinned exactly by the committed `mise.lock`.
+# The developer/lint tooling (`zig`, `cargo-zigbuild`, …) tracks `latest`, pinned exactly by the
+# committed `mise.lock`.
 #
 # conda is intentionally omitted: it has no clean mise-managed backend here (`mise ls-remote
 # conda` returns nothing), so pinning it would be a ghost. A real-tool conda integration test
@@ -20,17 +19,20 @@
 uv = "0.11.23"
 go = "1.26.4"
 node = "26.3.1"
-pnpm = "11.8.0"
+"npm:pnpm" = "11.8.0"
 yarn = "4.18.1"
 python = "3.14.6"
+deno = "2.8.3"
+bun = "1.4.5"
+"pypi:poetry" = "2.5.1"
+
+# Supported ecosystems whose real-tool integration tests are still to be written (#186); CI does
+# not install them yet.
 ruby = "4.0.5"
 erlang = "29.0.2"
 elixir = "1.20.1-otp-29"
 java = "26.0.1"
 maven = "3.9.16"
-deno = "2.8.3"
-bun = "1.4.5"
-"pipx:poetry" = "2.5.1"
 swift = "6.3.2"
 
 # Developer tools
