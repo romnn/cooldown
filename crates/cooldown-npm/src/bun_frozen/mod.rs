@@ -27,7 +27,8 @@ mod config;
 mod workspace;
 
 use crate::nodecmd::{EnvOverride, NodeCmd};
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8Path;
+use cooldown_adapter_util::{canonical_path, outside_project};
 use cooldown_core::{
     CoreError, LockStatus, LockVerifyReport, Result, ToolTermination, failure_detail,
 };
@@ -72,7 +73,7 @@ async fn lock_current_in(
     environment: &config::Environment,
 ) -> Result<LockVerifyReport> {
     let canonical =
-        canonical(root).map_err(|err| CoreError::Filesystem(format!("{root}: {err}")))?;
+        canonical_path(root).map_err(|err| CoreError::Filesystem(format!("{root}: {err}")))?;
 
     // Qualify the lock, the configuration, and the manifests before Bun runs
     let Ok(content) = std::fs::read_to_string(canonical.join(LOCKFILE)) else {
@@ -96,8 +97,8 @@ async fn lock_current_in(
     // Each directory Bun writes to is qualified itself, since either may be a link into the
     // project.
     let (Some(cache), Some(tmp)) = (
-        outside(&canonical, &scratch.join("cache")),
-        outside(&canonical, &scratch.join("tmp")),
+        outside_project(&canonical, &scratch.join("cache")),
+        outside_project(&canonical, &scratch.join("tmp")),
     ) else {
         return Ok(unknown(&format!(
             "cooldown's cache directory {scratch} leads into the project, where Bun would write \
@@ -223,33 +224,6 @@ fn unknown(reason: &str) -> LockVerifyReport {
         status: LockStatus::Unknown,
         detail: format!("{LOCKFILE} currency cannot be verified: {reason}"),
     }
-}
-
-/// `path` with every symbolic link resolved, spelled without Windows' verbatim prefix.
-fn canonical(path: &Utf8Path) -> std::io::Result<Utf8PathBuf> {
-    let resolved = dunce::canonicalize(path)?;
-    Utf8PathBuf::from_path_buf(resolved)
-        .map_err(|path| std::io::Error::other(format!("{} is not valid UTF-8", path.display())))
-}
-
-/// `directory` resolved through the symbolic links of its existing ancestors, itself included, or
-/// `None` when it lies inside the canonical `root` or cannot be resolved.
-///
-/// cooldown accepts a cache directory inside the project, and creating a directory there would
-/// itself change the project.
-fn outside(root: &Utf8Path, directory: &Utf8Path) -> Option<Utf8PathBuf> {
-    for ancestor in directory.ancestors() {
-        match canonical(ancestor) {
-            Ok(resolved) => {
-                let resolved = resolved.join(directory.strip_prefix(ancestor).ok()?);
-                return (!resolved.starts_with(root)).then_some(resolved);
-            }
-            // An entry that exists without resolving, such as a dangling link, could lead anywhere.
-            Err(_) if std::fs::symlink_metadata(ancestor).is_ok() => return None,
-            Err(_) => {}
-        }
-    }
-    None
 }
 
 /// Whether the Bun that printed `revision` for `--revision` is a stable release no older than

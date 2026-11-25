@@ -2,6 +2,7 @@
 //! `requirements.txt` (pinned `name==version` lines) and Poetry's `poetry.lock` (a TOML list of
 //! resolved packages), with `pyproject.toml` supplying Poetry's direct-dependency set.
 
+use cooldown_core::CoreError;
 use std::collections::HashSet;
 
 /// Normalises a distribution name per PEP 503 (lowercase; runs of `_`/`.`/`-` collapse to a single
@@ -285,11 +286,17 @@ fn parse_requirement_pin(raw: &str) -> Option<RequirementPin<'_>> {
 }
 
 /// Parses the `[[package]]` entries of a `poetry.lock` into resolved [`ResolvedPin`]s.
-#[must_use]
-pub fn parse_poetry_lock(content: &str) -> Vec<ResolvedPin> {
+///
+/// Poetry writes the `package` array even when it is empty, so a lock without one is refused
+/// rather than read as resolving nothing.
+///
+/// # Errors
+///
+/// Returns [`CoreError::LockUnreadable`] if the lock is not TOML or lacks the `package` array or
+/// a package's name or version.
+pub fn parse_poetry_lock(content: &str) -> Result<Vec<ResolvedPin>, CoreError> {
     #[derive(serde::Deserialize)]
     struct Lock {
-        #[serde(default)]
         package: Vec<Package>,
     }
     #[derive(serde::Deserialize)]
@@ -301,18 +308,17 @@ pub fn parse_poetry_lock(content: &str) -> Vec<ResolvedPin> {
         #[serde(default)]
         source: Option<toml::Value>,
     }
-    toml::from_str::<Lock>(content)
-        .map(|lock| {
-            lock.package
-                .into_iter()
-                .map(|p| ResolvedPin {
-                    name: p.name,
-                    version: p.version,
-                    pypi: p.source.is_none(),
-                })
-                .collect()
+    let lock = toml::from_str::<Lock>(content)
+        .map_err(|err| CoreError::LockUnreadable(format!("poetry.lock: {err}")))?;
+    Ok(lock
+        .package
+        .into_iter()
+        .map(|p| ResolvedPin {
+            name: p.name,
+            version: p.version,
+            pypi: p.source.is_none(),
         })
-        .unwrap_or_default()
+        .collect())
 }
 
 /// Returns the normalised set of distributions a Poetry `pyproject.toml` declares directly, reading
@@ -448,7 +454,7 @@ mod tests {
     #[test]
     fn poetry_lock_and_direct() {
         let lock = "[[package]]\nname = \"requests\"\nversion = \"2.28.0\"\n\n[[package]]\nname = \"urllib3\"\nversion = \"1.26.0\"\n";
-        let mut got = parse_poetry_lock(lock);
+        let mut got = parse_poetry_lock(lock).expect("lock");
         got.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(
             got,
@@ -459,5 +465,32 @@ mod tests {
         let direct = parse_poetry_direct(manifest);
         assert!(is_direct(&direct, "requests")); // normalised match
         assert!(!is_direct(&direct, "urllib3"));
+    }
+
+    /// A lock that is not TOML, or that lacks the `package` array Poetry always writes, is an
+    /// error rather than an empty inventory, while an explicit empty array reads as no packages.
+    #[test]
+    fn poetry_lock_reader_refuses_what_poetry_never_writes() {
+        assert!(matches!(
+            parse_poetry_lock("[[package]\n"),
+            Err(CoreError::LockUnreadable(_))
+        ));
+        assert!(matches!(
+            parse_poetry_lock(indoc! {r#"
+                [metadata]
+                lock-version = "2.1"
+            "#}),
+            Err(CoreError::LockUnreadable(_))
+        ));
+        assert_eq!(
+            parse_poetry_lock(indoc! {r#"
+                package = []
+
+                [metadata]
+                lock-version = "2.1"
+            "#})
+            .expect("empty lock"),
+            Vec::new()
+        );
     }
 }

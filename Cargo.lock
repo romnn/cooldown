@@ -448,6 +448,7 @@ version = "0.0.32"
 dependencies = [
  "camino",
  "cooldown-core",
+ "dunce",
  "indoc",
  "process-wrap",
  "serde_json",

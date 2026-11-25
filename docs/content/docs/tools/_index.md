@@ -90,6 +90,36 @@ is `lock_unknown` rather than current wherever the probe cannot establish what B
 
 `upgrade` and `fix` verify the lock they wrote the same way.
 
+`check` asks Poetry itself whether a `poetry.lock` is current, with a stable Poetry 2.3 or newer,
+the first release whose content hash covers PEP 735 `[dependency-groups]`: an older or prerelease
+Poetry leaves the lock `lock_unknown`. It runs `poetry check --lock --strict --no-plugins` in the
+project, with the `poetry` that `upgrade` runs (`COOLDOWN_POETRY` or `PATH`), Poetry's cache kept
+in cooldown's cache directory, and Python writing no bytecode. Poetry's check reads only
+`pyproject.toml` and the lock, so the probe needs no network, creates no virtualenv, and leaves the
+project byte for byte as it was.
+Poetry's refusal of a lock whose content hash no longer matches `pyproject.toml`, or of a missing
+lock, is a stale lock that `--allow-stale-lock` waives, but only when it is all Poetry prints; any
+other Poetry failure, such as an invalid configuration or a warning, which `--strict` makes fatal,
+is `tool_failed`. Poetry's content hash covers the declarations, not what the lock resolved them
+to, so the lock is `lock_unknown` rather than current wherever the probe cannot establish that the
+declarations decide the resolution:
+
+- no `pyproject.toml` at the project root, where Poetry would check an enclosing project instead;
+- a lock that lists no packages while `pyproject.toml` declares some;
+- a URL, git, or path origin, including a `develop = true` path, in a declaration, in the lock's
+  dependencies, or as a locked package's source, whose content can change while its declaration
+  stays the same;
+- `project.dynamic` in `pyproject.toml`, which changes how Poetry combines the `[project]` and
+  `[tool.poetry]` declarations;
+- a lock whose content hash may not cover `[dependency-groups]`, which newer Poetry compares an
+  older Poetry's lock without: any lock written by Poetry 2.2, one written by an older Poetry while
+  `pyproject.toml` declares dependency groups, and one without a readable generator comment unless
+  its `lock-version` predates 2.1 and no dependency group is declared.
+
+A hand-edited version of a registry package in the lock still passes, since Poetry compares no
+locked version, and cooldown evaluates the version the lock records. A `requirements.txt` has no
+native notion of being current, so a pip project's lock stays `lock_unknown`.
+
 Yarn Classic and Yarn Berry share the `yarn` tool, its `[tool.yarn]` config, and `yarn.lock`;
 cooldown tells them apart by the lock itself, since only a Berry lock opens with a `__metadata`
 entry. A Berry lock written by Yarn 2 through 4.18 (lockfile versions 4 to 6 and 8 to 10) is read

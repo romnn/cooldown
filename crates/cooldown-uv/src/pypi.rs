@@ -117,6 +117,13 @@ impl PyPi {
         }
     }
 
+    /// Returns the directory the client caches responses in, which adapters may also use for
+    /// scratch state of their own.
+    #[must_use]
+    pub fn cache_dir(&self) -> &std::path::Path {
+        self.http.cache_dir()
+    }
+
     /// Returns this registry's name, [`PYPI`], for tagging [`PackageId`]s.
     #[must_use]
     pub fn registry_name(&self) -> String {

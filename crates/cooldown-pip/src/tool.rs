@@ -6,17 +6,17 @@
 
 use crate::lock;
 use async_trait::async_trait;
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_adapter_util::{
     Driver, RegistryVersionClassifier, build_registry_releases, skipped_on_apply_error,
     verify_current_unknown,
 };
 use cooldown_core::{
-    ApplyReport, CandidateScope, Capabilities, Change, DepScope, Dependency, FetchContext,
-    LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
-    Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release, ReleaseFetcher,
-    ReleaseOrder, ReleaseQuality, ResolveInputs, Result, SkipReason, Skipped, ToolId, ToolRead,
-    ToolWrite, UpdateKind, VerifyReport, Version,
+    ApplyReport, CandidateScope, Capabilities, Change, CoreError, DepScope, Dependency,
+    FetchContext, LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan,
+    PreparedMutation, Project, ProjectMarker, ProjectMutationJournal, RawRelease, Release,
+    ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs, Result, SkipReason, Skipped,
+    ToolId, ToolRead, ToolWrite, UpdateKind, VerifyReport, Version,
 };
 use cooldown_registry::SharedHttp;
 use cooldown_uv::PyPi;
@@ -40,7 +40,11 @@ pub trait PyLayout: Send + Sync + 'static {
     const INSTALLS: bool;
 
     /// Parses the lock + manifest into the resolved [`ResolvedDep`] set.
-    fn parse(lock: &str, manifest: &str) -> Vec<ResolvedDep>;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LockUnreadable`] for a lock the layout cannot read.
+    fn parse(lock: &str, manifest: &str) -> Result<Vec<ResolvedDep>>;
 
     /// The driver args that re-pin `name` to `version`.
     fn upgrade_args(name: &str, version: &str) -> Vec<String>;
@@ -87,8 +91,8 @@ impl PyLayout for Pip {
     const BIN: &'static str = "pip";
     const INSTALLS: bool = false;
 
-    fn parse(lock: &str, _manifest: &str) -> Vec<ResolvedDep> {
-        lock::parse_requirements(lock)
+    fn parse(lock: &str, _manifest: &str) -> Result<Vec<ResolvedDep>> {
+        Ok(lock::parse_requirements(lock)
             .into_iter()
             .map(|pin| ResolvedDep {
                 name: pin.name,
@@ -96,7 +100,7 @@ impl PyLayout for Pip {
                 direct: true,
                 pypi: pin.pypi,
             })
-            .collect()
+            .collect())
     }
 
     fn upgrade_args(name: &str, version: &str) -> Vec<String> {
@@ -123,9 +127,9 @@ impl PyLayout for Poetry {
     const BIN: &'static str = "poetry";
     const INSTALLS: bool = true;
 
-    fn parse(lock: &str, manifest: &str) -> Vec<ResolvedDep> {
+    fn parse(lock: &str, manifest: &str) -> Result<Vec<ResolvedDep>> {
         let direct = lock::parse_poetry_direct(manifest);
-        lock::parse_poetry_lock(lock)
+        Ok(lock::parse_poetry_lock(lock)?
             .into_iter()
             .map(|pin| {
                 let is_direct = lock::is_direct(&direct, &pin.name);
@@ -136,7 +140,7 @@ impl PyLayout for Poetry {
                     pypi: pin.pypi,
                 }
             })
-            .collect()
+            .collect())
     }
 
     fn upgrade_args(name: &str, version: &str) -> Vec<String> {
@@ -317,7 +321,7 @@ impl<L: PyLayout> ToolRead for PyTool<L> {
         let manifest = std::fs::read_to_string(&project.manifest).unwrap_or_default();
         let ambient_intact = L::ambient_origin_intact(project);
         let mut deps = Vec::new();
-        for resolved in L::parse(&lock, &manifest) {
+        for resolved in L::parse(&lock, &manifest)? {
             if scope == DepScope::Direct && !resolved.direct {
                 continue;
             }
@@ -370,8 +374,20 @@ impl<L: PyLayout> ToolRead for PyTool<L> {
         Ok(None)
     }
 
-    async fn verify_lock_current(&self, _project: &Project) -> Result<LockVerifyReport> {
-        Ok(verify_current_unknown(L::LOCKFILE))
+    /// Poetry proves its lock with `poetry check --lock`.
+    /// A `requirements.txt` has no native notion of being current, so it stays unknown.
+    async fn verify_lock_current(&self, project: &Project) -> Result<LockVerifyReport> {
+        if L::ID != Poetry::ID {
+            return Ok(verify_current_unknown(L::LOCKFILE));
+        }
+        let scratch = Utf8PathBuf::from_path_buf(self.pypi.cache_dir().join("poetry-verify"))
+            .map_err(|path| {
+                CoreError::PathEncoding(format!(
+                    "cache directory is not valid UTF-8: {}",
+                    path.display()
+                ))
+            })?;
+        crate::poetry_check::lock_current(&self.driver, &project.root, &scratch).await
     }
 }
 
@@ -494,7 +510,6 @@ fn not_eligible(change: &Change) -> Skipped {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use camino::Utf8PathBuf;
     use color_eyre::eyre;
     use indoc::indoc;
 

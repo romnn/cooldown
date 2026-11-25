@@ -17,6 +17,7 @@ camino.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 process-wrap.workspace = true
+dunce.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

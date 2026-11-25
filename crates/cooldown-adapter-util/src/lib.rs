@@ -3,7 +3,9 @@
 
 mod driver;
 pub mod evidence;
+mod scratch;
 pub use driver::{Driver, program_on_path, resolve_program, supervised_output};
+pub use scratch::{canonical_path, outside_project};
 
 use camino::Utf8Path;
 use cooldown_core::{

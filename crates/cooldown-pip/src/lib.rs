@@ -5,6 +5,7 @@
 
 mod ambient;
 pub mod lock;
+mod poetry_check;
 pub mod tool;
 
 pub use tool::{Pip, Poetry, PyTool};
