@@ -73,8 +73,9 @@ is `lock_unknown` rather than current wherever the probe cannot establish what B
 - no readable text `bun.lock`;
 - a configuration that disables Bun's install cache, under which Bun writes into the project:
   `[install] cache = false` or `[install.cache] disable = true` in the project's `bunfig.toml` or
-  the global `.bunfig.toml`, or a `cache` value in the project's or the user's `.npmrc` that is
-  not plainly a directory or `true`, such as `cache=false # comment` or `cache=${VAR}`, and a
+  the global `.bunfig.toml`, or any line in the project's or the user's `.npmrc` that may set
+  `cache` other than a plain `cache`, `cache=true`, or `cache=<path>`, such as
+  `cache=false # comment`, `cache = ' false '`, or `cache=${VAR}`, and a
   `.env` file Bun loads (`.env`, `.env.local`, `.env.<NODE_ENV>`, `.env.<NODE_ENV>.local`) that
   mentions `NPM_CONFIG_USERCONFIG`, which chooses the user `.npmrc`;
 - an enclosing directory whose `package.json` declares workspaces, which Bun could run the project

@@ -153,33 +153,41 @@ fn bunfig_cache_veto(document: &toml::Table) -> Option<&'static str> {
     }
 }
 
-/// Whether an npmrc's `text` may disable Bun's cache: it has a `cache` key, or a key that could
-/// expand to one, whose value is not established as enabling the cache.
+/// Whether an npmrc's `text` may disable Bun's cache.
 ///
-/// Bun's ini parser ends a value at an unescaped `;` or `#`, drops surrounding quotes, and reads
-/// `false` as the switch that disables the cache, while another word names a cache directory.
-/// An empty value, `null`, or `undefined` is no directory either.
-/// A `${...}` expansion or a backslash escape can spell any of those, so it establishes nothing.
+/// Bun's ini parser unquotes keys and values, cuts comments, expands `${...}`, and parses
+/// quoted values as JSON, so `false` can be spelled many ways.
+/// Rather than follow it, only proven-safe lines pass: a comment, a line whose key is a plain
+/// word other than `cache`, or a plain `cache` key that is bare, `true`, or a plain path.
+/// Any other line that could name the `cache` key may disable the cache.
 fn npmrc_may_disable_cache(text: &str) -> bool {
     text.lines().any(|line| {
-        let line = line.trim_start();
-        if line.starts_with([';', '#']) {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with([';', '#']) {
             return false;
         }
-        let Some((key, value)) = line.split_once('=') else {
-            return false;
-        };
-        let key = unquote(key.trim());
-        let key = key.strip_suffix("[]").unwrap_or(key);
-        if key != "cache" && !key.contains(['$', '\\']) {
+        let (key, value) = line.split_once('=').unwrap_or((line, ""));
+        let key = key.trim();
+        if !is_plain(key) {
+            return key.to_ascii_lowercase().contains("cache") || key.contains(['$', '\\']);
+        }
+        if !key.eq_ignore_ascii_case("cache") {
             return false;
         }
-        let value = value.split([';', '#']).next().unwrap_or_default();
-        let value = unquote(value.trim());
-        value.is_empty()
-            || value.contains(['$', '\\'])
-            || matches!(value, "false" | "null" | "undefined")
+        let value = value.trim();
+        let safe = !line.contains('=')
+            || value == "true"
+            || (is_plain(value) && !matches!(value, "false" | "null" | "undefined"));
+        !safe
     })
+}
+
+/// Whether `text` is a non-empty run of characters Bun's ini parser reads literally.
+fn is_plain(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '@' | '~')
+        })
 }
 
 /// Why a dotenv file Bun loads in `root` may choose the user npmrc, if one may.
@@ -199,12 +207,4 @@ fn dotenv_veto(root: &Utf8Path) -> Option<String> {
                 format!("{file} may set `NPM_CONFIG_USERCONFIG`, which chooses the user npmrc")
             })
     })
-}
-
-/// `text` without one pair of surrounding double or single quotes.
-fn unquote(text: &str) -> &str {
-    ["\"", "'"]
-        .into_iter()
-        .find_map(|quote| text.strip_prefix(quote)?.strip_suffix(quote))
-        .unwrap_or(text)
 }

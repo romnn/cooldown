@@ -199,22 +199,28 @@ fn an_npmrc_can_disable_the_cache() -> eyre::Result<()> {
     let plain = |project: &TempProject| environment(project, false);
     let xdg = |project: &TempProject| environment(project, true);
 
-    // The project's `.npmrc`, with every value Bun may read as no cache, however it is spelled:
-    // after a comment is cut, through quotes, or behind an expansion or escape the probe cannot
-    // resolve
+    // The project's `.npmrc`, with every `cache` line that is not a proven-safe form, since Bun
+    // may read it as no cache: after a comment is cut, through quotes, behind an expansion or
+    // escape, or a directory the probe does not take apart
     for spelling in [
         "cache=false",
         " cache = false ",
+        "CACHE=false",
         "cache=false # keep it off",
         "cache=false;off",
         "cache=\"false\"",
         "cache='false'",
+        "cache = ' false '",
         "\"cache\"=false",
+        "'\"cache\"' = false",
+        "cache[]=false",
         "cache=${INSTALL_CACHE}",
         "cache=\\u0066alse",
         "${CACHE_KEY}=false",
+        "\\u0063ache=false",
         "cache=",
         "cache=null",
+        "cache=./cache # moved",
     ] {
         let reason = disabled(&[(".npmrc", spelling)], &plain)?;
         assert!(
@@ -224,12 +230,12 @@ fn an_npmrc_can_disable_the_cache() -> eyre::Result<()> {
             "{spelling}: {reason:?}"
         );
     }
-    // Comments, a cache directory or the enabled switch, and other keys
+    // Comments, a plain cache directory or the enabled switch, and other keys
     for other in [
         ";cache=false",
         "# cache=false",
         "cache=./cache",
-        "cache=./cache # moved",
+        "cache=/var/cache/bun",
         "cache=true",
         "cache",
         "cache-max=false",
