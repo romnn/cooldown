@@ -15,22 +15,19 @@
 mod executor;
 mod run_staled;
 
+pub(super) use self::executor::{CopyOutcome, Judged, PlannedCopy, upgrade_verdict};
 use self::executor::{PlanMode, ProjectRunStatus, ProjectUpgradeExecutor};
-pub(super) use self::executor::{target_package_for, upgrade_view};
 use self::run_staled::{CurrentAtStart, ProjectPass, TurnLock, refresh_gate};
-use super::advisories::ProjectAdvisories;
 use super::lanes::LaneAccess;
 use super::{
-    BuildInfo, Exit, ProjectProgress, RunOpts, UpgradeItem, UpgradeMeta, UpgradeSummary, Workspace,
-    diag_from_error,
+    BuildInfo, Exit, ProjectProgress, RunOpts, SkippedInfo, UpgradeItem, UpgradeMeta,
+    UpgradeSummary, Workspace, diag_from_error,
 };
 use cooldown_core::{
-    AcceptedPublication, BaselineViolation, Change, Diagnostic, DiagnosticKind, EdgeBindingAction,
-    IsolatedMutation, IsolatedMutationStrategy, LockStatus, MemberRef, MutationExecution,
-    PackageId, ToolRead, ToolWrite,
+    AcceptedPublication, BaselineViolation, Diagnostic, DiagnosticKind, EdgeBindingAction,
+    IsolatedMutation, IsolatedMutationStrategy, LockStatus, MutationExecution, ToolRead, ToolWrite,
 };
 use std::collections::HashSet;
-use std::sync::Arc;
 
 /// The result of `upgrade`: the plan that was applied (or, with `--dry-run`, the plan that would
 /// be), plus the re-lock/build status and the exit it implies.
@@ -72,20 +69,17 @@ pub(super) struct UpgradeAccum {
     /// The versions outside a configured `max-major` this project's passes authorized, which a
     /// later refresh of its lock may keep (see [`run_staled`]).
     pub(super) allowed_crossings: HashSet<BaselineViolation>,
+    /// What the project's pass read and settled, which only `outdated`'s dry run collects (see
+    /// [`Workspace::dry_run_upgrade`]).
+    pub(super) facts: Option<PlanFacts>,
 }
 
-/// The evidence a preview's targets were selected from, carried into the trial's policy run so
-/// it judges from exactly the data that selected them.
-pub(super) struct PreviewEvidence {
-    /// The build-backend requirements merged beside the resolved graph, which the lock never
-    /// records (see [`Workspace::manifest_constraints_in_scope`]).
-    pub(super) manifest_only: HashSet<PackageId>,
-    /// The caller's already-fetched feed snapshot: a second fetch could see a newer one and hold
-    /// a candidate the caller just reported adoptable.
-    /// `None` fetches one as usual.
-    pub(super) advisories: Option<Arc<ProjectAdvisories>>,
-    /// The members the run's scope and exclude policy dropped.
-    pub(super) excluded_members: Vec<MemberRef>,
+/// What one project's upgrade pass read and settled, which `outdated` reports from.
+#[derive(Default)]
+pub(super) struct PlanFacts {
+    /// Every dependency the first plan read, with the releases and verdict it was planned from
+    /// and what the pass settled for it; `None` while no plan has run.
+    pub(super) copies: Option<Vec<PlannedCopy>>,
 }
 
 /// The read/write adapter pair and shared per-project inputs the upgrade executor needs.
@@ -413,99 +407,33 @@ impl Workspace {
         }
     }
 
-    /// Runs preselected upgrade targets through the complete policy trial in a project copy,
-    /// reporting into the caller's open `progress` block.
-    pub(super) async fn preview_project_upgrade(
+    /// Runs `upgrade --dry-run`'s pass over one project, reporting into the caller's open
+    /// `progress` block: the same planning, trials, and final verification against a throwaway
+    /// copy of the project, without a build.
+    ///
+    /// `outdated` reports from it, so its rows say what `upgrade` does with each dependency: the
+    /// pass's own rows and diagnostics, and what it read and settled for each dependency
+    /// ([`PlanFacts`]).
+    pub(super) async fn dry_run_upgrade(
         &self,
         pctx: &super::ProjectCtx,
         opts: &RunOpts,
         progress: &ProjectProgress,
-        changes: Vec<Change>,
-        evidence: PreviewEvidence,
     ) -> UpgradeAccum {
-        let mut acc = UpgradeAccum::default();
-        let Some(reader) = self.adapter(pctx.tool) else {
-            return acc;
+        let opts = RunOpts {
+            dry_run: true,
+            build: false,
+            ..opts.clone()
         };
-        let Some(writer) = self.mutator(pctx.tool) else {
-            acc.errors.push(read_only_mutator_diag(pctx));
-            return acc;
+        let mode = PlanMode::Upgrade {
+            transitive: opts.transitive_mode,
         };
-        let guard = match self.project_read_guard(pctx).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                acc.errors.push(diag_from_error(
-                    &error,
-                    pctx.tool,
-                    pctx.rel_path.as_str(),
-                    None,
-                ));
-                return acc;
-            }
+        let mut acc = UpgradeAccum {
+            facts: Some(PlanFacts::default()),
+            ..UpgradeAccum::default()
         };
-        let prepared = match writer.mutation_execution() {
-            MutationExecution::InPlace => super::project_copy::ProjectCopy::create(
-                &pctx.project,
-                &writer.resolve_inputs(),
-                &writer.external_resolve_roots(&pctx.project),
-            )
-            .map(|copy| PreparedPreview::Generic(Box::new(copy))),
-            MutationExecution::Isolated(strategy) => strategy
-                .prepare(&pctx.project, guard.coordination())
-                .await
-                .map(PreparedPreview::Isolated),
-        };
-        let prepared = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                acc.errors.push(diag_from_error(
-                    &error,
-                    pctx.tool,
-                    pctx.rel_path.as_str(),
-                    None,
-                ));
-                return acc;
-            }
-        };
-        let copied_pctx = super::ProjectCtx {
-            tool: pctx.tool,
-            project: prepared.project().clone(),
-            rel_path: pctx.rel_path.clone(),
-            policy: pctx.policy.clone(),
-            edge_policy: pctx.edge_policy,
-            single_copy: pctx.single_copy.clone(),
-            generated_members: pctx.generated_members.clone(),
-        };
-        let mut preview_opts = opts.clone();
-        preview_opts.build = false;
-        // The preview really mutates — but only its throwaway copy, so a diagnostic it
-        // publishes into a read-only report (`outdated` forwards its warnings) must speak
-        // conditionally, the way a dry run's does.
-        preview_opts.dry_run = true;
-        preview_opts.lock = false;
-
-        ProjectUpgradeExecutor::new(
-            self,
-            UpgradeCtx {
-                reader,
-                writer,
-                pctx: &copied_pctx,
-                opts: &preview_opts,
-                progress,
-                repo_root: self.repo_root(),
-                source_root: &pctx.project.root,
-                access: prepared.execution(),
-                defer_build: false,
-            },
-            PlanMode::Upgrade {
-                transitive: preview_opts.transitive_mode,
-            },
-            &mut acc,
-        )
-        .run_policy(changes, evidence)
-        .await;
-        let (copy_root, source_root) = prepared.relabel_roots(pctx);
-        relabel_copy_paths(&mut acc, copy_root, source_root);
+        self.run_plan_pass(pctx, &opts, mode, progress, &mut acc)
+            .await;
         acc
     }
 
@@ -562,7 +490,10 @@ impl Workspace {
         let mut trial_opts = opts.clone();
         trial_opts.build = false;
         let execution = ProjectExecution::Isolated(trial.mutation_project());
-        let mut project_acc = UpgradeAccum::default();
+        let mut project_acc = UpgradeAccum {
+            facts: acc.facts.take(),
+            ..UpgradeAccum::default()
+        };
         let status = ProjectUpgradeExecutor::new(
             self,
             UpgradeCtx {
@@ -658,15 +589,31 @@ fn relabel_copy_paths(acc: &mut UpgradeAccum, copy: &camino::Utf8Path, source: &
         .iter_mut()
         .chain(acc.warnings.iter_mut())
         .for_each(&relabel_diag);
+    let relabel_skip = |skipped: &mut SkippedInfo| {
+        relabel(&mut skipped.message);
+        if let Some(offending) = &mut skipped.offending {
+            relabel(offending);
+        }
+    };
     for item in acc.items.iter_mut().chain(acc.edge_items.iter_mut()) {
         if let Some(skipped) = &mut item.skipped {
-            relabel(&mut skipped.message);
-            if let Some(offending) = &mut skipped.offending {
-                relabel(offending);
-            }
+            relabel_skip(skipped);
         }
         if let Some(error) = &mut item.error {
             relabel_diag(error);
+        }
+    }
+    let outcomes = acc
+        .facts
+        .iter_mut()
+        .filter_map(|facts| facts.copies.as_mut())
+        .flatten()
+        .filter_map(|copy| copy.outcome.as_mut());
+    for outcome in outcomes {
+        match outcome {
+            CopyOutcome::Refused { skip, .. } => relabel_skip(skip),
+            CopyOutcome::Failed(error) => relabel_diag(error),
+            CopyOutcome::Landed { .. } | CopyOutcome::Undecided => {}
         }
     }
 }
@@ -724,41 +671,6 @@ impl IsolatedAccessGuard {
     }
 }
 
-enum PreparedPreview {
-    // Boxed: the copy carries its rebase and spelling, far larger than the isolated stage's handle.
-    Generic(Box<super::project_copy::ProjectCopy>),
-    Isolated(Box<dyn IsolatedMutation>),
-}
-
-impl PreparedPreview {
-    fn project(&self) -> &cooldown_core::Project {
-        match self {
-            PreparedPreview::Generic(copy) => &copy.project,
-            PreparedPreview::Isolated(copy) => copy.project(),
-        }
-    }
-
-    fn execution(&self) -> ProjectExecution {
-        match self {
-            PreparedPreview::Generic(_) => ProjectExecution::Copy,
-            PreparedPreview::Isolated(copy) => ProjectExecution::Isolated(copy.mutation_project()),
-        }
-    }
-
-    /// The roots the relabel pass maps onto each other: a generic copy's scratch tree onto the
-    /// source ancestor it was staged from (so a staged sibling is covered), an isolated stage's
-    /// project onto the source project (its staging keeps the rest of its layout to itself).
-    fn relabel_roots<'p>(
-        &'p self,
-        source: &'p super::ProjectCtx,
-    ) -> (&'p camino::Utf8Path, &'p camino::Utf8Path) {
-        match self {
-            PreparedPreview::Generic(copy) => copy.relabel_roots(),
-            PreparedPreview::Isolated(copy) => (&copy.project().root, &source.project.root),
-        }
-    }
-}
-
 /// Folds `source` (one project's run, or one trial) into `target`.
 ///
 /// Every field folds commutatively, so the order projects finish in never shows; the rows and
@@ -773,6 +685,7 @@ fn merge_upgrade_accum(target: &mut UpgradeAccum, mut source: UpgradeAccum) {
     target.build_ok = combine_build_ok(target.build_ok, source.build_ok);
     target.lock_status = combine_lock_status(target.lock_status, source.lock_status);
     target.allowed_crossings.extend(source.allowed_crossings);
+    target.facts = target.facts.take().or(source.facts);
 }
 
 /// One failed build fails the run; a build that ran and passed is reported only when none
@@ -785,11 +698,22 @@ const fn combine_build_ok(left: Option<bool>, right: Option<bool>) -> Option<boo
     }
 }
 
+/// Folds a trial whose state was discarded into `target`: its errors, and what its plans read,
+/// which the discard does not change, while what it settled goes with its rows.
 fn merge_discarded_trial(target: &mut UpgradeAccum, source: UpgradeAccum) {
     target.errors.extend(source.errors);
     target
         .errors
         .extend(source.items.into_iter().filter_map(|item| item.error));
+    target.facts = target.facts.take().or(source.facts);
+    let copies = target
+        .facts
+        .iter_mut()
+        .filter_map(|facts| facts.copies.as_mut())
+        .flatten();
+    for copy in copies {
+        copy.outcome = None;
+    }
 }
 
 /// Publishes the trial's accepted state and folds its rows into `acc`.

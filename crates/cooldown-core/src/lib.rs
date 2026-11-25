@@ -30,6 +30,7 @@ pub use evaluate::{
     CeilingHold, CeilingReason, FixVerdict, ResolveContext, advisories_reintroduced_by, check_pin,
     check_pin_advised, evaluate, evaluate_advised, evaluate_ceiling_hold,
     evaluate_ceiling_hold_advised, evaluate_fix, evaluate_fix_advised, exceeds_max_major,
+    newest_eligible,
 };
 pub use model::*;
 pub use mutation::{

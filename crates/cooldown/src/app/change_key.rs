@@ -13,7 +13,7 @@
 //! current version must never label the other copy's row.
 
 use crate::app::UpgradeItem;
-use cooldown_core::{Change, MemberRef};
+use cooldown_core::{Change, MemberRef, PackageId};
 
 /// The identity of one change: its package, the versions it moves from and to, and, for a direct
 /// change, the workspace members that declare it.
@@ -77,6 +77,13 @@ impl ChangeKey {
     /// key never carries members.
     pub(crate) fn member_blind(mut self) -> Self {
         self.members.clear();
+        self
+    }
+
+    /// The key of the same move reported under `package`'s name.
+    pub(crate) fn reported_as(mut self, package: &PackageId) -> Self {
+        self.name.clone_from(&package.name);
+        self.registry.clone_from(&package.registry);
         self
     }
 

@@ -1,9 +1,9 @@
 //! File-backed Cargo trials exercise real rollback, remediation, and bounded target fallback.
 
-use crate::app::upgrade::{PreviewEvidence, UpgradeOutcome};
+use crate::app::upgrade::UpgradeOutcome;
 use crate::app::{
-    AdapterSet, Baseline, Exit, OutdatedStatus, Progress, ProjectCtx, ProjectProgress, RunOpts,
-    UpgradeItem, Workspace,
+    AdapterSet, Baseline, Exit, OutdatedStatus, Progress, ProjectCtx, RunOpts, UpgradeItem,
+    Workspace,
 };
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -19,7 +19,7 @@ use cooldown_core::{
     VerifyReport, Version,
 };
 use indoc::indoc;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::sync::Arc;
 
@@ -54,9 +54,16 @@ enum Resolver {
         coupled: bool,
         attests: bool,
     },
-    /// Offers `parent` only on its next major, which stays held, while the transitive `child` it
-    /// requires has a matured release on its own line.
-    MajorParent,
+    /// Offers `parent` only on its next major, while the transitive `child` it requires has a
+    /// matured release on its own line.
+    ///
+    /// Unless `lands`, the major stays held.
+    /// When `pinned`, `parent` 1.0.0 pins `child` exactly, while its major only requires `child`'s
+    /// line, and once the major lands the resolver refuses to move `child`.
+    MajorParent {
+        lands: bool,
+        pinned: bool,
+    },
     /// Resolves the transitive `child` on its next major exactly while `parent` sits on a minor in
     /// `lowest..=highest`: on the fresh `2.1.0` when `fresh_major`, else on the matured `2.0.0`;
     /// `child` is capped at major 1.
@@ -103,6 +110,11 @@ struct FakeCargo {
     failures: Vec<(&'static str, Failure)>,
     /// The packages whose releases the registry cannot serve.
     unavailable_releases: &'static [&'static str],
+    /// The `name@version` whose locking makes every later scoped graph read fail.
+    unreadable_with: Option<&'static str>,
+    /// A `name@target` whose landing drops another package from the lock, the way Cargo drops a
+    /// crate nothing requires any more.
+    drops: Option<(&'static str, &'static str)>,
 }
 
 fn timestamp(value: &str) -> jiff::Timestamp {
@@ -309,7 +321,8 @@ impl FakeCargo {
         let held: &[&str] = match self.resolver {
             Resolver::PersistentPair { coupled, .. } if coupled && !sibling_planned => &["sibling"],
             Resolver::PersistentPair { .. } => &["parent", "sibling"],
-            Resolver::MajorParent => &["parent"],
+            Resolver::MajorParent { lands: false, .. } => &["parent"],
+            Resolver::MajorParent { pinned: true, .. } => &["child"],
             Resolver::Scripted { held } => {
                 return plan
                     .changes
@@ -337,6 +350,17 @@ impl FakeCargo {
                 detail: Some(format!("{} is held by holder", change.package.name)),
             })
             .collect()
+    }
+
+    /// Drops the package [`drops`](Self::drops) names once its trigger is among `applied`.
+    fn drop_as_scripted(&self, versions: &mut BTreeMap<String, String>, applied: &[Change]) {
+        if let Some((trigger, dropped)) = self.drops
+            && applied
+                .iter()
+                .any(|change| format!("{}@{}", change.package.name, change.to) == trigger)
+        {
+            versions.remove(dropped);
+        }
     }
 
     /// The `child` the resolve settles on beside the locked `parent`.
@@ -414,7 +438,7 @@ impl FakeCargo {
             | Resolver::HeldParent { .. }
             | Resolver::PersistentParent { .. }
             | Resolver::PersistentPair { .. }
-            | Resolver::MajorParent
+            | Resolver::MajorParent { .. }
             | Resolver::MajorChild { .. }
             | Resolver::Scripted { .. }
             | Resolver::SnapshotFamily { .. }
@@ -500,11 +524,15 @@ impl ToolRead for FakeCargo {
                     dep.hold_edges = vec![hold(requirer, requiring_version, version, true)];
                 }
             }
-            if name == "child" && matches!(self.resolver, Resolver::MajorParent) {
+            if name == "child"
+                && let Resolver::MajorParent { pinned, .. } = self.resolver
+            {
                 let parent = versions
                     .get("parent")
                     .ok_or_else(|| CoreError::NotFound("parent".to_string()))?;
-                dep.hold_edges = vec![hold("parent", parent, "1.0.0", false)];
+                let exact = pinned && parent == "1.0.0";
+                dep.graph_ceiling = exact.then(|| Version::new(version));
+                dep.hold_edges = vec![hold("parent", parent, "1.0.0", exact)];
             } else if name == "child"
                 && let Resolver::DroppedPinner { pinned_child } = self.resolver
             {
@@ -534,6 +562,26 @@ impl ToolRead for FakeCargo {
             }
         }
         Ok(dependencies)
+    }
+
+    // Only a scoped read asks for the manifest's notices, so failing them fails the follower
+    // replan's read and the final one, never the graph reads that verify a batch.
+    async fn manifest_notices(
+        &self,
+        project: &Project,
+    ) -> cooldown_core::Result<Vec<cooldown_core::Diagnostic>> {
+        let locked = lock(project)?;
+        let unreadable = self.unreadable_with.is_some_and(|unreadable| {
+            locked
+                .iter()
+                .any(|(name, version)| format!("{name}@{version}") == unreadable)
+        });
+        if unreadable {
+            return Err(CoreError::LockUnreadable(
+                "the manifest cannot be read".to_string(),
+            ));
+        }
+        Ok(Vec::new())
     }
 
     async fn native_policy(
@@ -692,7 +740,7 @@ impl ToolWrite for FakeCargo {
                     | Resolver::CoupledPatchFrom(_)
                     | Resolver::HeldParent { .. }
                     | Resolver::PersistentPair { .. }
-                    | Resolver::MajorParent
+                    | Resolver::MajorParent { .. }
                     | Resolver::MajorChild { .. }
                     | Resolver::Scripted { .. }
                     | Resolver::PersistentParent { .. } => {
@@ -706,6 +754,7 @@ impl ToolWrite for FakeCargo {
                 }
             }
         }
+        self.drop_as_scripted(&mut versions, &applied);
         // Cargo moves an undeclared parent along with the sibling that pins it exactly.
         if let Resolver::SnapshotFamily {
             undeclared_parent: true,
@@ -797,6 +846,8 @@ fn fixture_adapter(
         edge_rebinds_on_apply,
         failures: Vec::new(),
         unavailable_releases: &[],
+        unreadable_with: None,
+        drops: None,
         releases: BTreeMap::from([
             ("parent".to_string(), parents),
             (
@@ -831,7 +882,7 @@ fn fixture_adapter(
         fake.releases
             .insert("holder".to_string(), vec![release("1.0.0", false)]);
     }
-    if matches!(resolver, Resolver::MajorParent) {
+    if matches!(resolver, Resolver::MajorParent { .. }) {
         fake.releases.insert(
             "parent".to_string(),
             vec![release("1.0.0", false), release("2.0.0", false)],
@@ -923,24 +974,32 @@ fn fixture_with_edges(
         newest,
         sibling,
         edge_rebinds_on_apply,
-        Faults::default(),
+        Overrides::default(),
     )
 }
 
-/// What the fixture's fake Cargo and registry fail at.
+/// What a fixture changes in its default fake Cargo, registry, and policy.
 #[derive(Default)]
-struct Faults {
+struct Overrides {
     /// The `name@target`s whose trials fail, and how.
     trials: Vec<(&'static str, Failure)>,
     /// The packages whose releases the registry cannot serve.
-    releases: &'static [&'static str],
+    unavailable: &'static [&'static str],
+    /// The `name@version` whose locking makes every later scoped graph read fail.
+    unreadable_with: Option<&'static str>,
+    /// A `name@target` whose landing drops another package from the lock.
+    drops: Option<(&'static str, &'static str)>,
+    /// Releases replacing the registry's for their packages.
+    releases: BTreeMap<String, Vec<Release>>,
+    /// Policy layers after the built-in default.
+    layers: Vec<PolicyLayer>,
 }
 
-impl From<Vec<(&'static str, Failure)>> for Faults {
+impl From<Vec<(&'static str, Failure)>> for Overrides {
     fn from(trials: Vec<(&'static str, Failure)>) -> Self {
-        Faults {
+        Overrides {
             trials,
-            ..Faults::default()
+            ..Overrides::default()
         }
     }
 }
@@ -950,7 +1009,7 @@ fn fixture_with(
     newest: u32,
     sibling: bool,
     edge_rebinds_on_apply: Vec<EdgeRebind>,
-    faults: Faults,
+    overrides: Overrides,
 ) -> eyre::Result<CargoFixture> {
     let directory = tempfile::tempdir()?;
     let root = Utf8PathBuf::from_path_buf(directory.path().to_owned())
@@ -995,23 +1054,27 @@ fn fixture_with(
     };
     let initial = initial_lock(resolver, newest, sibling);
     std::fs::write(root.join("Cargo.lock"), serde_json::to_vec(&initial)?)?;
-    let fake = FakeCargo {
-        failures: faults.trials,
-        unavailable_releases: faults.releases,
+    let mut fake = FakeCargo {
+        failures: overrides.trials,
+        unavailable_releases: overrides.unavailable,
+        unreadable_with: overrides.unreadable_with,
+        drops: overrides.drops,
         ..fixture_adapter(resolver, newest, edge_rebinds_on_apply)
     };
+    fake.releases.extend(overrides.releases);
     let mut adapters = AdapterSet::new();
     adapters.register_target_verified_mutator(Arc::new(fake))?;
+    let mut layers = vec![builtin_default_layer()];
+    if matches!(resolver, Resolver::MajorChild { .. }) {
+        layers.push(child_max_major_layer(&root)?);
+    }
+    layers.extend(overrides.layers);
     let context = ProjectCtx {
         tool: CARGO,
         project: project.clone(),
         rel_path: Utf8PathBuf::from("."),
         policy: PolicyStack {
-            layers: if matches!(resolver, Resolver::MajorChild { .. }) {
-                vec![builtin_default_layer(), child_max_major_layer(&root)?]
-            } else {
-                vec![builtin_default_layer()]
-            },
+            layers,
             strict_native: false,
         },
         edge_policy: cooldown_core::EdgePolicy::default(),
@@ -1033,8 +1096,12 @@ fn fixture_with(
     })
 }
 
+/// A dry run hands every batch the run's starting lock as its duplicate-guard baseline (the fake
+/// asserts it) and leaves the lock as it was.
+/// With a run-level edge snapshot, the final normalization rather than a batch reports edge rows,
+/// and this one finds none to report.
 #[tokio::test]
-async fn preview_keeps_per_batch_edge_rows_with_a_duplicate_guard_baseline() -> eyre::Result<()> {
+async fn a_dry_run_gives_every_batch_the_starting_lock() -> eyre::Result<()> {
     let rebind = EdgeRebind {
         dependent: "parent".to_string(),
         dependent_version: Version::new("1.1.0"),
@@ -1049,42 +1116,16 @@ async fn preview_keeps_per_batch_edge_rows_with_a_duplicate_guard_baseline() -> 
         directory: _directory,
         workspace,
         project,
-    } = fixture_with_edges(Resolver::ExactFrom(2), 1, false, vec![rebind.clone()])?;
+    } = fixture_with_edges(Resolver::ExactFrom(2), 1, false, vec![rebind])?;
     let before = std::fs::read(project.root.join("Cargo.lock"))?;
-    let context = workspace.projects().first().expect("fixture project");
-    let preview = workspace
-        .preview_project_upgrade(
-            context,
-            &RunOpts::default(),
-            &ProjectProgress::default(),
-            vec![Change {
-                package: PackageId::new(CARGO, "parent", Some("crates.io".to_string())),
-                from: Version::new("1.0.0"),
-                to: Version::new("1.1.0"),
-                kind: UpdateKind::Minor,
-                downgrade: false,
-                direct: true,
-                members: Vec::new(),
-            }],
-            PreviewEvidence {
-                manifest_only: HashSet::default(),
-                advisories: None,
-                excluded_members: Vec::new(),
-            },
-        )
+    let outcome = workspace
+        .upgrade(&RunOpts {
+            dry_run: true,
+            ..RunOpts::default()
+        })
         .await;
-    assert!(preview.errors.is_empty(), "{:?}", preview.errors);
-    assert_eq!(preview.items.len(), 1);
-    assert!(preview.items.first().expect("preview upgrade").applied);
-    assert_eq!(preview.edge_items.len(), 1);
-    let edge = preview.edge_items.first().expect("preview edge row");
-    assert_eq!(edge.name, rebind.dependency.name);
-    assert_eq!(edge.from, rebind.from.as_str());
-    assert_eq!(edge.to, rebind.to.as_str());
-    assert_eq!(
-        edge.edge.as_ref().expect("edge provenance").action,
-        rebind.action
-    );
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    assert_eq!(rows(&outcome), [row("parent", "1.0.0", "1.1.0", None)]);
     assert_eq!(std::fs::read(project.root.join("Cargo.lock"))?, before);
     Ok(())
 }
@@ -1913,7 +1954,14 @@ async fn a_child_deferred_for_a_held_major_parent_still_upgrades() -> eyre::Resu
         directory: _directory,
         workspace,
         project,
-    } = fixture(Resolver::MajorParent, 1, false)?;
+    } = fixture(
+        Resolver::MajorParent {
+            lands: false,
+            pinned: false,
+        },
+        1,
+        false,
+    )?;
     let outcome = workspace
         .upgrade(&RunOpts {
             allow_major: true,
@@ -2112,7 +2160,7 @@ fn assert_project_error(errors: &[cooldown_core::Diagnostic], items: &[UpgradeIt
 }
 
 /// Crashes every trial carrying one of `targets`.
-fn crashes(targets: &[&'static str]) -> Faults {
+fn crashes(targets: &[&'static str]) -> Overrides {
     targets
         .iter()
         .map(|target| (*target, Failure::Crash))
@@ -2404,90 +2452,8 @@ async fn a_failed_fallback_trial_with_a_restore_conflict_stops_without_a_replay(
     Ok(())
 }
 
-/// A preview, which looks the held parent's lower targets up only once its trial has run, cannot
-/// fetch them: the failed lookup is reported for the project, so a caller such as `outdated`
-/// knows the preview is incomplete, while the verified sibling still replays and lands beside
-/// the parent's original hold.
-#[tokio::test]
-async fn an_unavailable_fallback_lookup_still_replays_the_verified_set() -> eyre::Result<()> {
-    let CargoFixture {
-        directory: _directory,
-        workspace,
-        project: _,
-    } = fixture_with(
-        Resolver::Scripted {
-            held: &["parent@1.4.0"],
-        },
-        4,
-        true,
-        Vec::new(),
-        Faults {
-            releases: &["parent"],
-            ..Faults::default()
-        },
-    )?;
-    let changes = ["parent", "sibling"]
-        .into_iter()
-        .map(|name| Change {
-            package: PackageId::new(CARGO, name, Some("crates.io".to_string())),
-            from: Version::new("1.0.0"),
-            to: Version::new("1.4.0"),
-            kind: UpdateKind::Minor,
-            downgrade: false,
-            direct: true,
-            members: Vec::new(),
-        })
-        .collect();
-    let progress = Progress::plain().project(CARGO, ".");
-    let preview = workspace
-        .preview_project_upgrade(
-            workspace.projects().first().expect("fixture project"),
-            &RunOpts::default(),
-            &progress,
-            changes,
-            PreviewEvidence {
-                manifest_only: HashSet::default(),
-                advisories: None,
-                excluded_members: Vec::new(),
-            },
-        )
-        .await;
-    assert_project_error(
-        &preview.errors,
-        &preview.items,
-        "the registry cannot serve parent",
-    );
-    assert!(
-        preview
-            .warnings
-            .iter()
-            .all(|warning| !warning.message.contains("the registry cannot serve parent")),
-        "{:?}",
-        preview.warnings
-    );
-    let mut rows: Vec<_> = preview
-        .items
-        .iter()
-        .map(|item| {
-            (
-                item.name.as_str(),
-                item.to.as_str(),
-                item.applied,
-                item.skipped.as_ref().map(|skipped| skipped.reason),
-            )
-        })
-        .collect();
-    rows.sort_by_key(|row| row.0);
-    assert_eq!(
-        rows,
-        [
-            ("parent", "1.4.0", false, Some(SkipReason::ResolverConflict)),
-            ("sibling", "1.4.0", true, None),
-        ]
-    );
-    Ok(())
-}
-
+/// Progress counts each planned candidate decided once, whether its own target, a fallback, or
+/// its hold settled it.
 #[tokio::test]
 async fn original_candidates_are_decided_after_landing_fallback_or_hold() -> eyre::Result<()> {
     for (resolver, sibling, landed_parent) in [
@@ -2516,37 +2482,16 @@ async fn original_candidates_are_decided_after_landing_fallback_or_hold() -> eyr
             project: _,
         } = fixture(resolver, 4, sibling)?;
         let companion = if sibling { "sibling" } else { "safe000" };
-        let changes = [
-            ("parent", "1.4.0"),
-            (companion, if sibling { "1.1.0" } else { "1.4.0" }),
-        ]
-        .into_iter()
-        .map(|(name, target)| Change {
-            package: PackageId::new(CARGO, name, Some("crates.io".to_string())),
-            from: Version::new("1.0.0"),
-            to: Version::new(target),
-            kind: UpdateKind::Minor,
-            downgrade: false,
-            direct: true,
-            members: Vec::new(),
-        })
-        .collect();
         let progress = Progress::plain().project(CARGO, ".");
-        let preview = workspace
-            .preview_project_upgrade(
+        let dry_run = workspace
+            .dry_run_upgrade(
                 workspace.projects().first().expect("fixture project"),
                 &RunOpts::default(),
                 &progress,
-                changes,
-                PreviewEvidence {
-                    manifest_only: HashSet::default(),
-                    advisories: None,
-                    excluded_members: Vec::new(),
-                },
             )
             .await;
-        assert!(preview.errors.is_empty(), "{:?}", preview.errors);
-        let parent = preview
+        assert!(dry_run.errors.is_empty(), "{:?}", dry_run.errors);
+        let parent = dry_run
             .items
             .iter()
             .find(|item| item.name == "parent")
@@ -2556,12 +2501,12 @@ async fn original_candidates_are_decided_after_landing_fallback_or_hold() -> eyr
             assert_eq!(parent.to, target);
         }
         assert!(
-            preview
+            dry_run
                 .items
                 .iter()
                 .any(|item| item.name == companion && item.applied)
         );
-        assert_eq!(progress.decided_candidates(), 2, "{:?}", preview.items);
+        assert_eq!(progress.decided_candidates(), 2, "{:?}", dry_run.items);
     }
     Ok(())
 }
@@ -2785,7 +2730,14 @@ async fn fast_mode_notes_only_the_finally_held_candidates() -> eyre::Result<()> 
         directory: _directory,
         workspace,
         project,
-    } = fixture(Resolver::MajorParent, 1, false)?;
+    } = fixture(
+        Resolver::MajorParent {
+            lands: false,
+            pinned: false,
+        },
+        1,
+        false,
+    )?;
     let outcome = workspace
         .upgrade(&RunOpts {
             allow_major: true,
@@ -3029,5 +2981,430 @@ async fn fix_matures_a_version_already_above_its_ceiling() -> eyre::Result<()> {
     let child = item(&outcome, "child")?;
     assert!(child.applied, "{child:?}");
     assert_eq!(child.to, "2.0.0");
+    Ok(())
+}
+
+/// What `outdated` reports for `name`: its status and target.
+fn verdict_of(
+    outdated: &crate::app::outdated::OutdatedOutcome,
+    name: &str,
+) -> (OutdatedStatus, Option<String>) {
+    let item = outdated
+        .items
+        .iter()
+        .find(|item| item.name == name)
+        .unwrap_or_else(|| panic!("no {name} row: {:?}", outdated.items));
+    (item.status, item.adoptable_target.clone())
+}
+
+/// `opts` for `upgrade --dry-run`.
+fn dry_run(opts: &RunOpts) -> RunOpts {
+    RunOpts {
+        dry_run: true,
+        ..opts.clone()
+    }
+}
+
+/// An `allow`-exempt companion `upgrade` plans beside its driver lands with it, so `outdated`
+/// reports the driver adoptable rather than blocked by the companion it would move, and the
+/// companion stays `exempt` (#173).
+#[tokio::test]
+async fn outdated_lands_an_exempt_companion_beside_its_driver() -> eyre::Result<()> {
+    let mut layer = PolicyLayer::new(Origin::Repo("cooldown.toml".into()));
+    let mut rule = Rule::new(Selector::Package {
+        glob: PatternGlob::new("child")?,
+        tool: Some(CARGO),
+    });
+    rule.allow = true;
+    layer.rules.push(rule);
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project: _,
+    } = fixture_with(
+        Resolver::DroppedPinner {
+            pinned_child: false,
+        },
+        1,
+        false,
+        Vec::new(),
+        Overrides {
+            layers: vec![layer],
+            ..Overrides::default()
+        },
+    )?;
+
+    let outdated = workspace.outdated(&RunOpts::default()).await;
+    let upgrade = workspace.upgrade(&dry_run(&RunOpts::default())).await;
+
+    assert!(outdated.errors.is_empty(), "{:?}", outdated.errors);
+    assert_eq!(
+        rows(&upgrade),
+        [
+            row("child", "1.0.0", "1.1.0", None),
+            row("parent", "1.0.0", "1.1.0", None),
+        ]
+    );
+    assert_eq!(
+        verdict_of(&outdated, "parent"),
+        (OutdatedStatus::Adoptable, Some("1.1.0".to_string()))
+    );
+    assert_eq!(
+        verdict_of(&outdated, "child"),
+        (OutdatedStatus::Exempt, Some("1.1.0".to_string()))
+    );
+    Ok(())
+}
+
+/// A preferred target the resolve refuses leaves `upgrade` landing a lower fallback, which is
+/// the target `outdated` reports (#173).
+#[tokio::test]
+async fn outdated_reports_the_fallback_upgrade_lands() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project: _,
+    } = fixture(Resolver::ExactFrom(4), 4, true)?;
+
+    let outdated = workspace.outdated(&RunOpts::default()).await;
+    let upgrade = workspace.upgrade(&dry_run(&RunOpts::default())).await;
+
+    assert!(
+        rows(&upgrade).contains(&row("parent", "1.0.0", "1.3.0", None)),
+        "{:?}",
+        rows(&upgrade)
+    );
+    assert_eq!(
+        verdict_of(&outdated, "parent"),
+        (OutdatedStatus::Adoptable, Some("1.3.0".to_string()))
+    );
+    Ok(())
+}
+
+/// `outdated --major --transitive` judges a transitive within its own major, as `upgrade`
+/// plans it, rather than offering the next major `upgrade` never grants an undeclared node
+/// (#173).
+#[tokio::test]
+async fn outdated_judges_a_transitive_within_its_major() -> eyre::Result<()> {
+    let releases = BTreeMap::from([(
+        "child".to_string(),
+        vec![
+            release("1.0.0", false),
+            release("1.1.0", false),
+            release("2.0.0", false),
+        ],
+    )]);
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project: _,
+    } = fixture_with(
+        Resolver::MajorParent {
+            lands: false,
+            pinned: false,
+        },
+        1,
+        false,
+        Vec::new(),
+        Overrides {
+            releases,
+            ..Overrides::default()
+        },
+    )?;
+    let opts = RunOpts {
+        allow_major: true,
+        transitive: true,
+        ..RunOpts::default()
+    };
+
+    let outdated = workspace.outdated(&opts).await;
+    let upgrade = workspace.upgrade(&dry_run(&opts)).await;
+
+    assert!(
+        rows(&upgrade).contains(&row("child", "1.0.0", "1.1.0", None)),
+        "{:?}",
+        rows(&upgrade)
+    );
+    assert_eq!(
+        verdict_of(&outdated, "child"),
+        (OutdatedStatus::Adoptable, Some("1.1.0".to_string()))
+    );
+    // Latest still names the newest version there is.
+    let child = outdated
+        .items
+        .iter()
+        .find(|item| item.name == "child")
+        .ok_or_else(|| eyre::eyre!("no child row: {:?}", outdated.items))?;
+    assert_eq!(
+        child.latest.as_ref().map(|latest| latest.version.as_str()),
+        Some("2.0.0")
+    );
+    Ok(())
+}
+
+/// A transitive its requirer pins exactly is tried once that requirer's major drops the pin,
+/// in the follower pass, and `outdated` reports that pass's refusal rather than the pin its row
+/// started under (#173).
+#[tokio::test]
+async fn outdated_reports_a_followers_refusal() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project: _,
+    } = fixture(
+        Resolver::MajorParent {
+            lands: true,
+            pinned: true,
+        },
+        1,
+        false,
+    )?;
+    let opts = RunOpts {
+        allow_major: true,
+        transitive: true,
+        ..RunOpts::default()
+    };
+
+    let outdated = workspace.outdated(&opts).await;
+    let upgrade = workspace.upgrade(&dry_run(&opts)).await;
+
+    assert_eq!(
+        rows(&upgrade),
+        [
+            row(
+                "child",
+                "1.0.0",
+                "1.1.0",
+                Some(SkipReason::ResolverConflict)
+            ),
+            row("parent", "1.0.0", "2.0.0", None),
+        ]
+    );
+    assert_eq!(
+        verdict_of(&outdated, "parent"),
+        (OutdatedStatus::Adoptable, Some("2.0.0".to_string()))
+    );
+    let child = outdated
+        .items
+        .iter()
+        .find(|item| item.name == "child")
+        .ok_or_else(|| eyre::eyre!("no child row: {:?}", outdated.items))?;
+    assert_eq!(
+        (
+            child.status,
+            child.adoptable_target.as_deref(),
+            child.blocked_reason.as_deref(),
+            child.held_by.as_ref(),
+        ),
+        (
+            OutdatedStatus::Blocked,
+            Some("1.1.0"),
+            Some("child is held by holder"),
+            None
+        )
+    );
+    Ok(())
+}
+
+/// A move the first pass landed is no landing for `outdated` once a follower pass drops the
+/// package from the lock, though `upgrade` still reports the first pass's row: only the lock the
+/// dry run left proves one (#173).
+/// The fake drops the declared sibling to stand in for a transitive the follower's move orphans,
+/// which Cargo's lock diff reports no row for.
+#[tokio::test]
+async fn a_landing_a_later_pass_dropped_is_not_adoptable() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project: _,
+    } = fixture_with(
+        Resolver::MajorParent {
+            lands: true,
+            pinned: false,
+        },
+        1,
+        true,
+        Vec::new(),
+        Overrides {
+            drops: Some(("child@1.1.0", "sibling")),
+            ..Overrides::default()
+        },
+    )?;
+    let opts = RunOpts {
+        allow_major: true,
+        transitive: true,
+        ..RunOpts::default()
+    };
+
+    let outdated = workspace.outdated(&opts).await;
+    let upgrade = workspace.upgrade(&dry_run(&opts)).await;
+
+    assert_eq!(
+        rows(&upgrade),
+        [
+            row("child", "1.0.0", "1.1.0", None),
+            row("parent", "1.0.0", "2.0.0", None),
+            row("sibling", "1.0.0", "1.1.0", None),
+        ]
+    );
+    assert_eq!(
+        verdict_of(&outdated, "parent"),
+        (OutdatedStatus::Adoptable, Some("2.0.0".to_string()))
+    );
+    assert_eq!(
+        verdict_of(&outdated, "child"),
+        (OutdatedStatus::Adoptable, Some("1.1.0".to_string()))
+    );
+    assert_eq!(
+        verdict_of(&outdated, "sibling"),
+        (OutdatedStatus::Blocked, Some("1.1.0".to_string()))
+    );
+    Ok(())
+}
+
+/// A follower replan that cannot read the graph leaves the deferred transitive to that failure,
+/// so `outdated` reports it on that row beside the requirer's landed major (#173).
+/// The transitive carries it even when its row started out held by the pin the major dropped.
+#[tokio::test]
+async fn a_follower_its_replan_cannot_read_carries_the_failure() -> eyre::Result<()> {
+    for pinned in [false, true] {
+        let CargoFixture {
+            directory: _directory,
+            workspace,
+            project: _,
+        } = fixture_with(
+            Resolver::MajorParent {
+                lands: true,
+                pinned,
+            },
+            1,
+            false,
+            Vec::new(),
+            Overrides {
+                unreadable_with: Some("parent@2.0.0"),
+                ..Overrides::default()
+            },
+        )?;
+        let opts = RunOpts {
+            allow_major: true,
+            transitive: true,
+            ..RunOpts::default()
+        };
+
+        let outdated = workspace.outdated(&opts).await;
+
+        assert_eq!(
+            verdict_of(&outdated, "parent"),
+            (OutdatedStatus::Adoptable, Some("2.0.0".to_string())),
+            "{pinned}"
+        );
+        let child = outdated
+            .items
+            .iter()
+            .find(|item| item.name == "child")
+            .ok_or_else(|| eyre::eyre!("no child row: {:?}", outdated.items))?;
+        assert_eq!(child.status, OutdatedStatus::Error, "{pinned}: {child:?}");
+        assert!(
+            child
+                .error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("the manifest cannot be read")),
+            "{pinned}: {child:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A failure the dry run meets only for a package `explain` does not report reaches the
+/// verdict as a warning, never as the reported row's error (#173).
+#[tokio::test]
+async fn explain_notes_another_packages_failure() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project: _,
+    } = fixture_with(
+        Resolver::MajorParent {
+            lands: true,
+            pinned: true,
+        },
+        1,
+        false,
+        Vec::new(),
+        crashes(&["child@1.1.0"]),
+    )?;
+    let opts = RunOpts {
+        allow_major: true,
+        ..RunOpts::default()
+    };
+
+    let explained = workspace.explain("parent", &opts).await?;
+
+    let [parent] = explained.meta.verdicts.as_slice() else {
+        eyre::bail!("expected one parent verdict: {:?}", explained.meta.verdicts);
+    };
+    assert_eq!(
+        (parent.status, parent.adoptable_target.as_deref()),
+        (OutdatedStatus::Adoptable, Some("2.0.0"))
+    );
+    assert!(explained.errors.is_empty(), "{:?}", explained.errors);
+    assert!(
+        explained.warnings.iter().any(|warning| {
+            warning.message.contains(CRASH) && warning.package.as_deref() == Some("child")
+        }),
+        "{:?}",
+        explained.warnings
+    );
+    Ok(())
+}
+
+/// A registry failure for one dependency leaves the dry run's settled outcomes standing: the
+/// sibling it landed stays adoptable, and only the row it could not judge is an error.
+#[tokio::test]
+async fn an_unavailable_registry_entry_keeps_the_other_rows_settled() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project: _,
+    } = fixture_with(
+        Resolver::Scripted { held: &[] },
+        4,
+        true,
+        Vec::new(),
+        Overrides {
+            unavailable: &["parent"],
+            ..Overrides::default()
+        },
+    )?;
+
+    let outdated = workspace.outdated(&RunOpts::default()).await;
+
+    assert_eq!(
+        verdict_of(&outdated, "sibling"),
+        (OutdatedStatus::Adoptable, Some("1.4.0".to_string()))
+    );
+    let parent = outdated
+        .items
+        .iter()
+        .find(|item| item.name == "parent")
+        .expect("parent row");
+    assert_eq!(parent.status, OutdatedStatus::Error);
+    assert!(
+        parent
+            .error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("the registry cannot serve parent")),
+        "{parent:?}"
+    );
+    // The row carries the failure, so the report does not repeat it.
+    assert!(outdated.errors.is_empty(), "{:?}", outdated.errors);
+    assert!(
+        outdated
+            .warnings
+            .iter()
+            .all(|warning| !warning.message.contains("the registry cannot serve parent")),
+        "{:?}",
+        outdated.warnings
+    );
     Ok(())
 }

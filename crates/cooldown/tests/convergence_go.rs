@@ -807,6 +807,75 @@ fn upgrade_holds_a_candidate_that_would_lift_a_capped_module_across_its_max_majo
     );
 }
 
+/// The cutoff for the next-major-path test: `github.com/cenkalti/backoff/v4` v4.0.2 has matured.
+const FREEZE_PATH_MAJOR: &str = "2020-06-01T00:00:00Z";
+
+const BACKOFF_V3: &str = "github.com/cenkalti/backoff/v3";
+const BACKOFF_V4: &str = "github.com/cenkalti/backoff/v4";
+
+/// A module on `backoff/v3`, whose next major lives under the module path `backoff/v4`.
+fn path_major_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write(
+        "go.mod",
+        &indoc::formatdoc! {"
+            module example.com/cooldown-go-path-major
+
+            go 1.21
+
+            require {BACKOFF_V3} v3.2.2
+        "},
+    );
+    fixture.write(
+        "main.go",
+        &indoc::formatdoc! {r#"
+            package main
+
+            import "{BACKOFF_V3}"
+
+            func main() {{ _ = backoff.NewExponentialBackOff() }}
+        "#},
+    );
+    fixture
+        .run_tool("go", &["mod", "tidy"], &[("GOFLAGS", "")])
+        .expect_success();
+    fixture
+}
+
+/// `upgrade --major` moves a module onto its next major's module path, a name the `--package`
+/// filter that selected the old path leaves out, and `outdated` still reports that move as the
+/// row's landing (#173).
+#[test]
+fn outdated_reports_a_package_scoped_move_onto_the_next_major_path() {
+    skip_if_missing!("go");
+    let fixture = path_major_fixture();
+    let scope = [
+        "--major",
+        "--freeze",
+        FREEZE_PATH_MAJOR,
+        "--package",
+        BACKOFF_V3,
+    ];
+
+    let upgrade = fixture.cooldown_json(&[&["upgrade", "--dry-run"][..], &scope].concat());
+    let outdated = fixture.cooldown_json(&[&["outdated"][..], &scope].concat());
+
+    let landed = upgrade
+        .applied_change_for(BACKOFF_V4)
+        .unwrap_or_else(|| panic!("the dry run moves the module onto v4: {upgrade:?}"));
+    assert!(landed.to.starts_with("v4."), "{landed:?}");
+    assert_eq!(
+        outdated.item_field_str(BACKOFF_V3, "status").as_deref(),
+        Some("adoptable"),
+        "{outdated:?}"
+    );
+    assert_eq!(
+        outdated.item_field_str(BACKOFF_V3, "adoptableTarget"),
+        Some(landed.to),
+        "{outdated:?}"
+    );
+}
+
 /// The cutoff for the requirer-follow test: `go.opentelemetry.io/otel/sdk/metric` v1.19.0 has
 /// matured, and with it `go.opentelemetry.io/otel/metric` v1.19.0, which it requires.
 const FREEZE_OTEL: &str = "2023-10-01T00:00:00Z";

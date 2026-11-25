@@ -1,11 +1,54 @@
 use super::PlanMode;
-use crate::app::TransitiveGate;
+use crate::app::advisories::{ClassifiedAdvisories, ProjectAdvisories};
+use crate::app::{ProjectCtx, RunOpts, TransitiveGate, Workspace};
 use cooldown_core::{
     BaselineViolation, Candidate, Change, DepScope, Dependency, GraphHoldEdge, GraphHoldKind,
-    MajorKey, PackageId, Release, ResolveContext, Status, UpdateKind, Verdict, Version,
+    MajorKey, PackageId, Release, ResolveContext, RewriteMode, Status, ToolRead, UpdateKind,
+    Verdict, Version, evaluate_advised,
 };
 use std::borrow::Cow;
 use std::collections::HashSet;
+
+/// A dependency's candidate releases and the verdict [`upgrade_verdict`] draws from them.
+pub(crate) struct Judged {
+    pub(crate) releases: Vec<Release>,
+    pub(crate) verdict: Verdict,
+}
+
+/// The resolve context the forward upgrade plans under: the run's, except that a declared upper
+/// bound holds only under the default rewrite mode, since `--rewrite` rewrites it.
+pub(super) fn upgrade_resolve_ctx<'a>(pctx: &'a ProjectCtx, opts: &RunOpts) -> ResolveContext<'a> {
+    ResolveContext {
+        honor_declared_bounds: opts.rewrite == RewriteMode::Auto,
+        ..Workspace::resolve_ctx(pctx, opts)
+    }
+}
+
+/// Judges `dep`'s candidate `releases` exactly as the forward planner does, advised by the
+/// `advisories` snapshot.
+///
+/// `outdated` judges its rows through this one call too, so a row's target is the one `upgrade`
+/// plans for that dependency.
+pub(crate) fn upgrade_verdict(
+    reader: &dyn ToolRead,
+    pctx: &ProjectCtx,
+    opts: &RunOpts,
+    now: jiff::Timestamp,
+    advisories: Option<&ProjectAdvisories>,
+    dep: &Dependency,
+    releases: &[Release],
+) -> Verdict {
+    let advised = advisories.and_then(|project| project.classify(reader, dep, releases));
+    let advisory_ctx = advised.as_ref().map(ClassifiedAdvisories::context);
+    evaluate_advised(
+        &upgrade_view(dep),
+        releases,
+        advisory_ctx.as_ref(),
+        &pctx.policy.layers,
+        &dep_resolve_ctx(&upgrade_resolve_ctx(pctx, opts), dep),
+        now,
+    )
+}
 
 /// Limits fallback to three older adoptable targets on the originally selected line.
 pub(super) fn lower_adoptable_targets<'a>(

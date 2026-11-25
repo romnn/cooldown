@@ -2,9 +2,8 @@
 //! retries the highest adoptable target on the current major line through the same rollback and
 //! replay the lower-line fallback uses.
 
-use crate::app::upgrade::PreviewEvidence;
 use crate::app::{
-    AdapterSet, Baseline, Exit, ProjectCtx, ProjectProgress, RunOpts, TransitiveGate, Workspace,
+    AdapterSet, Baseline, Exit, OutdatedStatus, ProjectCtx, RunOpts, TransitiveGate, Workspace,
 };
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -12,16 +11,16 @@ use color_eyre::eyre;
 use cooldown_core::config::builtin_default_layer;
 use cooldown_core::{
     AdvisoryFetch, AdvisoryPolicy, AdvisorySource, AdvisorySourceId, ApplyReport, CandidateScope,
-    Capabilities, Change, CoreError, DepScope, Dependency, FetchContext, GeneratedMembers,
-    GraphHoldEdge, GraphHoldKind, JudgedPin, LockStatus, LockVerifyReport, LockedVersion, MajorKey,
-    MemberRef, NativeAdmissionQuery, NativeAssessment, NativeEdit, NativeGateQuery,
-    NativeGateRefusal, NativePolicyLayer, PackageAdvisories, PackageId, Plan, PolicyLayer,
-    PolicyStack, PreparedMutation, Project, ProjectMarker, ProjectMutationJournal, RawAdvisory,
-    Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs, SkipReason, Skipped,
-    TargetFallback, ToolId, ToolRead, ToolTermination, ToolWrite, UpdateKind, VerifyReport,
-    Version,
+    Capabilities, Change, CoreError, DepScope, Dependency, Diagnostic, FetchContext,
+    GeneratedMembers, GraphHoldEdge, GraphHoldKind, JudgedPin, LockStatus, LockVerifyReport,
+    LockedVersion, MajorKey, MemberRef, NativeAdmissionQuery, NativeAssessment, NativeEdit,
+    NativeGateQuery, NativeGateRefusal, NativePolicyLayer, PackageAdvisories, PackageId, Plan,
+    PolicyLayer, PolicyStack, PreparedMutation, Project, ProjectMarker, ProjectMutationJournal,
+    RawAdvisory, Release, ReleaseFetcher, ReleaseOrder, ReleaseQuality, ResolveInputs, SkipReason,
+    Skipped, TargetFallback, ToolId, ToolRead, ToolTermination, ToolWrite, UpdateKind,
+    VerifyReport, Version,
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 const NODE: ToolId = ToolId("fakenode");
@@ -117,6 +116,8 @@ struct Float {
 struct Straggler {
     package: &'static str,
     member: &'static str,
+    /// Whether the member binds the new version too, as a uv fork pin keeps one fork behind.
+    forked: bool,
 }
 
 /// One copy's move the resolver leaves short of its target, matched by its source version, while
@@ -233,6 +234,10 @@ struct FakeNode {
     transitive_advance: bool,
     script: Script,
     releases: BTreeMap<String, Vec<Release>>,
+    /// The packages, or `name@version` copies, whose releases the registry cannot serve.
+    unavailable: &'static [&'static str],
+    /// The lock keys whose copy an exact pin holds.
+    pinned: &'static [&'static str],
     advisory_ecosystem: Option<&'static str>,
     /// Each apply's plan as `name@target` entries, kept outside the project because a policy
     /// preview runs in a throwaway copy.
@@ -269,6 +274,8 @@ impl FakeNode {
             transitive_advance: false,
             script,
             releases: BTreeMap::new(),
+            unavailable: &[],
+            pinned: &[],
             advisory_ecosystem: None,
             trials: Mutex::new(Vec::new()),
             shared: None,
@@ -486,14 +493,20 @@ impl ToolRead for FakeNode {
                 .map_or((key.as_str(), None), |(name, member)| (name, Some(member)));
             let name = copy_name(name);
             let mut dep = dependency(name, version);
+            dep.pinned = self.pinned.contains(&key.as_str());
             if dep.direct {
+                let forked = self
+                    .script
+                    .straggler
+                    .as_ref()
+                    .is_some_and(|straggler| straggler.forked && straggler.package == name);
                 dep.members = self
                     .script
                     .members
                     .iter()
                     .filter(|member| match straggler {
                         Some(straggler) => **member == straggler,
-                        None => !versions.contains_key(&format!("{name}@{member}")),
+                        None => forked || !versions.contains_key(&format!("{name}@{member}")),
                     })
                     .map(|member| member_ref(member))
                     .collect();
@@ -563,6 +576,14 @@ impl ReleaseFetcher for FakeNode {
         _fetch: &FetchContext<'_>,
         _candidates: CandidateScope,
     ) -> cooldown_core::Result<Vec<Release>> {
+        let copy = format!("{}@{}", dep.package.name, dep.current);
+        if self.unavailable.contains(&dep.package.name.as_str())
+            || self.unavailable.contains(&copy.as_str())
+        {
+            return Err(CoreError::Transient(
+                format!("the registry cannot serve {}", dep.package.name).into(),
+            ));
+        }
         Ok(self
             .releases
             .get(&dep.package.name)
@@ -1688,88 +1709,49 @@ async fn a_failed_current_line_trial_with_a_restore_conflict_stops_without_a_rep
     Ok(())
 }
 
-/// A preview that bypasses planning selects the same in-line target as a planned run, even
-/// though the companion's initial landing floats the held package off the version it moves
-/// from.
+/// The in-line target is selected from the graph the planner read, even though the companion's
+/// initial landing floats the held package off the version it moves from.
 #[tokio::test]
-async fn warm_and_cold_caches_select_the_same_current_line_target() -> eyre::Result<()> {
-    let script = || Script {
-        holds: vec![peer_held_dom()],
-        float: Some(Float {
-            trigger: "safe",
-            floated: "dom",
-            from: "1.0.0",
-            to: "1.0.1",
-        }),
-        ..Script::default()
-    };
-    let initial = [("dom", "1.0.0"), ("safe", "1.0.0")];
-
-    // Warm: the planner caches the alternative.
-    let planned = fixture(
-        dom_and_safe(TargetFallback::CurrentLine, script(), true),
-        &initial,
-    )?;
-    let upgrade = planned.workspace.upgrade(&major()).await;
-    assert!(upgrade.errors.is_empty(), "{:?}", upgrade.errors);
-    assert_eq!(locked(&planned, "dom")?.as_deref(), Some("1.1.0"));
-
-    // Cold: the preview receives preselected targets.
-    let previewed = fixture(
-        dom_and_safe(TargetFallback::CurrentLine, script(), true),
-        &initial,
-    )?;
-    let context = previewed
-        .workspace
-        .projects()
-        .first()
-        .ok_or_else(|| eyre::eyre!("fixture project"))?;
-    let change = |name: &str, to: &str, kind| Change {
-        package: package(name),
-        from: Version::new("1.0.0"),
-        to: Version::new(to),
-        kind,
-        downgrade: false,
-        direct: true,
-        members: Vec::new(),
-    };
-    let preview = previewed
-        .workspace
-        .preview_project_upgrade(
-            context,
-            &major(),
-            &ProjectProgress::default(),
-            vec![
-                change("dom", "2.0.0", UpdateKind::Major),
-                change("safe", "1.1.0", UpdateKind::Minor),
-            ],
-            PreviewEvidence {
-                manifest_only: HashSet::default(),
-                advisories: None,
-                excluded_members: Vec::new(),
+async fn a_floated_held_major_still_selects_its_current_line_target() -> eyre::Result<()> {
+    let fixture = fixture(
+        dom_and_safe(
+            TargetFallback::CurrentLine,
+            Script {
+                holds: vec![peer_held_dom()],
+                float: Some(Float {
+                    trigger: "safe",
+                    floated: "dom",
+                    from: "1.0.0",
+                    to: "1.0.1",
+                }),
+                ..Script::default()
             },
-        )
-        .await;
-    assert!(preview.errors.is_empty(), "{:?}", preview.errors);
-
-    // Both select the in-line target from the pre-lock graph and run the same trials.
-    let expected = sorted(vec![
-        applied("dom", "1.0.0", "1.1.0"),
-        skipped(
-            "dom",
-            "1.0.0",
-            "2.0.0",
-            SkipReason::PeerHeld,
-            "plugin@1.0.0 peer-requires dom@^1.0.0",
+            true,
         ),
-        applied("safe", "1.0.0", "1.1.0"),
-    ]);
-    assert_eq!(rows(&upgrade.items), expected);
-    assert_eq!(rows(&preview.items), expected);
-    let trials = planned.fake.trials();
-    assert_eq!(previewed.fake.trials(), trials);
+        &[("dom", "1.0.0"), ("safe", "1.0.0")],
+    )?;
+
+    let upgrade = fixture.workspace.upgrade(&major()).await;
+
+    assert!(upgrade.errors.is_empty(), "{:?}", upgrade.errors);
+    assert_eq!(locked(&fixture, "dom")?.as_deref(), Some("1.1.0"));
+    assert_eq!(
+        rows(&upgrade.items),
+        sorted(vec![
+            applied("dom", "1.0.0", "1.1.0"),
+            skipped(
+                "dom",
+                "1.0.0",
+                "2.0.0",
+                SkipReason::PeerHeld,
+                "plugin@1.0.0 peer-requires dom@^1.0.0",
+            ),
+            applied("safe", "1.0.0", "1.1.0"),
+        ])
+    );
     // The initial trial really moved the held `dom` off `1.0.0`, so evidence read from the
     // trial graph would find no dependency to move from; later trials pin `dom` and never float.
+    let trials = fixture.fake.trials();
     let floated = |trial: &Vec<String>| trial.iter().any(|entry| entry == "float:dom@1.0.1");
     assert!(trials.first().is_some_and(floated), "{trials:?}");
     assert!(!trials.iter().skip(1).any(floated), "{trials:?}");
@@ -1779,8 +1761,9 @@ async fn warm_and_cold_caches_select_the_same_current_line_target() -> eyre::Res
 /// Two members declare `a` and `c`; both majors are rejected and only `a` has an in-line target,
 /// whose landing floats `c` onto `2.0.0` as an unattributed transitive row, the shape the npm
 /// adapter's lock diff reports.
-/// `straggler` names a member that float leaves on `c@1.0.0`.
-fn collateral_major_fixture(straggler: Option<&'static str>) -> eyre::Result<NodeFixture> {
+/// `straggler` names a member that float leaves on `c@1.0.0`, and whether it binds `c@2.0.0` as
+/// well.
+fn collateral_major_fixture(straggler: Option<(&'static str, bool)>) -> eyre::Result<NodeFixture> {
     let fake = FakeNode::new(
         TargetFallback::CurrentLine,
         Script {
@@ -1806,9 +1789,10 @@ fn collateral_major_fixture(straggler: Option<&'static str>) -> eyre::Result<Nod
                 to: "2.0.0",
             }),
             members: &["web", "api"],
-            straggler: straggler.map(|member| Straggler {
+            straggler: straggler.map(|(member, forked)| Straggler {
                 package: "c",
                 member,
+                forked,
             }),
             ..Script::default()
         },
@@ -1826,12 +1810,32 @@ fn strict_major() -> RunOpts {
     }
 }
 
+/// The status and target `outdated --major` reports for `name`.
+async fn outdated_verdict(
+    fixture: &NodeFixture,
+    name: &str,
+) -> eyre::Result<(OutdatedStatus, Option<String>)> {
+    let outdated = fixture.workspace.outdated(&major()).await;
+    let item = outdated
+        .items
+        .iter()
+        .find(|item| item.name == name)
+        .ok_or_else(|| eyre::eyre!("no {name} row: {:?}", outdated.items))?;
+    Ok((item.status, item.adoptable_target.clone()))
+}
+
 /// A rejected major that a retried sibling floats onto its own target in every declaring member
 /// is reported as that landing alone: no held row beside it, so neither the skip count nor
-/// `outdated` nor `--strict` reads a target the lock now holds as held.
+/// `--strict` reads a target the lock now holds as held.
+/// `outdated` claims only the copy's own move, though, so with that move rejected it reads the
+/// row as following its requirers rather than as the sibling's collateral landing.
 #[tokio::test]
 async fn a_major_landed_as_collateral_is_not_also_reported_held() -> eyre::Result<()> {
     let fixture = collateral_major_fixture(None)?;
+    assert_eq!(
+        outdated_verdict(&fixture, "c").await?,
+        (OutdatedStatus::Blocked, Some("2.0.0".to_string()))
+    );
 
     let outcome = fixture.workspace.upgrade(&strict_major()).await;
 
@@ -1866,10 +1870,15 @@ async fn a_major_landed_as_collateral_is_not_also_reported_held() -> eyre::Resul
 }
 
 /// A collateral move that leaves one declaring member on the old version has not landed the
-/// planned change, so its hold is kept beside the partial landing.
+/// planned change, so its hold is kept beside the partial landing, and `outdated` reports the
+/// declared row blocked rather than adoptable for every member.
 #[tokio::test]
 async fn a_major_landed_in_only_some_members_keeps_its_hold() -> eyre::Result<()> {
-    let fixture = collateral_major_fixture(Some("api"))?;
+    let fixture = collateral_major_fixture(Some(("api", false)))?;
+    assert_eq!(
+        outdated_verdict(&fixture, "c").await?,
+        (OutdatedStatus::Blocked, Some("2.0.0".to_string()))
+    );
 
     let outcome = fixture.workspace.upgrade(&strict_major()).await;
 
@@ -1893,8 +1902,258 @@ async fn a_major_landed_in_only_some_members_keeps_its_hold() -> eyre::Result<()
     Ok(())
 }
 
+/// A collateral move that leaves one declaring member bound to the old version as well, as a uv
+/// fork pin does, has not landed the copy, so `outdated` reports the refused target rather than
+/// the version the other fork reached (#173).
+#[tokio::test]
+async fn a_member_left_on_both_versions_keeps_the_copy_unlanded() -> eyre::Result<()> {
+    let fixture = collateral_major_fixture(Some(("api", true)))?;
+
+    let outdated = fixture.workspace.outdated(&major()).await;
+
+    let c = outdated
+        .items
+        .iter()
+        .find(|item| item.name == "c")
+        .ok_or_else(|| eyre::eyre!("no c row: {:?}", outdated.items))?;
+    assert_eq!(
+        (
+            c.status,
+            c.adoptable_target.as_deref(),
+            c.blocked_reason.as_deref()
+        ),
+        (
+            OutdatedStatus::Blocked,
+            Some("2.0.0"),
+            Some(SkipReason::ResolverConflict.message())
+        )
+    );
+    Ok(())
+}
+
+/// A tried target the resolver refuses for a reason `--strict` accepts, such as a workspace
+/// split, still blocks the row with that reason (#173).
+#[tokio::test]
+async fn a_conservative_refusal_keeps_its_reason() -> eyre::Result<()> {
+    let fake = FakeNode::new(
+        TargetFallback::CurrentLine,
+        Script {
+            holds: vec![Hold {
+                target: "m@2.0.0",
+                reason: SkipReason::MultiVersionHeld,
+                offending: None,
+                detail: Some("members would split across two majors"),
+            }],
+            ..Script::default()
+        },
+    )
+    .with_releases("m", &[("1.0.0", false), ("2.0.0", false)]);
+    let fixture = fixture(fake, &[("m", "1.0.0")])?;
+
+    let outdated = fixture.workspace.outdated(&major()).await;
+
+    let m = outdated
+        .items
+        .iter()
+        .find(|item| item.name == "m")
+        .ok_or_else(|| eyre::eyre!("no m row: {:?}", outdated.items))?;
+    assert_eq!(
+        (
+            m.status,
+            m.adoptable_target.as_deref(),
+            m.blocked_reason.as_deref()
+        ),
+        (
+            OutdatedStatus::Blocked,
+            Some("2.0.0"),
+            Some("members would split across two majors")
+        )
+    );
+    Ok(())
+}
+
+/// An in-line fallback the final replay refuses is the nearest move `upgrade` tried, so
+/// `outdated` blocks the row there with the replay's reason, beside the major's own hold (#173).
+#[tokio::test]
+async fn a_fallback_the_replay_refuses_blocks_the_row_there() -> eyre::Result<()> {
+    let fixture = fixture(
+        dom_and_safe(
+            TargetFallback::CurrentLine,
+            Script {
+                holds: vec![peer_held_dom()],
+                refused_after_first: Some("dom@1.1.0"),
+                ..Script::default()
+            },
+            true,
+        ),
+        &[("dom", "1.0.0"), ("safe", "1.0.0")],
+    )?;
+
+    let outdated = fixture.workspace.outdated(&major()).await;
+
+    let dom = outdated
+        .items
+        .iter()
+        .find(|item| item.name == "dom")
+        .ok_or_else(|| eyre::eyre!("no dom row: {:?}", outdated.items))?;
+    assert_eq!(
+        (
+            dom.status,
+            dom.adoptable_target.as_deref(),
+            dom.blocked_reason.as_deref()
+        ),
+        (
+            OutdatedStatus::Blocked,
+            Some("1.1.0"),
+            Some("the registry moved between trials")
+        )
+    );
+    Ok(())
+}
+
+/// A collateral move that lands a declared package in every declaring member, below the target
+/// its own trial was refused, leaves `outdated` reporting that refusal (#173).
+/// Only another package's move carried the copy there, and that row cannot prove the copy's own
+/// bindings moved, so the claim stays with the copy's own move.
+#[tokio::test]
+async fn a_collateral_landing_below_a_refused_target_keeps_the_refusal() -> eyre::Result<()> {
+    let fake = FakeNode::new(
+        TargetFallback::CurrentLine,
+        Script {
+            holds: vec![Hold {
+                target: "c@1.2.0",
+                reason: SkipReason::ResolverConflict,
+                offending: None,
+                detail: None,
+            }],
+            float: Some(Float {
+                trigger: "a",
+                floated: "c",
+                from: "1.0.0",
+                to: "1.1.0",
+            }),
+            members: &["web", "api"],
+            ..Script::default()
+        },
+    )
+    .with_releases("a", &[("1.0.0", false), ("1.1.0", false)])
+    .with_releases("c", &[("1.0.0", false), ("1.1.0", false), ("1.2.0", false)]);
+    let fixture = fixture(fake, &[("a", "1.0.0"), ("c", "1.0.0")])?;
+
+    let outdated = outdated_verdict(&fixture, "c").await?;
+    let upgrade = fixture
+        .workspace
+        .upgrade(&RunOpts {
+            dry_run: true,
+            ..major()
+        })
+        .await;
+
+    assert!(upgrade.errors.is_empty(), "{:?}", upgrade.errors);
+    assert_eq!(
+        rows(&upgrade.items),
+        sorted(vec![
+            applied("a", "1.0.0", "1.1.0"),
+            applied("c", "1.0.0", "1.1.0"),
+            skipped(
+                "c",
+                "1.0.0",
+                "1.2.0",
+                SkipReason::ResolverConflict,
+                SkipReason::ResolverConflict.message()
+            ),
+        ])
+    );
+    assert_eq!(
+        outdated,
+        (OutdatedStatus::Blocked, Some("1.2.0".to_string()))
+    );
+    Ok(())
+}
+
+/// On a tool that never plans an indirect dependency, a registry failure for a direct one is
+/// that row's error alone: the indirect row `upgrade` never tries still follows its requirers
+/// (#173).
+#[tokio::test]
+async fn a_failure_for_one_package_never_settles_another() -> eyre::Result<()> {
+    let mut fake = FakeNode::new(TargetFallback::CurrentLine, Script::default())
+        .with_releases("child", &[("1.0.0", false), ("1.1.0", false)])
+        .with_releases("dom", &[("1.0.0", false), ("1.1.0", false)]);
+    // The locked release stays readable, so only the lookup of newer ones fails.
+    fake.unavailable = &["dom"];
+    let fixture = fixture(fake, &[("child", "1.0.0"), ("dom", "1.0.0")])?;
+
+    let outdated = fixture
+        .workspace
+        .outdated(&RunOpts {
+            transitive: true,
+            ..major()
+        })
+        .await;
+
+    let row = |name: &str| {
+        outdated
+            .items
+            .iter()
+            .find(|item| item.name == name)
+            .ok_or_else(|| eyre::eyre!("no {name} row: {:?}", outdated.items))
+    };
+    let child = row("child")?;
+    assert_eq!(child.status, OutdatedStatus::Blocked, "{child:?}");
+    assert!(
+        child
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("follows the packages that require it")),
+        "{child:?}"
+    );
+    let dom = row("dom")?;
+    assert_eq!(dom.status, OutdatedStatus::Error, "{dom:?}");
+    assert!(
+        dom.error
+            .as_ref()
+            .is_some_and(|error| error.message.contains("cannot serve dom")),
+        "{dom:?}"
+    );
+    Ok(())
+}
+
+/// A release lookup that fails for one copy of a package is that copy's error alone: another
+/// copy of the same package, held by its exact pin, keeps its own verdict (#173).
+#[tokio::test]
+async fn a_failed_lookup_settles_only_its_own_copy() -> eyre::Result<()> {
+    let mut fake = FakeNode::new(TargetFallback::CurrentLine, Script::default()).with_releases(
+        "dom",
+        &[
+            ("1.0.0", false),
+            ("1.1.0", false),
+            ("2.0.0", false),
+            ("2.1.0", false),
+        ],
+    );
+    fake.pinned = &["dom"];
+    fake.unavailable = &["dom@2.0.0"];
+    let fixture = fixture(fake, &[("dom", "1.0.0"), ("dom#2", "2.0.0")])?;
+
+    let outdated = fixture.workspace.outdated(&major()).await;
+
+    let row = |version: &str| {
+        outdated
+            .items
+            .iter()
+            .find(|item| item.name == "dom" && item.current == version)
+            .ok_or_else(|| eyre::eyre!("no dom {version} row: {:?}", outdated.items))
+    };
+    let pinned = row("1.0.0")?;
+    assert_eq!(pinned.status, OutdatedStatus::Held, "{pinned:?}");
+    let unread = row("2.0.0")?;
+    assert_eq!(unread.status, OutdatedStatus::Error, "{unread:?}");
+    Ok(())
+}
+
 /// Each row carries the security provenance of its own target: the in-line move fixes only the
-/// advisory it escapes, the held major both.
+/// advisory it escapes, the held major both, and `outdated` reports the in-line landing with
+/// its own.
 #[tokio::test]
 async fn security_provenance_follows_each_target() -> eyre::Result<()> {
     let mut fake = dom_and_safe(
@@ -1907,6 +2166,20 @@ async fn security_provenance_follows_each_target() -> eyre::Result<()> {
     );
     fake.advisory_ecosystem = Some("npm");
     let fixture = fixture(fake, &[("dom", "1.0.0")])?;
+
+    let outdated = fixture.workspace.outdated(&major()).await;
+    let dom = outdated
+        .items
+        .iter()
+        .find(|item| item.name == "dom")
+        .ok_or_else(|| eyre::eyre!("no dom row: {:?}", outdated.items))?;
+    assert_eq!(dom.adoptable_target.as_deref(), Some("1.1.0"));
+    assert_eq!(
+        dom.security
+            .as_ref()
+            .map(|security| (security.version.as_str(), security.fixes.as_slice())),
+        Some(("1.1.0", ["GHSA-inline".to_string()].as_slice()))
+    );
 
     let outcome = fixture.workspace.upgrade(&major()).await;
 
@@ -2030,6 +2303,8 @@ async fn a_shared_file_the_run_does_not_lease_is_refused() -> eyre::Result<()> {
 
 /// A dry run trials a throwaway copy, so a shared file outside that copy is the real one, and
 /// the trial is refused rather than allowed to write it.
+/// Nothing ran, so the refusal is the project's error rather than one package's, and `outdated`
+/// reports it on the row whose move it stopped (#173).
 #[tokio::test]
 async fn a_dry_run_refuses_a_shared_file_outside_its_copy() -> eyre::Result<()> {
     let (_outside, shared, fixture) = refused_safe_with_shared_file(true)?;
@@ -2042,16 +2317,24 @@ async fn a_dry_run_refuses_a_shared_file_outside_its_copy() -> eyre::Result<()> 
         })
         .await;
 
+    let refused = |error: &Diagnostic| error.message.contains("which this run does not hold");
+    let refusals: Vec<&Diagnostic> = outcome.errors.iter().filter(|e| refused(e)).collect();
     assert!(
-        outcome
-            .errors
-            .iter()
-            .any(|error| error.message.contains("which this run does not hold")),
+        !refusals.is_empty() && refusals.iter().all(|error| error.package.is_none()),
         "{:?}",
         outcome.errors
     );
     assert_eq!(fixture.fake.trials(), Vec::<Vec<String>>::new());
     assert_eq!(std::fs::read_to_string(&shared)?, "original");
+
+    let outdated = fixture.workspace.outdated(&RunOpts::default()).await;
+    let row = outdated
+        .items
+        .iter()
+        .find(|item| item.name == "safe")
+        .ok_or_else(|| eyre::eyre!("no safe row: {:?}", outdated.items))?;
+    assert_eq!(row.status, OutdatedStatus::Error, "{row:?}");
+    assert!(row.error.as_ref().is_some_and(refused), "{row:?}");
     Ok(())
 }
 

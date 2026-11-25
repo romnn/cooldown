@@ -338,7 +338,7 @@ fn assert_declared_rows_follow(fixture: &Fixture, baseline_check: &support::Enve
         "the stale line is reported for regeneration: {:?}",
         outdated.warning_messages()
     );
-    // The policy preview that verified the move rewrote only its throwaway copy, and says so
+    // The dry run that settled the move rewrote only its throwaway copy, and says so
     // conditionally.
     assert!(
         outdated

@@ -1,5 +1,6 @@
-use super::{PreviewEvidence, UpgradeAccum, UpgradeCtx};
+use super::{UpgradeAccum, UpgradeCtx};
 mod batch;
+mod outcome;
 mod planning;
 mod report;
 mod transitive_gate;
@@ -8,12 +9,14 @@ use self::batch::{
     BatchOutcome, CommittedBatch, HoldAttestation, VerifiedBatchReport, indeterminate_trial,
     trial_errors,
 };
+use self::outcome::Provenance;
+pub(crate) use self::outcome::{CopyOutcome, PlannedCopy};
 use self::planning::{
     EffectiveHold, candidate_scope, crosses_line, current_line_target, dep_resolve_ctx,
     effective_hold, fix_change, is_downgrade, line_leaving_nodes, lower_adoptable_targets,
-    plan_baseline_violations, sort_planned_changes,
+    plan_baseline_violations, sort_planned_changes, upgrade_resolve_ctx, upgrade_view,
 };
-pub(crate) use self::planning::{target_package_for, upgrade_view};
+pub(crate) use self::planning::{Judged, target_package_for, upgrade_verdict};
 use self::report::{collapse_applied_legs, combine_lock_status, conflict_skip_message, plan_item};
 use self::transitive_gate::{
     TransitiveGateVerdict, admitted_crossings, insert_graph_violation, newly_introduced_violations,
@@ -33,8 +36,8 @@ use cooldown_core::{
     ApplyReport, BaselineViolation, CeilingReason, Change, DepScope, Dependency, Diagnostic,
     DiagnosticKind, FixVerdict, JudgedPin, LockStatus, LockedVersion, MemberRef,
     NativeAdmissionQuery, NativeAssessment, NativeGateQuery, NativeGateRefusal, PackageId, Plan,
-    ProjectMutationJournal, ProjectMutationState, Release, ResolveContext, RewriteMode, SkipReason,
-    Skipped, Status, TargetFallback, UpdateKind, Version, check_pin_advised, evaluate_advised,
+    ProjectMutationJournal, ProjectMutationState, Release, ResolveContext, SkipReason, Skipped,
+    Status, TargetFallback, UpdateKind, Version, check_pin_advised, evaluate_advised,
     evaluate_ceiling_hold_advised, evaluate_fix_advised, exceeds_max_major,
 };
 use std::collections::{HashMap, HashSet};
@@ -461,7 +464,7 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     lock_edges_enforced: bool,
     /// Adapter-owned edge state captured before this project's first mutation.
     initial_edge_snapshot: Option<Vec<u8>>,
-    /// Run-level lock baseline shared with duplicate guards, including preview trials.
+    /// Run-level lock baseline shared with duplicate guards.
     initial_duplicate_snapshot: Option<std::sync::Arc<[u8]>>,
     /// Correction provenance from committed batches, pending validation against the final lock.
     committed_edge_rebinds: Vec<cooldown_core::EdgeRebind>,
@@ -490,9 +493,8 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     /// [`TargetFallback`] selects them.
     ///
     /// Alternatives reuse the original planning evidence across isolation and replay trials.
-    /// Current-line alternatives are only ever read from here: they come from the pre-lock graph
-    /// (the planner's, or [`prepare_current_line_fallbacks`](Self::prepare_current_line_fallbacks)
-    /// for preselected targets), never from a trial that already moved the graph.
+    /// They are only ever read from here: they come from the graph the planner read, never from a
+    /// trial that already moved it.
     fallback_changes: HashMap<ChangeKey, Vec<Change>>,
     /// The advisory relevance of locked pins, keyed by `(name, version, registry)`, captured on
     /// every residual-gate pass ([`graph_violations`](Self::graph_violations)).
@@ -561,6 +563,9 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     /// What the writer's native gate makes of the lock the run starts from, asked once, with the
     /// first batch (see [`judge_starting_lock`](Self::judge_starting_lock)).
     starting_verdict: StartingVerdict,
+    /// The first-plan copy each tried change moves, traced only while `outdated`'s dry run
+    /// collects what the pass settled (see [`settle_copies`](Self::settle_copies)).
+    provenance: Provenance,
 }
 
 /// The writer's native gate's verdict on the lock a run starts from.
@@ -625,6 +630,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             violation_ages: HashMap::new(),
             published_times: HashMap::new(),
             starting_verdict: StartingVerdict::Unasked,
+            provenance: Provenance::default(),
         }
     }
 
@@ -639,7 +645,57 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
 
     pub(super) fn run(&mut self) -> impl std::future::Future<Output = ProjectRunStatus> {
         // Keep the executor's async state out of project orchestration and tracing wrappers.
-        Box::pin(self.run_inner())
+        Box::pin(async move {
+            let status = self.run_inner().await;
+            self.settle_copies().await;
+            status
+        })
+    }
+
+    /// Settles what the pass did with each copy its first plan read, from the graph the pass
+    /// left, when `outdated`'s dry run collects it and a plan ran.
+    async fn settle_copies(&mut self) {
+        if self
+            .acc
+            .facts
+            .as_ref()
+            .is_none_or(|facts| facts.copies.is_none())
+        {
+            return;
+        }
+        let graph = self.final_graph().await;
+        let UpgradeAccum {
+            facts,
+            items,
+            errors,
+            ..
+        } = &mut *self.acc;
+        if let Some(copies) = facts.as_mut().and_then(|facts| facts.copies.as_mut()) {
+            outcome::settle(copies, &self.provenance, items, errors, graph.as_deref());
+        }
+    }
+
+    /// The whole graph the pass left, with its build-backend requirements, or `None` after
+    /// recording why it could not be read.
+    ///
+    /// The planning scope stays out of this read: a move can land under a name `--package`
+    /// filters out, such as a Go module's next major path, while each copy's own declaration
+    /// still decides whose bindings count.
+    async fn final_graph(&mut self) -> Option<Vec<Dependency>> {
+        let project = &self.ctx.pctx.project;
+        let mut deps = match self.ctx.reader.dependencies(project, DepScope::Graph).await {
+            Ok(deps) => deps,
+            Err(error) => {
+                self.record_project_error(&error, None);
+                return None;
+            }
+        };
+        // A build backend has no lock entry, so only its manifest shows a raised floor; without
+        // it such a move reads as not landed.
+        if let Ok(constraints) = self.ctx.reader.manifest_constraints(project).await {
+            deps.extend(constraints);
+        }
+        Some(deps)
     }
 
     async fn run_inner(&mut self) -> ProjectRunStatus {
@@ -805,83 +861,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 ControlFlow::Break(MutationTerminated)
             }
         }
-    }
-
-    /// Runs the upgrade policy state machine for targets selected by another read path.
-    ///
-    /// This deliberately stops before final lock/build reporting: candidate eligibility is decided
-    /// by the apply, graph gate, reconciliation, and residual-isolation phases. The caller owns a
-    /// throwaway project copy, so every settled mutation is discarded with that copy.
-    pub(super) async fn run_policy(&mut self, mut changes: Vec<Change>, evidence: PreviewEvidence) {
-        let guard = match self.ctx.write_guard().await {
-            Ok(guard) => guard,
-            Err(error) => {
-                self.record_project_error(&error, None);
-                return;
-            }
-        };
-        self.record_leased_shared_files(guard.as_ref());
-        let recovery_result = match guard.as_ref() {
-            Some(guard) => {
-                self.ctx
-                    .writer
-                    .recover_pending_mutation(&self.ctx.pctx.project, guard.coordination())
-                    .await
-            }
-            None => Ok(cooldown_core::MutationRecovery::settled(
-                cooldown_core::RecoveryDisposition::Unchanged,
-            )),
-        };
-        let recovery = match recovery_result {
-            Ok(recovery) => recovery,
-            Err(error) => {
-                self.record_project_error(&error, None);
-                return;
-            }
-        };
-        self.acc.warnings.extend(recovery_diagnostics(
-            recovery,
-            self.ctx.pctx.tool,
-            self.ctx.pctx.rel_path.as_str(),
-        ));
-        let PreviewEvidence {
-            manifest_only,
-            advisories,
-            excluded_members,
-        } = evidence;
-        self.manifest_only = manifest_only;
-        self.excluded_members = excluded_members;
-        sort_planned_changes(&mut changes);
-        // The caller's snapshot when it has one: the trial must judge from the same feed data
-        // that selected these targets, or it could hold a candidate on a newer snapshot's
-        // evidence.
-        match advisories {
-            Some(shared) => self.advisories = Some(shared),
-            None => {
-                // Planned changes carry no advisory identity of their own — identity lives on
-                // the resolved dependencies (see [`Dependency::advisory_identity`]) — so the
-                // fetch scopes itself from the graph read inside. Every planned package is
-                // locked in that graph; if the read fails, the run is honestly unadvised
-                // (fail-open) rather than queried on unproven identities.
-                self.fetch_advisories(Vec::new()).await;
-            }
-        }
-        self.initial_duplicate_snapshot = match self
-            .ctx
-            .writer
-            .lock_edge_snapshot(&self.ctx.pctx.project)
-            .await
-        {
-            Ok(snapshot) => snapshot.map(std::sync::Arc::from),
-            Err(err) => {
-                self.record_project_error(&err, None);
-                return;
-            }
-        };
-        let Some(mut state) = self.initial_trial_state().await else {
-            return;
-        };
-        let _ = self.apply_upgrade_changes(changes, &mut state).await;
     }
 
     /// Fetches the project's advisories once, before planning, so the planner and every
@@ -1114,6 +1093,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let Some(deps) = self.scoped_deps(GraphRead::Replan).await else {
             return flow;
         };
+        self.provenance.replanned();
         let followers: Vec<_> = deps
             .into_iter()
             .filter(|dep| {
@@ -1128,7 +1108,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     }
 
     /// Applies planned changes: manifest-only build-backend floors in their own batch, then the
-    /// lock batch through the policy trials. Shared by the real `upgrade` and the policy preview.
+    /// lock batch through the policy trials.
     async fn apply_upgrade_changes(
         &mut self,
         planned: Vec<Change>,
@@ -1255,16 +1235,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         lock_changes: Vec<Change>,
         state: &mut TrialState,
     ) -> MutationFlow {
-        // Only a `--major` run plans a cross-major target, so only one can have a current-line
-        // alternative to prepare.
-        if self.ctx.writer.target_fallback() == TargetFallback::CurrentLine
-            && self.ctx.opts.allow_major
-            && let Err(error) = self.prepare_current_line_fallbacks(&lock_changes).await
-        {
-            let mut outcome = BatchOutcome::default();
-            outcome.errors.push(*error);
-            return self.merge_batch_outcome(outcome);
-        }
         let baseline_before_lock = state.clone();
         let mut rollback = TrialRollback::default();
         let initial = self
@@ -1761,18 +1731,17 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         if rejected.is_empty() || self.ctx.opts.fast {
             return UpgradeSelectionResult::Selected { accepted, rejected };
         }
-        let candidates = match self
-            .fallback_candidates(rejected.iter().map(|item| item.change.clone()).collect())
-            .await
-        {
-            Ok(candidates) => candidates,
-            // Without alternatives there is nothing older to try, but the accepted set was
-            // verified by settled trials, so it still replays instead of being discarded.
-            Err(error) => {
-                self.record_fallback_failure([*error]);
-                return UpgradeSelectionResult::Selected { accepted, rejected };
-            }
-        };
+        let candidates: Vec<UpgradeFallback> = rejected
+            .iter()
+            .map(|item| UpgradeFallback {
+                original: item.change.clone(),
+                alternatives: self
+                    .fallback_changes
+                    .get(&ChangeKey::of(&item.change))
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect();
         // Retry only rejected candidates. Joint substitutions preserve coupled exact families;
         // individual substitutions salvage independent candidates if the joint family cannot land.
         // The budget excludes initial isolation and the final replay: at most 3 + 3 * |R| trials.
@@ -1974,24 +1943,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .collect()
     }
 
-    async fn fallback_candidates(
-        &mut self,
-        changes: Vec<Change>,
-    ) -> Result<Vec<UpgradeFallback>, Box<Diagnostic>> {
-        let mut candidates = Vec::new();
-        for change in changes {
-            let alternatives = self
-                .upgrade_fallbacks(&change)
-                .await
-                .map_err(|err| Box::new(self.project_diag(&err, Some(&change.package.name))))?;
-            candidates.push(UpgradeFallback {
-                original: change,
-                alternatives,
-            });
-        }
-        Ok(candidates)
-    }
-
     /// Runs a candidate landing and its transitive remediation before rejecting the graph.
     fn try_upgrade_group_once(
         &mut self,
@@ -2153,131 +2104,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 }
             })
             .collect()
-    }
-
-    async fn upgrade_fallbacks(&mut self, change: &Change) -> cooldown_core::Result<Vec<Change>> {
-        let key = ChangeKey::of(change);
-        if let Some(alternatives) = self.fallback_changes.get(&key) {
-            return Ok(alternatives.clone());
-        }
-        // Policy previews supply preselected targets without calling the forward planner.
-        // Reconstruct their alternatives only after restoration, using the same advisory snapshot.
-        let deps = self.read_reconcile_deps().await?;
-        let Some(dep) = deps
-            .into_iter()
-            .find(|dep| dep.package == change.package && dep.current == change.from)
-        else {
-            return Ok(Vec::new());
-        };
-        let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
-        let fetched = self
-            .ws
-            .fetch_candidate_releases(
-                self.ctx.reader,
-                vec![dep.clone()],
-                &fctx,
-                self.ctx.opts.candidate_scope(),
-                self.ctx.progress,
-                self.ctx.opts.fanout(),
-            )
-            .await;
-        let Some(fetched) = fetched.into_iter().next() else {
-            return Ok(Vec::new());
-        };
-        let releases = fetched.result?;
-        let verdict = self.upgrade_verdict(&dep, &releases);
-        self.remember_upgrade_fallbacks(change, &releases, &verdict);
-        Ok(self.fallback_changes.get(&key).cloned().unwrap_or_default())
-    }
-
-    /// Caches the current-line alternatives of preselected targets the forward planner never
-    /// evaluated, before the first trial moves the graph.
-    ///
-    /// A trial can move a held candidate collaterally, so evidence read after it would no longer
-    /// find the version the candidate moves from; reading the pre-lock graph here keeps a policy
-    /// preview selecting exactly the alternatives a planned run does.
-    /// Changes the planner already evaluated are served from the cache without any read.
-    async fn prepare_current_line_fallbacks(
-        &mut self,
-        changes: &[Change],
-    ) -> Result<(), Box<Diagnostic>> {
-        let pending: Vec<&Change> = changes
-            .iter()
-            .filter(|change| !self.fallback_changes.contains_key(&ChangeKey::of(change)))
-            .collect();
-        if pending.is_empty() {
-            return Ok(());
-        }
-        let deps = self
-            .read_reconcile_deps()
-            .await
-            .map_err(|err| Box::new(self.project_diag(&err, None)))?;
-        let mut evaluated: Vec<Dependency> = Vec::new();
-        for change in &pending {
-            let Some(dep) = deps
-                .iter()
-                .find(|dep| dep.package == change.package && dep.current == change.from)
-            else {
-                self.fallback_changes
-                    .insert(ChangeKey::of(change), Vec::new());
-                continue;
-            };
-            if !evaluated
-                .iter()
-                .any(|seen| seen.package == dep.package && seen.current == dep.current)
-            {
-                evaluated.push(dep.clone());
-            }
-        }
-        let fctx = Workspace::fetch_context(self.ctx.pctx, self.ctx.opts);
-        let fetched = self
-            .ws
-            .fetch_candidate_releases(
-                self.ctx.reader,
-                evaluated,
-                &fctx,
-                self.ctx.opts.candidate_scope(),
-                self.ctx.progress,
-                self.ctx.opts.fanout(),
-            )
-            .await;
-        for FetchedRelease {
-            dependency: dep,
-            result,
-        } in fetched
-        {
-            let releases =
-                result.map_err(|err| Box::new(self.project_diag(&err, Some(&dep.package.name))))?;
-            let verdict = self.upgrade_verdict(&dep, &releases);
-            for change in &pending {
-                if change.package == dep.package && change.from == dep.current {
-                    self.remember_upgrade_fallbacks(change, &releases, &verdict);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Judges `dep`'s candidates exactly as the forward planner does, with the run's advisory
-    /// snapshot, so a fallback alternative is a target planning would have admitted.
-    fn upgrade_verdict(&self, dep: &Dependency, releases: &[Release]) -> cooldown_core::Verdict {
-        let advised = self
-            .advisories
-            .as_ref()
-            .and_then(|project| project.classify(self.ctx.reader, dep, releases));
-        let advisory_ctx = advised.as_ref().map(ClassifiedAdvisories::context);
-        let rctx = ResolveContext {
-            honor_declared_bounds: self.ctx.opts.rewrite == RewriteMode::Auto,
-            ..Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts)
-        };
-        evaluate_advised(
-            &upgrade_view(dep),
-            releases,
-            advisory_ctx.as_ref(),
-            &self.ctx.pctx.policy.layers,
-            &dep_resolve_ctx(&rctx, dep),
-            self.ws.now(),
-        )
     }
 
     fn remember_upgrade_fallbacks(
@@ -2625,16 +2451,14 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
     /// Its deferral skips only undeclared nodes, which never cross a line: their targets stay on
     /// their current major.
     fn line_leaving(
-        &self,
         deps: &[Dependency],
-        fetched: &[FetchedRelease<Vec<Release>>],
+        judged: &[FetchedRelease<Judged>],
     ) -> HashSet<(String, String)> {
-        let crossing = fetched
+        let crossing = judged
             .iter()
             .filter_map(|fetched| {
                 let dep = &fetched.dependency;
-                let releases = fetched.result.as_ref().ok()?;
-                let verdict = self.upgrade_verdict(dep, releases);
+                let Judged { releases, verdict } = fetched.result.as_ref().ok()?;
                 let target = verdict
                     .adoptable_target
                     .as_ref()
@@ -2646,10 +2470,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         line_leaving_nodes(deps, crossing)
     }
 
-    async fn fetch_upgrade_releases(
-        &self,
-        deps: &[Dependency],
-    ) -> Vec<FetchedRelease<Vec<Release>>> {
+    /// Fetches each dependency's releases and judges them once, so that one verdict decides its
+    /// line, its plan, and the `outdated` row reported from it.
+    async fn judge_upgrade_releases(&self, deps: &[Dependency]) -> Vec<FetchedRelease<Judged>> {
         self.ctx.progress.phase(format!(
             "fetching metadata for {} upgrade candidates",
             deps.len()
@@ -2665,27 +2488,46 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.ctx.opts.fanout(),
             )
             .await
+            .into_iter()
+            .map(|FetchedRelease { dependency, result }| FetchedRelease {
+                result: result.map(|releases| Judged {
+                    verdict: upgrade_verdict(
+                        self.ctx.reader,
+                        self.ctx.pctx,
+                        self.ctx.opts,
+                        self.ws.now(),
+                        self.advisories.as_deref(),
+                        &dependency,
+                        &releases,
+                    ),
+                    releases,
+                }),
+                dependency,
+            })
+            .collect()
     }
 
     async fn plan_upgrade_changes(&mut self, deps: &[Dependency]) -> PlannedUpgrade {
-        let fetched = self.fetch_upgrade_releases(deps).await;
-        let rctx = ResolveContext {
-            honor_declared_bounds: self.ctx.opts.rewrite == RewriteMode::Auto,
-            ..Workspace::resolve_ctx(self.ctx.pctx, self.ctx.opts)
-        };
+        let judged = self.judge_upgrade_releases(deps).await;
+        let rctx = upgrade_resolve_ctx(self.ctx.pctx, self.ctx.opts);
         let advisories = self.advisories.clone();
-        let leaving = self.line_leaving(deps, &fetched);
+        let leaving = Self::line_leaving(deps, &judged);
         let mut planned = Vec::new();
         let mut deferred = HashSet::new();
-        for FetchedRelease {
-            dependency: dep,
-            result,
-        } in fetched
-        {
-            let releases = match result {
-                Ok(releases) => releases,
+        let mut deferred_copies = Vec::new();
+        for (copy, fact) in judged.iter().enumerate() {
+            let FetchedRelease {
+                dependency: dep,
+                result,
+            } = fact;
+            let Judged { releases, verdict } = match result {
+                Ok(judged) => judged,
                 Err(error) => {
-                    self.record_project_error(&error, Some(&dep.package.name));
+                    let diagnostic = self.project_diag(error, Some(&dep.package.name));
+                    if let Some(origin) = self.origin_of(dep, copy) {
+                        self.provenance.failed(origin, diagnostic.clone());
+                    }
+                    self.acc.errors.push(diagnostic);
                     continue;
                 }
             };
@@ -2693,27 +2535,20 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             let node = (dep.package.name.clone(), dep.current.as_str().to_string());
             if !dep.direct && leaving.contains(&node) {
                 deferred.insert(node);
+                deferred_copies.push(copy);
                 continue;
             }
             let advised = advisories
                 .as_ref()
-                .and_then(|project| project.classify(self.ctx.reader, &dep, &releases));
+                .and_then(|project| project.classify(self.ctx.reader, dep, releases));
             let advisory_ctx = advised.as_ref().map(ClassifiedAdvisories::context);
-            let effective = upgrade_view(&dep);
-            let verdict = evaluate_advised(
-                &effective,
-                &releases,
-                advisory_ctx.as_ref(),
-                &self.ctx.pctx.policy.layers,
-                &dep_resolve_ctx(&rctx, &dep),
-                self.ws.now(),
-            );
-            self.record_held_back_ceiling(&effective, &releases, advisory_ctx.as_ref(), &rctx);
+            let effective = upgrade_view(dep);
+            self.record_held_back_ceiling(&effective, releases, advisory_ctx.as_ref(), &rctx);
             // Surface an adoptable cross-major update the user could take with `--major` (it would
             // otherwise vanish from a default run even though `outdated` lists it).
             self.record_held_back_major(
                 &effective,
-                &releases,
+                releases,
                 advisory_ctx.as_ref(),
                 &rctx,
                 verdict.adoptable_target.as_ref(),
@@ -2721,7 +2556,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             // A held dep (exact pin or commit pin) carries an `adoptable_target` for the report — the
             // version a human could manually pin to — but `upgrade` must never move it on its own.
             if verdict.status == cooldown_core::Status::Held {
-                self.record_held_pin(&effective, &releases, &verdict);
+                self.record_held_pin(&effective, releases, verdict);
                 continue;
             }
             let Some(target) = verdict.adoptable_target.clone() else {
@@ -2738,12 +2573,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             let security = chosen
                 .and_then(|candidate| candidate.security.as_ref())
                 .map(|relevance| crate::app::workspace::security_info(relevance, &target));
-            let package = target_package_for(&releases, &dep, &target);
+            let package = target_package_for(releases, dep, &target);
             // Whether this move is a rollback. The forward planner only adopts a strictly newer
             // matured version (`evaluate` filters to `order > current`), so this is currently always
             // false — a too-fresh pin is rolled back by the fix/reconcile pass instead, which flags it
             // directly. Computed rather than hardcoded so the label stays correct if that ever changes.
-            let downgrade = is_downgrade(&releases, &dep.current, &target);
+            let downgrade = is_downgrade(releases, &dep.current, &target);
             let change = Change {
                 package,
                 from: dep.current.clone(),
@@ -2761,13 +2596,70 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.security_by_change
                     .insert(ChangeKey::of(&change), security);
             }
-            self.remember_upgrade_fallbacks(&change, &releases, &verdict);
+            self.remember_upgrade_fallbacks(&change, releases, verdict);
+            self.trace_tried(&change, dep, copy);
             planned.push(change);
         }
         sort_planned_changes(&mut planned);
+        self.record_first_plan(judged, deferred_copies);
         PlannedUpgrade {
             changes: planned,
             deferred,
+        }
+    }
+
+    /// Keeps a first plan's facts, and the copies it deferred to a follower replan, when
+    /// `outdated`'s dry run collects them.
+    fn record_first_plan(&mut self, judged: Vec<FetchedRelease<Judged>>, deferred: Vec<usize>) {
+        // A follower replan reads the graph the first plan's moves left, while `outdated`
+        // reports the starting one.
+        if let Some(facts) = &mut self.acc.facts
+            && facts.copies.is_none()
+        {
+            let copies = judged
+                .into_iter()
+                .map(|fact| PlannedCopy {
+                    fact,
+                    outcome: None,
+                })
+                .collect();
+            facts.copies = Some(copies);
+            self.provenance.await_replan(deferred);
+        }
+    }
+
+    /// The first-plan copy that `dep`, at index `copy` in the plan reading it, is, when
+    /// `outdated`'s dry run collects what the pass settled.
+    ///
+    /// A follower replan's copy is the first plan's with the same declaration, if the first plan
+    /// read one.
+    fn origin_of(&self, dep: &Dependency, copy: usize) -> Option<usize> {
+        match &self.acc.facts.as_ref()?.copies {
+            None => Some(copy),
+            Some(first) => first.iter().position(|planned| {
+                let first = &planned.fact.dependency;
+                first.package == dep.package
+                    && first.current == dep.current
+                    && first.direct == dep.direct
+                    && first.members == dep.members
+            }),
+        }
+    }
+
+    /// Traces `change`, and the fallbacks it may be retried at, to the first-plan copy of `dep`
+    /// it moves (see [`origin_of`](Self::origin_of)).
+    fn trace_tried(&mut self, change: &Change, dep: &Dependency, copy: usize) {
+        let Some(origin) = self.origin_of(dep, copy) else {
+            return;
+        };
+        self.provenance.tried(change, origin, &dep.package);
+        for alternative in self
+            .fallback_changes
+            .get(&ChangeKey::of(change))
+            .into_iter()
+            .flatten()
+        {
+            self.provenance.tried(alternative, origin, &dep.package);
         }
     }
 
@@ -3387,10 +3279,6 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             return outcome;
         }
         let plan = self.batch_plan(&changes, state, search);
-        let primary = changes
-            .first()
-            .map(|change| change.package.name.clone())
-            .unwrap_or_default();
         self.ctx
             .progress
             .phase(format!("applying {} planned changes", changes.len()));
@@ -3400,10 +3288,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             .await
         {
             Ok(prepared) => prepared,
+            // Nothing ran, so the failure is the project's rather than any one change's, and it
+            // settles every copy the pass tried and left undecided.
             Err(error) => {
-                outcome
-                    .errors
-                    .push(self.project_diag(&error, Some(&primary)));
+                outcome.errors.push(self.project_diag(&error, None));
                 return outcome;
             }
         };
@@ -4913,8 +4801,8 @@ fn push_upgrade_halves(work: &mut Vec<Vec<Change>>, mut changes: Vec<Change>) {
 /// The note that a generated manifest's projected requirements followed the batch's moves, so it
 /// no longer matches its generator's output and the user's flow ends with a regeneration.
 ///
-/// Like the advisory rollback note, it speaks in the run's mood: a dry run (or `outdated`'s
-/// policy preview) *would* rewrite the projection, a real run *has*.
+/// Like the advisory rollback note, it speaks in the run's mood: a dry run (`outdated`'s
+/// included) *would* rewrite the projection, a real run *has*.
 fn followed_manifest_warning(rel: &camino::Utf8Path, dry_run: bool) -> Diagnostic {
     let message = if dry_run {
         format!(
@@ -4988,11 +4876,29 @@ fn verify_applied_targets(
 }
 
 fn target_reached(deps: &[Dependency], change: &Change) -> bool {
-    if change.direct && !change.members.is_empty() {
-        return change.members.iter().all(|member| {
+    let declared = change.direct && !change.members.is_empty();
+    line_reached(
+        deps,
+        (&change.package, &change.from),
+        (&change.package, &change.to),
+        declared.then_some(change.members.as_slice()),
+    )
+}
+
+/// Whether `deps` holds the `destination` line of a move from the `source` line: in each of the
+/// `members` declaring a direct move, with that member's own source line gone, and anywhere for
+/// any other move.
+fn line_reached(
+    deps: &[Dependency],
+    (package, from): (&PackageId, &Version),
+    (destination, to): (&PackageId, &Version),
+    members: Option<&[MemberRef]>,
+) -> bool {
+    if let Some(members) = members {
+        return members.iter().all(|member| {
             let reached = deps.iter().any(|dep| {
-                dep.package == change.package
-                    && dep.current == change.to
+                dep.package == *destination
+                    && dep.current == *to
                     && dep.members.iter().any(|dep_member| dep_member == member)
             });
             // The planned line must actually have moved. A member that declares the crate twice
@@ -5003,8 +4909,8 @@ fn target_reached(deps: &[Dependency], change: &Change) -> bool {
             // from node the member only *reaches* transitively is fine — its own edges moved).
             let from_line_remains = deps.iter().any(|dep| {
                 dep.direct
-                    && dep.package == change.package
-                    && dep.current == change.from
+                    && dep.package == *package
+                    && dep.current == *from
                     && dep.members.iter().any(|dep_member| dep_member == member)
             });
             reached && !from_line_remains
@@ -5012,7 +4918,7 @@ fn target_reached(deps: &[Dependency], change: &Change) -> bool {
     }
 
     deps.iter()
-        .any(|dep| dep.package == change.package && dep.current == change.to)
+        .any(|dep| dep.package == *destination && dep.current == *to)
 }
 
 /// The hold for a candidate the adapter reported applied whose target the post-apply graph does
