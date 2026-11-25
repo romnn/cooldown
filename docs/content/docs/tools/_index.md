@@ -57,6 +57,39 @@ than current wherever its check does not reach:
 `upgrade` and `fix` verify the lock they wrote the same way. npm has no lock-only refresh for
 `check --lock`; re-lock with `npm install`.
 
+Bun's text `bun.lock` is the lock cooldown reads; a project with only the binary `bun.lockb` is no
+Bun project to it. `check` asks Bun itself whether the lock is current, with a stable Bun 1.4.5 or
+newer, the oldest release measured to leave the project alone: an older or prerelease Bun leaves
+the lock `lock_unknown`. It runs `bun install --frozen-lockfile --dry-run --ignore-scripts` in the
+project, which installs nothing, with Bun's install cache and temporary files kept in cooldown's
+cache directory and `BUN_OPTIONS` ignored, so the project, its `node_modules` included, stays byte
+for byte as it was. Bun's refusal of a lock that has changes is a stale lock that
+`--allow-stale-lock` waives, but only when it is Bun's sole error; any other Bun failure, such as a
+registry or resolution error or a lock Bun could not load, is `tool_failed`. Under `--offline` Bun
+runs offline too: it still proves a current lock from the lock alone, but a stale lock whose
+resolution needs registry metadata Bun has not cached is `tool_failed` rather than stale. The lock
+is `lock_unknown` rather than current wherever the probe cannot establish what Bun verifies:
+
+- no readable text `bun.lock`;
+- a configuration that disables Bun's install cache, under which Bun writes into the project:
+  `[install] cache = false` or `[install.cache] disable = true` in the project's `bunfig.toml` or
+  the global `.bunfig.toml`, or any line in the project's or the user's `.npmrc` that may set
+  `cache` other than a plain `cache`, `cache=true`, or `cache=<path>`, such as
+  `cache=false # comment`, `cache = ' false '`, or `cache=${VAR}`, and a
+  `.env` file Bun loads (`.env`, `.env.local`, `.env.<NODE_ENV>`, `.env.<NODE_ENV>.local`) that
+  mentions `NPM_CONFIG_USERCONFIG`, which chooses the user `.npmrc`;
+- an enclosing directory whose `package.json` declares workspaces, which Bun could run the project
+  as a member of;
+- `trustedDependencies` in any workspace manifest or the lock, or `patchedDependencies` in the
+  root manifest or the lock, since a frozen install compares neither, or a local `file:` or
+  `link:` dependency in the lock, whose own manifest Bun does not compare;
+- a workspace pattern other than a literal path or a path ending in `/*`;
+- workspace members other than those the lock records, such as a new member named like a locked
+  registry package, or a member's name, version, or declarations differing from what the lock
+  recorded for it, which Bun's frozen check passes.
+
+`upgrade` and `fix` verify the lock they wrote the same way.
+
 Yarn Classic and Yarn Berry share the `yarn` tool, its `[tool.yarn]` config, and `yarn.lock`;
 cooldown tells them apart by the lock itself, since only a Berry lock opens with a `__metadata`
 entry. A Berry lock written by Yarn 2 through 4.18 (lockfile versions 4 to 6 and 8 to 10) is read

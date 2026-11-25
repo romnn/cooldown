@@ -10,6 +10,7 @@
 
 mod admissions;
 mod apply;
+mod bun_frozen;
 pub mod deno;
 mod exclusions;
 pub mod jsr;

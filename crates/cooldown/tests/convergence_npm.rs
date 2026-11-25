@@ -11,7 +11,7 @@
 mod support;
 
 use indoc::{formatdoc, indoc};
-use support::{ChangeVersions, Fixture, REGISTRY_HISTORY};
+use support::{ChangeVersions, Fixture, REGISTRY_HISTORY, project_files};
 
 const SEED_BEFORE: &str = "2025-05-20T00:00:00Z";
 const FREEZE: &str = "2026-06-30T00:00:00Z";
@@ -1973,38 +1973,6 @@ fn declare_ms(fixture: &Fixture, spec: &str) {
         );
     let body = serde_json::to_string_pretty(&manifest).expect("manifest serializes");
     fixture.write("package.json", &format!("{body}\n"));
-}
-
-/// Every file of the project outside `.git`, by `/`-separated relative path, with its bytes.
-fn project_files(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
-    fn walk(
-        root: &std::path::Path,
-        dir: &std::path::Path,
-        files: &mut std::collections::BTreeMap<String, Vec<u8>>,
-    ) {
-        for entry in std::fs::read_dir(dir).expect("read project directory") {
-            let path = entry.expect("read directory entry").path();
-            if path.file_name().is_some_and(|name| name == ".git") {
-                continue;
-            }
-            if path.is_dir() {
-                walk(root, &path, files);
-            } else {
-                let relative = path.strip_prefix(root).expect("path below the root");
-                let relative: Vec<String> = relative
-                    .components()
-                    .map(|component| component.as_os_str().to_string_lossy().into_owned())
-                    .collect();
-                files.insert(
-                    relative.join("/"),
-                    std::fs::read(&path).expect("read project file"),
-                );
-            }
-        }
-    }
-    let mut files = std::collections::BTreeMap::new();
-    walk(root, root, &mut files);
-    files
 }
 
 /// npm's own `npm ci --dry-run` proves a current lock, and the project, its `node_modules`

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **`check` gates Bun projects.** `check` failed every Bun project with `lock_unknown`, which
+  `--allow-stale-lock` does not waive, because nothing proved a `bun.lock` current. A stable Bun
+  1.4.5 or newer now proves it with `bun install --frozen-lockfile --dry-run --ignore-scripts`, run
+  with Bun's cache and temporary files outside the project, which stays byte for byte as it was:
+  Bun's refusal of a lock that has changes, as its sole error, is `stale_lock`, which
+  `--allow-stale-lock` waives as before, and any other Bun failure is `tool_failed`. Bun's frozen
+  check passes some edits it does not compare, so workspace members other than those the lock
+  records, a member's version or declarations differing from the lock's, a workspace pattern
+  other than a literal path or `dir/*`, a configuration that disables Bun's cache, an enclosing
+  workspace, `trustedDependencies`, `patchedDependencies`, a local `file:` or `link:` dependency,
+  and an older or prerelease Bun leave the lock `lock_unknown` instead. `upgrade` and `fix` verify
+  the lock they wrote the same way, and the integration tests pin Bun 1.4.5 through `mise.toml`.
+  Closes #179.
 - **`check` gates npm projects.** `check` failed every npm project with `lock_unknown`, which
   `--allow-stale-lock` does not waive, because nothing proved a `package-lock.json` current. npm
   10.5.1 and newer now prove it with `npm ci --dry-run --ignore-scripts`, run with npm's cache and
