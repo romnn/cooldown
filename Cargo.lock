@@ -556,6 +556,7 @@ dependencies = [
  "cooldown-adapter-util",
  "cooldown-core",
  "cooldown-registry",
+ "indoc",
  "jiff",
  "semver",
  "serde",
