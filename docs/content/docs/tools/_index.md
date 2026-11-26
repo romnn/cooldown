@@ -332,6 +332,22 @@ each gem at exactly its planned version.
 They need a Bundler `>= 2.7.2, < 5` and refuse while a mirror is configured for rubygems.org.
 cooldown plans only gems Bundler fetches from rubygems.org itself, so none from a private, Git or
 path source.
+Hex's `upgrade` and `fix` relock with `mix` in a scratch directory and publish only `mix.lock`,
+so `deps/` and `_build/` stay as they were until the next `mix deps.get`.
+They need Elixir `>= 1.15.6` and Hex `>= 2.5.2`, exercised with Elixir 1.20 and Hex 2.5 to 2.7,
+turn off Hex's own cooldown and policy for the relock, and refuse while a mirror or another
+repository stands in for hex.pm.
+A preview with `--dry-run` refuses a project whose path dependency lies outside it, which the
+preview's copy of the project leaves behind.
+Two cases stay outside that boundary.
+A Git dependency the relock fetches can have Mix fetch its own dependencies outside the scratch
+directory, as a plain `mix deps.get` would; cooldown then refuses the relock, but cannot undo that
+fetch.
+An umbrella that keeps its apps elsewhere than `apps/` (`apps_path`) can have a member's `mix.exs`
+change while cooldown relocks without cooldown noticing.
+cooldown plans only packages Hex fetches from hex.pm itself, so none from a private organization or
+repository, Git or path source, and reads an aliased dependency, such as
+`{:parsec, "~> 1.2", hex: :nimble_parsec}`, under its Hex package.
 
 When `PATH` leads to a [mise](https://mise.jdx.dev) shim, every command first runs mise, which picks
 the tool and its environment for the command's directory.
@@ -390,7 +406,7 @@ in Cargo's spelling (`"14 days"`); it bounds what Cargo can resolve but is not r
 
 ## Several ecosystems at once
 
-In a polyglot repository every detected ecosystem runs in its own lane, and the lanes run concurrently: while `cargo` waits on crates.io, `uv` is already resolving against PyPI, whether they live in different directories or share one. A lane runs its own projects one after another, since concurrent invocations of one package manager block on that manager's own cache lock. Only ecosystems that rewrite the same manifest take turns under `upgrade`, `fix`, or `--lock`: uv and poetry both own `pyproject.toml`, and every npm-family tool owns `package.json`, so two of them at one root, or one nested in the other's workspace, run in turn (`--dry-run` mutates a throwaway copy, so it reads side by side too). Each adapter declares the file its lease guards: pixi is detected by `pixi.lock` but rewrites `pixi.toml`, or the `pyproject.toml` hosting its tables, and takes turns with uv and poetry in the latter case. `--build` steps run one at a time across ecosystems, since every ecosystem installs into the environment shared at a root (`node_modules`, `.venv`); so do the upgrades of tools whose native command installs as it pins (`poetry add`, `conda install`, `mix deps.update`, `swift package update`), and `outdated`'s preview of such an update, which runs the same command on a copy. `--jobs <N>` caps how many ecosystems run at once; `--jobs 1` runs them one after another. The reports, their order, and the exit code are the same as a sequential run's. The interactive progress display shows one block per live ecosystem, and the plain transcript names the tool and project on every per-project line.
+In a polyglot repository every detected ecosystem runs in its own lane, and the lanes run concurrently: while `cargo` waits on crates.io, `uv` is already resolving against PyPI, whether they live in different directories or share one. A lane runs its own projects one after another, since concurrent invocations of one package manager block on that manager's own cache lock. Only ecosystems that rewrite the same manifest take turns under `upgrade`, `fix`, or `--lock`: uv and poetry both own `pyproject.toml`, and every npm-family tool owns `package.json`, so two of them at one root, or one nested in the other's workspace, run in turn (`--dry-run` mutates a throwaway copy, so it reads side by side too). Each adapter declares the file its lease guards: pixi is detected by `pixi.lock` but rewrites `pixi.toml`, or the `pyproject.toml` hosting its tables, and takes turns with uv and poetry in the latter case. `--build` steps run one at a time across ecosystems, since every ecosystem installs into the environment shared at a root (`node_modules`, `.venv`); so do the upgrades of tools whose native command installs as it pins (`poetry add`, `conda install`, `swift package update`), and `outdated`'s preview of such an update, which runs the same command on a copy. `--jobs <N>` caps how many ecosystems run at once; `--jobs 1` runs them one after another. The reports, their order, and the exit code are the same as a sequential run's. The interactive progress display shows one block per live ecosystem, and the plain transcript names the tool and project on every per-project line.
 
 ## Scoping to a subset
 

@@ -111,13 +111,14 @@ enum Horizon {
 /// cache, so the virtualenv Poetry creates for each throwaway project never lands in the user's.
 /// It also owns a private Bundler home and gem install path, so the registry index Bundler caches
 /// and anything Bundler installs or checks out never land in the user's home or the Ruby's own gem
-/// dir.
+/// dir, and a private Mix home, Mix archive dir and Hex home, so the Hex archive and the registry
+/// and package caches Hex keeps never land in the user's home or the Elixir install.
 /// A fixture built with [`Fixture::pnpm`] also starts its cache seeded from a [`PnpmPool`] of the
 /// metadata earlier fixtures fetched.
 pub struct Fixture {
     dir: tempfile::TempDir,
-    /// The fixture's private pnpm cache and store, its private Poetry cache, and its private
-    /// Bundler home and gem install path.
+    /// The fixture's private pnpm cache and store, its private Poetry cache, its private Bundler
+    /// home and gem install path, and its private Mix and Hex homes.
     ///
     /// It is a sibling of the project tree rather than inside it, so cooldown's project discovery
     /// never walks into the cache or the store.
@@ -248,14 +249,21 @@ impl Fixture {
     /// Bundler keeps its registry index cache and user config under `BUNDLE_USER_HOME` (otherwise
     /// `~/.bundle`), and installs gems and checks Git sources out into `BUNDLE_PATH` (otherwise the
     /// Ruby's own gem dir).
+    /// Mix installs archives such as Hex into `MIX_ARCHIVES`, which mise points into the Elixir
+    /// install it shares between projects, and keeps its own config under `MIX_HOME` (otherwise
+    /// `~/.mix`); Hex keeps its registry and package caches and its config under `HEX_HOME`
+    /// (otherwise `~/.hex`).
     /// The variables are inert for every other tool, so each fixture sets them whatever it drives.
-    fn tool_env(&self) -> [(&'static str, PathBuf); 5] {
+    fn tool_env(&self) -> [(&'static str, PathBuf); 8] {
         [
             ("pnpm_config_cache_dir", self.pnpm_cache_dir()),
             ("pnpm_config_store_dir", self.pnpm_store_dir()),
             ("POETRY_CACHE_DIR", self.tool_home.path().join("poetry")),
             ("BUNDLE_USER_HOME", self.tool_home.path().join("bundle")),
             ("BUNDLE_PATH", self.bundle_path()),
+            ("MIX_HOME", self.tool_home.path().join("mix")),
+            ("MIX_ARCHIVES", self.tool_home.path().join("mix-archives")),
+            ("HEX_HOME", self.tool_home.path().join("hex")),
         ]
     }
 
@@ -778,6 +786,14 @@ impl Envelope {
         self.value
             .get("lockStatus")
             .and_then(serde_json::Value::as_str)
+    }
+
+    /// Whether the `--build` step succeeded, or `None` when it did not run.
+    pub fn build_ok(&self) -> Option<bool> {
+        self.value
+            .get("build")
+            .and_then(|build| build.get("ok"))
+            .and_then(serde_json::Value::as_bool)
     }
 
     pub fn summary_applied(&self) -> u64 {

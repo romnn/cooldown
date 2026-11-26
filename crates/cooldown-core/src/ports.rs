@@ -970,16 +970,16 @@ pub trait ToolWrite: Send + Sync {
 
     /// Whether applying a change installs, fetches, or compiles into an environment rather than
     /// only rewriting the manifest and lock: poetry's `poetry add` syncs the active virtualenv,
-    /// conda's `conda install` writes the active prefix, and mix's `deps.update` and Swift's
-    /// `package update` fetch and build dependencies into directories a build writes too and an
-    /// environment variable can share.
+    /// conda's `conda install` writes the active prefix, and Swift's `package update` fetches and
+    /// builds dependencies into directories a build writes too and an environment variable can
+    /// share.
     ///
     /// Such an apply takes the environment turn a `--build` step takes, so it never overlaps
     /// another lane's install or build in an environment the lanes share.
     /// A tool whose apply only rewrites files and its own registry cache, which every package
     /// manager guards itself (cargo, pip's requirements rewrite, uv's `uv lock`, the npm
-    /// family's `--lockfile-only`, Bundler's `bundle lock`), leaves this `false` and applies side
-    /// by side.
+    /// family's `--lockfile-only`, Bundler's `bundle lock`, Mix's fetch into a scratch directory),
+    /// leaves this `false` and applies side by side.
     fn mutation_installs(&self) -> bool {
         false
     }
@@ -987,7 +987,7 @@ pub trait ToolWrite: Send + Sync {
     /// Whether this tool's apply engine can move a *transitive* planned change — pin a package no
     /// manifest declares to an exact lock version (cargo's per-spec `--precise` pins, pnpm's
     /// temporary qualified overrides, `go get`, uv's `--upgrade-package`, Bundler's relock with
-    /// each target the only candidate).
+    /// each target the only candidate, Mix's relock from a lock holding each target).
     /// `upgrade` plans graph-wide transitive advance only when this holds; an engine that needs a
     /// declared requirement (npm/yarn/bun per-package landing) would report every such candidate
     /// not-eligible, so it keeps direct-only upgrade planning.
@@ -1566,9 +1566,12 @@ impl ResolveInputs {
         // ruby
         "Gemfile",
         "Gemfile.lock",
-        // elixir / hex
+        // elixir / hex, and the Rebar config and lock of a Rebar dependency Mix resolves
         "mix.exs",
         "mix.lock",
+        "rebar.config",
+        "rebar.config.script",
+        "rebar.lock",
         // maven
         "pom.xml",
         // swift

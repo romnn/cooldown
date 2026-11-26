@@ -1,63 +1,110 @@
-//! Parsing `mix.lock` (the resolved graph) and `mix.exs` (the direct deps). `mix.lock` is an Elixir
-//! map literal whose every entry is `"name": {:hex, :name, "version", ...}`; the third tuple element
-//! is the resolved version, and a `:hex` source tag marks it as coming from hex.pm. `mix.lock` does
-//! not record which deps are direct, so that split is recovered from the `deps` list in `mix.exs`.
+//! Parsing `mix.lock` (the resolved graph) and `mix.exs` (the direct deps).
+//!
+//! `mix.lock` is an Elixir map literal with one entry per line, keyed by the app name Mix gives the
+//! dependency.
+//! A Hex entry is the tuple `{:hex, :package, "version", "inner checksum", [managers], [deps],
+//! "repo", "outer checksum"}`, whose package differs from the app name for an aliased dependency
+//! (`{:parsec, "~> 1.2", hex: :nimble_parsec}`).
+//! `mix.lock` does not record which deps are direct, so that split is recovered from the `deps`
+//! list in `mix.exs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-/// A package and the exact version a `mix.lock` entry resolves it to.
-#[derive(Debug, PartialEq)]
-pub struct ResolvedPin {
-    /// The package name (the lock entry's map key).
-    pub name: String,
-    /// The resolved version recorded in the entry's tuple.
+/// The Hex release a `mix.lock` entry locks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HexPin {
+    /// The Hex package, which an aliased dependency names apart from its app name.
+    pub package: String,
+    /// The locked version.
     pub version: String,
-    /// Whether the entry's repo element is `hexpm` — the public hex.pm repository behind OSV's
-    /// `Hex` ecosystem. A private Hex repo records its own name there, and an old-format entry
-    /// without the element is indistinguishable from one, so both decline.
-    pub hexpm: bool,
+    /// The repository the release comes from: `hexpm` for the public hex.pm, `hexpm:<org>` for an
+    /// organization's private packages, or another configured repository.
+    /// It is `None` for an old-format entry that does not record its repository.
+    pub repo: Option<String>,
 }
 
-/// Returns the [`ResolvedPin`] of every hex.pm-sourced entry in a `mix.lock`.
-/// Non-hex sources (`:git`, `:path`) are skipped, as cooldown has no registry publish time for them.
+impl HexPin {
+    /// Whether the release comes from the public hex.pm, the repository whose release history
+    /// cooldown reads and whose packages OSV's `Hex` ecosystem describes.
+    ///
+    /// A private repository's package merely shares the name, and an old-format entry names no
+    /// repository at all, so neither is one.
+    #[must_use]
+    pub fn is_hexpm(&self) -> bool {
+        self.repo.as_deref() == Some(crate::registry::HEXPM)
+    }
+}
+
+/// Every entry of a `mix.lock`, keyed by the app name Mix gives the dependency, with the Hex
+/// release it locks, or `None` for a Git or other non-Hex source.
+///
+/// A line that is not an entry, such as the map's braces, is skipped.
 #[must_use]
-pub fn parse_resolved(content: &str) -> Vec<ResolvedPin> {
-    let mut out = Vec::new();
-    for line in content.lines() {
-        if let Some(entry) = parse_entry(line.trim()) {
-            out.push(entry);
+pub fn parse(content: &str) -> BTreeMap<String, Option<HexPin>> {
+    content.lines().filter_map(parse_entry).collect()
+}
+
+/// Parses one lock line `"app": {…},` into its app name and the Hex release it locks.
+fn parse_entry(line: &str) -> Option<(String, Option<HexPin>)> {
+    let (app, rest) = line.trim().strip_prefix('"')?.split_once("\":")?;
+    let elements = tuple_elements(rest.trim_start())?;
+    let hex = match elements.as_slice() {
+        [":hex", package, version, rest @ ..] => Some(HexPin {
+            package: package.trim_start_matches(':').to_owned(),
+            version: unquote(version)?.to_owned(),
+            // The repository is the seventh element, after the checksum, the managers and the
+            // dependencies.
+            repo: rest
+                .get(3)
+                .and_then(|repo| unquote(repo))
+                .map(str::to_owned),
+        }),
+        _ => None,
+    };
+    Some((app.to_owned(), hex))
+}
+
+/// The top-level elements, trimmed, of the tuple that `text` opens with.
+///
+/// Commas inside a nested list, tuple or string do not separate elements.
+fn tuple_elements(text: &str) -> Option<Vec<&str>> {
+    let body = text.strip_prefix('{')?;
+    let mut elements = Vec::new();
+    let mut depth = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut start = 0;
+    for (index, character) in body.char_indices() {
+        if in_string {
+            match character {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' if depth == 0 => {
+                elements.push(body.get(start..index)?.trim());
+                return Some(elements);
+            }
+            '}' | ']' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => {
+                elements.push(body.get(start..index)?.trim());
+                start = index + 1;
+            }
+            _ => {}
         }
     }
-    out
+    None
 }
 
-/// Parses one lock line `"name": {:hex, :name, "version", ...}`. The version is the first quoted
-/// string inside the tuple (the atoms before it are unquoted).
-fn parse_entry(line: &str) -> Option<ResolvedPin> {
-    let line = line.strip_prefix('"')?;
-    let (name, after) = line.split_once("\":")?;
-    let after = after.trim_start();
-    if !after.starts_with("{:hex") {
-        return None; // only registry-backed (hex.pm) packages have a publish time to reason about
-    }
-    let start = after.find('"')?;
-    let rest = after.get(start + 1..)?;
-    let end = rest.find('"')?;
-    // The tuple's quoted strings, in order, are the version, the inner checksum, any quoted
-    // dependency requirements, the repo name, and the outer checksum — so the repo is the
-    // second-to-last. An old-format entry without repo + outer checksum lands on the version
-    // there instead, which correctly reads as not-hexpm.
-    let quoted: Vec<&str> = after.split('"').skip(1).step_by(2).collect();
-    let hexpm = quoted
-        .len()
-        .checked_sub(2)
-        .and_then(|repo| quoted.get(repo))
-        .is_some_and(|repo| *repo == crate::registry::HEXPM);
-    Some(ResolvedPin {
-        name: name.to_string(),
-        version: rest.get(..end)?.to_string(),
-        hexpm,
-    })
+/// The contents of the Elixir string literal `element`.
+fn unquote(element: &str) -> Option<&str> {
+    element.strip_prefix('"')?.strip_suffix('"')
 }
 
 /// The graph ceiling for each dependency some *requirer* pins exactly in `mix.lock`. Every lock
@@ -163,24 +210,62 @@ fn deps_block(src: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const LOCK: &str = "%{\n  \"jason\": {:hex, :jason, \"1.4.0\", \"abc\", [:mix], [], \"hexpm\", \"def\"},\n  \"plug\": {:hex, :plug, \"1.14.0\", \"ghi\", [:mix], [{:mime, \"~> 1.0\", [hex: :mime]}], \"hexpm\", \"jkl\"},\n  \"local\": {:path, \"../local\"},\n}\n";
+    use indoc::indoc;
 
     const MIX_EXS: &str = "defmodule Demo.MixProject do\n  use Mix.Project\n  def project do\n    [app: :demo, deps: deps()]\n  end\n  defp deps do\n    [\n      {:jason, \"~> 1.4\"},\n      {:plug, \"~> 1.14\"}\n    ]\n  end\nend\n";
 
-    fn pin(name: &str, version: &str) -> ResolvedPin {
-        ResolvedPin {
-            name: name.to_string(),
-            version: version.to_string(),
-            hexpm: true,
+    fn hex(package: &str, version: &str, repo: Option<&str>) -> HexPin {
+        HexPin {
+            package: package.to_owned(),
+            version: version.to_owned(),
+            repo: repo.map(str::to_owned),
         }
     }
 
+    /// Each entry is keyed by its app name and read by tuple position, so an alias keeps its
+    /// package apart from its app name, a requirement string is never taken for the repository,
+    /// and an entry from a private repository, an old-format entry and a Git checkout are told
+    /// apart from a hex.pm release.
     #[test]
-    fn resolved_skips_non_hex_sources() {
-        let mut got = parse_resolved(LOCK);
-        got.sort_by(|a, b| a.name.cmp(&b.name));
-        assert_eq!(got, vec![pin("jason", "1.4.0"), pin("plug", "1.14.0")]);
+    fn entries_are_read_by_tuple_position() {
+        let lock = indoc! {r#"
+            %{
+              "parsec": {:hex, :nimble_parsec, "1.4.0", "abc", [:mix], [], "hexpm", "def"},
+              "plug": {:hex, :plug, "1.14.0", "ghi", [:mix], [{:mime, "~> 1.0", [hex: :mime, repo: "hexpm", optional: false]}], "hexpm", "jkl"},
+              "private": {:hex, :private, "0.1.0", "abc", [:mix], [], "hexpm:acme", "def"},
+              "legacy": {:hex, :legacy, "0.2.0", "abc", [:mix], [{:mime, "~> 1.0", [hex: :mime]}]},
+              "local": {:git, "https://example.com/local.git", "0123abc", []},
+            }
+        "#};
+
+        let entries = parse(lock);
+
+        assert_eq!(
+            entries,
+            BTreeMap::from([
+                (
+                    "parsec".to_owned(),
+                    Some(hex("nimble_parsec", "1.4.0", Some("hexpm")))
+                ),
+                (
+                    "plug".to_owned(),
+                    Some(hex("plug", "1.14.0", Some("hexpm")))
+                ),
+                (
+                    "private".to_owned(),
+                    Some(hex("private", "0.1.0", Some("hexpm:acme")))
+                ),
+                ("legacy".to_owned(), Some(hex("legacy", "0.2.0", None))),
+                ("local".to_owned(), None),
+            ])
+        );
+        // Only the public hex.pm's releases count as hex.pm packages.
+        let hexpm: Vec<&str> = entries
+            .iter()
+            .filter(|(_, pin)| pin.as_ref().is_some_and(HexPin::is_hexpm))
+            .map(|(app, _)| app.as_str())
+            .collect();
+        assert_eq!(hexpm, ["parsec", "plug"]);
     }
 
     #[test]

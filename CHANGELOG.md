@@ -12,6 +12,15 @@
   rubygems.org.
 - **Bundler `outdated`, `upgrade` and `fix` no longer plan gems from a private, Git or path source**
   by the release ages of the same-named rubygems.org gem.
+- **Hex `upgrade` and `fix` land exactly the versions cooldown plans, transitives included, and
+  leave `deps/` and `_build/` alone.** They relock with `mix` (`COOLDOWN_MIX`) under Elixir
+  `>= 1.15.6` and Hex `>= 2.5.2`, exercised with Elixir 1.20.0, 1.20.1 and 1.20.5 and Hex 2.5.2,
+  2.6.0 and 2.7.0, and refuse an older release, one that lacks a function the relock calls, or a
+  mirror standing in for hex.pm.
+- **Hex dependencies declared under another app name are looked up under their Hex package**, such
+  as `{:parsec, "~> 1.2", hex: :nimble_parsec}`.
+- **Hex `outdated`, `upgrade` and `fix` no longer plan packages from a private organization or
+  repository, Git or path source** by the release ages of the same-named hex.pm package.
 
 ## v0.0.33
 
