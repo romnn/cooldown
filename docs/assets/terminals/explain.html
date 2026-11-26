@@ -1,1 +1,22 @@
 <span class="term-fg32 term-fg1">$</span> cooldown explain itertools --tool cargo
+&nbsp;
+effective window: 0d (decided by repo:cooldown.toml:package=itertools)
+project: .
+registry: crates.io
+verdict: 0.10.5 up-to-date (cooldown 1370d&#47;0d)
+&nbsp;
+<span class="term-fgx240">──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+ Layer                Field                Selector            Window   Applied   Note
+<span class="term-fgx240">══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════</span>
+ default              default                                  7d      <span class="term-fgx8">         </span>  considered
+<span class="term-fgx240">──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+ repo:cooldown.toml   default                                  7d      <span class="term-fgx10"> ✓       </span>  selected (highest layer, then most specific selector and pattern)
+<span class="term-fgx240">──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+ repo:cooldown.toml   allow                package=itertools   0d      <span class="term-fgx10"> ✓       </span>  exemption zeroes the window; floors in other layers still bind (residual) [layer 1]
+<span class="term-fgx240">──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+ repo:cooldown.toml   advisories.enabled                               <span class="term-fgx10"> ✓       </span>  enabled = true
+<span class="term-fgx240">──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+ repo:cooldown.toml   advisories.mode                                  <span class="term-fgx10"> ✓       </span>  mode = shorten
+<span class="term-fgx240">──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
+ repo:cooldown.toml   advisories.min-age                       1d      <span class="term-fgx10"> ✓       </span>  min-age = 1d
+<span class="term-fgx240">──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</span>
