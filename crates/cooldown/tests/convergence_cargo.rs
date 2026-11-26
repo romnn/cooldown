@@ -597,6 +597,106 @@ fn outdated_agrees_with_upgrade() {
     );
 }
 
+/// regex 1.7 has no `regex-automata`; regex 1.9.3, the newest release under the freeze, requires
+/// `regex-automata ^0.3.6`. Cargo's run horizon resolves that at 0.3.8 (2023-09-02), past the
+/// freeze, so the reconcile matures it to 0.3.6 (2023-08-05).
+const ADDED_CRATE_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2023-04-01T00:00:00Z",
+    run: "2023-09-15T00:00:00Z",
+};
+const ADDED_CRATE_FREEZE: &str = "2023-08-10T00:00:00Z";
+
+fn added_crate_fixture() -> Fixture {
+    let fixture = Fixture::cargo(ADDED_CRATE_AS_OF);
+    fixture
+        .write(
+            "Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "cargo-added-crate"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                regex = "1.7"
+            "#},
+        )
+        .write("src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+    fixture
+}
+
+/// #189: a crate the upgrade pulls into the lock, which the reconcile then matures, is not
+/// reported as a downgrade from a version the user never had. Every applied version row starts
+/// at a version the starting lock holds, in the real run and its dry run alike.
+#[test]
+fn upgrade_reports_no_move_for_a_crate_it_adds() {
+    skip_if_missing!("cargo");
+    let real_fixture = added_crate_fixture();
+    let before = real_fixture.read_bytes("Cargo.lock");
+    let start = toml_lock_entries(&before);
+    assert!(
+        start.iter().all(|(name, _)| name != "regex-automata"),
+        "regex 1.7 must not need regex-automata yet; {REGISTRY_HISTORY}"
+    );
+
+    let real = real_fixture.cooldown_json(&["upgrade", "--freeze", ADDED_CRATE_FREEZE]);
+    assert!(real.ok(), "upgrade should succeed");
+    let after = toml_lock_entries(&real_fixture.read_bytes("Cargo.lock"));
+    assert!(
+        after.contains(&("regex-automata".to_owned(), "0.3.6".to_owned())),
+        "the upgrade adds regex-automata, matured to 0.3.6; {REGISTRY_HISTORY}"
+    );
+
+    let dry_fixture = added_crate_fixture();
+    let dry_before = dry_fixture.read_bytes("Cargo.lock");
+    let dry = dry_fixture.cooldown_json(&["upgrade", "--freeze", ADDED_CRATE_FREEZE, "--dry-run"]);
+    assert!(dry.ok(), "dry run should succeed");
+    assert_eq!(
+        dry_before,
+        dry_fixture.read_bytes("Cargo.lock"),
+        "--dry-run must leave the lock byte-identical"
+    );
+
+    let applied_moves = |report: &Envelope| -> BTreeSet<(String, String, String)> {
+        report
+            .items()
+            .iter()
+            .filter(|item| item.get("applied").and_then(serde_json::Value::as_bool) == Some(true))
+            .filter(|item| item.get("edge").is_none_or(serde_json::Value::is_null))
+            .filter_map(|item| {
+                Some((
+                    item.get("name")?.as_str()?.to_owned(),
+                    item.get("from")?.as_str()?.to_owned(),
+                    item.get("to")?.as_str()?.to_owned(),
+                ))
+            })
+            .collect()
+    };
+    let real_moves = applied_moves(&real);
+    assert!(
+        real_moves
+            .iter()
+            .any(|(name, from, _)| name == "regex" && from == "1.7.3"),
+        "the planned regex upgrade is reported, got {real_moves:?}"
+    );
+    let unseen: Vec<_> = real_moves
+        .iter()
+        .filter(|(name, from, _)| !start.contains(&(name.clone(), from.clone())))
+        .collect();
+    assert!(
+        unseen.is_empty(),
+        "every applied row starts at a version the user's lock had, got {unseen:?}"
+    );
+    assert_eq!(
+        real_moves,
+        applied_moves(&dry),
+        "the dry run reports exactly the moves the real upgrade applies"
+    );
+}
+
 #[test]
 fn upgrade_dry_run_agrees_with_real_upgrade() {
     skip_if_missing!("cargo");
