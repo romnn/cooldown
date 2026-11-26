@@ -60,7 +60,7 @@ shoot() {
   cp -r "$examples/$sub/." "$work/"
   git init -q "$work" # its own repo root → project renders as "." (not the temp path)
   local status=0 output
-  output="$(cd "$work" && "$cooldown" "$@" --now "$now" --color always --no-progress 2>/dev/null)" || status=$?
+  output="$(cd "$work" && COOLDOWN_NO_TRACE=true "$cooldown" "$@" --now "$now" --color always --no-progress 2>/dev/null)" || status=$?
   rm -rf "$work"
   if ((status > 1)); then
     echo "cooldown $* exited $status; not writing $out/$name.html" >&2
@@ -84,6 +84,9 @@ shoot upgrade cargo upgrade --tool cargo --major --dry-run
 
 # The CI gate over the resolved graph.
 shoot check cargo check --tool cargo
+
+# The same gate failing: a 30-day window makes four of the example's transitives too fresh.
+shoot check-violation cargo check --tool cargo --min-age 30d
 
 # Why a package has the window it has — every layer and rule that applied.
 # `itertools` is exempt via `allow`, so its derivation shows the exemption zeroing

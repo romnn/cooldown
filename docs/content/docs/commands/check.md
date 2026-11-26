@@ -13,15 +13,9 @@ cooldown check
 
 {{< terminal name="check" >}}
 
-A clean run exits `0`. When a dependency is too fresh, `check` lists the violation and exits `1`:
+A clean run exits `0`. When a dependency is too fresh, `check` lists the violation and exits `1`. Here the same project under a 30-day window: four transitives are younger than that, and each row names the graph floor that a `fix` could roll it back to:
 
-```text
- Package   Version   Cooldown   Status      Notes
-──────────────────────────────────────────────────────────
- left-pad  3.1.0     2d/7d      too fresh   published 2d ago
-
-checked 41 (7 direct) · 1 violation · 0 acknowledged · …
-```
+{{< terminal name="check-violation" >}}
 
 Because the gate is fail-closed, a non-zero exit is its contract — wire it into CI as-is and a too-fresh dependency stops the build. See [Exit codes]({{< relref "cli-reference.md" >}}#exit-codes) for what each code means.
 
