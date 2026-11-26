@@ -25,3 +25,14 @@ min-age = "30d"
 # including `once_cell`, which is pinned to its latest release.
 [outdated]
 all = true
+
+# `lettre` waits 60 days, but 0.11.22 fixes a critical advisory affecting the pinned 0.11.21. The
+# advisory feed's `shorten` mode lets an exact fix clear a 1-day security window instead, so its row is
+# adoptable and names the advisory.
+[package.lettre]
+min-age = "60d"
+
+[advisories]
+enabled = true
+mode = "shorten"
+min-age = "1d"

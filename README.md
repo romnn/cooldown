@@ -1,7 +1,10 @@
 # cooldown
 
 <p align="center">
-  <img src="docs/static/images/outdated.png" alt="cooldown outdated — adoptable updates (green) vs. those still in their cooldown window (yellow)" width="760">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset="docs/static/images/outdated-light.png">
+    <img src="docs/static/images/outdated.png" alt="cooldown outdated — adoptable updates (green), those still in their cooldown window (yellow), and a security fix eligible early on the advisory feed's security window" width="760">
+  </picture>
 </p>
 
 <p align="center">
@@ -60,6 +63,13 @@ cooldown fix           # remediate: downgrade too-fresh deps to a matured versio
 
 `cooldown upgrade --dry-run` previews the plan without touching the lock — only versions that have
 already cleared their cooldown window are proposed.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset="docs/static/images/upgrade-light.png">
+    <img src="docs/static/images/upgrade.png" alt="cooldown upgrade --dry-run — each planned move with its source, a security fix it would adopt on the security window, and the exact pin and major update it holds back" width="760">
+  </picture>
+</p>
 
 `upgrade`, `fix`, and `outdated` record local, zstd-compressed JSON Lines traces for debugging.
 Use `--trace-dir PATH` to choose their directory, `--full-trace` to record everything instead of the

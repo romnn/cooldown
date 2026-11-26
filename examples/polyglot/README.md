@@ -5,17 +5,22 @@ Throwaway projects used to generate the README screenshots (`task screenshots`, 
 old dependency versions so `cooldown` always has updates to show; the exact "latest" versions drift
 as registries evolve, but the demo stays valid and regenerates from this repo (no external checkout).
 The screenshots are captured at a fixed instant via the debug-only `--now` flag, so they regenerate
-identically; run live (a release build, no `--now`), the same projects show the same statuses with
-day-counts that have simply moved on.
+identically. Run live (a release build, no `--now`), the day-counts have moved on, so versions that
+were still cooling at the capture instant may have cleared their windows since.
 
 - `cargo/` — a standalone Cargo project (`Cargo.toml` + `Cargo.lock` + `cooldown.toml`; its
   `[workspace]` keeps it out of the parent workspace). Tuned so one `outdated --countdown soonest` run
-  lands on **every** status at once: a few old caret pins (**adoptable**); `bincode` is an exact `=`
+  lands on **every** status at once: a few old caret pins (**adoptable**); `hex` is an exact `=`
   pin (**held**); `once_cell` is pinned to its latest (**up-to-date**); `itertools` is waived by an
   `allow` rule (**exempt**); and two contrasting **in cooldown** rows — `bytes`, whose only newer
   release is still cooling, and `log`, pinned below a burst of releases so `--countdown soonest`
-  counts down to the *next* version to unlock (an intermediate) rather than the newest. This is the
-  project the README screenshots are shot from.
+  counts down to the *next* version to unlock (an intermediate) rather than the newest. `lettre` is
+  pinned below a security fix still inside its 60-day window: the
+  [advisory feed](../../docs/content/docs/configuration/advisories.md)'s `shorten` mode makes the fix
+  adoptable on a 1-day security window and names the advisory. Its lock was matured to the
+  screenshots' fixed instant with `cooldown fix --now`, so `upgrade` moves only what it plans. This
+  is the project the README screenshots are shot from; run live, the `log` and `lettre` rows clear
+  their windows as time passes.
 - `go/`   — a Go module (`go.mod` + `go.sum`). `require`s old versions of a few well-known modules.
 - `python/` — a uv project (`pyproject.toml` + `uv.lock`). Dependencies are `==`-pinned to old
   versions so the lock stays in sync (no stale-lock error); `outdated`/`check` work, but `upgrade`
