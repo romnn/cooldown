@@ -52,10 +52,16 @@ mkdir -p "$out"
 # `pwd -P` spells the path as cooldown prints it: on macOS the temp dir sits behind
 # the `/var` → `/private/var` symlink.
 #
-# Each shot names the exit code it must end with, and its output must carry no
-# `error [...]` diagnostic: `outdated` and `explain` report some errors, such as a
-# stale lock, and still exit 0. Anything else fails the run rather than being
-# rendered.
+# Each shot names the exit code it must end with, and its output must report no
+# error: `outdated` and `explain` report some, such as a stale lock or a failed
+# lookup, and still exit 0. `reports_error` (below) reads the three forms they take.
+# Anything else fails the run rather than being rendered.
+# Whether the ANSI-free report on stdin reports an error: an `error [...]`
+# diagnostic, a non-zero `N errors` tally in a summary line, or an `error` verdict.
+reports_error() {
+  grep -Eq '^error \[|(^|[ ·])[1-9][0-9]* errors?( |$)|^verdict: .*\berror\b'
+}
+
 shoot() {
   local name="$1" sub="$2" expected="$3"; shift 3
   local work; work="$(cd "$(mktemp -d)" && pwd -P)"
@@ -65,7 +71,7 @@ shoot() {
   output="$(cd "$work" && COOLDOWN_NO_TRACE=true "$cooldown" "$@" --now "$now" --color always --no-progress)" || status=$?
   rm -rf "$work"
   local plain; plain="$(sed 's/\x1b\[[0-9;]*m//g' <<<"$output")"
-  if ((status != expected)) || grep -q '^error \[' <<<"$plain"; then
+  if ((status != expected)) || reports_error <<<"$plain"; then
     printf '%s\n' "$output" >&2
     echo "cooldown $* exited $status (expected $expected) or reported an error; not writing $out/$name.html" >&2
     exit 1

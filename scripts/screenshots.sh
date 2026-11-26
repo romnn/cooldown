@@ -69,11 +69,12 @@ shoot() { # <tool-subdir> <name> <cooldown args...>
   cp -r "$example/$sub/." "$work/"
   git init -q "$work" # make it its own repo root → project renders as "." (not the temp path)
   # A pipe is not a terminal, so cooldown renders its tables at full width. Like
-  # scripts/terminals.sh, a shot must exit 0 and carry no `error [...]` diagnostic, which `outdated`
-  # reports for a stale lock while still exiting 0.
+  # scripts/terminals.sh, a shot must exit 0 and report no error: an `error [...]` diagnostic or a
+  # non-zero `N errors` tally, which `outdated` reports for a stale lock or a failed lookup while
+  # still exiting 0.
   ( cd "$work" && COOLDOWN_NO_TRACE=true "$cooldown" "$@" --now "$now" --color always \
       --no-progress --log-level error ) | perl -pe 's/\e\[39m/\e[0m/g' > "$work/dark.ansi"
-  if grep -q '^error \[' < <(perl -pe 's/\e\[[0-9;]*m//g' "$work/dark.ansi"); then
+  if grep -Eq '^error \[|(^|[ ·])[1-9][0-9]* errors?( |$)' < <(perl -pe 's/\e\[[0-9;]*m//g' "$work/dark.ansi"); then
     cat "$work/dark.ansi" >&2
     echo "cooldown $* reported an error; not writing $docs/$name.png" >&2
     exit 1
