@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.0.33
+
 - **`upgrade` no longer reports a package it adds as downgraded.** A transitive that an upgrade
   pulled into the lock and then matured read as a downgrade from a version the lock never had,
   such as `regex-automata 0.4.19 → 0.4.14`; it now gets no row. Closes #189.
