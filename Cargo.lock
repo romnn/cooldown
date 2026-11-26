@@ -662,6 +662,7 @@ dependencies = [
  "cooldown-adapter-util",
  "cooldown-core",
  "cooldown-registry",
+ "indoc",
  "jiff",
  "serde",
  "serde_json",

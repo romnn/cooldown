@@ -235,11 +235,11 @@ pub(in crate::cli) enum Command {
     Upgrade {
         /// How to treat *transitive* (indirect) deps. Default: move them too — advance each to its
         /// newest matured version where the tool's engine can pin an undeclared package (cargo,
-        /// pnpm, go, uv; all other tools plan direct deps only), and reconcile any too-fresh one a
-        /// re-lock drags in back down, so the new lock is gate-clean. `hide` plans direct deps
-        /// only (a re-lock can still move transitives, reported as collateral); `allow` still
-        /// advances the graph but leaves a floated-up too-fresh transitive in place (reported, not
-        /// rolled back).
+        /// pnpm, go, uv, bundler; all other tools plan direct deps only), and reconcile any
+        /// too-fresh one a re-lock drags in back down, so the new lock is gate-clean. `hide` plans
+        /// direct deps only (a re-lock can still move transitives, reported as collateral);
+        /// `allow` still advances the graph but leaves a floated-up too-fresh transitive in place
+        /// (reported, not rolled back).
         #[arg(long, value_enum, value_name = "MODE")]
         transitive: Option<TransitiveMode>,
         /// Also compile/sync after re-locking.
