@@ -9,7 +9,7 @@ use super::{
     conflict_skip_message, conservative_hold, followed_manifest_warning, indeterminate_trial,
     insert_graph_violation, is_downgrade, landed_upgrade_changes, newly_introduced_violations,
     package_label, planned_changes_landed, preserve_rollback_entries, sort_planned_changes,
-    unauthorized_crossings, verify_applied_targets, violation_identity,
+    starts_at_introduced_pin, unauthorized_crossings, verify_applied_targets, violation_identity,
 };
 use crate::app::change_key::ChangeKey;
 use crate::app::{TransitiveGate, UpgradeItem};
@@ -1177,6 +1177,93 @@ fn no_kind(_: &str, _: &str) -> Option<UpdateKind> {
     None
 }
 
+fn none_introduced(_: &UpgradeItem) -> bool {
+    false
+}
+
+/// #189: a crate an upgrade pulls in arrives at its newest version, and the reconcile matures it.
+/// The only leg the report sees starts at a version the user never had, so it gets no row.
+#[test]
+fn collapse_drops_a_leg_from_a_version_the_pass_introduced() {
+    let mut items = vec![
+        applied_item("regex-automata", "0.4.19", "0.4.14", true),
+        applied_item("regex", "1.7.0", "1.12.4", false),
+    ];
+    let removed = collapse_applied_legs(
+        &mut items,
+        ".",
+        "cargo",
+        &no_prior(),
+        per_row_batches,
+        no_kind,
+        |item| item.name == "regex-automata" && item.from == "0.4.19",
+    );
+    assert_eq!(items.len(), 1, "only the planned move remains: {items:?}");
+    assert_eq!(items[0].name, "regex");
+    assert_eq!(
+        removed,
+        [0],
+        "the caller shifts its batch boundaries by the removed rows"
+    );
+}
+
+/// A build-backend floor raise is a manifest move no graph read sees: a lock copy of the same name
+/// arriving at the old floor's version must not take the floor's row with it, while a move from
+/// that lock copy is still one the user never saw.
+#[test]
+fn a_floor_raise_is_not_mistaken_for_a_lock_copy_the_pass_introduced() {
+    let package = PackageId::new(ToolId("uv"), "hatchling", Some("pypi".to_string()));
+    let introduced = HashSet::from([(package.clone(), Version::new("1.0.0"))]);
+    let floor_moves = HashSet::from([(package, Version::new("1.0.0"), Version::new("1.1.0"))]);
+    let row = |from: &str, to: &str| {
+        let mut item = applied_item("hatchling", from, to, false);
+        item.registry = Some("pypi".to_string());
+        item
+    };
+    assert!(!starts_at_introduced_pin(
+        &row("1.0.0", "1.1.0"),
+        ToolId("uv"),
+        &introduced,
+        &floor_moves
+    ));
+    assert!(starts_at_introduced_pin(
+        &row("1.0.0", "0.9.0"),
+        ToolId("uv"),
+        &introduced,
+        &floor_moves
+    ));
+    assert!(!starts_at_introduced_pin(
+        &row("0.8.0", "0.9.0"),
+        ToolId("uv"),
+        &introduced,
+        &floor_moves
+    ));
+}
+
+/// A version the pass passed through is not the start of a chain that began at a version the
+/// user had: the net row still runs from the user's version.
+#[test]
+fn collapse_keeps_a_chain_through_an_introduced_version() {
+    let mut items = vec![
+        applied_item("quote", "1.0.44", "1.0.46", false),
+        applied_item("quote", "1.0.46", "1.0.45", true),
+    ];
+    collapse_applied_legs(
+        &mut items,
+        ".",
+        "cargo",
+        &no_prior(),
+        per_row_batches,
+        no_kind,
+        |item| item.from == "1.0.46",
+    );
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        (items[0].from.as_str(), items[0].to.as_str()),
+        ("1.0.44", "1.0.45")
+    );
+}
+
 #[test]
 fn restore_conflict_does_not_claim_rows_from_an_earlier_committed_batch() {
     let mut committed = BatchOutcome::default();
@@ -1432,7 +1519,15 @@ fn collapse_keeps_same_batch_sibling_moves_apart() {
         applied_item("lodash", "4.17.19", "4.17.20", false),
         applied_item("lodash", "4.17.20", "4.17.21", false),
     ];
-    collapse_applied_legs(&mut items, ".", "cargo", &no_prior(), |_| 0, no_kind);
+    collapse_applied_legs(
+        &mut items,
+        ".",
+        "cargo",
+        &no_prior(),
+        |_| 0,
+        no_kind,
+        none_introduced,
+    );
     assert_eq!(items.len(), 2, "sibling copies keep their own rows");
     assert_eq!(
         (items[0].from.as_str(), items[0].to.as_str()),
@@ -1458,6 +1553,7 @@ fn collapse_merges_float_then_reconcile_into_a_net_forward_row() {
         &no_prior(),
         per_row_batches,
         no_kind,
+        none_introduced,
     );
     assert_eq!(items.len(), 1, "the two legs collapse to one net row");
     assert_eq!(items[0].from, "1.0.44");
@@ -1494,6 +1590,7 @@ fn collapse_carries_the_final_legs_security_block() {
         &no_prior(),
         per_row_batches,
         no_kind,
+        none_introduced,
     );
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].to, "1.0.45");
@@ -1525,6 +1622,7 @@ fn collapse_reclassifies_kind_against_the_net_target_when_available() {
                 None
             }
         },
+        none_introduced,
     );
     assert_eq!(items.len(), 1);
     assert_eq!(
@@ -1552,6 +1650,7 @@ fn collapse_merges_two_fix_rounds_into_one_net_downgrade_row() {
         &no_prior(),
         per_row_batches,
         no_kind,
+        none_introduced,
     );
     assert_eq!(items.len(), 1, "two fix rounds report one net movement");
     assert_eq!(
@@ -1574,6 +1673,7 @@ fn collapse_drops_a_package_that_floats_up_then_fully_back() {
         &no_prior(),
         per_row_batches,
         no_kind,
+        none_introduced,
     );
     assert!(
         items.is_empty(),
@@ -1595,6 +1695,7 @@ fn collapse_keeps_single_leg_rows_including_a_genuine_downgrade() {
         &no_prior(),
         per_row_batches,
         no_kind,
+        none_introduced,
     );
     assert_eq!(items.len(), 2);
     let refr = items
@@ -1619,6 +1720,7 @@ fn collapse_does_not_merge_across_projects() {
         &no_prior(),
         per_row_batches,
         no_kind,
+        none_introduced,
     );
     // Only project `a` is in scope, and it has a single leg there, so nothing merges.
     assert_eq!(items.len(), 2);
@@ -1636,7 +1738,15 @@ fn collapse_marks_a_net_downgrade_when_the_start_was_a_prior_violation() {
         package: PackageId::new(ToolId("cargo"), "quote", Some("crates.io".to_string())),
         version: Version::new("1.0.5"),
     }]);
-    collapse_applied_legs(&mut items, ".", "cargo", &prior, per_row_batches, no_kind);
+    collapse_applied_legs(
+        &mut items,
+        ".",
+        "cargo",
+        &prior,
+        per_row_batches,
+        no_kind,
+        none_introduced,
+    );
     assert_eq!(items.len(), 1);
     assert_eq!(
         (items[0].from.as_str(), items[0].to.as_str()),
@@ -1664,6 +1774,7 @@ fn collapse_does_not_merge_two_coexisting_majors_of_one_crate() {
         &no_prior(),
         per_row_batches,
         no_kind,
+        none_introduced,
     );
     assert_eq!(items.len(), 2, "independent version lines stay distinct");
     let lines: HashSet<(String, String)> = items
@@ -1688,6 +1799,7 @@ fn collapse_leaves_reciprocal_edge_rows_independent() {
         &no_prior(),
         per_row_batches,
         no_kind,
+        none_introduced,
     );
 
     assert_eq!(items.len(), 2, "edge relationships are not version legs");
@@ -1714,6 +1826,7 @@ fn collapse_does_not_chain_an_edge_row_with_a_version_row() {
         &no_prior(),
         per_row_batches,
         no_kind,
+        none_introduced,
     );
 
     assert_eq!(items.len(), 2);

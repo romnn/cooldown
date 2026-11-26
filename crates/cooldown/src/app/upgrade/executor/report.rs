@@ -1,5 +1,7 @@
 use crate::app::{SecurityInfo, SkippedInfo, UpgradeItem};
-use cooldown_core::{BaselineViolation, Change, LockStatus, SkipReason, UpdateKind};
+use cooldown_core::{
+    BaselineViolation, Change, LockStatus, PackageId, SkipReason, ToolId, UpdateKind, Version,
+};
 use std::collections::{HashMap, HashSet};
 
 /// One collapsed chain: the surviving row and the net fields recomputed for it.
@@ -18,6 +20,9 @@ struct CollapsedLeg {
 /// Contiguous chains keep coexisting version lines independent even when they share a package name
 /// and registry.
 /// A chain that returns to its starting version is removed because it has no net movement.
+/// A chain that starts from a version the pass itself brought into the lock (`introduced`) is
+/// removed too: the user never had that version, so a row from it would claim a move they never
+/// saw. A package that joins the lock is left to the lock diff, as one that leaves it is.
 ///
 /// Legs chain only across batches (`batch_of` yields each row's batch ordinal): one batch report
 /// emits one row per copy, so two same-batch rows sharing a name and registry are *coexisting*
@@ -27,6 +32,9 @@ struct CollapsedLeg {
 /// Direction is recomputed from the first leg and the violations that existed before the batch.
 /// Classification is recomputed through the adapter when it understands the collapsed endpoints.
 /// Only applied version rows for the selected project and tool are eligible.
+///
+/// Returns the indices of the removed rows, ascending, so the caller can keep its batch
+/// boundaries aligned with the rows that remain.
 pub(super) fn collapse_applied_legs(
     items: &mut Vec<UpgradeItem>,
     project: &str,
@@ -34,7 +42,8 @@ pub(super) fn collapse_applied_legs(
     prior_violations: &HashSet<BaselineViolation>,
     batch_of: impl Fn(usize) -> usize,
     classify_update_kind: impl Fn(&str, &str) -> Option<UpdateKind>,
-) {
+    introduced: impl Fn(&UpgradeItem) -> bool,
+) -> Vec<usize> {
     let mut groups: HashMap<(String, Option<String>), Vec<usize>> = HashMap::new();
     for (idx, item) in items.iter().enumerate() {
         let applied =
@@ -73,6 +82,10 @@ pub(super) fn collapse_applied_legs(
             let (Some(&first), Some(&last)) = (chain.first(), chain.last()) else {
                 continue;
             };
+            if items.get(first).is_some_and(&introduced) {
+                remove.extend(chain.iter().copied());
+                continue;
+            }
             if first == last {
                 // A single-leg chain already represents its net movement.
                 continue;
@@ -115,7 +128,7 @@ pub(super) fn collapse_applied_legs(
         }
     }
     if remove.is_empty() {
-        return;
+        return Vec::new();
     }
     *items = std::mem::take(items)
         .into_iter()
@@ -123,6 +136,31 @@ pub(super) fn collapse_applied_legs(
         .filter(|(idx, _)| !remove.contains(idx))
         .map(|(_, item)| item)
         .collect();
+    let mut removed: Vec<usize> = remove.into_iter().collect();
+    removed.sort_unstable();
+    removed
+}
+
+/// Whether an applied row starts at a version the pass itself brought into the lock, as
+/// [`collapse_applied_legs`] asks: `introduced` holds the pins the pass's graph reads found that its
+/// first read did not.
+///
+/// A build-backend floor raise (`floor_moves`) is a manifest move that no graph read sees, so a
+/// lock copy of the same name arriving at the old floor's version must not take its row with it.
+pub(super) fn starts_at_introduced_pin(
+    item: &UpgradeItem,
+    tool: ToolId,
+    introduced: &HashSet<(PackageId, Version)>,
+    floor_moves: &HashSet<(PackageId, Version, Version)>,
+) -> bool {
+    let package = PackageId::new(tool, item.name.clone(), item.registry.clone());
+    let from = Version::new(item.from.clone());
+    let floor = (package, from, Version::new(item.to.clone()));
+    if floor_moves.contains(&floor) {
+        return false;
+    }
+    let (package, from, _) = floor;
+    introduced.contains(&(package, from))
 }
 
 fn violation_matches_report_row(

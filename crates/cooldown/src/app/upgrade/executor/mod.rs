@@ -17,7 +17,10 @@ use self::planning::{
     plan_baseline_violations, sort_planned_changes, upgrade_resolve_ctx, upgrade_view,
 };
 pub(crate) use self::planning::{Judged, target_package_for, upgrade_verdict};
-use self::report::{collapse_applied_legs, combine_lock_status, conflict_skip_message, plan_item};
+use self::report::{
+    collapse_applied_legs, combine_lock_status, conflict_skip_message, plan_item,
+    starts_at_introduced_pin,
+};
 use self::transitive_gate::{
     TransitiveGateVerdict, admitted_crossings, insert_graph_violation, newly_introduced_violations,
     package_label,
@@ -522,6 +525,19 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     /// re-classify its advisories against a full release list; the gate already materialized
     /// exactly that set, so it is kept instead of re-reading the graph.
     last_gate_graph: Vec<Dependency>,
+    /// The pins the first gate pass read, before this pass mutated anything: the lock the user
+    /// had.
+    start_pins: Option<HashSet<(PackageId, Version)>>,
+    /// The pins a later gate pass read that the start did not have: versions this pass itself
+    /// brought into the lock.
+    ///
+    /// A collateral row whose `from` is one of them describes a move the user never saw, such as
+    /// a crate an upgrade pulled in at its newest version and the reconcile then matured, so the
+    /// report drops it (see [`collapse_applied_legs`]).
+    introduced_pins: HashSet<(PackageId, Version)>,
+    /// The build-backend floor raises this pass applied, as `(package, from, to)`: manifest moves
+    /// no graph read sees, which a lock copy of the same name must not be mistaken for.
+    floor_moves: HashSet<(PackageId, Version, Version)>,
     /// Advisory-package identities a top-up tried and could not cover.
     ///
     /// A feed that just failed will fail the same way next round, so retrying would re-query it
@@ -623,6 +639,9 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             pin_security: HashMap::new(),
             pin_affected: HashMap::new(),
             last_gate_graph: Vec::new(),
+            start_pins: None,
+            introduced_pins: HashSet::new(),
+            floor_moves: HashSet::new(),
             top_up_declined: HashSet::new(),
             unproven_reported: HashSet::new(),
             advisories: None,
@@ -1125,6 +1144,13 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .progress
                 .candidates(&build_changes, "checking build backend updates");
             let decided = build_changes.clone();
+            self.floor_moves.extend(build_changes.iter().map(|change| {
+                (
+                    change.package.clone(),
+                    change.from.clone(),
+                    change.to.clone(),
+                )
+            }));
             let outcome = self.apply_batch(build_changes, state).await;
             self.ctx.progress.candidates_decided(&decided);
             Self::advance_trial_state(&outcome, state);
@@ -2150,14 +2176,22 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         let tool = self.ctx.tool_name();
         let classifier = self.ctx.reader;
         let offsets = self.batch_item_offsets.clone();
-        collapse_applied_legs(
+        let tool_id = self.ctx.pctx.tool;
+        let (introduced, floor_moves) = (&self.introduced_pins, &self.floor_moves);
+        let removed = collapse_applied_legs(
             &mut self.acc.items,
             &project,
             tool,
             prior_violations,
             move |idx| offsets.partition_point(|&start| start <= idx),
             |from, to| classifier.classify_update_kind(from, to),
+            |item| starts_at_introduced_pin(item, tool_id, introduced, floor_moves),
         );
+        // A later batch's rows are ordered by these boundaries, so each one moves down by the
+        // rows removed before it; a stale boundary would merge two batches' rows into one.
+        for start in &mut self.batch_item_offsets {
+            *start -= removed.partition_point(|&idx| idx < *start);
+        }
     }
 
     /// Fold a batch's report into the run accumulator. Report-only: trial state advances exactly
@@ -4449,12 +4483,27 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             }
             graph.push(dep);
         }
+        self.record_pins(&graph);
         self.last_gate_graph = graph;
         Ok(GraphGate {
             violations,
             ceiling_crossings,
             pins,
         })
+    }
+
+    /// Records the pins a gate pass read: the first pass's as the start, and every later pass's
+    /// pins the start did not have as [`introduced_pins`](Self::introduced_pins).
+    fn record_pins(&mut self, graph: &[Dependency]) {
+        let read = graph
+            .iter()
+            .map(|dep| (dep.package.clone(), dep.current.clone()));
+        match &self.start_pins {
+            None => self.start_pins = Some(read.collect()),
+            Some(start) => self
+                .introduced_pins
+                .extend(read.filter(|pin| !start.contains(pin))),
+        }
     }
 
     /// Remembers what the advisory feed says about one locked pin, the evidence a committed

@@ -15,7 +15,7 @@ Preview the plan without touching anything with `--dry-run`:
 
 {{< terminal name="upgrade" >}}
 
-The **From → To** columns show the move; a row can be a `downgraded` as well as an `upgraded` when a re-lock would otherwise pull a too-fresh transitive in and it has to be reconciled back down (see [Transitive dependencies](#transitive-dependencies)).
+The **From → To** columns show the move from the version your lock had; a row can be a `downgraded` as well as an `upgraded` when your lock already held a too-fresh transitive and the run reconciles it back down (see [Transitive dependencies](#transitive-dependencies)). A package the run adds to the lock, such as a new transitive a newer release requires, gets no row even when the run matures it before writing the lock; the lock diff shows it.
 
 A row that moved for security reasons says so in **Reason** — `⚠ fixes GHSA-… (high); adopted on the security window` — and carries the same `security` object in `--json`, so a fast-tracked adoption is never indistinguishable from a routine bump. A row the security window made eligible but that did not land (a skip, an error) says `eligible on the security window` instead, and a `--dry-run` row that would land says `would adopt on the security window`: the block describes the window, not the outcome.
 

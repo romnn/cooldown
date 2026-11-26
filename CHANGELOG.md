@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **`upgrade` no longer reports a package it adds as downgraded.** A transitive that an upgrade
+  pulled into the lock and then matured read as a downgrade from a version the lock never had,
+  such as `regex-automata 0.4.19 → 0.4.14`; it now gets no row. Closes #189.
 - **`check` gates Poetry projects.** `check` failed every Poetry project with `lock_unknown`, which
   `--allow-stale-lock` does not waive, because nothing proved a `poetry.lock` current. A stable
   Poetry 2.3 or newer now proves it with `poetry check --lock --no-plugins`, run offline with

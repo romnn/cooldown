@@ -4780,12 +4780,19 @@ async fn upgrade_reconciles_a_floated_up_transitive_instead_of_rolling_back() {
 
     // The forward move is kept (not rolled back) and the floated-up transitive is reconciled down to
     // its newest matured version — one `upgrade` leaves a gate-clean lock, no separate `fix` needed.
+    // The residual gate would roll `a` back if `t` were still too fresh, so `a`'s row proves the
+    // reconcile.
     assert_eq!(out.exit, Exit::Ok);
-    assert_eq!(out.summary.applied, 2);
     let upgraded = out.items.iter().find(|item| item.name == "a").expect("a");
     assert_eq!(upgraded.to, "v1.1.0");
-    let reconciled = out.items.iter().find(|item| item.name == "t").expect("t");
-    assert_eq!(reconciled.to, "v1.0.1");
+    // `t` joined the lock during this run, so its reconcile from a version the user never had gets
+    // no row (#189): it would read as `v1.0.2 → v1.0.1 downgraded`.
+    assert_eq!(out.summary.applied, 1);
+    assert!(
+        out.items.iter().all(|item| item.name != "t"),
+        "a package the run added has no version-move row: {:?}",
+        out.items
+    );
 }
 
 /// The circular-hold discount through the reconcile entry (`reconcile_to_fixpoint`): the floated
@@ -4850,14 +4857,15 @@ async fn upgrade_reconcile_discounts_a_hold_from_a_co_violating_requirer() {
     let out = workspace(fake, Baseline::default()).upgrade(&opts()).await;
 
     assert_eq!(out.exit, Exit::Ok);
+    // `t` joined the lock during this run, so its reconcile has no row (#189); `u` was in the
+    // user's lock at the fresh version, so its maturing is a real downgrade row.
     assert_eq!(
-        out.summary.applied, 3,
-        "forward move plus both reconciled violations"
+        out.summary.applied, 2,
+        "forward move plus the pre-existing violation"
     );
     let upgraded = out.items.iter().find(|item| item.name == "a").expect("a");
     assert_eq!(upgraded.to, "v1.1.0");
-    let reconciled = out.items.iter().find(|item| item.name == "t").expect("t");
-    assert_eq!(reconciled.to, "v1.0.1");
+    assert!(out.items.iter().all(|item| item.name != "t"));
     let unblocked = out.items.iter().find(|item| item.name == "u").expect("u");
     assert_eq!(
         unblocked.to, "v1.0.1",
@@ -4920,11 +4928,11 @@ async fn upgrade_attempts_reconcile_without_a_known_floor_prediction() {
     let out = workspace(fake, Baseline::default()).upgrade(&opts()).await;
 
     assert_eq!(out.exit, Exit::Ok);
-    assert_eq!(out.summary.applied, 2);
     let upgraded = out.items.iter().find(|item| item.name == "a").expect("a");
     assert_eq!(upgraded.to, "v1.1.0");
-    let reconciled = out.items.iter().find(|item| item.name == "t").expect("t");
-    assert_eq!(reconciled.to, "v1.0.1");
+    // `t` joined the lock during this run, so its reconcile has no row (#189).
+    assert_eq!(out.summary.applied, 1);
+    assert!(out.items.iter().all(|item| item.name != "t"));
 }
 
 #[tokio::test]
