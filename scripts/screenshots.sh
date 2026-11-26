@@ -16,8 +16,8 @@
 #   * `--now <date>` pins cooldown's evaluation clock to a fixed instant (a debug-build-only flag), so
 #     the `age/window` countdowns and the in-cooldown row don't drift as the wall clock and the
 #     registry move on. That is why we build and run the DEBUG binary, not `--release`.
-#   * `--color always` forces ANSI: freeze captures through a PTY, but cooldown still probes for a
-#     real terminal. `--log-level error` silences the diagnostic log.
+#   * `--color always` forces ANSI, since the capture is a pipe, not a terminal.
+#     `--log-level error` silences the diagnostic log.
 #   * `--no-progress` suppresses the live progress display so freeze captures only the final report,
 #     not the intermediate per-dependency fetch frames (which would render as a very tall image).
 #   * `--language text` stops freeze from syntax-highlighting the captured output — otherwise it
@@ -27,10 +27,16 @@
 #   * freeze ignores the `\e[39m` "reset foreground to default" code, so a colored cell's color bleeds
 #     into the following uncolored cells (e.g. the magenta "Adoptable" leaking into "Latest" and
 #     "Cooldown"). Rewriting `\e[39m` to a full reset `\e[0m`, which freeze does honor, stops it.
-#   * freeze runs the command in an 80-column PTY, so `stty cols 160` widens it first to stop the
-#     table wrapping.
+#   * freeze replays the capture in an 80-column PTY, so `stty cols 200` widens it first to stop
+#     the table wrapping.
 # Each tool's example is copied into a throwaway, freshly `git init`ed dir so it is its own repo root
 # and the project renders as "." (rather than a temp path).
+#
+# Every shot is rendered twice, so the README can follow the reader's color scheme through
+# `<picture>`: `<name>.png` on freeze's dark window, and `<name>-light.png` on white. freeze draws
+# cooldown's 256-color codes from a fixed palette meant for a dark background, whose bright yellow
+# and cyan wash out on white, so the light pass rewrites each code cooldown uses into a darker
+# truecolor one first.
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -52,20 +58,29 @@ mkdir -p "$docs"
 # freeze's window-chrome flags, shared by every shot.
 frame=(--window --shadow.blur 20 --border.radius 8 --padding 20)
 
-shoot() { # <tool-subdir> <output.png> <cooldown args...>
-  local sub="$1" out="$2"; shift 2
+# The light pass's palette: each 256-color index cooldown emits, as a truecolor that reads on white.
+light_palette='my %rgb = (2 => "26;127;55", 8 => "101;109;118", 9 => "207;34;46", 10 => "26;127;55", 11 => "154;103;0", 13 => "130;80;223", 14 => "9;105;218", 240 => "208;215;222"); s/38;5;(\d+)/exists $rgb{$1} ? "38;2;$rgb{$1}" : "38;5;$1"/ge;'
+
+shoot() { # <tool-subdir> <name> <cooldown args...>
+  local sub="$1" name="$2"; shift 2
   local work; work="$(mktemp -d)"
   trap 'rm -rf "$work"' RETURN
   cp -r "$example/$sub/." "$work/"
   git init -q "$work" # make it its own repo root → project renders as "." (not the temp path)
-  # `set -o pipefail` inside the inner shell so a cooldown failure surfaces instead of being masked
-  # by the trailing perl; the outer `set -e` does not reach freeze's child shell.
-  ( cd "$work" && freeze --language text --output "$out" "${frame[@]}" \
-      --execute "bash -c 'set -o pipefail; stty cols 160; $cooldown $* --now $now --color always --no-progress --log-level error | perl -pe \"s/\e\[39m/\e[0m/g\"'" )
-  echo "wrote $out"
+  # A pipe is not a terminal, so cooldown renders its tables at full width.
+  ( cd "$work" && COOLDOWN_NO_TRACE=true "$cooldown" "$@" --now "$now" --color always \
+      --no-progress --log-level error ) | perl -pe 's/\e\[39m/\e[0m/g' > "$work/dark.ansi"
+  perl -pe "$light_palette" "$work/dark.ansi" > "$work/light.ansi"
+  # freeze waits on stdin unless it has none.
+  freeze --language text --output "$docs/$name.png" "${frame[@]}" \
+    --execute "bash -c 'stty cols 200; cat $work/dark.ansi'" </dev/null
+  freeze --language text --output "$docs/$name-light.png" "${frame[@]}" \
+    --background '#ffffff' --theme github \
+    --execute "bash -c 'stty cols 200; cat $work/light.ansi'" </dev/null
+  echo "wrote $docs/$name.png and $docs/$name-light.png"
 }
 
 # `--countdown soonest` so the `log` row counts down to the next version to unlock (an intermediate),
 # showing off the soonest horizon; it is a no-op for the single-candidate rows.
-shoot cargo "$docs/outdated.png" outdated --tool cargo --countdown soonest
-shoot cargo "$docs/upgrade.png"  upgrade  --tool cargo --dry-run
+shoot cargo outdated outdated --tool cargo --countdown soonest
+shoot cargo upgrade  upgrade  --tool cargo --dry-run
