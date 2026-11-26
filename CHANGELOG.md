@@ -6,6 +6,12 @@
   dependency's requirement admits the locked version but not the newer one, such as bincode's
   `unty = "^0.0.4"`, the row reads `held: bincode requires unty ^0.0.4` and `outdated` shows it
   blocked by `bincode`, instead of quoting Cargo's refusal. Closes #198.
+- **Bundler `upgrade` and `fix` land exactly the versions cooldown plans and no longer install
+  gems.** They run `ruby` (`COOLDOWN_RUBY`) with a Bundler `>= 2.7.2, < 5`, exercised with 2.7.2,
+  4.0.9, 4.0.10, 4.0.25 and 4.1.1, and refuse any other Bundler or a mirror configured for
+  rubygems.org.
+- **Bundler `outdated`, `upgrade` and `fix` no longer plan gems from a private, Git or path source**
+  by the release ages of the same-named rubygems.org gem.
 
 ## v0.0.33
 

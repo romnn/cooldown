@@ -109,11 +109,15 @@ enum Horizon {
 /// Every fixture also owns a private pnpm cache and store, which every process it starts resolves
 /// through, so concurrent tests never share pnpm's mutable metadata cache, and a private Poetry
 /// cache, so the virtualenv Poetry creates for each throwaway project never lands in the user's.
+/// It also owns a private Bundler home and gem install path, so the registry index Bundler caches
+/// and anything Bundler installs or checks out never land in the user's home or the Ruby's own gem
+/// dir.
 /// A fixture built with [`Fixture::pnpm`] also starts its cache seeded from a [`PnpmPool`] of the
 /// metadata earlier fixtures fetched.
 pub struct Fixture {
     dir: tempfile::TempDir,
-    /// The fixture's private pnpm cache and store, and its private Poetry cache.
+    /// The fixture's private pnpm cache and store, its private Poetry cache, and its private
+    /// Bundler home and gem install path.
     ///
     /// It is a sibling of the project tree rather than inside it, so cooldown's project discovery
     /// never walks into the cache or the store.
@@ -228,20 +232,30 @@ impl Fixture {
         self.tool_home.path().join("store")
     }
 
-    /// The environment that points every pnpm and Poetry a fixture process starts at the fixture's
-    /// own caches.
+    /// The gem install path (`BUNDLE_PATH`) every process of this fixture uses.
+    pub fn bundle_path(&self) -> PathBuf {
+        self.tool_home.path().join("gems")
+    }
+
+    /// The environment that points every pnpm, Poetry and Bundler a fixture process starts at the
+    /// fixture's own caches.
     ///
     /// Concurrent pnpm processes sharing one metadata cache race on its entries, which surfaces as
     /// `ERR_PNPM_CACHE_MISSING_AFTER_304`, and a damaged entry fails every later test resolving
     /// that package.
     /// pnpm 11 reads its settings from `pnpm_config_*` variables and ignores `npm_config_*` ones.
     /// Poetry keeps a virtualenv per project in its cache, and every fixture is a new project.
+    /// Bundler keeps its registry index cache and user config under `BUNDLE_USER_HOME` (otherwise
+    /// `~/.bundle`), and installs gems and checks Git sources out into `BUNDLE_PATH` (otherwise the
+    /// Ruby's own gem dir).
     /// The variables are inert for every other tool, so each fixture sets them whatever it drives.
-    fn tool_env(&self) -> [(&'static str, PathBuf); 3] {
+    fn tool_env(&self) -> [(&'static str, PathBuf); 5] {
         [
             ("pnpm_config_cache_dir", self.pnpm_cache_dir()),
             ("pnpm_config_store_dir", self.pnpm_store_dir()),
             ("POETRY_CACHE_DIR", self.tool_home.path().join("poetry")),
+            ("BUNDLE_USER_HOME", self.tool_home.path().join("bundle")),
+            ("BUNDLE_PATH", self.bundle_path()),
         ]
     }
 

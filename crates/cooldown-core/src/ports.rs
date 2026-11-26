@@ -970,26 +970,29 @@ pub trait ToolWrite: Send + Sync {
 
     /// Whether applying a change installs, fetches, or compiles into an environment rather than
     /// only rewriting the manifest and lock: poetry's `poetry add` syncs the active virtualenv,
-    /// conda's `conda install` writes the active prefix, bundler's `bundle update` installs the
-    /// gem, and mix's `deps.update` and Swift's `package update` fetch and build dependencies
-    /// into directories a build writes too and an environment variable can share.
+    /// conda's `conda install` writes the active prefix, and mix's `deps.update` and Swift's
+    /// `package update` fetch and build dependencies into directories a build writes too and an
+    /// environment variable can share.
     ///
     /// Such an apply takes the environment turn a `--build` step takes, so it never overlaps
     /// another lane's install or build in an environment the lanes share.
     /// A tool whose apply only rewrites files and its own registry cache, which every package
     /// manager guards itself (cargo, pip's requirements rewrite, uv's `uv lock`, the npm
-    /// family's `--lockfile-only`), leaves this `false` and applies side by side.
+    /// family's `--lockfile-only`, Bundler's `bundle lock`), leaves this `false` and applies side
+    /// by side.
     fn mutation_installs(&self) -> bool {
         false
     }
 
     /// Whether this tool's apply engine can move a *transitive* planned change — pin a package no
     /// manifest declares to an exact lock version (cargo's per-spec `--precise` pins, pnpm's
-    /// temporary qualified overrides, `go get`, uv's `--upgrade-package`). `upgrade` plans
-    /// graph-wide transitive advance only when this holds; an engine that needs a declared
-    /// requirement (npm/yarn/bun per-package landing) would report every such candidate
-    /// not-eligible, so it keeps direct-only upgrade planning. `fix` is unaffected — a too-fresh
-    /// transitive is a policy violation that must at least be reported.
+    /// temporary qualified overrides, `go get`, uv's `--upgrade-package`, Bundler's relock with
+    /// each target the only candidate).
+    /// `upgrade` plans graph-wide transitive advance only when this holds; an engine that needs a
+    /// declared requirement (npm/yarn/bun per-package landing) would report every such candidate
+    /// not-eligible, so it keeps direct-only upgrade planning.
+    /// `fix` is unaffected — a too-fresh transitive is a policy violation that must at least be
+    /// reported.
     fn supports_transitive_advance(&self) -> bool {
         false
     }

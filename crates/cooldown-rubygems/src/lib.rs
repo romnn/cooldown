@@ -1,5 +1,5 @@
 //! The Ruby/Bundler tool adapter. It reads the resolved graph from `Gemfile.lock`, resolves
-//! publish times from rubygems.org, computes verdicts in the cooldown core, and drives `bundle`
+//! publish times from rubygems.org, computes verdicts in the cooldown core, and drives Bundler
 //! only to apply a chosen version.
 
 pub mod lock;
