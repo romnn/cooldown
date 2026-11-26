@@ -49,16 +49,27 @@ mkdir -p "$out"
 # The throwaway dir's absolute path (`$work`) leaks into `explain`/`config`, which
 # print the cooldown.toml's location — rewrite it back to `.` so the committed
 # snippet is deterministic (the random mktemp name would otherwise churn every run).
+# `pwd -P` spells the path as cooldown prints it: on macOS the temp dir sits behind
+# the `/var` → `/private/var` symlink.
+#
+# A shot exits 0 or 1 (a `check` violation is a valid snippet); anything higher is
+# an error such as a stale lock, which must fail the run rather than be rendered.
 shoot() {
   local name="$1" sub="$2"; shift 2
-  local work; work="$(mktemp -d)"
+  local work; work="$(cd "$(mktemp -d)" && pwd -P)"
   cp -r "$examples/$sub/." "$work/"
   git init -q "$work" # its own repo root → project renders as "." (not the temp path)
+  local status=0 output
+  output="$(cd "$work" && "$cooldown" "$@" --now "$now" --color always --no-progress 2>/dev/null)" || status=$?
+  rm -rf "$work"
+  if ((status > 1)); then
+    echo "cooldown $* exited $status; not writing $out/$name.html" >&2
+    exit 1
+  fi
   {
     printf '\033[1;32m$\033[0m cooldown %s\n\n' "$*"
-    ( cd "$work" && "$cooldown" "$@" --now "$now" --color always --no-progress 2>/dev/null || true )
+    printf '%s\n' "$output"
   } | sed "s#$work#.#g" | terminal-to-html > "$out/$name.html"
-  rm -rf "$work"
   echo "wrote $out/$name.html"
 }
 
@@ -71,10 +82,8 @@ shoot outdated cargo outdated --tool cargo --countdown soonest
 # The upgrade plan (dry run) — cross-major bumps included via --major.
 shoot upgrade cargo upgrade --tool cargo --major --dry-run
 
-# The CI gate over the resolved graph. The example lock is intentionally stale (it
-# is arranged for `outdated`), so `--allow-stale-lock` demotes that to a warning
-# and lets the gate evaluate and pass over the resolved graph.
-shoot check cargo check --tool cargo --allow-stale-lock
+# The CI gate over the resolved graph.
+shoot check cargo check --tool cargo
 
 # Why a package has the window it has — every layer and rule that applied.
 # `itertools` is exempt via `allow`, so its derivation shows the exemption zeroing
