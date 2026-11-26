@@ -52,18 +52,22 @@ mkdir -p "$out"
 # `pwd -P` spells the path as cooldown prints it: on macOS the temp dir sits behind
 # the `/var` → `/private/var` symlink.
 #
-# A shot exits 0 or 1 (a `check` violation is a valid snippet); anything higher is
-# an error such as a stale lock, which must fail the run rather than be rendered.
+# Each shot names the exit code it must end with, and its output must carry no
+# `error [...]` diagnostic: `outdated` and `explain` report some errors, such as a
+# stale lock, and still exit 0. Anything else fails the run rather than being
+# rendered.
 shoot() {
-  local name="$1" sub="$2"; shift 2
+  local name="$1" sub="$2" expected="$3"; shift 3
   local work; work="$(cd "$(mktemp -d)" && pwd -P)"
   cp -r "$examples/$sub/." "$work/"
   git init -q "$work" # its own repo root → project renders as "." (not the temp path)
   local status=0 output
-  output="$(cd "$work" && COOLDOWN_NO_TRACE=true "$cooldown" "$@" --now "$now" --color always --no-progress 2>/dev/null)" || status=$?
+  output="$(cd "$work" && COOLDOWN_NO_TRACE=true "$cooldown" "$@" --now "$now" --color always --no-progress)" || status=$?
   rm -rf "$work"
-  if ((status > 1)); then
-    echo "cooldown $* exited $status; not writing $out/$name.html" >&2
+  local plain; plain="$(sed 's/\x1b\[[0-9;]*m//g' <<<"$output")"
+  if ((status != expected)) || grep -q '^error \[' <<<"$plain"; then
+    printf '%s\n' "$output" >&2
+    echo "cooldown $* exited $status (expected $expected) or reported an error; not writing $out/$name.html" >&2
     exit 1
   fi
   {
@@ -77,21 +81,21 @@ shoot() {
 # adoptable, in cooldown, exempt, held, and up-to-date. `--countdown soonest`
 # makes the `log` row count down to the next intermediate version to unlock.
 # This is also the landing-page hero.
-shoot outdated cargo outdated --tool cargo --countdown soonest
+shoot outdated cargo 0 outdated --tool cargo --countdown soonest
 
 # The upgrade plan (dry run) — cross-major bumps included via --major.
-shoot upgrade cargo upgrade --tool cargo --major --dry-run
+shoot upgrade cargo 0 upgrade --tool cargo --major --dry-run
 
 # The CI gate over the resolved graph.
-shoot check cargo check --tool cargo
+shoot check cargo 0 check --tool cargo
 
 # The same gate failing: a 30-day window makes four of the example's transitives too fresh.
-shoot check-violation cargo check --tool cargo --min-age 30d
+shoot check-violation cargo 1 check --tool cargo --min-age 30d
 
 # Why a package has the window it has — every layer and rule that applied.
 # `itertools` is exempt via `allow`, so its derivation shows the exemption zeroing
 # the window on top of the default layers.
-shoot explain cargo explain itertools --tool cargo
+shoot explain cargo 0 explain itertools --tool cargo
 
 # The fully-resolved config, with the origin of each value.
-shoot config cargo config --tool cargo
+shoot config cargo 0 config --tool cargo

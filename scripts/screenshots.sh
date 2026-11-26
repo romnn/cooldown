@@ -27,8 +27,8 @@
 #   * freeze ignores the `\e[39m` "reset foreground to default" code, so a colored cell's color bleeds
 #     into the following uncolored cells (e.g. the magenta "Adoptable" leaking into "Latest" and
 #     "Cooldown"). Rewriting `\e[39m` to a full reset `\e[0m`, which freeze does honor, stops it.
-#   * freeze replays the capture in an 80-column PTY, so `stty cols 200` widens it first to stop
-#     the table wrapping.
+#   * freeze would replay an `--execute` command in an 80-column PTY and wrap the tables, so the
+#     output is captured first and freeze renders the capture file instead.
 # Each tool's example is copied into a throwaway, freshly `git init`ed dir so it is its own repo root
 # and the project renders as "." (rather than a temp path).
 #
@@ -58,8 +58,9 @@ mkdir -p "$docs"
 # freeze's window-chrome flags, shared by every shot.
 frame=(--window --shadow.blur 20 --border.radius 8 --padding 20)
 
-# The light pass's palette: each 256-color index cooldown emits, as a truecolor that reads on white.
-light_palette='my %rgb = (2 => "26;127;55", 8 => "101;109;118", 9 => "207;34;46", 10 => "26;127;55", 11 => "154;103;0", 13 => "130;80;223", 14 => "9;105;218", 240 => "208;215;222"); s/38;5;(\d+)/exists $rgb{$1} ? "38;2;$rgb{$1}" : "38;5;$1"/ge;'
+# The light pass's palette: each color cooldown emits, as a truecolor that reads on white. The tables
+# use 256-color indices; the tip card uses the basic cyan (36) and green (32).
+light_palette='my %rgb = (2 => "26;127;55", 8 => "101;109;118", 9 => "207;34;46", 10 => "26;127;55", 11 => "154;103;0", 13 => "130;80;223", 14 => "9;105;218", 240 => "208;215;222", 32 => "26;127;55", 36 => "9;105;218"); s/38;5;(\d+)/exists $rgb{$1} ? "38;2;$rgb{$1}" : "38;5;$1"/ge; s/\e\[(1;)?(3[26])m/"\e[" . ($1 \/\/ "") . "38;2;$rgb{$2}m"/ge;'
 
 shoot() { # <tool-subdir> <name> <cooldown args...>
   local sub="$1" name="$2"; shift 2
@@ -67,16 +68,21 @@ shoot() { # <tool-subdir> <name> <cooldown args...>
   trap 'rm -rf "$work"' RETURN
   cp -r "$example/$sub/." "$work/"
   git init -q "$work" # make it its own repo root → project renders as "." (not the temp path)
-  # A pipe is not a terminal, so cooldown renders its tables at full width.
+  # A pipe is not a terminal, so cooldown renders its tables at full width. Like
+  # scripts/terminals.sh, a shot must exit 0 and carry no `error [...]` diagnostic, which `outdated`
+  # reports for a stale lock while still exiting 0.
   ( cd "$work" && COOLDOWN_NO_TRACE=true "$cooldown" "$@" --now "$now" --color always \
       --no-progress --log-level error ) | perl -pe 's/\e\[39m/\e[0m/g' > "$work/dark.ansi"
+  if grep -q '^error \[' < <(perl -pe 's/\e\[[0-9;]*m//g' "$work/dark.ansi"); then
+    cat "$work/dark.ansi" >&2
+    echo "cooldown $* reported an error; not writing $docs/$name.png" >&2
+    exit 1
+  fi
   perl -pe "$light_palette" "$work/dark.ansi" > "$work/light.ansi"
-  # freeze waits on stdin unless it has none.
-  freeze --language text --output "$docs/$name.png" "${frame[@]}" \
-    --execute "bash -c 'stty cols 200; cat $work/dark.ansi'" </dev/null
+  # freeze renders the captured ANSI from the file; it waits on stdin unless it has none.
+  freeze --language text --output "$docs/$name.png" "${frame[@]}" "$work/dark.ansi" </dev/null
   freeze --language text --output "$docs/$name-light.png" "${frame[@]}" \
-    --background '#ffffff' --theme github \
-    --execute "bash -c 'stty cols 200; cat $work/light.ansi'" </dev/null
+    --background '#ffffff' --theme github "$work/light.ansi" </dev/null
   echo "wrote $docs/$name.png and $docs/$name-light.png"
 }
 

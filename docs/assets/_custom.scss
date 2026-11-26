@@ -419,13 +419,14 @@ code, kbd, samp, pre, .chroma, .cd-term__body {
 
 /* cooldown colors its tables with 256-color SGR codes (`38;5;N`), which
    terminal-to-html classes as `term-fgxN` (x = the xterm-256 palette index).
-   These are every index cooldown emits, plus the script's own bold green `$`
-   prompt. Keep them in sync with cooldown-render's status colors
+   These are every index cooldown emits, plus the basic green and cyan of the
+   tip card and the script's `$` prompt. Keep them in sync with cooldown-render's status colors
    (crates/cooldown-render/src/tty.rs) and the light palette in
    scripts/screenshots.sh. */
 .cd-term__body {
   .term-fg1    { font-weight: 600; }
-  .term-fg32   { color: var(--cd-term-green); }   /* the `$` prompt */
+  .term-fg32   { color: var(--cd-term-green); }   /* the `$` prompt, tip commands */
+  .term-fg36   { color: var(--cd-term-cyan); }    /* tip card frame and title */
   .term-fgx2   { color: var(--cd-term-green); }   /* green — adoptable */
   .term-fgx8   { color: var(--cd-term-gray); }    /* gray — muted / up-to-date */
   .term-fgx9   { color: var(--cd-term-red); }     /* bright red — violation / error */
