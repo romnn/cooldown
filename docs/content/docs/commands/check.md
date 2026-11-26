@@ -13,7 +13,7 @@ cooldown check
 
 {{< terminal name="check" >}}
 
-A clean run exits `0`. When a dependency is too fresh, `check` lists the violation and exits `1`. Here the same project under a 30-day window: four transitives are younger than that, and each row names the graph floor that a `fix` could roll it back to:
+A clean run exits `0`. When a dependency is too fresh, `check` lists the violation and exits `1`. Here the same project under a 30-day window: four transitives are younger than that, and each row names its graph floor, the lowest version its requirers allow:
 
 {{< terminal name="check-violation" >}}
 

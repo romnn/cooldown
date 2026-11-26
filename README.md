@@ -3,7 +3,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: light)" srcset="docs/static/images/outdated-light.png">
-    <img src="docs/static/images/outdated.png" alt="cooldown outdated — adoptable updates (green), those still in their cooldown window (yellow), and a security fix adopted early on the advisory feed's security window" width="760">
+    <img src="docs/static/images/outdated.png" alt="cooldown outdated — adoptable updates (green), those still in their cooldown window (yellow), and a security fix eligible early on the advisory feed's security window" width="760">
   </picture>
 </p>
 
@@ -67,7 +67,7 @@ already cleared their cooldown window are proposed.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: light)" srcset="docs/static/images/upgrade-light.png">
-    <img src="docs/static/images/upgrade.png" alt="cooldown upgrade --dry-run — each move with its source, a security fix adopted on the security window, and the exact pin and major update it holds back" width="760">
+    <img src="docs/static/images/upgrade.png" alt="cooldown upgrade --dry-run — each planned move with its source, a security fix it would adopt on the security window, and the exact pin and major update it holds back" width="760">
   </picture>
 </p>
 

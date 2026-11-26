@@ -5,8 +5,8 @@ Throwaway projects used to generate the README screenshots (`task screenshots`, 
 old dependency versions so `cooldown` always has updates to show; the exact "latest" versions drift
 as registries evolve, but the demo stays valid and regenerates from this repo (no external checkout).
 The screenshots are captured at a fixed instant via the debug-only `--now` flag, so they regenerate
-identically; run live (a release build, no `--now`), the same projects show the same statuses with
-day-counts that have simply moved on.
+identically. Run live (a release build, no `--now`), the day-counts have moved on, so versions that
+were still cooling at the capture instant may have cleared their windows since.
 
 - `cargo/` — a standalone Cargo project (`Cargo.toml` + `Cargo.lock` + `cooldown.toml`; its
   `[workspace]` keeps it out of the parent workspace). Tuned so one `outdated --countdown soonest` run
@@ -19,7 +19,8 @@ day-counts that have simply moved on.
   [advisory feed](../../docs/content/docs/configuration/advisories.md)'s `shorten` mode makes the fix
   adoptable on a 1-day security window and names the advisory. Its lock was matured to the
   screenshots' fixed instant with `cooldown fix --now`, so `upgrade` moves only what it plans. This
-  is the project the README screenshots are shot from.
+  is the project the README screenshots are shot from; run live, the `log` and `lettre` rows clear
+  their windows as time passes.
 - `go/`   — a Go module (`go.mod` + `go.sum`). `require`s old versions of a few well-known modules.
 - `python/` — a uv project (`pyproject.toml` + `uv.lock`). Dependencies are `==`-pinned to old
   versions so the lock stays in sync (no stale-lock error); `outdated`/`check` work, but `upgrade`
