@@ -949,11 +949,11 @@ impl PinBatchStats {
     /// Records Cargo's refusal `err` of a step for `change`'s held row, and whether the same
     /// native inputs reproduce it.
     fn record_refusal(&mut self, change: &Change, err: &CoreError, rejections: &mut PinRejections) {
-        if let Some(summary) = summarize_pin_rejection(err) {
+        if let Some(detail) = pin_rejection_detail(err, change) {
             let rejection = MemoRejection {
                 effects: vec![RejectionEffect {
                     key: rejection_key(change),
-                    detail: RejectionDetail::resolver(summary, rejection_parties(err)),
+                    detail,
                 }],
                 ..MemoRejection::default()
             };
@@ -1377,8 +1377,7 @@ impl GroupResolve {
         Self::Refused {
             short: short.map(|change| ShortCandidate {
                 key: rejection_key(change),
-                detail: summarize_pin_rejection(error)
-                    .map(|summary| RejectionDetail::resolver(summary, parties.clone())),
+                detail: pin_rejection_detail(error, change),
             }),
             chain: rejection_chain(error),
             parties,
@@ -1853,16 +1852,20 @@ fn classify_planned_changes(
         if reached_after(crates_io_after, graph, change) {
             report.applied.push(change.clone());
         } else {
-            let offender = graph
-                .and_then(|graph| {
-                    blocking_requirer(graph, &change.package.name, change.to.as_str())
+            let rejection = pin_rejections.get(&rejection_key(change));
+            // The dependency Cargo named as excluding the target holds it; otherwise an `=` pin
+            // capping the shared node does, when the graph shows one.
+            let offender = rejection
+                .and_then(|rejection| rejection.holder.clone())
+                .or_else(|| {
+                    graph.and_then(|graph| {
+                        blocking_requirer(graph, &change.package.name, change.to.as_str())
+                    })
                 })
                 .unwrap_or_else(|| change.package.name.clone());
             // Cargo's own rejection sentence (which requirement, declared by whom) beats
             // both the generic reason and the `=`-pin-only graph offender.
-            let detail = pin_rejections
-                .get(&rejection_key(change))
-                .map(|rejection| reported_rejection(rejection, graph));
+            let detail = rejection.map(|rejection| reported_rejection(rejection, graph));
             report.skipped.push(Skipped {
                 change: change.clone(),
                 // A pin cargo itself refused is the resolver's rejection, and its sentence says
@@ -1990,15 +1993,112 @@ fn summarize_pin_rejection(error: &CoreError) -> Option<String> {
         let requirer = requirer.split(" (").next().unwrap_or(requirer);
         let _ = write!(summary, " (required by {requirer})");
     }
+    Some(report_line(&summary))
+}
+
+/// `text` made fit for a held row, which the TTY and JSON reports show verbatim.
+fn report_line(text: &str) -> String {
     // Cargo quotes registry URLs inside requirement errors; a private-registry URL can embed
     // credentials, so redact before the cap bounds the (possibly lengthened) line.
-    let mut summary = cooldown_core::redact::url_secrets(&summary);
+    let mut line = cooldown_core::redact::url_secrets(text);
     // Char-boundary-safe cap: the requirement sentence quotes tool-controlled strings.
-    if let Some((cut, _)) = summary.char_indices().nth(220) {
-        summary.truncate(cut);
-        summary.push('…');
+    if let Some((cut, _)) = line.char_indices().nth(220) {
+        line.truncate(cut);
+        line.push('…');
     }
-    Some(summary)
+    line
+}
+
+/// Cargo's refusal of `change`, summarized for its held row, with the packages it sets against each
+/// other and, when a dependency's requirement excludes the target, that dependency as the holder.
+fn pin_rejection_detail(error: &CoreError, change: &Change) -> Option<RejectionDetail> {
+    let CoreError::Tool { stderr, .. } = error else {
+        return None;
+    };
+    let parties = rejection_parties(error);
+    if let Some(held) = requirement_holder(stderr, change) {
+        let text = report_line(&format!(
+            "held: {} requires {} {}",
+            held.requirer, held.name, held.requirement
+        ));
+        return Some(RejectionDetail {
+            holder: Some(held.requirer),
+            ..RejectionDetail::resolver(text, parties)
+        });
+    }
+    summarize_pin_rejection(error).map(|summary| RejectionDetail::resolver(summary, parties))
+}
+
+/// A dependency's requirement that Cargo reports excluding a planned target.
+#[derive(Debug, PartialEq, Eq)]
+struct RequirementHolder {
+    /// The package that declares the requirement.
+    requirer: String,
+    /// The required crate, as Cargo names it.
+    name: String,
+    /// The requirement, as declared.
+    requirement: String,
+}
+
+/// The dependency whose requirement holds `change` back, read from Cargo's refusal `stderr`.
+///
+/// Only the first error is read, and every fact comes from its own lines: the `failed to select a
+/// version for the requirement` form, for the change's own crate on crates.io, whose requirement
+/// admits the change's current version but not its target, which Cargo lists among the candidates
+/// that did not match; and the first `required by package` line, naming the requirer.
+///
+/// Any other shape names no holder: a requirement nothing published satisfies, one for another
+/// copy of the crate (another source, or `locked to` another version), one that excludes the
+/// current version too, or a target Cargo refused for another reason, such as its age.
+fn requirement_holder(stderr: &str, change: &Change) -> Option<RequirementHolder> {
+    let mut lines = stderr
+        .lines()
+        .map(str::trim)
+        .skip_while(|line| !line.starts_with("error: "));
+    let header = lines
+        .next()?
+        .strip_prefix("error: failed to select a version for the requirement `")?;
+    let lines: Vec<&str> = lines
+        .take_while(|line| !line.starts_with("error: "))
+        .collect();
+    let (requirement, rest) = header.split_once('`')?;
+    let (name, quoted) = requirement.split_once(" = ")?;
+    let requirement = quoted.trim_matches('"');
+    if name != change.package.name {
+        return None;
+    }
+    // Cargo appends the copy it tried to keep; a refusal for another copy says nothing of this one.
+    if let Some((_, locked)) = rest.split_once("(locked to ")
+        && locked.trim_end_matches(')') != change.from.as_str()
+    {
+        return None;
+    }
+    if !lines.contains(&"location searched: crates.io index")
+        || change.package.registry.as_deref() != Some(CRATES_IO)
+    {
+        return None;
+    }
+    let mismatched = lines.iter().any(|line| {
+        line.strip_prefix("candidate versions found which didn't match: ")
+            .is_some_and(|versions| versions.split(", ").any(|v| v == change.to.as_str()))
+    });
+    if !mismatched
+        || !version::version_in_range(requirement, change.from.as_str())
+        || version::version_in_range(requirement, change.to.as_str())
+    {
+        return None;
+    }
+    let requirer = lines.iter().find_map(|line| {
+        line.trim_start_matches('.')
+            .trim_start()
+            .strip_prefix("required by package `")
+            .and_then(|rest| rest.split(" v").next())
+    })?;
+    Some(RequirementHolder {
+        requirer: requirer.to_string(),
+        name: name.to_string(),
+        requirement: requirement.to_string(),
+    })
 }
 
 /// The crate whose `=x.y.z` requirement structurally holds `held` out of the graph at `target` —
@@ -4403,12 +4503,10 @@ impl CargoTool {
             Err(err) => {
                 // A refused re-pin leaves the overshoot behind; a refused first pin left nothing.
                 restore()?;
-                let parties = rejection_parties(&err);
                 Ok(PrecisePinOutcome::Rejected {
                     resolver_rejection: memoizable_resolver_rejection(&err),
-                    detail: summarize_pin_rejection(&err)
-                        .map(|summary| RejectionDetail::resolver(summary, parties.clone())),
-                    parties,
+                    detail: pin_rejection_detail(&err, change),
+                    parties: rejection_parties(&err),
                     split: None,
                 })
             }
@@ -7305,6 +7403,133 @@ mod tests {
         };
         assert_eq!(reported_rejection(&violation, Some(&pinned)), summary);
         Ok(())
+    }
+
+    /// Cargo's refusal of a precise pin a dependency's `^0.0.z` requirement excludes, verbatim
+    /// from `cargo update -p unty --precise 0.0.5` under `bincode = "=2.0.1"`, with the source the
+    /// search used.
+    fn excluded_target_stderr(location: &str) -> String {
+        formatdoc! {"
+            error: failed to select a version for the requirement `unty = \"^0.0.4\"`
+            candidate versions found which didn't match: 0.0.5
+            location searched: {location}
+            required by package `bincode v2.0.1`
+                ... which satisfies dependency `bincode = \"=2.0.1\"` (locked to 2.0.1) of package `app v0.1.0 (/repo/app)`
+        "}
+    }
+
+    fn tool_error(stderr: String) -> CoreError {
+        CoreError::Tool {
+            tool: "cargo".to_string(),
+            termination: cooldown_core::ToolTermination::ExitCode(101),
+            stderr,
+        }
+    }
+
+    /// #198: a dependency's requirement that admits the current version but not the target holds
+    /// the change, and the held row names that dependency instead of quoting Cargo.
+    #[test]
+    fn a_requirement_excluding_the_target_names_its_requirer_as_the_holder() {
+        let change = change("unty", "0.0.4", "0.0.5", false);
+        let error = tool_error(excluded_target_stderr("crates.io index"));
+        let detail = pin_rejection_detail(&error, &change).expect("a detail");
+        assert_eq!(detail.holder.as_deref(), Some("bincode"));
+        assert_eq!(detail.text, "held: bincode requires unty ^0.0.4");
+        assert!(
+            detail.parties.is_empty(),
+            "the holder is not a releasable party"
+        );
+    }
+
+    /// Only a refusal Cargo reached on crates.io, for the copy the change moves, whose requirement
+    /// admits the current version, names a holder; every other shape keeps Cargo's summary.
+    #[test]
+    fn a_requirement_for_another_copy_or_none_names_no_holder() {
+        let excluded = change("unty", "0.0.4", "0.0.5", false);
+        let git = excluded_target_stderr("git repository `https://example.com/unty`");
+        assert_eq!(requirement_holder(&git, &excluded), None, "another source");
+        let crates_io = excluded_target_stderr("crates.io index");
+        let locked_elsewhere = crates_io.replacen("^0.0.4\"`", "^0.0.4\"` (locked to 0.0.3)", 1);
+        assert_eq!(
+            requirement_holder(&locked_elsewhere, &excluded),
+            None,
+            "another locked copy"
+        );
+        let other_crate = change("virtue", "0.0.18", "0.0.19", false);
+        assert_eq!(requirement_holder(&crates_io, &other_crate), None);
+        let below = change("unty", "0.0.3", "0.0.5", false);
+        assert_eq!(
+            requirement_holder(&crates_io, &below),
+            None,
+            "a requirement excluding the current version too is no hold"
+        );
+        let unsatisfiable = indoc! {r#"
+            error: failed to select a version for the requirement `serde = "^9"`
+            candidate versions found which didn't match: 1.0.228
+            location searched: crates.io index
+            required by package `app v0.1.0 (/repo/app)`
+        "#};
+        let serde = change("serde", "1.0.200", "1.0.228", false);
+        assert_eq!(requirement_holder(unsatisfiable, &serde), None);
+    }
+
+    /// Every fact comes from the first error: a second one's source or requirer never lends a
+    /// holder to the first.
+    #[test]
+    fn a_second_error_lends_no_evidence_to_the_first() {
+        let stderr = indoc! {r#"
+            error: failed to select a version for the requirement `unty = "^0.0.4"`
+            candidate versions found which didn't match: 0.0.5
+            location searched: git repository `https://example.com/unty`
+            error: failed to select a version for the requirement `other = "^1"`
+            candidate versions found which didn't match: 2.0.0
+            location searched: crates.io index
+            required by package `bincode v2.0.1`
+        "#};
+        let unty = change("unty", "0.0.4", "0.0.5", false);
+        assert_eq!(requirement_holder(stderr, &unty), None);
+        let detail =
+            pin_rejection_detail(&tool_error(stderr.to_string()), &unty).expect("a detail");
+        assert_eq!(detail.holder, None);
+        assert!(
+            detail
+                .text
+                .starts_with("failed to select a version for the requirement")
+        );
+    }
+
+    /// A target Cargo refused for its age, not because the requirement excludes it, has no holder,
+    /// even when the plain semver matcher would reject it, as with a precise prerelease.
+    #[test]
+    fn a_target_cargo_refused_for_its_age_names_no_holder() {
+        let stderr = indoc! {r#"
+            error: failed to select a version for the requirement `beta = "^1.2.3-alpha.1"`
+            version 1.2.4-beta.1 is too new
+            location searched: crates.io index
+            required by package `app v0.1.0 (/repo/app)`
+        "#};
+        let beta = change("beta", "1.2.3-alpha.1", "1.2.4-beta.1", false);
+        let detail =
+            pin_rejection_detail(&tool_error(stderr.to_string()), &beta).expect("a detail");
+        assert_eq!(detail.holder, None);
+        assert!(
+            detail
+                .text
+                .starts_with("failed to select a version for the requirement")
+        );
+    }
+
+    /// A workspace member's requirement names the member, without its version or path.
+    #[test]
+    fn a_workspace_member_requirer_is_named_by_package() {
+        let stderr = indoc! {r#"
+            error: failed to select a version for the requirement `log = "~0.4.20"`
+            candidate versions found which didn't match: 0.5.0
+            location searched: crates.io index
+            required by package `app v0.1.0 (/repo/app)`
+        "#};
+        let held = requirement_holder(stderr, &change("log", "0.4.21", "0.5.0", false));
+        assert_eq!(held.map(|held| held.requirer).as_deref(), Some("app"));
     }
 
     #[test]

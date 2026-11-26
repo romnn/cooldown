@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **`upgrade` and `outdated` name the dependency that holds a transitive back.** When a
+  dependency's requirement admits the locked version but not the newer one, such as bincode's
+  `unty = "^0.0.4"`, the row reads `held: bincode requires unty ^0.0.4` and `outdated` shows it
+  blocked by `bincode`, instead of quoting Cargo's refusal. Closes #198.
+
 ## v0.0.33
 
 - **`upgrade` no longer reports a package it adds as downgraded.** A transitive that an upgrade

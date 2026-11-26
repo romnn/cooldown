@@ -240,6 +240,10 @@ pub(crate) struct RejectionDetail {
     /// What the rejected step showed of the change's target; [`TargetReach::Unknown`] for a
     /// Cargo refusal.
     pub(crate) reach: TargetReach,
+    /// The package whose requirement admits the change's current version but not its target, when
+    /// Cargo's refusal names one: the dependency that holds the change back, which its held row
+    /// reports. Unlike [`parties`](Self::parties), it is never a node the resolver may release.
+    pub(crate) holder: Option<String>,
 }
 
 impl RejectionDetail {
@@ -250,6 +254,7 @@ impl RejectionDetail {
             origin: DiagnosticOrigin::Resolver,
             parties,
             reach: TargetReach::Unknown,
+            holder: None,
         }
     }
 
@@ -278,6 +283,7 @@ impl RejectionDetail {
             origin: DiagnosticOrigin::Acceptance,
             parties: Vec::new(),
             reach,
+            holder: None,
         }
     }
 }

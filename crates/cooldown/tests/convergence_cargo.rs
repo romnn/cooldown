@@ -697,6 +697,82 @@ fn upgrade_reports_no_move_for_a_crate_it_adds() {
     );
 }
 
+/// bincode 2.0.1 requires `unty = "^0.0.4"` and its derive `virtue = "^0.0.18"`, each of which
+/// admits only that one release; unty 0.0.5 and virtue 0.0.19 (2025-12-17) have matured by the
+/// freeze.
+const REQUIREMENT_HOLD_AS_OF: CargoAsOf = CargoAsOf {
+    seed: "2025-06-01T00:00:00Z",
+    run: "2026-02-01T00:00:00Z",
+};
+const REQUIREMENT_HOLD_FREEZE: &str = "2026-01-15T00:00:00Z";
+
+fn requirement_hold_fixture() -> Fixture {
+    let fixture = Fixture::cargo(REQUIREMENT_HOLD_AS_OF);
+    fixture
+        .write(
+            "Cargo.toml",
+            indoc! {r#"
+                [package]
+                name = "cargo-requirement-hold"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                bincode = "=2.0.1"
+            "#},
+        )
+        .write("src/lib.rs", "");
+    fixture
+        .run_tool("cargo", &["generate-lockfile"], &[])
+        .expect_success();
+    fixture
+}
+
+/// #198: a transitive whose newer matured release its dependent's requirement excludes is held by
+/// that dependent, named in both `upgrade`'s row and `outdated`'s blocked status, rather than
+/// reported with Cargo's raw refusal.
+#[test]
+fn a_dependents_requirement_names_the_holder_of_a_transitive() {
+    skip_if_missing!("cargo");
+    let fixture = requirement_hold_fixture();
+    let lock = toml_lock_entries(&fixture.read_bytes("Cargo.lock"));
+    assert!(
+        lock.contains(&("unty".to_owned(), "0.0.4".to_owned()))
+            && lock.contains(&("virtue".to_owned(), "0.0.18".to_owned())),
+        "the seed locks bincode 2.0.1's exact transitives; {REGISTRY_HISTORY}"
+    );
+
+    let upgrade =
+        fixture.cooldown_json(&["upgrade", "--freeze", REQUIREMENT_HOLD_FREEZE, "--dry-run"]);
+    assert!(upgrade.ok(), "upgrade --dry-run should succeed");
+    for (name, holder, requirement) in [
+        ("unty", "bincode", "^0.0.4"),
+        ("virtue", "bincode_derive", "^0.0.18"),
+    ] {
+        assert_eq!(
+            upgrade.skip_detail_for(name).as_deref(),
+            Some(format!("held: {holder} requires {name} {requirement}").as_str()),
+            "{name}'s row names the dependency holding it"
+        );
+        assert_eq!(upgrade.skipped_offending_for(name).as_deref(), Some(holder));
+    }
+
+    let outdated = fixture.cooldown_json(&[
+        "outdated",
+        "--freeze",
+        REQUIREMENT_HOLD_FREEZE,
+        "--transitive",
+    ]);
+    assert!(
+        outdated.outdated_with_status("blocked").contains("unty"),
+        "outdated agrees that unty is blocked"
+    );
+    assert_eq!(
+        outdated.item_field_str("unty", "blockedBy").as_deref(),
+        Some("bincode")
+    );
+}
+
 #[test]
 fn upgrade_dry_run_agrees_with_real_upgrade() {
     skip_if_missing!("cargo");
