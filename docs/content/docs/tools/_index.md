@@ -348,6 +348,26 @@ change while cooldown relocks without cooldown noticing.
 cooldown plans only packages Hex fetches from hex.pm itself, so none from a private organization or
 repository, Git or path source, and reads an aliased dependency, such as
 `{:parsec, "~> 1.2", hex: :nimble_parsec}`, under its Hex package.
+Maven treats a reactor, the root `pom.xml` and every module its `<modules>` reach, as one
+project, and each row names the module it belongs to.
+Its `upgrade` and `fix` rewrite only the text of each version they move: a literal `<version>`,
+the property a version reads when nothing else reads it, or the project's own
+`dependencyManagement` entry.
+They verify every edit with `mvn` in a scratch copy of the project, through
+`maven-help-plugin` 3.5.1 and `maven-dependency-plugin` 3.8.1, and publish only POMs that Maven
+resolves to exactly the planned versions.
+The edit has to move nothing else in any project Maven builds there, so a module only an active
+profile lists counts as well.
+They refuse while a mirror stands in for Maven Central, or while `.mvn/maven.config` or
+`MAVEN_ARGS` limits the build to part of the reactor or another POM, such as with `-pl` or `-f`.
+A version from a property that something else reads too or that `-D` sets in `.mvn/maven.config`
+or `MAVEN_ARGS`, an imported BOM, and a parent POM are reported but never moved.
+A version range floats, so cooldown warns about it instead of judging it, as it does about a
+version that only a remote parent or BOM manages.
+cooldown cannot tell which profiles Maven activates, so it plans nothing from a POM that declares a
+repository other than Maven Central, in a profile or not, and no dependency a profile declares too.
+It never reads a build plugin's dependencies.
+`--build` runs `mvn -B -ntp -DskipTests package`.
 
 When `PATH` leads to a [mise](https://mise.jdx.dev) shim, every command first runs mise, which picks
 the tool and its environment for the command's directory.

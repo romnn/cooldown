@@ -342,11 +342,7 @@ impl Workspace {
         } else {
             progress.phase("preparing isolated dry-run project");
             let copy = match self.project_read_guard(pctx).await {
-                Ok(_guard) => super::project_copy::ProjectCopy::create(
-                    &pctx.project,
-                    &writer.resolve_inputs(),
-                    &writer.external_resolve_roots(&pctx.project),
-                ),
+                Ok(_guard) => super::project_copy::ProjectCopy::for_preview(&pctx.project, writer),
                 Err(error) => Err(error),
             };
             match copy {

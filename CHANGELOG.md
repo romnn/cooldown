@@ -21,6 +21,10 @@
   as `{:parsec, "~> 1.2", hex: :nimble_parsec}`.
 - **Hex `outdated`, `upgrade` and `fix` no longer plan packages from a private organization or
   repository, Git or path source** by the release ages of the same-named hex.pm package.
+- **Maven `upgrade` and `fix` land exactly the planned versions, verified with `mvn` in a scratch
+  copy, and rewrite only the version text that owns them.** Properties, `dependencyManagement` and
+  reactor modules are read as Maven reads them; plugin dependencies, comments and version ranges are
+  no longer planned, and `--build` now runs `mvn package`.
 
 ## v0.0.33
 

@@ -94,8 +94,18 @@ impl ProjectCopy {
                 .unwrap_or_else(|| path.to_owned())
         };
         let canonical_root = canonical(&project.root);
-        let external_roots: Vec<camino::Utf8PathBuf> =
-            external_roots.iter().map(|root| canonical(root)).collect();
+        // A file root the adapter names inside the project is staged at the path it names, its
+        // content read through any link, as a resolver reading that path sees it, so it stays
+        // out of the canonical staging below.
+        let mut in_tree = Vec::new();
+        let mut canonical_roots = Vec::new();
+        for root in external_roots {
+            match in_tree_file(root, &project.root) {
+                Some(rel) => in_tree.push((root, rel)),
+                None => canonical_roots.push(canonical(root)),
+            }
+        }
+        let external_roots = canonical_roots;
         let external_roots = external_roots.as_slice();
         // Without external roots — or when they share no prefix with the project — the project
         // root itself anchors the rebase: nothing extra is staged, but the walk still needs the
@@ -136,6 +146,15 @@ impl ProjectCopy {
         let project_dest = rebase
             .rebase(&canonical_root)
             .unwrap_or_else(|| rebase.scratch_root.clone());
+        // Before the walk, so a link the walk would recreate at the same path finds the file
+        // there.
+        for (root, rel) in in_tree {
+            let dest = project_dest.join(rel);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(root, dest)?;
+        }
         copy_project_tree(
             project.root.as_std_path(),
             project_dest.as_std_path(),
@@ -158,6 +177,19 @@ impl ProjectCopy {
             rebase,
             source_spelling,
         })
+    }
+
+    /// A preview copy of `project` for `writer`: its resolver inputs and the roots it names.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error that keeps `writer` from naming its roots, or that stops the copy.
+    pub(crate) fn for_preview(
+        project: &Project,
+        writer: &dyn cooldown_core::ToolWrite,
+    ) -> cooldown_core::Result<Self> {
+        let roots = writer.external_resolve_roots(project)?;
+        Self::create(project, &writer.resolve_inputs(), &roots)
     }
 
     /// The scratch tree and what to spell it as in a report: a path under the copy — the
@@ -314,6 +346,19 @@ fn copy_project_tree_inner(
         // Other special entries (sockets, FIFOs) are irrelevant to resolution and are skipped.
     }
     Ok(())
+}
+
+/// The path of `root` relative to `project_root` when `root` is a file below it, spelled in
+/// plain components only: `root/../x` leaves the project, so it is not one.
+fn in_tree_file(
+    root: &camino::Utf8Path,
+    project_root: &camino::Utf8Path,
+) -> Option<camino::Utf8PathBuf> {
+    let rel = root.strip_prefix(project_root).ok()?;
+    let plain = rel
+        .components()
+        .all(|part| matches!(part, camino::Utf8Component::Normal(_)));
+    (plain && root.is_file()).then(|| rel.to_owned())
 }
 
 #[cfg(unix)]
@@ -771,7 +816,9 @@ mod tests {
             .expect("http client"),
         );
 
-        let roots = tool.external_resolve_roots(&project);
+        let roots = tool
+            .external_resolve_roots(&project)
+            .expect("resolve roots");
         assert_eq!(
             roots,
             vec![root.join("vendor/mylib")],
@@ -1033,6 +1080,121 @@ mod tests {
         assert!(
             !dest_default.path().join("_internal/helper.go").exists(),
             "underscore source still requires an opted-in source extension"
+        );
+    }
+
+    /// A Maven project at `project` below a fresh directory, holding a `pom.xml` and an empty
+    /// `markers/on`, with the adapter that previews it.
+    #[cfg(unix)]
+    fn maven_project() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Project,
+        cooldown_maven::MavenTool,
+    ) {
+        let dir = tempfile::tempdir().expect("project dir");
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().join("project"))
+            .expect("UTF-8 project path");
+        std::fs::create_dir_all(root.join("markers")).expect("create markers");
+        std::fs::write(root.join("pom.xml"), "<project/>").expect("write pom");
+        std::fs::write(root.join("markers/on"), "").expect("write marker");
+        let cache = tempfile::tempdir().expect("cache");
+        let tool = cooldown_maven::MavenTool::from_http(
+            cooldown_registry::SharedHttp::new(
+                cache.path(),
+                cooldown_registry::HttpOptions::default(),
+            )
+            .expect("http client"),
+        );
+        let project = Project {
+            root: root.clone(),
+            kind: cooldown_maven::maven::MAVEN_ID,
+            manifest: root.join("pom.xml"),
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        };
+        (dir, cache, project, tool)
+    }
+
+    /// A linked file in a directory the walk prunes reaches the preview at the path the adapter
+    /// names, as its content, as Maven's own copy stages it: a profile that marker activates is
+    /// active in the preview too.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_marker_below_a_pruned_directory_keeps_its_path() {
+        let (_dir, _cache, project, tool) = maven_project();
+        std::fs::create_dir(project.root.join(".mvn")).expect("create .mvn");
+        std::os::unix::fs::symlink("../markers/on", project.root.join(".mvn/extra.enabled"))
+            .expect("link the marker");
+
+        let copy = ProjectCopy::for_preview(&project, &tool).expect("copy project");
+
+        let marker = std::fs::symlink_metadata(copy.project.root.join(".mvn/extra.enabled"))
+            .expect("the marker is in the copy");
+        assert!(marker.is_file());
+    }
+
+    /// A root spelled through `..` leaves the project, so it is staged at its canonical position
+    /// rather than joined below the copy, where `..` would write outside the scratch directory.
+    #[test]
+    fn a_root_that_climbs_out_of_the_project_stays_in_the_scratch() {
+        let repo = tempfile::tempdir().expect("repo");
+        let base = camino::Utf8PathBuf::from_path_buf(
+            std::fs::canonicalize(repo.path()).expect("canonicalize"),
+        )
+        .expect("UTF-8 fixture path");
+        let root = base.join("app");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(root.join("pyproject.toml"), "[project]").expect("write");
+        std::fs::write(base.join("shared.yml"), "shared").expect("write");
+        let project = Project {
+            root: root.clone(),
+            kind: ToolId("test"),
+            manifest: root.join("pyproject.toml"),
+            exclude_newer: None,
+            exclude_newer_package: std::collections::BTreeMap::new(),
+            generated_members: cooldown_core::GeneratedMembers::undeclared(),
+        };
+
+        let copy = ProjectCopy::create(
+            &project,
+            &ResolveInputs::DEFAULT,
+            &[root.join("../shared.yml")],
+        )
+        .expect("copy project");
+
+        assert!(
+            copy.project.root.ends_with("app"),
+            "the project sits below its staged ancestor: {}",
+            copy.project.root
+        );
+        let staged = copy
+            .project
+            .root
+            .parent()
+            .expect("the copy has its ancestor level")
+            .join("shared.yml");
+        assert!(
+            staged.is_file(),
+            "the root is staged beside the project: {staged}"
+        );
+    }
+
+    /// A link to a directory fails the preview as it fails Maven's own copy, rather than leaving
+    /// the preview to resolve without it.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_directory_fails_the_preview() {
+        let (_dir, _cache, project, tool) = maven_project();
+        std::os::unix::fs::symlink("markers", project.root.join("linked")).expect("link");
+
+        let copy = ProjectCopy::for_preview(&project, &tool);
+
+        assert!(
+            matches!(&copy, Err(cooldown_core::CoreError::System(detail)) if detail.starts_with("linked ")),
+            "{:?}",
+            copy.err()
         );
     }
 }

@@ -620,9 +620,9 @@ impl ToolWrite for YarnTool {
     /// A preview of a Berry mutation runs in a copy that must hold what Yarn reads, so every file a
     /// verification copies is a root: each `file:` folder's files, which Yarn archives into the
     /// lock, and the rc files above the project among them.
-    fn external_resolve_roots(&self, project: &Project) -> Vec<Utf8PathBuf> {
+    fn external_resolve_roots(&self, project: &Project) -> Result<Vec<Utf8PathBuf>> {
         match LockFormat::on_disk(&project.root) {
-            Ok(LockFormat::Berry) => verify::copied_sources(project, &self.verify_context()),
+            Ok(LockFormat::Berry) => Ok(verify::copied_sources(project, &self.verify_context())),
             _ => self.classic.external_resolve_roots(project),
         }
     }

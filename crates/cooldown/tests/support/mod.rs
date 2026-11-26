@@ -33,6 +33,7 @@
 )]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -113,12 +114,14 @@ enum Horizon {
 /// and anything Bundler installs or checks out never land in the user's home or the Ruby's own gem
 /// dir, and a private Mix home, Mix archive dir and Hex home, so the Hex archive and the registry
 /// and package caches Hex keeps never land in the user's home or the Elixir install.
+/// It also owns a private Maven user home, so the local repository Maven downloads plugins and
+/// dependencies into, and any `settings.xml` it reads, are never the user's.
 /// A fixture built with [`Fixture::pnpm`] also starts its cache seeded from a [`PnpmPool`] of the
 /// metadata earlier fixtures fetched.
 pub struct Fixture {
     dir: tempfile::TempDir,
     /// The fixture's private pnpm cache and store, its private Poetry cache, its private Bundler
-    /// home and gem install path, and its private Mix and Hex homes.
+    /// home and gem install path, its private Mix and Hex homes, and its private Maven user home.
     ///
     /// It is a sibling of the project tree rather than inside it, so cooldown's project discovery
     /// never walks into the cache or the store.
@@ -233,6 +236,20 @@ impl Fixture {
         self.tool_home.path().join("store")
     }
 
+    /// The Maven user home every process of this fixture uses, which holds its `.m2` directory.
+    ///
+    /// A Maven suite asks for it as it builds each fixture, so that it refuses a temp dir path with
+    /// whitespace, which `mvn` would split in `MAVEN_OPTS`, while other suites run on such a host.
+    pub fn maven_user_home(&self) -> PathBuf {
+        let home = self.tool_home.path().join("maven");
+        assert!(
+            !home.to_string_lossy().contains(char::is_whitespace),
+            "mvn would split the Maven user home {} in MAVEN_OPTS",
+            home.display()
+        );
+        home
+    }
+
     /// The gem install path (`BUNDLE_PATH`) every process of this fixture uses.
     pub fn bundle_path(&self) -> PathBuf {
         self.tool_home.path().join("gems")
@@ -253,17 +270,32 @@ impl Fixture {
     /// install it shares between projects, and keeps its own config under `MIX_HOME` (otherwise
     /// `~/.mix`); Hex keeps its registry and package caches and its config under `HEX_HOME`
     /// (otherwise `~/.hex`).
+    /// Maven reads `settings.xml` from, and downloads into, `.m2` under the JVM's `user.home`,
+    /// which `mvn` takes from `MAVEN_OPTS`.
+    /// Moving `user.home` moves both, where `maven.repo.local` would move only the repository,
+    /// and Maven 4's `maven.user.home` defaults to the same place.
+    /// `mvn` splits `MAVEN_OPTS` on whitespace, which [`maven_user_home`](Self::maven_user_home)
+    /// refuses for a Maven suite.
+    /// `mvn` also puts `MAVEN_ARGS` on every command line, where an inherited value could name
+    /// another settings file or local repository, so it is emptied, and `MAVEN_SKIP_RC` keeps it
+    /// from sourcing a `~/.mavenrc` that could set either.
     /// The variables are inert for every other tool, so each fixture sets them whatever it drives.
-    fn tool_env(&self) -> [(&'static str, PathBuf); 8] {
+    fn tool_env(&self) -> [(&'static str, OsString); 11] {
+        let home = self.tool_home.path();
+        let mut maven_opts = OsString::from("-Duser.home=");
+        maven_opts.push(home.join("maven"));
         [
-            ("pnpm_config_cache_dir", self.pnpm_cache_dir()),
-            ("pnpm_config_store_dir", self.pnpm_store_dir()),
-            ("POETRY_CACHE_DIR", self.tool_home.path().join("poetry")),
-            ("BUNDLE_USER_HOME", self.tool_home.path().join("bundle")),
-            ("BUNDLE_PATH", self.bundle_path()),
-            ("MIX_HOME", self.tool_home.path().join("mix")),
-            ("MIX_ARCHIVES", self.tool_home.path().join("mix-archives")),
-            ("HEX_HOME", self.tool_home.path().join("hex")),
+            ("pnpm_config_cache_dir", self.pnpm_cache_dir().into()),
+            ("pnpm_config_store_dir", self.pnpm_store_dir().into()),
+            ("POETRY_CACHE_DIR", home.join("poetry").into()),
+            ("BUNDLE_USER_HOME", home.join("bundle").into()),
+            ("BUNDLE_PATH", self.bundle_path().into()),
+            ("MIX_HOME", home.join("mix").into()),
+            ("MIX_ARCHIVES", home.join("mix-archives").into()),
+            ("HEX_HOME", home.join("hex").into()),
+            ("MAVEN_OPTS", maven_opts),
+            ("MAVEN_ARGS", OsString::new()),
+            ("MAVEN_SKIP_RC", "1".into()),
         ]
     }
 

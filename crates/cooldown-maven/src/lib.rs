@@ -1,18 +1,12 @@
 //! The Java tool adapters: Maven (`pom.xml`) and Gradle (`gradle.lockfile` + `build.gradle`), both
-//! resolving from Maven Central and sharing one Maven version model. A single generic adapter
-//! ([`JavaTool`]) is specialised per build tool via a [`JavaLayout`](tool::JavaLayout), so each is
-//! its own [`ToolId`](cooldown_core::ToolId) while reusing the registry client and release
-//! classification.
+//! resolving from Maven Central and sharing one Maven version model and registry client.
 
+pub mod gradle;
 pub mod lock;
+pub mod maven;
 pub mod registry;
-pub mod tool;
 pub mod version;
 
+pub use gradle::GradleTool;
+pub use maven::MavenTool;
 pub use registry::{MAVEN_CENTRAL, MavenCentral};
-pub use tool::{Gradle, JavaTool, Maven};
-
-/// The Maven adapter (`pom.xml`).
-pub type MavenTool = JavaTool<Maven>;
-/// The Gradle adapter (`gradle.lockfile`).
-pub type GradleTool = JavaTool<Gradle>;

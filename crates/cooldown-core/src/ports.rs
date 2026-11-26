@@ -1013,11 +1013,16 @@ pub trait ToolWrite: Send + Sync {
     /// temp root). Roots are usually directories *outside* the project root; a single file (a
     /// local wheel/sdist archive) is valid too — even in-tree, where its extension matches no
     /// resolver-input filter — and is staged verbatim. The generic preview copy stages each root
-    /// at its relative position. Best-effort: an unreadable manifest yields an empty set, and
-    /// adapters with tool-specific staging (cargo) handle their own topology and keep the
+    /// at its relative position.
+    /// Adapters with tool-specific staging (cargo) handle their own topology and keep the
     /// default.
-    fn external_resolve_roots(&self, _project: &Project) -> Vec<camino::Utf8PathBuf> {
-        Vec::new()
+    ///
+    /// # Errors
+    ///
+    /// Returns the error that keeps the adapter from naming every root an apply would stage, so
+    /// the preview fails as the apply would rather than resolving a copy that lacks them.
+    fn external_resolve_roots(&self, _project: &Project) -> Result<Vec<camino::Utf8PathBuf>> {
+        Ok(Vec::new())
     }
 
     /// Captures the current contents of only the files `plan` may mutate.

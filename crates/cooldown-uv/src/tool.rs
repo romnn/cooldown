@@ -820,7 +820,7 @@ impl ToolWrite for UvTool {
         true
     }
 
-    fn external_resolve_roots(&self, project: &Project) -> Vec<Utf8PathBuf> {
+    fn external_resolve_roots(&self, project: &Project) -> Result<Vec<Utf8PathBuf>> {
         // `uv lock` regenerates metadata for every local source in the lock — editable installs,
         // directory dependencies, and local archives (`path` sources, a wheel/sdist file) — via
         // the PEP 517 backend or the archive itself. A source outside the project root must
@@ -836,10 +836,10 @@ impl ToolWrite for UvTool {
         // sources in place. Best-effort: an unreadable lock or a stale entry pointing at a
         // removed source contributes nothing.
         let Ok(lock) = read_lock(project) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Ok(project_root) = std::fs::canonicalize(project.root.as_std_path()) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let mut roots = std::collections::BTreeSet::new();
         for package in &lock.packages {
@@ -871,7 +871,7 @@ impl ToolWrite for UvTool {
                 }
             }
         }
-        roots.into_iter().collect()
+        Ok(roots.into_iter().collect())
     }
 
     fn resolve_inputs(&self) -> ResolveInputs {
@@ -2317,7 +2317,9 @@ mod tests {
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
-        let roots = uv_tool().external_resolve_roots(&project);
+        let roots = uv_tool()
+            .external_resolve_roots(&project)
+            .expect("resolve roots");
 
         let canonical = |rel: &str| {
             Utf8PathBuf::from_path_buf(
@@ -2384,7 +2386,9 @@ mod tests {
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
-        let roots = uv_tool().external_resolve_roots(&project);
+        let roots = uv_tool()
+            .external_resolve_roots(&project)
+            .expect("resolve roots");
 
         let canonical = |rel: &str| {
             Utf8PathBuf::from_path_buf(
@@ -2436,7 +2440,9 @@ mod tests {
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
-        let roots = uv_tool().external_resolve_roots(&project);
+        let roots = uv_tool()
+            .external_resolve_roots(&project)
+            .expect("resolve roots");
 
         let archive = Utf8PathBuf::from_path_buf(
             std::fs::canonicalize(root.join("wheels/pkg-2.0.tar.gz").as_std_path())
@@ -2486,7 +2492,9 @@ mod tests {
             generated_members: cooldown_core::GeneratedMembers::undeclared(),
         };
 
-        let roots = uv_tool().external_resolve_roots(&project);
+        let roots = uv_tool()
+            .external_resolve_roots(&project)
+            .expect("resolve roots");
 
         let target = Utf8PathBuf::from_path_buf(
             std::fs::canonicalize(base_path.join("shared/lib")).expect("canonicalize fixture path"),

@@ -5075,9 +5075,9 @@ impl<L: NodeLock> ToolWrite for NpmTool<L> {
         TargetFallback::CurrentLine
     }
 
-    fn external_resolve_roots(&self, project: &Project) -> Vec<Utf8PathBuf> {
+    fn external_resolve_roots(&self, project: &Project) -> Result<Vec<Utf8PathBuf>> {
         // Declared patch files are in-tree, but their `.patch` basename matches no resolver input.
-        crate::patches::declared_patch_files(&project.root)
+        Ok(crate::patches::declared_patch_files(&project.root))
     }
 
     async fn mutation_journal(

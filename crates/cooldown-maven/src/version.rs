@@ -6,7 +6,8 @@
 //! This is a pragmatic subset of Maven's full algorithm — enough to order the common
 //! `X.Y.Z[-qualifier]` shapes correctly — not a bit-exact reimplementation of every edge case.
 
-use cooldown_core::{MajorKey, UpdateKind};
+use cooldown_adapter_util::{RegistryVersionClassifier, build_registry_releases};
+use cooldown_core::{MajorKey, RawRelease, Release, ReleaseQuality, UpdateKind};
 use std::cmp::Ordering;
 
 #[derive(PartialEq, Eq)]
@@ -188,6 +189,32 @@ pub fn compare(left: &str, right: &str) -> Ordering {
         }
     }
     Ordering::Equal
+}
+
+/// The quality of the release `v`: a prerelease when it carries a prerelease qualifier.
+pub(crate) fn classify_quality(v: &str) -> ReleaseQuality {
+    if is_prerelease(v) {
+        ReleaseQuality::Prerelease
+    } else {
+        ReleaseQuality::Stable
+    }
+}
+
+/// The candidate releases of a dependency at `current` from Maven Central's `raw` listing,
+/// classified by the Maven version model.
+pub(crate) fn build_releases(current: &str, raw: Vec<RawRelease>) -> Vec<Release> {
+    build_registry_releases(
+        current,
+        raw,
+        RegistryVersionClassifier {
+            is_valid: |value| !value.is_empty(),
+            compare,
+            major_key,
+            major_number,
+            classify_kind,
+            classify_quality,
+        },
+    )
 }
 
 #[cfg(test)]
