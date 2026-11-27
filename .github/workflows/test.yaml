@@ -54,7 +54,8 @@ jobs:
 
   integration:
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    # Gradle starts a fresh JVM for every run, so its suite alone takes about 15 minutes on Windows.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
