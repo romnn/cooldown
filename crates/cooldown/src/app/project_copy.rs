@@ -118,6 +118,16 @@ impl ProjectCopy {
         } else {
             ancestor.clone()
         };
+        // The copy keeps the name of the directory it reproduces, which a tool can take for the
+        // project's own, as Gradle names a root project after its directory.
+        let scratch_root = match ancestor.file_name() {
+            Some(name) => {
+                let named = scratch_root.join(name);
+                std::fs::create_dir(&named)?;
+                named
+            }
+            None => scratch_root,
+        };
         let rebase = StagedRebase {
             ancestor,
             scratch_root,

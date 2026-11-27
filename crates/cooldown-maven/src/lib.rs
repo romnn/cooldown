@@ -5,6 +5,7 @@ pub mod gradle;
 pub mod lock;
 pub mod maven;
 pub mod registry;
+mod tree;
 pub mod version;
 
 pub use gradle::GradleTool;

@@ -115,13 +115,16 @@ enum Horizon {
 /// dir, and a private Mix home, Mix archive dir and Hex home, so the Hex archive and the registry
 /// and package caches Hex keeps never land in the user's home or the Elixir install.
 /// It also owns a private Maven user home, so the local repository Maven downloads plugins and
-/// dependencies into, and any `settings.xml` it reads, are never the user's.
+/// dependencies into, and any `settings.xml` it reads, are never the user's, and a private Gradle
+/// user home, so the caches Gradle resolves into, and any `gradle.properties` or init script it
+/// reads, are never the user's either.
 /// A fixture built with [`Fixture::pnpm`] also starts its cache seeded from a [`PnpmPool`] of the
 /// metadata earlier fixtures fetched.
 pub struct Fixture {
     dir: tempfile::TempDir,
     /// The fixture's private pnpm cache and store, its private Poetry cache, its private Bundler
-    /// home and gem install path, its private Mix and Hex homes, and its private Maven user home.
+    /// home and gem install path, its private Mix and Hex homes, and its private Maven and Gradle
+    /// user homes.
     ///
     /// It is a sibling of the project tree rather than inside it, so cooldown's project discovery
     /// never walks into the cache or the store.
@@ -250,6 +253,11 @@ impl Fixture {
         home
     }
 
+    /// The Gradle user home (`GRADLE_USER_HOME`) every process of this fixture uses.
+    pub fn gradle_user_home(&self) -> PathBuf {
+        self.tool_home.path().join("gradle")
+    }
+
     /// The gem install path (`BUNDLE_PATH`) every process of this fixture uses.
     pub fn bundle_path(&self) -> PathBuf {
         self.tool_home.path().join("gems")
@@ -279,8 +287,13 @@ impl Fixture {
     /// `mvn` also puts `MAVEN_ARGS` on every command line, where an inherited value could name
     /// another settings file or local repository, so it is emptied, and `MAVEN_SKIP_RC` keeps it
     /// from sourcing a `~/.mavenrc` that could set either.
+    /// Gradle keeps its caches, and reads `gradle.properties` and init scripts, under
+    /// `GRADLE_USER_HOME` (otherwise `~/.gradle`).
+    /// Gradle leaves a daemon running for hours after each build, one per user home, so every
+    /// fixture would leave one behind; `GRADLE_OPTS` turns the daemon off, and replacing an
+    /// inherited value also drops any `-Dgradle.user.home` that would move the home elsewhere.
     /// The variables are inert for every other tool, so each fixture sets them whatever it drives.
-    fn tool_env(&self) -> [(&'static str, OsString); 11] {
+    fn tool_env(&self) -> [(&'static str, OsString); 13] {
         let home = self.tool_home.path();
         let mut maven_opts = OsString::from("-Duser.home=");
         maven_opts.push(home.join("maven"));
@@ -296,6 +309,8 @@ impl Fixture {
             ("MAVEN_OPTS", maven_opts),
             ("MAVEN_ARGS", OsString::new()),
             ("MAVEN_SKIP_RC", "1".into()),
+            ("GRADLE_USER_HOME", self.gradle_user_home().into()),
+            ("GRADLE_OPTS", "-Dorg.gradle.daemon=false".into()),
         ]
     }
 

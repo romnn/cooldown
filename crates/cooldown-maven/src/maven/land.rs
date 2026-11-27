@@ -8,8 +8,9 @@ use std::ops::Range;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{Change, CoreError, MemberRef, Result};
 
-use super::reactor::{Entry, Reactor, Resolution, Source, foreign_releases, slash_path};
+use super::reactor::{Entry, Reactor, Resolution, Source, foreign_releases};
 use super::verify::{Module, Verdict};
+use crate::tree::slash_path;
 
 /// One element an edit replaces.
 #[derive(Debug, Clone, PartialEq, Eq)]

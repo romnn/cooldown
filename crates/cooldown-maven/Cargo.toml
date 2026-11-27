@@ -23,7 +23,7 @@ async-trait.workspace = true
 camino.workspace = true
 roxmltree.workspace = true
 tempfile.workspace = true
+indoc.workspace = true
 
 [dev-dependencies]
-indoc.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }

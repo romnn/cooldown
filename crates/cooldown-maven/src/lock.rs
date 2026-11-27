@@ -5,7 +5,7 @@
 //! Coordinates are normalised to `group:artifact`, which is how the Maven Central registry and the
 //! cooldown [`PackageId`](cooldown_core::PackageId) name them.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 /// A dependency coordinate and the exact version a build file resolves it to.
 #[derive(Debug, PartialEq)]
@@ -14,6 +14,9 @@ pub struct ResolvedPin {
     pub name: String,
     /// The exact version the file pins the coordinate to.
     pub version: String,
+    /// The configurations the lock pins the coordinate at this version in; another line may pin
+    /// it at another version in others.
+    pub configurations: Vec<String>,
 }
 
 /// Parses a `gradle.lockfile` into resolved [`ResolvedPin`]s.
@@ -27,7 +30,7 @@ pub fn parse_gradle_lock(content: &str) -> Vec<ResolvedPin> {
         if line.is_empty() || line.starts_with('#') || line.starts_with("empty=") {
             continue;
         }
-        let coord = line.split('=').next().unwrap_or("");
+        let (coord, configurations) = line.split_once('=').unwrap_or((line, ""));
         // coord == group:artifact:version — split the version off the right.
         if let Some((ga, version)) = coord.rsplit_once(':')
             && ga.contains(':')
@@ -36,10 +39,29 @@ pub fn parse_gradle_lock(content: &str) -> Vec<ResolvedPin> {
             out.push(ResolvedPin {
                 name: ga.to_string(),
                 version: version.to_string(),
+                configurations: names(configurations).map(str::to_owned).collect(),
             });
         }
     }
     out
+}
+
+/// Every configuration a `gradle.lockfile` locks, those its `empty=` line lists as locking
+/// nothing included.
+pub(crate) fn locked_configurations(content: &str) -> BTreeSet<String> {
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.split_once('='))
+        .flat_map(|(_, configurations)| names(configurations))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The configuration names of a lock line's comma-separated list.
+fn names(configurations: &str) -> impl Iterator<Item = &str> {
+    configurations.split(',').filter(|name| !name.is_empty())
 }
 
 /// Returns the `group:artifact` coordinates declared directly in a `build.gradle(.kts)`: the
@@ -87,6 +109,7 @@ mod tests {
         ResolvedPin {
             name: name.to_string(),
             version: version.to_string(),
+            configurations: vec!["compileClasspath".to_string()],
         }
     }
 
