@@ -14,9 +14,9 @@ use crate::apply::landing::{
 };
 use crate::exclusions::{MatchSemantics, exact_exclusion};
 use crate::lock::{
-    AliasOnlyVersions, EffectiveRegistryQuery, FixedBinding, FixedOwner, MemberAttribution,
-    MemberIndex, MemberResolution, MinimumAgeRefusal, NameVersion, NodeLock, SplitHold,
-    SplitVerdict, UnattributedName, Unproven, UnprovenDeclaration, WorkspaceDialect,
+    AliasOnlyVersions, EffectiveRegistryQuery, FixedBinding, FixedOwner, LockBinding,
+    MemberAttribution, MemberIndex, MemberResolution, MinimumAgeRefusal, NameVersion, NodeLock,
+    SplitHold, SplitVerdict, UnattributedName, Unproven, UnprovenDeclaration, WorkspaceDialect,
     WorkspaceManifests, YarnBindings,
 };
 use crate::manifest;
@@ -562,6 +562,15 @@ impl<L: NodeLock> ToolRead for NpmTool<L> {
                 "PNPM_HOME",
             ],
         );
+        // An rc file may hold registry credentials, which a trace never records.
+        for input in &mut evidence.inputs {
+            if matches!(
+                input.path.file_name(),
+                Some(".npmrc" | ".yarnrc" | ".yarnrc.yml")
+            ) {
+                input.role = InputRole::Credentials;
+            }
+        }
         Ok(evidence)
     }
 
@@ -1147,21 +1156,124 @@ impl LandingBaseline {
     }
 }
 
-/// The newest locked version of each name in the lock the landings of a per-package apply left.
+/// The collateral rows of a per-package apply that started from the lock `started`, whose newest
+/// copies are `before`: every move to the lock the landings left that `applied` does not report,
+/// read per selector where the lock binds by selector ([`NodeLock::bindings`]), and by each name's
+/// newest copy otherwise.
+///
+/// An applied row reports the moves of the selectors its members request in `workspace`.
 ///
 /// # Errors
 ///
-/// Returns a [`CoreError`] when the lock cannot be read or parsed.
-fn settled_versions<L: NodeLock>(project: &Project) -> Result<HashMap<String, String>> {
-    let after_content = match std::fs::read_to_string(project.root.join(L::LOCKFILE)) {
+/// Returns a [`CoreError`] when the settled lock cannot be read or parsed.
+fn settled_collateral<L: NodeLock>(
+    project: &Project,
+    workspace: Option<&WorkspaceManifests>,
+    started: Option<&str>,
+    before: &HashMap<String, String>,
+    applied: &[Change],
+) -> Result<Vec<Change>> {
+    let settled = match std::fs::read_to_string(project.root.join(L::LOCKFILE)) {
         Ok(content) => Some(content),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
+    if let (Some(started), Some(settled)) = (
+        started.and_then(L::bindings),
+        settled.as_deref().and_then(L::bindings),
+    ) {
+        let owned: HashSet<String> = workspace.map_or_else(HashSet::new, |workspace| {
+            applied
+                .iter()
+                .flat_map(|change| {
+                    member_paths(change).into_iter().filter_map(|member| {
+                        L::member_selector(workspace, member, &change.package.name)
+                    })
+                })
+                .collect()
+        });
+        return Ok(binding_collateral::<L>(&started, &settled, &owned));
+    }
     // This is fresh post-install content the driver just wrote, so the earlier strict reads
     // prove nothing about it: a failed parse must fail the batch rather than diff against an
     // empty map that hides every collateral move. Only an absent lock diffs as empty.
-    versions_in::<L>(after_content.as_deref())
+    Ok(collateral_changes::<L>(
+        before,
+        &versions_in::<L>(settled.as_deref())?,
+        applied,
+    ))
+}
+
+/// The row rejecting `change`, whose install succeeded without binding its target, as the
+/// resolver's, its detail what the settled lock binds for the change under the manifests the
+/// landing left in `workspace` ([`miss_detail`]).
+///
+/// # Errors
+///
+/// Returns a [`CoreError`] when the lock cannot be read.
+fn unreached_row<L: NodeLock>(
+    project: &Project,
+    change: &Change,
+    workspace: Option<&WorkspaceManifests>,
+) -> Result<Skipped> {
+    let content = read_lock::<L>(project)?;
+    Ok(Skipped {
+        change: change.clone(),
+        reason: SkipReason::ResolverConflict,
+        offending: Some(change.package.clone()),
+        detail: Some(miss_detail::<L>(&content, workspace, change)),
+    })
+}
+
+/// The member paths whose declarations `change` lands: its members', or the root's for a change
+/// without members.
+pub(crate) fn member_paths(change: &Change) -> Vec<&str> {
+    if change.members.is_empty() {
+        return vec!["."];
+    }
+    change
+        .members
+        .iter()
+        .map(|member| member.path.as_str())
+        .collect()
+}
+
+/// The detail of the row whose landing requested `change.to` without the lock `content` binding
+/// it: each member's own binding of the name that missed the target, where the lock attributes
+/// one to the member under `workspace`, and none of the name's other copies.
+pub(crate) fn miss_detail<L: NodeLock>(
+    content: &str,
+    workspace: Option<&WorkspaceManifests>,
+    change: &Change,
+) -> String {
+    let name = change.package.name.as_str();
+    let to = change.to.as_str();
+    let attribution = L::member_attribution_in(content, workspace);
+    let resolution = |member: &str| match &attribution {
+        MemberAttribution::Selectors(bindings) => match bindings.resolution(member, name) {
+            MemberResolution::Resolved(version) => Some(version.to_string()),
+            _ => None,
+        },
+        MemberAttribution::PackageKeys(bindings) => match bindings.resolution(member, name) {
+            MemberResolution::Resolved(version) => Some(version.to_string()),
+            _ => None,
+        },
+        MemberAttribution::Importers(_)
+        | MemberAttribution::InstallTree(_)
+        | MemberAttribution::Unknown => None,
+    };
+    let missed: Vec<String> = member_paths(change)
+        .into_iter()
+        .filter_map(|member| {
+            let version = resolution(member).filter(|version| version != to)?;
+            let member = if member == "." { "the root" } else { member };
+            Some(format!("{member} binds {name} {version}"))
+        })
+        .collect();
+    if missed.is_empty() {
+        return format!("requested {to} did not land");
+    }
+    format!("requested {to} did not land: {}", missed.join("; "))
 }
 
 /// The newest locked version of each name in the lock `content`, or none without a lock.
@@ -1174,16 +1286,6 @@ fn versions_in<L: NodeLock>(content: Option<&str>) -> Result<HashMap<String, Str
         .map(locked_versions::<L>)
         .transpose()?
         .unwrap_or_default())
-}
-
-/// The row skipping `change` for `reason`, which names the package itself and needs no detail.
-fn own_row(change: &Change, reason: SkipReason) -> Skipped {
-    Skipped {
-        change: change.clone(),
-        reason,
-        offending: Some(change.package.clone()),
-        detail: None,
-    }
 }
 
 /// The row `runner` holds `change` with before its landing runs, or `None` to land it.
@@ -1439,6 +1541,47 @@ fn collateral_changes<L: NodeLock>(
         .collect();
     changes.sort_by(|a, b| a.package.name.cmp(&b.package.name));
     changes
+}
+
+/// One release move of a name between two locks.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct BindingMove {
+    name: String,
+    from: String,
+    to: String,
+}
+
+/// The moves of every selector bound in both locks `before` and `after`, as sorted collateral
+/// rows ([`NodeLock::bindings`]), but for the `owned` selectors, whose moves the applied rows
+/// report.
+///
+/// A selector bound in one lock alone moved nothing: the release it binds joined or left the
+/// graph, which the graph gate judges.
+fn binding_collateral<L: NodeLock>(
+    before: &[LockBinding],
+    after: &[LockBinding],
+    owned: &HashSet<String>,
+) -> Vec<Change> {
+    let after: HashMap<&str, &LockBinding> = after
+        .iter()
+        .map(|binding| (binding.selector.as_str(), binding))
+        .collect();
+    let moves: BTreeSet<BindingMove> = before
+        .iter()
+        .filter(|binding| !owned.contains(&binding.selector))
+        .filter_map(|binding| {
+            let moved = after.get(binding.selector.as_str())?;
+            (moved.version != binding.version).then(|| BindingMove {
+                name: binding.name.clone(),
+                from: binding.version.clone(),
+                to: moved.version.clone(),
+            })
+        })
+        .collect();
+    moves
+        .into_iter()
+        .map(|BindingMove { name, from, to }| collateral_change::<L>(&name, &from, &to))
+        .collect()
 }
 
 /// Whether `landed` is at or beyond `change`'s target, respecting the move's direction (a forward
@@ -2540,13 +2683,10 @@ impl<L: NodeLock> NpmTool<L> {
                     }
                 }
                 Ok(()) => {
-                    // The install ran but the target did not land: a dependent's range holds
-                    // the package where it is, a ceiling the resolver imposed rather than a
-                    // rejection it raised.
+                    // The install ran without landing the target, and no cap is shown to hold it.
+                    let unreached = unreached_row::<L>(project, change, landed_workspace.as_ref())?;
                     restore_after_owned_step(&candidate_journal, &attempt.postimage)?;
-                    report
-                        .skipped
-                        .push(own_row(change, SkipReason::GraphCeilingHeld));
+                    report.skipped.push(unreached);
                 }
                 Err(error) if error.is_local_environment_failure() => {
                     restore_after_owned_step(&candidate_journal, &attempt.postimage)?;
@@ -2560,8 +2700,11 @@ impl<L: NodeLock> NpmTool<L> {
                 }
             }
         }
-        let after = settled_versions::<L>(project)?;
-        let collateral = collateral_changes::<L>(&before, &after, &report.applied);
+        // The accepted candidates' manifest edits name the selectors their rows own.
+        let settled = workspace.map(|workspace| accepted_edits.apply_to(workspace));
+        let started = journaled_lock::<L>(baseline_journal);
+        let collateral =
+            settled_collateral::<L>(project, settled.as_ref(), started, &before, &report.applied)?;
         report.applied.extend(collateral);
         Ok(report)
     }
@@ -6485,6 +6628,54 @@ packages:
         assert_eq!(
             collateral_changes::<Pnpm>(&before, &after, &stale_duplicate_baseline),
             []
+        );
+    }
+
+    /// Collateral is read per selector: `leaf@^1` moving while `leaf@^2` stays the newest copy is
+    /// a move, and so is `chalk@^4.1.0` moving to the applied row's destination, since only the
+    /// applied row's own `chalk@^4.0.0` is reported by it.
+    /// A selector that left or joined the lock moved nothing, whatever release it bound.
+    #[test]
+    fn binding_collateral_reports_each_selector_moved_in_place() {
+        let binding = |selector: &str, version: &str| LockBinding {
+            selector: selector.to_string(),
+            name: selector
+                .rsplit_once('@')
+                .map_or(selector, |(name, _)| name)
+                .to_string(),
+            version: version.to_string(),
+        };
+        let before = [
+            binding("leaf@^1.0.0", "1.0.0"),
+            binding("leaf@^2.0.0", "2.0.0"),
+            binding("other@^3.0.0", "3.0.0"),
+            binding("chalk@^4.0.0", "4.0.0"),
+            binding("chalk@^4.1.0", "4.1.0"),
+        ];
+        let after = [
+            binding("leaf@^1.0.0", "1.1.0"),
+            binding("leaf@^2.0.0", "2.0.0"),
+            binding("other@^3.1.0", "3.1.0"),
+            binding("chalk@^4.0.0", "4.1.2"),
+            binding("chalk@^4.1.0", "4.1.2"),
+        ];
+        let owned = HashSet::from(["chalk@^4.0.0".to_string()]);
+
+        let collateral = binding_collateral::<Yarn>(&before, &after, &owned);
+
+        let moves: Vec<(&str, &str, &str)> = collateral
+            .iter()
+            .map(|change| {
+                (
+                    change.package.name.as_str(),
+                    change.from.as_str(),
+                    change.to.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            moves,
+            [("chalk", "4.1.0", "4.1.2"), ("leaf", "1.0.0", "1.1.0")]
         );
     }
 

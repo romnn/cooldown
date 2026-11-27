@@ -118,13 +118,15 @@ enum Horizon {
 /// dependencies into, and any `settings.xml` it reads, are never the user's, and a private Gradle
 /// user home, so the caches Gradle resolves into, and any `gradle.properties` or init script it
 /// reads, are never the user's either.
+/// It also owns a cache home, which a Yarn Classic suite hands Yarn Classic and cooldown (see
+/// [`Fixture::yarn_cache_home`]).
 /// A fixture built with [`Fixture::pnpm`] also starts its cache seeded from a [`PnpmPool`] of the
 /// metadata earlier fixtures fetched.
 pub struct Fixture {
     dir: tempfile::TempDir,
     /// The fixture's private pnpm cache and store, its private Poetry cache, its private Bundler
-    /// home and gem install path, its private Mix and Hex homes, and its private Maven and Gradle
-    /// user homes.
+    /// home and gem install path, its private Mix and Hex homes, its private Maven and Gradle user
+    /// homes, and the cache home of a Yarn Classic suite.
     ///
     /// It is a sibling of the project tree rather than inside it, so cooldown's project discovery
     /// never walks into the cache or the store.
@@ -261,6 +263,16 @@ impl Fixture {
     /// The gem install path (`BUNDLE_PATH`) every process of this fixture uses.
     pub fn bundle_path(&self) -> PathBuf {
         self.tool_home.path().join("gems")
+    }
+
+    /// The cache home a Yarn Classic suite points `XDG_CACHE_HOME` at, below which Yarn Classic
+    /// keeps its default cache folder (otherwise `~/.cache/yarn` on Linux), the one a landing lets
+    /// Yarn write.
+    ///
+    /// The variable stays out of [`tool_env`](Self::tool_env) because it moves every other cache
+    /// that follows the XDG layout too, cooldown's own included.
+    pub fn yarn_cache_home(&self) -> PathBuf {
+        self.tool_home.path().join("xdg-cache")
     }
 
     /// The environment that points every pnpm, Poetry and Bundler a fixture process starts at the

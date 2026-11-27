@@ -646,6 +646,9 @@ pub struct PreparedMutation {
     baseline: Arc<MutationBaseline>,
     tool: ToolId,
     execution: PreparedMutationExecution,
+    /// The root of the source project `project` stands for, `None` until a caller names it
+    /// ([`Self::with_source_root`]).
+    source_root: Option<Utf8PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -722,7 +725,28 @@ impl PreparedMutation {
             baseline: Arc::new(baseline),
             tool,
             execution,
+            source_root: None,
         })
+    }
+
+    /// Names `root` as the root of the source project this operation's project stands for: the
+    /// project's own root, or the source of a copy, such as a preview, that it runs in.
+    #[must_use]
+    pub fn with_source_root(self, root: &Utf8Path) -> Self {
+        PreparedMutation {
+            source_root: Some(root.to_owned()),
+            ..self
+        }
+    }
+
+    /// The root of the source project this operation's project stands for, or `None` when no
+    /// caller named it, so an adapter cannot tell its project from a copy.
+    ///
+    /// An adapter that lets its resolver write outside the project judges those places against
+    /// it, since a copy's own root says nothing about the source.
+    #[must_use]
+    pub fn source_root(&self) -> Option<&Utf8Path> {
+        self.source_root.as_deref()
     }
 
     /// Revalidates an in-place tool-family operation and its write set for one dispatch.
@@ -887,6 +911,7 @@ impl PreparedMutation {
             baseline: Arc::clone(&self.baseline),
             tool: self.tool,
             execution: self.execution,
+            source_root: self.source_root.clone(),
         })
     }
 }

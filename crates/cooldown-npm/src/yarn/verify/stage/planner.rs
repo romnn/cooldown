@@ -5,6 +5,7 @@ use super::{Entry, InPlace, Merge, Plan, Refusal, filesystem, merge};
 use crate::lock::{BerryLock, percent_decode};
 use crate::manifest::display_rel;
 use crate::manifest::workspaces::{DEFAULT_RC_FILENAME, YarnEnvironment, parse_settings};
+use crate::yarn::LockFormat;
 use crate::yarn::verify::settings::{self, RcFile};
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use cooldown_core::CoreError;
@@ -15,6 +16,10 @@ use std::collections::{BTreeMap, BTreeSet};
 const MANIFEST: &str = "package.json";
 
 const LOCKFILE: &str = "yarn.lock";
+
+/// The rc files Yarn Classic reads in the project, each directory above it, and the home
+/// directory.
+const CLASSIC_RC_FILES: [&str; 2] = [".yarnrc", ".npmrc"];
 
 /// The environment file Yarn 4 injects by default.
 const ENVIRONMENT_FILE: &str = ".env.yarn";
@@ -41,12 +46,15 @@ const RANGE_FIELDS: [&str; 5] = [
 
 /// The state of one planning pass.
 pub(super) struct Planner<'a> {
+    /// The lock's format, which decides the rc files Yarn reads.
+    format: LockFormat,
     root: Utf8PathBuf,
     boundary: Utf8PathBuf,
     environment: &'a YarnEnvironment,
     folders: Vec<Utf8PathBuf>,
     entries: BTreeMap<Utf8PathBuf, Entry>,
     in_place: BTreeMap<Utf8PathBuf, InPlace>,
+    rc_files: BTreeSet<Utf8PathBuf>,
     /// Where each recreated link the walk meets must resolve in the copy: the mirrored position
     /// of what the source's link reaches.
     expected_links: BTreeMap<Utf8PathBuf, Utf8PathBuf>,
@@ -62,14 +70,17 @@ impl<'a> Planner<'a> {
         environment: &'a YarnEnvironment,
         bases: &[Utf8PathBuf],
     ) -> std::result::Result<Plan, Refusal> {
-        let lock = BerryLock::read(lock_text)?;
-        let root = canonical(root.as_std_path())?;
-        if let Some(reference) = lock.references().find(|range| settings::is_exec(range)) {
-            return decline(format!(
-                "{LOCKFILE} records the `exec:` package `{reference}`, whose generator may read \
-                 files the verification copy leaves out"
-            ));
+        let format = LockFormat::of(lock_text);
+        if format == LockFormat::Berry {
+            let lock = BerryLock::read(lock_text)?;
+            if let Some(reference) = lock.references().find(|range| settings::is_exec(range)) {
+                return decline(format!(
+                    "{LOCKFILE} records the `exec:` package `{reference}`, whose generator may \
+                     read files the verification copy leaves out"
+                ));
+            }
         }
+        let root = canonical(root.as_std_path())?;
         let Some(home) = &environment.home else {
             return decline(
                 "no home directory is established, so the rc file Yarn reads there is unknown",
@@ -89,12 +100,14 @@ impl<'a> Planner<'a> {
             root.ancestors().last().unwrap_or(&root).to_owned()
         };
         let mut planner = Planner {
+            format,
             root,
             boundary,
             environment,
             folders: Vec::new(),
             entries: BTreeMap::new(),
             in_place: BTreeMap::new(),
+            rc_files: BTreeSet::new(),
             expected_links: BTreeMap::new(),
             pending: Vec::new(),
             followed: BTreeSet::new(),
@@ -108,9 +121,13 @@ impl<'a> Planner<'a> {
         let base = planner.choose_base(&home, under_home, bases)?;
         let rc_files = planner.stage_rc_files(&home, &base)?;
         let root = planner.root.clone();
-        settings::screen(&rc_files, environment, |path| shown(&root, path))
-            .map_err(Refusal::Decline)?;
-        planner.stage_yarn_paths(&rc_files)?;
+        // Yarn Classic reads none of these settings, and a landing runs it with `yarn-path`
+        // ignored.
+        if format == LockFormat::Berry {
+            settings::screen(&rc_files, environment, |path| shown(&root, path))
+                .map_err(Refusal::Decline)?;
+            planner.stage_yarn_paths(&rc_files)?;
+        }
         planner.check_links()?;
 
         Ok(Plan {
@@ -120,20 +137,24 @@ impl<'a> Planner<'a> {
             folders: planner.folders,
             entries: planner.entries,
             in_place: planner.in_place,
+            rc_files: planner.rc_files,
         })
     }
 
     fn stage_project(&mut self, lock_text: &str) -> std::result::Result<(), Refusal> {
         let root = self.root.clone();
         self.stage_screened(&root.join(LOCKFILE), lock_text.as_bytes().to_vec())?;
-        let environment_file = root.join(ENVIRONMENT_FILE);
-        if is_file(&environment_file)? {
-            self.stage_file(&environment_file)?;
-        }
-        for folder in YARN_FOLDERS {
-            let folder = root.join(".yarn").join(folder);
-            if is_directory(&folder)? {
-                self.stage_folder(&folder)?;
+        // Yarn Classic reads none of these.
+        if self.format == LockFormat::Berry {
+            let environment_file = root.join(ENVIRONMENT_FILE);
+            if is_file(&environment_file)? {
+                self.stage_file(&environment_file)?;
+            }
+            for folder in YARN_FOLDERS {
+                let folder = root.join(".yarn").join(folder);
+                if is_directory(&folder)? {
+                    self.stage_folder(&folder)?;
+                }
             }
         }
         self.walk(&root)
@@ -497,9 +518,12 @@ impl<'a> Planner<'a> {
         Ok(None)
     }
 
-    /// Every rc file name Yarn reads: the project's, and `.yarnrc.yml`, which Yarn 4 reads in
-    /// the home directory whatever the project's is.
+    /// Every rc file name Yarn reads: Yarn Classic's own, or the Berry project's and
+    /// `.yarnrc.yml`, which Yarn 4 reads in the home directory whatever the project's is.
     fn rc_names(&self) -> Vec<&'a str> {
+        if self.format == LockFormat::Classic {
+            return CLASSIC_RC_FILES.to_vec();
+        }
         let mut names = vec![DEFAULT_RC_FILENAME];
         let renamed = self.environment.rc_filename();
         if renamed != DEFAULT_RC_FILENAME {
@@ -524,40 +548,47 @@ impl<'a> Planner<'a> {
         home: &Utf8Path,
         base: &Utf8Path,
     ) -> std::result::Result<Vec<RcFile>, Refusal> {
-        let name = self.environment.rc_filename();
+        let names = match self.format {
+            LockFormat::Classic => CLASSIC_RC_FILES.to_vec(),
+            LockFormat::Berry => vec![self.environment.rc_filename()],
+        };
         let root = self.root.clone();
         let mut rc_files = Vec::new();
         for directory in root.ancestors() {
-            let path = directory.join(name);
-            let shared = base.starts_with(directory);
-            let content = read_optional(&path)?;
-            if shared {
-                self.in_place
-                    .insert(path.clone(), InPlace::Screened(content.clone()));
+            for name in &names {
+                let path = directory.join(name);
+                self.rc_files.insert(path.clone());
+                let shared = base.starts_with(directory);
+                let content = read_optional(&path)?;
+                if shared {
+                    self.in_place
+                        .insert(path.clone(), InPlace::Screened(content.clone()));
+                }
+                let Some(content) = content else {
+                    continue;
+                };
+                let settings = self.rc_settings(&path, &content)?;
+                if !shared {
+                    self.stage_screened(&path, content)?;
+                }
+                rc_files.push(RcFile {
+                    path,
+                    staged: !shared,
+                    settings,
+                });
             }
-            let Some(content) = content else {
-                continue;
-            };
-            let settings = parse_settings(&root, &path, &content).map_err(Refusal::Decline)?;
-            if !shared {
-                self.stage_screened(&path, content)?;
-            }
-            rc_files.push(RcFile {
-                path,
-                staged: !shared,
-                settings,
-            });
         }
         for home_name in self.rc_names() {
             let path = home.join(home_name);
             if self.in_place.contains_key(&path) || rc_files.iter().any(|rc| rc.path == path) {
                 continue;
             }
+            self.rc_files.insert(path.clone());
             let content = read_optional(&path)?;
             self.in_place
                 .insert(path.clone(), InPlace::Screened(content.clone()));
             if let Some(content) = content {
-                let settings = parse_settings(&root, &path, &content).map_err(Refusal::Decline)?;
+                let settings = self.rc_settings(&path, &content)?;
                 rc_files.push(RcFile {
                     path,
                     staged: false,
@@ -571,12 +602,25 @@ impl<'a> Planner<'a> {
                 continue;
             }
             for name in &names {
-                self.in_place
-                    .entry(directory.join(name))
-                    .or_insert(InPlace::Screened(None));
+                let path = directory.join(name);
+                self.rc_files.insert(path.clone());
+                self.in_place.entry(path).or_insert(InPlace::Screened(None));
             }
         }
         Ok(rc_files)
+    }
+
+    /// The settings of the rc file at `path`: a Berry file's, and none of a Yarn Classic one, whose
+    /// settings the copy never follows.
+    fn rc_settings(
+        &self,
+        path: &Utf8Path,
+        content: &[u8],
+    ) -> std::result::Result<serde_json::Map<String, Value>, Refusal> {
+        if self.format == LockFormat::Classic {
+            return Ok(serde_json::Map::new());
+        }
+        parse_settings(&self.root, path, content).map_err(Refusal::Decline)
     }
 
     /// Stages or records the Yarn release each `yarnPath` names, in an rc file or the

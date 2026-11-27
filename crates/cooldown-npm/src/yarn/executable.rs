@@ -10,6 +10,10 @@
 //! - the version `yarn --version` reports in the project, which is the executable actually
 //!   reached, a `yarnPath` redirect or a Corepack shim included.
 //!
+//! A Classic landing asks the version only inside its confined copy, with `yarnPath` ignored, so
+//! no repository's launcher runs unconfined ([`ensure_classic_declared`]); the probe in the
+//! project serves `--build`, which runs Yarn there anyway.
+//!
 //! A `yarnPath` setting found in a `.yarnrc.yml` is named in the refusal, since it is the usual
 //! reason a project runs another Yarn than the one on `PATH`.
 
@@ -26,20 +30,7 @@ use cooldown_core::{CoreError, Result};
 /// Berry release, when `yarn --version` fails or names no version, or when it names a Yarn Berry
 /// release; returns [`CoreError::ToolSpawn`] when `yarn` cannot be spawned.
 pub(super) async fn ensure_classic_executable(driver: &NodeCmd, root: &Utf8Path) -> Result<()> {
-    match declared_manager(root)? {
-        Some(DeclaredManager::Yarn { spelled, major }) if major >= FIRST_BERRY_MAJOR => {
-            return Err(classic_lock_refused(&format!(
-                "package.json declares \"packageManager\": \"{spelled}\", a Yarn Berry (v2+) release"
-            )));
-        }
-        Some(DeclaredManager::Other { spelled }) => {
-            return Err(CoreError::System(format!(
-                "package.json declares \"packageManager\": \"{spelled}\", so this project is not \
-                 run by Yarn, and cooldown does not run Yarn on its yarn.lock"
-            )));
-        }
-        Some(DeclaredManager::Yarn { .. }) | None => {}
-    }
+    ensure_classic_declared(root)?;
     let version = executable_version(driver, root).await?;
     if version.major >= FIRST_BERRY_MAJOR {
         let redirect = configured_yarn_path(root).map_or_else(String::new, |configured| {
@@ -54,6 +45,28 @@ pub(super) async fn ensure_classic_executable(driver: &NodeCmd, root: &Utf8Path)
         )));
     }
     Ok(())
+}
+
+/// Refuses to let Yarn run a Classic lock in `root` when the root `package.json` declares another
+/// package manager than Yarn Classic, without running any.
+///
+/// # Errors
+///
+/// Returns [`CoreError::System`] when `packageManager` names another package manager or a Yarn
+/// Berry release.
+pub(super) fn ensure_classic_declared(root: &Utf8Path) -> Result<()> {
+    match declared_manager(root)? {
+        Some(DeclaredManager::Yarn { spelled, major }) if major >= FIRST_BERRY_MAJOR => {
+            Err(classic_lock_refused(&format!(
+                "package.json declares \"packageManager\": \"{spelled}\", a Yarn Berry (v2+) release"
+            )))
+        }
+        Some(DeclaredManager::Other { spelled }) => Err(CoreError::System(format!(
+            "package.json declares \"packageManager\": \"{spelled}\", so this project is not \
+             run by Yarn, and cooldown does not run Yarn on its yarn.lock"
+        ))),
+        Some(DeclaredManager::Yarn { .. }) | None => Ok(()),
+    }
 }
 
 /// The first major version of Yarn Berry; every earlier one is Yarn Classic.
@@ -106,7 +119,7 @@ fn berry_lock_refused(executable: &str) -> CoreError {
 }
 
 /// The refusal to run a Berry executable on a Classic lock, `executable` saying which one.
-fn classic_lock_refused(executable: &str) -> CoreError {
+pub(super) fn classic_lock_refused(executable: &str) -> CoreError {
     CoreError::System(format!(
         "yarn.lock is a Yarn Classic (v1) lockfile, but {executable}, which would migrate the lock \
          to its own format; cooldown does not migrate a lock: finish the migration with that Yarn \

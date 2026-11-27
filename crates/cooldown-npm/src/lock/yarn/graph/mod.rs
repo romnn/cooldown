@@ -12,7 +12,7 @@
 
 use super::{Field, Item, LockedEntry, Value, is_registry_tarball, locked_entry, read_items};
 use crate::lock::{
-    AliasOnlyVersions, LockOrigin, NameVersion, RegistryRelease, is_registry_specifier,
+    AliasOnlyVersions, LockBinding, LockOrigin, NameVersion, RegistryRelease, is_registry_specifier,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -48,6 +48,20 @@ pub(in crate::lock) fn packages(content: &str) -> Option<Vec<NameVersion>> {
         }));
     }
     Some(rows)
+}
+
+/// Every selector the lock records, with the package and version it binds, or `None` where Yarn's
+/// own reader would not read the lock.
+pub(in crate::lock) fn bindings(content: &str) -> Option<Vec<LockBinding>> {
+    let mut bindings = Vec::new();
+    for entry in entries(content)? {
+        bindings.extend(entry.selectors.into_iter().map(|selector| LockBinding {
+            selector: selector.key,
+            name: selector.package,
+            version: entry.version.clone(),
+        }));
+    }
+    Some(bindings)
 }
 
 /// The registry releases the lock installs only through aliases
@@ -123,7 +137,7 @@ fn entries(content: &str) -> Option<Vec<ClassicEntry>> {
     let entries = items
         .iter()
         .enumerate()
-        .filter_map(|(index, Item { keys, value })| {
+        .filter_map(|(index, Item { keys, value, .. })| {
             let Value::Object(fields) = value else {
                 return None;
             };
@@ -160,6 +174,8 @@ fn entries(content: &str) -> Option<Vec<ClassicEntry>> {
 
 /// The package one selector of an entry installs.
 struct Selector {
+    /// The selector as the lock keys it (`chalk@^4.0.0`).
+    key: String,
     /// The package the selector resolves.
     package: String,
     /// Whether the selector installs the package under another name: an alias of it, or an entry
@@ -183,6 +199,7 @@ impl Selector {
         }) = registry_reference(range)
         {
             return (!target.is_empty()).then(|| Selector {
+                key: key.to_string(),
                 package: target.to_string(),
                 aliased: target != name,
                 registry: true,
@@ -190,6 +207,7 @@ impl Selector {
         }
         let package = recorded.unwrap_or(name);
         (!package.is_empty()).then(|| Selector {
+            key: key.to_string(),
             package: package.to_string(),
             aliased: package != name,
             registry: is_registry_specifier(range),

@@ -34,6 +34,7 @@ pub(super) use stage::{InputDigest, Outputs};
 
 use crate::manifest::workspaces::YarnEnvironment;
 use crate::nodecmd::{EnvOverride, NodeCmd};
+use crate::yarn::LockFormat;
 use camino::{Utf8Path, Utf8PathBuf};
 use cooldown_core::{CoreError, LockStatus, LockVerifyReport, Project, Result};
 use profile::Profile;
@@ -70,9 +71,9 @@ pub(super) struct Verification {
 ///
 /// # Errors
 ///
-/// Returns [`CoreError::LockUnreadable`] for a lock the Berry reader refuses,
-/// [`CoreError::Filesystem`] when an input cannot be read or the copy cannot be written, and
-/// [`CoreError::ToolSpawn`] when `yarn` cannot be spawned.
+/// Returns [`CoreError::LockUnreadable`] for a lock that is no Berry lock or that the Berry reader
+/// refuses, [`CoreError::Filesystem`] when an input cannot be read or the copy cannot be written,
+/// and [`CoreError::ToolSpawn`] when `yarn` cannot be spawned.
 /// Every other reason not to trust a verdict is a [`LockStatus::Unknown`] report.
 pub(super) async fn lock_current(
     driver: &NodeCmd,
@@ -82,6 +83,11 @@ pub(super) async fn lock_current(
     let lock_path = project.root.join(LOCKFILE);
     let lock_text = std::fs::read_to_string(&lock_path)
         .map_err(|err| CoreError::Filesystem(format!("{lock_path}: {err}")))?;
+    if LockFormat::of(&lock_text) != LockFormat::Berry {
+        return Err(CoreError::LockUnreadable(format!(
+            "{lock_path} is no Yarn Berry lock"
+        )));
+    }
     let plan = match stage::plan(
         &project.root,
         &lock_text,
@@ -171,10 +177,7 @@ pub(super) async fn lock_current(
 /// change in place of the project.
 #[derive(Debug)]
 pub(super) struct ResolveCopy {
-    #[expect(
-        dead_code,
-        reason = "the scratch directory lives as long as the copy, which dropping it deletes"
-    )]
+    /// The scratch directory, which lives as long as the copy, and which dropping it deletes.
     scratch: stage::Scratch,
     /// The project's position in the copy, where Yarn runs.
     pub(super) copy_root: Utf8PathBuf,
@@ -183,6 +186,13 @@ pub(super) struct ResolveCopy {
     /// The digest of the project's inputs the copy holds, which [`live_digest`] gives again only
     /// while none of them changed.
     pub(super) digest: InputDigest,
+}
+
+impl ResolveCopy {
+    /// The scratch directory, below which the copy and Yarn's output lie.
+    pub(super) fn scratch(&self) -> &Utf8Path {
+        self.scratch.root()
+    }
 }
 
 /// Whether a project could be copied for Yarn's resolver, and the copy if it could.
@@ -263,10 +273,20 @@ pub(super) async fn copy_current(
     Ok(Err(relabel(&detail, &copy.copy_root)))
 }
 
-pub(super) fn evidence_paths(project: &Project, context: &Context) -> Result<Vec<Utf8PathBuf>> {
+/// Every input a copy of `project` holds or Yarn reads in place, as the run's evidence
+/// ([`stage`]).
+///
+/// # Errors
+///
+/// Returns [`CoreError::Config`] with the reason a copy cannot reproduce the project, and the
+/// error of a lock or input that cannot be read.
+pub(super) fn evidence_inputs(
+    project: &Project,
+    context: &Context,
+) -> Result<Vec<cooldown_core::trace::EvidenceInput>> {
     let lock = std::fs::read_to_string(project.root.join(LOCKFILE))?;
     match stage::plan(&project.root, &lock, &context.environment, &context.bases)? {
-        Planned::Ready(plan) => Ok(plan.evidence_paths()),
+        Planned::Ready(plan) => Ok(plan.evidence_inputs()),
         Planned::Declined(reason) => Err(CoreError::Config(reason)),
     }
 }
@@ -275,14 +295,21 @@ pub(super) fn evidence_paths(project: &Project, context: &Context) -> Result<Vec
 /// holds them has what Yarn reads for the project: its manifests, each `file:` folder whole, each
 /// rc file between the project and the copy's boundary, and the rest [`stage`] names.
 ///
-/// A project the copy cannot reproduce, or whose lock cannot be read, has none to name.
-pub(super) fn copied_sources(project: &Project, context: &Context) -> Vec<Utf8PathBuf> {
-    let Ok(lock) = std::fs::read_to_string(project.root.join(LOCKFILE)) else {
-        return Vec::new();
+/// A project without a lock has none to name.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Config`] with the reason a copy cannot reproduce the project, and the
+/// error of a lock or input that cannot be read.
+pub(super) fn copied_sources(project: &Project, context: &Context) -> Result<Vec<Utf8PathBuf>> {
+    let lock = match std::fs::read_to_string(project.root.join(LOCKFILE)) {
+        Ok(lock) => lock,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
     };
-    match stage::plan(&project.root, &lock, &context.environment, &context.bases) {
-        Ok(Planned::Ready(plan)) => plan.copied_sources(),
-        Ok(Planned::Declined(_)) | Err(_) => Vec::new(),
+    match stage::plan(&project.root, &lock, &context.environment, &context.bases)? {
+        Planned::Ready(plan) => Ok(plan.copied_sources()),
+        Planned::Declined(reason) => Err(CoreError::Config(reason)),
     }
 }
 

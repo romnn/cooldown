@@ -1,5 +1,11 @@
-//! The copy of a Yarn Berry project a verification runs in: every input Yarn reads, where Yarn
-//! looks for it, and nothing Yarn could write back to the source through.
+//! The copy of a Yarn project a verification or a landing runs in: every input Yarn reads, where
+//! Yarn looks for it, and nothing Yarn could write back to the source through.
+//!
+//! The lock's format decides which Yarn reads the copy.
+//! For a Yarn Classic lock the rc files are `.yarnrc` and `.npmrc`, wherever Yarn Classic looks
+//! for them, and no setting is followed or screened, since a landing runs Yarn Classic with
+//! `yarn-path` ignored and its writes to file contents and directory entries confined to the
+//! scratch directory.
 //!
 //! # Placement
 //!
@@ -18,14 +24,15 @@
 //!
 //! The copy holds:
 //!
-//! - `yarn.lock`, `.env.yarn`, and the `.yarn/releases` and `.yarn/patches` folders;
+//! - `yarn.lock`, and for a Berry lock `.env.yarn` and the `.yarn/releases` and `.yarn/patches`
+//!   folders;
 //! - every `package.json` below the project outside `node_modules`, `.git`, and `.yarn`, a superset
 //!   of the manifests Yarn's workspace glob reads, and the symbolic links that glob follows;
 //! - each `file:` folder whole, since Yarn archives it and hashes the archive into the lock, and
 //!   each `file:` archive;
 //! - the manifest of each `portal:` and `link:` target;
 //! - each patch file a `patch:` range names;
-//! - each `yarnPath` a copied rc file names by a relative path.
+//! - each `yarnPath` a copied Berry rc file names by a relative path.
 //!
 //! Local references are followed from every copied manifest, those of `file:`, `portal:`, and
 //! `link:` targets included.
@@ -56,6 +63,8 @@
 //! The [`InputDigest`] covers every entry of the copy, with the bytes and permissions written,
 //! and every input read in place, absent ones included, so planning again after verification
 //! tells whether any input changed or appeared.
+//! The run's trace records every input but the rc files, which may hold registry credentials and
+//! are recorded by length and digest alone.
 
 mod planner;
 #[cfg(test)]
@@ -64,10 +73,11 @@ mod tests;
 use crate::manifest::display_rel;
 use crate::manifest::workspaces::YarnEnvironment;
 use camino::{Utf8Path, Utf8PathBuf};
+use cooldown_core::trace::{ArtifactSource, EvidenceInput, InputRole};
 use cooldown_core::{CoreError, Result};
 use planner::{Planner, canonical};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A SHA-256 digest of every input a verification copied or read in place.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +130,8 @@ pub(super) struct Plan {
     entries: BTreeMap<Utf8PathBuf, Entry>,
     /// The files Yarn reads in place in both runs, which the digest covers where they are.
     in_place: BTreeMap<Utf8PathBuf, InPlace>,
+    /// Every rc file planning read, copied or in place, which may hold registry credentials.
+    rc_files: BTreeSet<Utf8PathBuf>,
 }
 
 /// One entry of the copy.
@@ -247,8 +259,9 @@ pub(super) fn plan(
 }
 
 impl Plan {
-    pub(super) fn evidence_paths(&self) -> Vec<Utf8PathBuf> {
-        let mut paths: std::collections::BTreeSet<_> = self.in_place.keys().cloned().collect();
+    /// Every file the copy holds or Yarn reads in place, an rc file in the credentials role.
+    pub(super) fn evidence_inputs(&self) -> Vec<EvidenceInput> {
+        let mut paths: BTreeSet<_> = self.in_place.keys().cloned().collect();
         for entry in self.entries.values() {
             match entry {
                 Entry::File { source } | Entry::Screened { source, .. } => {
@@ -257,21 +270,56 @@ impl Plan {
                 Entry::Directory { .. } | Entry::Link { .. } => {}
             }
         }
-        paths.into_iter().collect()
+        paths
+            .into_iter()
+            .map(|path| EvidenceInput {
+                role: self.role(&path),
+                path,
+            })
+            .collect()
+    }
+
+    /// The trace role of the input at `path`.
+    fn role(&self, path: &Utf8Path) -> InputRole {
+        if self.rc_files.contains(path) {
+            InputRole::Credentials
+        } else {
+            InputRole::ResolverInput
+        }
+    }
+
+    /// Records `bytes`, read from `path`, in the trace: an rc file, which may hold registry
+    /// credentials, by length and digest alone.
+    fn trace(&self, path: &Utf8Path, bytes: &[u8]) {
+        let role = self.role(path);
+        let source = ArtifactSource::File {
+            path: path.as_str(),
+            role,
+        };
+        match role {
+            InputRole::Credentials => cooldown_core::trace::summarized_artifact(source, bytes),
+            _ => cooldown_core::trace::artifact(source, bytes),
+        }
     }
 
     /// The source of every file and directory the copy holds, in the copy's order, an empty
-    /// directory of a `file:` folder included.
+    /// directory of a `file:` folder included, then every rc file Yarn reads in place.
+    ///
+    /// A preview copy holding them sees the rc files above the project that the project itself
+    /// has, which its own copy would otherwise read from wherever the preview copy lies.
     pub(super) fn copied_sources(&self) -> Vec<Utf8PathBuf> {
-        self.entries
-            .values()
-            .filter_map(|entry| match entry {
-                Entry::File { source }
-                | Entry::Screened { source, .. }
-                | Entry::Directory { source } => Some(source.clone()),
-                Entry::Link { .. } => None,
-            })
-            .collect()
+        let copied = self.entries.values().filter_map(|entry| match entry {
+            Entry::File { source }
+            | Entry::Screened { source, .. }
+            | Entry::Directory { source } => Some(source.clone()),
+            Entry::Link { .. } => None,
+        });
+        let read_in_place = self
+            .in_place
+            .iter()
+            .filter(|(_, read)| matches!(read, InPlace::Screened(Some(_))))
+            .map(|(path, _)| path.clone());
+        copied.chain(read_in_place).collect()
     }
 
     /// The digest the copy would have if it were written now, or `None` when a screened input
@@ -295,16 +343,18 @@ impl Plan {
     /// Returns [`CoreError::Filesystem`] when an input cannot be read or the copy written.
     pub(super) fn materialize(self) -> Result<Materialized> {
         std::fs::create_dir_all(&self.base).map_err(|err| filesystem(&self.base, &err))?;
-        let scratch = Scratch {
-            directory: tempfile::Builder::new()
-                .prefix("cooldown-yarn-")
-                .tempdir_in(&self.base)
-                .map_err(|err| filesystem(&self.base, &err))?,
-        };
-        let anchor = match canonical(scratch.path()) {
+        let directory = tempfile::Builder::new()
+            .prefix("cooldown-yarn-")
+            .tempdir_in(&self.base)
+            .map_err(|err| filesystem(&self.base, &err))?;
+        let anchor = match canonical(directory.path()) {
             Ok(anchor) => anchor,
             Err(Refusal::Decline(reason)) => return Ok(Materialized::Declined(reason)),
             Err(Refusal::Error(err)) => return Err(err),
+        };
+        let scratch = Scratch {
+            directory,
+            root: anchor.clone(),
         };
         if anchor.starts_with(&self.root)
             || self
@@ -366,13 +416,7 @@ impl Plan {
                     if let Some(destination) = &destination {
                         write_file(destination, &bytes, permissions.clone())?;
                     }
-                    cooldown_core::trace::artifact(
-                        cooldown_core::trace::ArtifactSource::File {
-                            path: source.as_str(),
-                            role: cooldown_core::trace::InputRole::ResolverInput,
-                        },
-                        &bytes,
-                    );
+                    self.trace(source, &bytes);
                     digest.record(Record::File(mode(&permissions)), relative, &bytes);
                 }
                 Entry::Screened { source, bytes } => {
@@ -383,13 +427,7 @@ impl Plan {
                     if let Some(destination) = &destination {
                         write_file(destination, bytes, permissions.clone())?;
                     }
-                    cooldown_core::trace::artifact(
-                        cooldown_core::trace::ArtifactSource::File {
-                            path: source.as_str(),
-                            role: cooldown_core::trace::InputRole::ResolverInput,
-                        },
-                        bytes,
-                    );
+                    self.trace(source, bytes);
                     digest.record(Record::File(mode(&permissions)), relative, bytes);
                 }
                 Entry::Link { target, directory } => {
@@ -417,13 +455,7 @@ impl Plan {
             }
             match bytes {
                 Some(bytes) => {
-                    cooldown_core::trace::artifact(
-                        cooldown_core::trace::ArtifactSource::File {
-                            path: path.as_str(),
-                            role: cooldown_core::trace::InputRole::ResolverInput,
-                        },
-                        &bytes,
-                    );
+                    self.trace(path, &bytes);
                     digest.record(Record::InPlace, path, &bytes);
                 }
                 None => digest.record(Record::Absent, path, &[]),
@@ -454,11 +486,14 @@ struct Permitted {
 #[derive(Debug)]
 pub(super) struct Scratch {
     directory: tempfile::TempDir,
+    /// The directory's canonical path.
+    root: Utf8PathBuf,
 }
 
 impl Scratch {
-    pub(super) fn path(&self) -> &std::path::Path {
-        self.directory.path()
+    /// The directory's canonical path, below which the copy and Yarn's output lie.
+    pub(super) fn root(&self) -> &Utf8Path {
+        &self.root
     }
 }
 

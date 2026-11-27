@@ -212,6 +212,61 @@ fn ancestor_rc_files_are_mirrored_below_the_home_directory() -> eyre::Result<()>
     Ok(())
 }
 
+/// A Yarn Classic lock's copy holds Yarn Classic's inputs instead: each `.yarnrc` and `.npmrc`
+/// between the home directory and the project is mirrored, and the home directory's are read in
+/// place, but nothing of Berry's own, its environment file or its `.yarn` folder, not even the
+/// release a `yarn-path` names, which a landing ignores.
+#[test]
+fn a_classic_lock_copies_only_yarn_classics_inputs() -> eyre::Result<()> {
+    let world = new_world()?;
+    let root = world.home.join("work/project");
+    write(
+        &root.join("package.json"),
+        r#"{ "dependencies": { "chalk": "^4.0.0" } }"#,
+    )?;
+    write(
+        &root.join("yarn.lock"),
+        indoc::indoc! {r#"
+            # yarn lockfile v1
+
+
+            chalk@^4.0.0:
+              version "4.1.2"
+        "#},
+    )?;
+    write(
+        &root.join(".yarnrc"),
+        "yarn-path \".yarn/releases/yarn-1.22.22.js\"\n",
+    )?;
+    write(&root.join(".yarn/releases/yarn-1.22.22.js"), "// yarn")?;
+    write(&root.join(".yarn/patches/chalk.patch"), "--- a\n")?;
+    write(&root.join(".env.yarn"), "YARN_ENABLE_TELEMETRY=0\n")?;
+    write(
+        &world.home.join("work/.npmrc"),
+        "@corp:registry=https://npm.corp.example\n",
+    )?;
+    write(&world.home.join(".npmrc"), "always-auth=true\n")?;
+
+    let plan = world.ready(&root)?;
+
+    for mirrored in ["work/project/.yarnrc", "work/.npmrc"] {
+        assert!(
+            plan.entries.contains_key(Utf8Path::new(mirrored)),
+            "{mirrored} missing from {:?}",
+            plan.entries.keys()
+        );
+    }
+    assert!(plan.in_place.contains_key(&world.home.join(".npmrc")));
+    for berry in [
+        ".env.yarn",
+        ".yarn/patches/chalk.patch",
+        ".yarn/releases/yarn-1.22.22.js",
+    ] {
+        assert!(!staged(&plan).contains(berry), "{berry} was copied");
+    }
+    Ok(())
+}
+
 /// Outside the home directory, an rc file in a directory the scratch base shares is read in
 /// place, and one in a directory only the project has is mirrored.
 #[test]
@@ -232,6 +287,11 @@ fn ancestor_rc_files_are_shared_or_mirrored_outside_the_home_directory() -> eyre
         plan.entries.keys()
     );
     assert!(plan.in_place.contains_key(&world.top.join(".yarnrc.yml")));
+    // A preview copy holds the shared one too, so it reads the same rc files above the project.
+    assert!(
+        plan.copied_sources()
+            .contains(&world.top.join(".yarnrc.yml"))
+    );
     Ok(())
 }
 
@@ -775,7 +835,7 @@ fn the_copy_and_its_digest_cover_every_input() -> eyre::Result<()> {
     assert_eq!(seen.len(), 3);
 
     // Dropping the copy deletes it.
-    let scratch = staged.scratch.path().to_path_buf();
+    let scratch = staged.scratch.root().to_path_buf();
     drop(staged);
     assert!(!scratch.exists());
     Ok(())
@@ -904,7 +964,7 @@ fn a_folder_keeps_its_permissions_and_they_are_digested() -> eyre::Result<()> {
             & 0o777,
         0o500
     );
-    let scratch = read_only.scratch.path().to_path_buf();
+    let scratch = read_only.scratch.root().to_path_buf();
     drop(read_only);
     assert!(!scratch.exists());
     set(&root.join("local/lib"), 0o755)?;

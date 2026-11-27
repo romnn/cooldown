@@ -390,6 +390,32 @@ async fn a_malformed_lock_is_unreadable() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A Classic lock is no lock a Berry verification judges, so it is unreadable before any copy or
+/// Yarn runs.
+#[tokio::test]
+async fn a_classic_lock_is_never_verified_as_berry() -> eyre::Result<()> {
+    let fixture = new_fixture()?;
+    write(
+        &fixture.project.root.join("yarn.lock"),
+        "# yarn lockfile v1\n\n\nchalk@^4.0.0:\n  version \"4.1.2\"\n",
+    )?;
+
+    let verified = fixture.verify(&YARN_4).await;
+
+    let err = verified
+        .err()
+        .ok_or_else(|| eyre::eyre!("the lock is refused"))?;
+    assert!(
+        matches!(
+            err.downcast_ref::<CoreError>(),
+            Some(CoreError::LockUnreadable(detail)) if detail.contains("no Yarn Berry lock")
+        ),
+        "{err:?}"
+    );
+    assert_eq!(fixture.log(), Vec::<String>::new());
+    Ok(())
+}
+
 /// Every path, kind, mode, content, and link target below `root`.
 fn snapshot(root: &Utf8Path) -> eyre::Result<BTreeMap<String, String>> {
     use std::os::unix::fs::PermissionsExt as _;

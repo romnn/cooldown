@@ -116,6 +116,22 @@ impl NodeCmd {
         args: &[String],
         overrides: &[EnvOverride],
     ) -> Result<std::process::Output> {
+        let mut command = self.command(dir, args, overrides);
+        supervised_output(&mut command, &self.bin, || {
+            format!("{} {}", self.bin, args.join(" "))
+        })
+        .await
+    }
+
+    /// The command that runs the driver in `dir` with `args` and `overrides`, as
+    /// [`output_overriding`](Self::output_overriding) runs it, for a caller that adjusts it before
+    /// running it.
+    pub(crate) fn command(
+        &self,
+        dir: &Utf8Path,
+        args: &[String],
+        overrides: &[EnvOverride],
+    ) -> Command {
         let names: Vec<&str> = self
             .env
             .iter()
@@ -135,10 +151,7 @@ impl NodeCmd {
                     .map(|EnvOverride { name, value }| (name, value)),
             )
             .current_dir(dir.as_std_path());
-        supervised_output(&mut command, &self.bin, || {
-            format!("{} {}", self.bin, args.join(" "))
-        })
-        .await
+        command
     }
 
     async fn checked_output(

@@ -42,7 +42,7 @@ impl CandidateCommand for NodeCmd {
 /// How the per-package apply runs each candidate's landing transaction.
 ///
 /// [`NodeCmd`] runs the transaction [`candidate_landing`] planned with the manager's own commands.
-/// A manager whose exact landing needs more than commands in the project, such as Yarn Berry's
+/// A manager whose exact landing needs more than commands in the project, such as either Yarn's
 /// descriptor seeding ([`CandidateLanding::Seeded`]), brings its own runner.
 #[async_trait]
 pub(crate) trait CandidateRunner: Send + Sync {
@@ -820,6 +820,11 @@ mod tests {
         );
         assert_eq!(crate::lock::Yarn::relock_args(None), ["install"]);
         assert_eq!(crate::lock::Bun::relock_args(None), ["install"]);
+        // A Yarn Classic build installs the settled lock and refuses to rewrite it.
+        assert_eq!(
+            crate::lock::Yarn::build_args(None),
+            ["install", "--frozen-lockfile"]
+        );
     }
 
     #[test]

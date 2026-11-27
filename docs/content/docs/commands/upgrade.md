@@ -69,6 +69,20 @@ to a Berry Yarn either, since that Yarn's first install would migrate the lock: 
 `packageManager` declares Yarn 2 or later, or `yarn --version` in the project reports it, through
 a `yarnPath` or Corepack, the run refuses the project and says what to do instead.
 
+On Yarn Classic (v1), `upgrade` and `fix` land each target exactly on Linux, in a throwaway copy of
+the project: Yarn installs there with the target pinned, the lock's own selectors are bound to the
+entry it recorded, and a second install settles what the target requires, after which only
+`yarn.lock` is written back. Every Yarn process runs the Yarn Classic cooldown found, whatever a
+`yarn-path` names, with lifecycle scripts off, and Linux Landlock (ABI 3, Linux 6.2 or later)
+confines what it writes, file contents and directory entries though not metadata such as
+permissions, to the copy, Yarn's default cache folder (unless that lies in the project), and the
+devices Node opens. A setting that sends such a write elsewhere, such as a modules folder or an
+offline mirror, fails the landing with Yarn's own message, and one that keeps Yarn from writing
+the lock, such as `pure-lockfile`, publishes nothing. On macOS, Windows, a kernel without
+Landlock, or while `YARN_CONFIG` is set, `upgrade`, `fix`, and `outdated` hold Yarn Classic rows
+as `not_eligible` before Yarn runs. `--build` runs `yarn install --frozen-lockfile`, which a
+`no-lockfile` setting makes ignore the lock.
+
 A package declared in several install fields of one manifest (npm family: `dependencies` beside
 `devDependencies` or `optionalDependencies`) is judged by every declaration, not the first: the
 target must sit inside each range, and the strictest explicit bound across them caps it. On npm,
@@ -92,7 +106,8 @@ The lock-only default is honored where the tool can pin an exact in-range versio
 | cargo | `update --precise` | lock-only |
 | uv | `lock --upgrade-package` | lock-only |
 | pnpm | `update --no-save` | lock-only |
-| npm, yarn (Classic), bun | *(no such command)* | always rewrites the manifest |
+| yarn (Classic) | selector seeding in a confined copy, Linux only | lock-only |
+| npm, bun | *(no such command)* | always rewrites the manifest |
 | Go | `go.mod` *is* the version source | always rewrites the manifest |
 
 Cargo resolver and edge-normalization trials run in an isolated project copy. Cooldown compares the

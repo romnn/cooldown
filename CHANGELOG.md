@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **On Linux, Yarn Classic `upgrade` and `fix` land exactly the planned versions, resolved in a
+  scratch copy whose writes Landlock confines, and change only `yarn.lock` for a move within the
+  declared range.** Elsewhere they hold Yarn Classic rows as `not_eligible`, and `--build` now runs
+  `yarn install --frozen-lockfile`.
 - **`upgrade` and `outdated` name the dependency that holds a transitive back.** When a
   dependency's requirement admits the locked version but not the newer one, such as bincode's
   `unty = "^0.0.4"`, the row reads `held: bincode requires unty ^0.0.4` and `outdated` shows it

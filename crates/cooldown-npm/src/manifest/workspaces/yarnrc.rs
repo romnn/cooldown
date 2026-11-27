@@ -34,6 +34,9 @@ pub(crate) struct YarnEnvironment {
     /// The user's home directory, whose rc file Yarn reads too, or `None` when none is
     /// established ([`home_directory`]).
     pub(crate) home: Option<Utf8PathBuf>,
+    /// `XDG_CACHE_HOME` when it is set, where Yarn Classic keeps its cache on Linux in place of
+    /// `~/.cache`.
+    pub(crate) xdg_cache_home: Option<Utf8PathBuf>,
     /// `YARN_RC_FILENAME`: the rc file name Yarn reads in place of `.yarnrc.yml`.
     pub(crate) rc_filename: Option<String>,
     /// Every `YARN_PLUGINS` value: `;`-separated plugin files Yarn loads.
@@ -60,8 +63,13 @@ impl YarnEnvironment {
             |name: &str| std::env::var_os(name),
             std::env::home_dir,
         );
+        let xdg_cache_home = std::env::var("XDG_CACHE_HOME")
+            .ok()
+            .filter(|path| !path.is_empty())
+            .map(Utf8PathBuf::from);
         let mut environment = YarnEnvironment {
             home,
+            xdg_cache_home,
             ..YarnEnvironment::default()
         };
         for (key, value) in std::env::vars_os() {

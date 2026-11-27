@@ -20,7 +20,9 @@ uv = "0.11.23"
 go = "1.26.4"
 node = "26.3.1"
 "npm:pnpm" = "11.8.0"
-yarn = "4.18.1"
+# Yarn Berry is the `yarn` on PATH; Yarn Classic, for convergence_yarn_classic, is reached as
+# `yarnpkg`, a name only Yarn Classic installs.
+yarn = ["4.18.1", "1.22.22"]
 python = "3.14.6"
 deno = "2.8.3"
 bun = "1.4.5"

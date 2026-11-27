@@ -23,6 +23,7 @@ mod yarn_berry;
 pub use crate::manifest::workspaces::{WorkspaceDialect, WorkspaceManifests};
 pub use bindings::{BindingContext, CopyBinding};
 pub use yarn::{UnattributedName, Unproven, UnprovenDeclaration, YarnBindings};
+pub(crate) use yarn::{classic_selector, seed as classic_seed};
 
 pub(crate) use pnpm_frozen::strip_ansi;
 pub(crate) use yarn_berry::{
@@ -35,6 +36,17 @@ use serde::Deserialize;
 use serde::de::{Deserializer, IgnoredAny, Visitor};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use yaml::{YamlEntries, parse_lock_yaml};
+
+/// One selector of a lock, with the package and version it binds ([`NodeLock::bindings`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockBinding {
+    /// The selector as the lock keys it (`chalk@^4.0.0`).
+    pub selector: String,
+    /// The package the selector binds.
+    pub name: String,
+    /// The version the selector binds.
+    pub version: String,
+}
 
 /// A manager's refusal of locked versions younger than its native release-age window, as one
 /// failed [`NodeLock::verify_current_args`] run reported it.
@@ -113,8 +125,8 @@ pub trait NodeLock: Send + Sync + 'static {
     /// lock itself, through a runner of its own, rather than through a command
     /// ([`preserving_pin`](NodeLock::preserving_pin) or [`relock_args`](NodeLock::relock_args)).
     ///
-    /// Only Yarn Berry does: it reuses every binding its lock records, so no command lands a
-    /// version below the maximum of a range the lock binds elsewhere.
+    /// Both Yarns do: each reuses every binding its lock records and resolves a range it lacks to
+    /// the range's maximum, so no command lands a version below that maximum.
     /// The landing keeps every declaration that admits the target as it is.
     const SEEDS_EXACT_DESCRIPTORS: bool = false;
 
@@ -124,6 +136,28 @@ pub trait NodeLock: Send + Sync + 'static {
     ///
     /// Returns a [`CoreError`] if the lockfile cannot be parsed.
     fn parse(content: &str) -> Result<Vec<NameVersion>>;
+
+    /// Every selector the lock binds, with the package and version it binds, which a per-package
+    /// apply reports collateral moves by, or `None` for a lock whose moves are read by each
+    /// name's newest copy.
+    ///
+    /// Only Yarn Classic keys its entries by selector, so one range's copy can move while another
+    /// copy of the name stays the newest.
+    #[must_use]
+    fn bindings(_content: &str) -> Option<Vec<LockBinding>> {
+        None
+    }
+
+    /// The lock key of the selector through which `member`'s declaration of `name` binds, for a
+    /// lock that binds by selector ([`bindings`](NodeLock::bindings)), or `None`.
+    #[must_use]
+    fn member_selector(
+        _workspace: &WorkspaceManifests,
+        _member: &str,
+        _name: &str,
+    ) -> Option<String> {
+        None
+    }
 
     /// The workspace member package(s) that declare each dependency, for attributing a dependency
     /// to its source package(s) in reports.
@@ -2356,6 +2390,7 @@ impl NodeLock for Yarn {
     const BIN: &'static str = "yarn";
     const PEER_CONTEXTS_MODELED: bool = false;
     const WORKSPACE_MANIFESTS: Option<WorkspaceDialect> = Some(WorkspaceDialect::Classic);
+    const SEEDS_EXACT_DESCRIPTORS: bool = true;
 
     fn parse(content: &str) -> Result<Vec<NameVersion>> {
         // A Berry lock shares the file name but none of the Classic grammar, so the Classic
@@ -2388,6 +2423,14 @@ impl NodeLock for Yarn {
         yarn::graph::alias_only_versions(content)
     }
 
+    fn bindings(content: &str) -> Option<Vec<LockBinding>> {
+        yarn::graph::bindings(content)
+    }
+
+    fn member_selector(workspace: &WorkspaceManifests, member: &str, name: &str) -> Option<String> {
+        classic_selector(workspace, member, name).map(|selector| format!("{name}@{selector}"))
+    }
+
     fn member_paths_in(_content: &str, workspace: Option<&WorkspaceManifests>) -> HashSet<String> {
         workspace
             .map(WorkspaceManifests::member_paths)
@@ -2418,8 +2461,12 @@ impl NodeLock for Yarn {
         vec!["install".into()]
     }
 
+    /// The build installs the lock the run settled, which `--frozen-lockfile` refuses to rewrite.
+    ///
+    /// A `no-lockfile` setting in the user's configuration still makes it install without reading
+    /// the lock at all.
     fn build_args(_before: Option<&str>) -> Vec<String> {
-        vec!["install".into()]
+        vec!["install".into(), "--frozen-lockfile".into()]
     }
 }
 

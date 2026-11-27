@@ -193,6 +193,100 @@ fn baseline_binds_the_exact_native_graph_and_preserves_input_bytes() -> eyre::Re
     Ok(())
 }
 
+/// A token in the home directory's `.npmrc` never reaches the trace, neither through the run's
+/// evidence nor through the copy a Yarn Classic landing resolves in, which reads that file in
+/// place: the trace records the file by its length and digest alone.
+///
+/// Only Linux lands a Yarn Classic version, and so copies the project.
+#[cfg(target_os = "linux")]
+#[test]
+fn rc_file_credentials_never_reach_the_trace() -> eyre::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    const TOKEN: &str = "cooldown-trace-secret";
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    let project = home.join("project");
+    std::fs::create_dir_all(project.join(".git"))?;
+    // The copy's scratch directory lies below the home directory, as the project does.
+    std::fs::create_dir_all(home.join("tmp"))?;
+    let npmrc = home.join(".npmrc");
+    std::fs::write(
+        &npmrc,
+        format!("//registry.npmjs.org/:_authToken={TOKEN}\n"),
+    )?;
+    std::fs::write(
+        project.join("package.json"),
+        r#"{"name":"sample","version":"1.0.0","dependencies":{"dep":"^1.0.0"}}"#,
+    )?;
+    std::fs::write(
+        project.join("yarn.lock"),
+        indoc! {r#"
+            # yarn lockfile v1
+
+
+            dep@^1.0.0:
+              version "1.0.0"
+              resolved "https://registry.yarnpkg.com/dep/-/dep-1.0.0.tgz"
+        "#},
+    )?;
+    cooldown_registry::cache::write_entry(
+        &root.path().join("cache").join("cooldown"),
+        &cooldown_registry::cache::CacheEntry {
+            url: "https://registry.npmjs.org/dep".into(),
+            fetched_at: jiff::Timestamp::now().to_string(),
+            etag: None,
+            status: 200,
+            body: dep_document(),
+            request_body: None,
+        },
+    )?;
+    // A Yarn Classic whose installs fail, so the landing copies the project and lands nothing.
+    let yarn = root.path().join("yarn");
+    std::fs::write(
+        &yarn,
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 1.22.22; exit 0; fi\nexit 1\n",
+    )?;
+    std::fs::set_permissions(&yarn, std::fs::Permissions::from_mode(0o755))?;
+    let config = root.path().join("config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cooldown"))
+        .current_dir(&project)
+        .env_remove("COOLDOWN_NO_TRACE")
+        .env_remove("COOLDOWN_TRACE_DIR")
+        .env_remove("COOLDOWN_FULL_TRACE")
+        .env("XDG_CONFIG_HOME", &config)
+        .env("XDG_CACHE_HOME", root.path().join("cache"))
+        .env("HOME", &home)
+        .env("TMPDIR", home.join("tmp"))
+        .env("COOLDOWN_YARN", &yarn)
+        .args([
+            "upgrade",
+            "--offline",
+            "--no-advisories",
+            "--json",
+            "--no-progress",
+        ])
+        .output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Yarn refused the landing"), "{output:?}");
+    let files = traces(&config)?;
+    let file = files.first().ok_or_else(|| eyre::eyre!("missing trace"))?;
+    let events = records(file)?;
+    for record in &events {
+        assert!(!record.to_string().contains(TOKEN), "{record}");
+    }
+    let npmrc = npmrc.to_string_lossy();
+    assert!(
+        events.iter().any(|record| {
+            record["event"]["kind"] == "artifact_summary"
+                && record["event"]["source"]["path"] == *npmrc
+        }),
+        "the .npmrc is recorded by its digest"
+    );
+    Ok(())
+}
+
 /// The cached npm package document of the offline evaluation's dependency, with three releases.
 fn dep_document() -> String {
     serde_json::json!({
