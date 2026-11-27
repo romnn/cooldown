@@ -24,7 +24,9 @@ use std::time::Instant;
 /// Version 4 records a decoded npm package document in a compact trace as an `artifact_summary`.
 /// Version 5 records a compact evaluation's member list as a `member_set` named by
 /// `dependency.memberSet`, and an identical `policy_resolved` once.
-const SCHEMA_VERSION: u32 = 5;
+/// Version 6 records an input that may hold credentials, of the `credentials` role, as an
+/// `artifact_summary`.
+const SCHEMA_VERSION: u32 = 6;
 /// The oldest schema whose files this producer still recognizes as its own, so pruning keeps
 /// removing traces written before the current version.
 const OLDEST_OWNED_SCHEMA_VERSION: u32 = 1;

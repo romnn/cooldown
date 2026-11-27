@@ -626,7 +626,7 @@ const SIBLING_PIN_LOCK: &str = indoc! {r#"
 /// excluded-to-be member `packages/a` (`pkg-a`) declares `pinned` at the same caret beside an
 /// exact dev pin, which Yarn normalizes to the caret, driven by a scripted `yarn install`.
 ///
-/// The script lands each widened root caret at 1.1.0 under its rewritten descriptor.
+/// The script lands each root caret at 1.1.0 under its own descriptor.
 /// Landing `second` also moves the shared `pinned@^1.0.0` entry to 1.1.0, the synthetic stand-in
 /// for a resolve that re-resolves a sibling's caret, so `pkg-a`'s dev pin no longer holds.
 #[cfg(unix)]
@@ -659,17 +659,18 @@ fn yarn_sibling_pin_fixture(root: &Utf8Path) -> eyre::Result<(tempfile::TempDir,
     scripted_yarn(
         root,
         indoc! {r#"
-            if grep -q '"first": "^1.1.0"' package.json; then land first 1.0.0 1.1.0; fi
-            if grep -q '"second": "^1.1.0"' package.json; then
-              land second 1.0.0 1.1.0
+            if [ "$2" = first ]; then move first 1.0.0 1.1.0; fi
+            if [ "$2" = second ]; then
+              move second 1.0.0 1.1.0
               move pinned 1.0.0 1.1.0
             fi
         "#},
     )
 }
 
-/// The tool driving a scripted `yarn` at `root` whose `install` runs `on_install`, a shell snippet
-/// rewriting `yarn.lock` the way a resolve would.
+/// The tool driving a scripted `yarn` at `root` whose `install <name>`, run by
+/// [`ScriptedLanding`] for the candidate `name`, runs `on_install`, a shell snippet rewriting
+/// `yarn.lock` the way a landing would.
 ///
 /// The snippet's `move <name> <from> <to>` moves the entry of `name` at `from` to `to`, and
 /// `land <name> <from> <to>` also moves its `^<from>` descriptor to `^<to>`, the key a widened
@@ -695,7 +696,7 @@ fn scripted_yarn(
                 move "$1" "$2" "$3"
                 sed -e "s|^$1@^$2:|$1@^$3:|" yarn.lock > yarn.next && mv yarn.next yarn.lock
             }}
-            case "$*" in
+            case "$1" in
               install)
             {on_install}
                 exit 0 ;;
@@ -709,9 +710,34 @@ fn scripted_yarn(
     Ok((cache, tool))
 }
 
+/// A landing that runs the scripted `yarn install <name>` in the project itself, standing in for
+/// the seeded landing Yarn Classic runs in a copy, so the guards on the settled lock are judged
+/// whatever the landing did.
+#[cfg(unix)]
+struct ScriptedLanding<'a> {
+    cmd: &'a crate::nodecmd::NodeCmd,
+}
+
+#[cfg(unix)]
+#[async_trait]
+impl CandidateRunner for ScriptedLanding<'_> {
+    async fn land(
+        &self,
+        project: &Project,
+        change: &Change,
+        candidate_journal: &ProjectMutationJournal,
+        _landing: &CandidateLanding,
+        _authorized: &ProjectMutationState,
+    ) -> Result<OwnedStep> {
+        let args = ["install".to_string(), change.package.name.clone()];
+        let result = self.cmd.run(&project.root, &args).await;
+        OwnedStep::capture(result, candidate_journal)
+    }
+}
+
 /// Yarn lands candidates one at a time, judging each against the state the earlier landings left:
-/// the first lands under its rewritten selector, while the second's install moves an excluded
-/// member's hidden pin, absent from the plan, and alone is rolled back.
+/// the first lands under its own selector, while the second's install moves an excluded member's
+/// hidden pin, absent from the plan, and alone is rolled back.
 #[cfg(unix)]
 #[tokio::test]
 async fn yarn_rolls_back_only_the_candidate_that_moves_an_excluded_members_pin() -> eyre::Result<()>
@@ -731,7 +757,8 @@ async fn yarn_rolls_back_only_the_candidate_that_moves_an_excluded_members_pin()
     };
 
     let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
-    let report = tool.apply(&mutation).await?;
+    let landing = ScriptedLanding { cmd: &tool.cmd };
+    let report = tool.apply_with_runner(&mutation, &landing).await?;
 
     // The accepted candidate stays applied.
     assert_eq!(
@@ -757,12 +784,12 @@ async fn yarn_rolls_back_only_the_candidate_that_moves_an_excluded_members_pin()
         )
     );
 
-    // The lock and manifests are the first candidate's post-state: the shared `pinned` entry and
-    // the second caret are restored.
+    // The lock is the first candidate's post-state, the shared `pinned` entry restored, and the
+    // in-range landings left the manifest as it was.
     let first_landed = SIBLING_PIN_LOCK
         .replace(
             "first@^1.0.0:\n  version \"1.0.0\"",
-            "first@^1.1.0:\n  version \"1.1.0\"",
+            "first@^1.0.0:\n  version \"1.1.0\"",
         )
         .replace("/first-1.0.0.tgz", "/first-1.1.0.tgz");
     assert_eq!(
@@ -770,8 +797,86 @@ async fn yarn_rolls_back_only_the_candidate_that_moves_an_excluded_members_pin()
         first_landed
     );
     let declared = std::fs::read_to_string(project.root.join("package.json"))?;
-    assert!(declared.contains(r#""first": "^1.1.0""#), "{declared}");
+    assert!(declared.contains(r#""first": "^1.0.0""#), "{declared}");
     assert!(declared.contains(r#""second": "^1.0.0""#), "{declared}");
+    Ok(())
+}
+
+/// A landing whose install succeeds without binding the target is the resolver's rejection,
+/// naming the binding the member's own selector moved to and none of the name's other copies.
+#[cfg(unix)]
+#[tokio::test]
+async fn yarn_an_unreached_target_names_only_the_members_own_binding() -> eyre::Result<()> {
+    let TempProject { _guard, project } = yarn_project(&[])?;
+    yarn_sibling_pin_fixture(&project.root)?;
+    let other_copy = indoc! {r#"
+        first@^2.0.0:
+          version "2.0.0"
+          resolved "https://registry.yarnpkg.com/first/-/first-2.0.0.tgz"
+
+        pinned@^1.0.0:"#};
+    std::fs::write(
+        project.root.join("yarn.lock"),
+        SIBLING_PIN_LOCK.replace("pinned@^1.0.0:", other_copy),
+    )?;
+    let (_cache, tool) = scripted_yarn(
+        &project.root,
+        r#"if [ "$2" = first ]; then move first 1.0.0 1.2.0; fi"#,
+    )?;
+    let plan = Plan {
+        changes: vec![yarn_change("first", "1.0.0", "1.1.0", &[("app", ".")])],
+        ..Plan::default()
+    };
+
+    let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
+    let landing = ScriptedLanding { cmd: &tool.cmd };
+    let report = tool.apply_with_runner(&mutation, &landing).await?;
+
+    let [skip] = report.skipped.as_slice() else {
+        eyre::bail!("one rejected candidate: {report:?}")
+    };
+    assert_eq!(skip.reason, SkipReason::ResolverConflict);
+    assert_eq!(
+        skip.detail.as_deref(),
+        Some("requested 1.1.0 did not land: the root binds first 1.2.0")
+    );
+    Ok(())
+}
+
+/// A target outside the declared range is judged under the manifest the landing widened: the
+/// root's `^1.0.0`, rewritten to `^2.0.0`, binds 2.1.0, which the detail names.
+#[cfg(unix)]
+#[tokio::test]
+async fn yarn_an_unreached_widened_target_names_the_widened_binding() -> eyre::Result<()> {
+    let TempProject { _guard, project } = yarn_project(&[])?;
+    yarn_sibling_pin_fixture(&project.root)?;
+    let (_cache, tool) = scripted_yarn(
+        &project.root,
+        indoc! {r#"
+            if [ "$2" = first ]; then
+              move first 1.0.0 2.1.0
+              sed -e "s|^first@^1.0.0:|first@^2.0.0:|" yarn.lock > yarn.next && mv yarn.next yarn.lock
+            fi
+        "#},
+    )?;
+    let mut change = yarn_change("first", "1.0.0", "2.0.0", &[("app", ".")]);
+    change.kind = cooldown_core::UpdateKind::Major;
+    let plan = Plan {
+        changes: vec![change],
+        ..Plan::default()
+    };
+
+    let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
+    let landing = ScriptedLanding { cmd: &tool.cmd };
+    let report = tool.apply_with_runner(&mutation, &landing).await?;
+
+    let [skip] = report.skipped.as_slice() else {
+        eyre::bail!("one rejected candidate: {report:?}")
+    };
+    assert_eq!(
+        skip.detail.as_deref(),
+        Some("requested 2.0.0 did not land: the root binds first 2.1.0")
+    );
     Ok(())
 }
 
@@ -816,9 +921,9 @@ async fn yarn_protects_an_exact_self_alias_pin() -> eyre::Result<()> {
     let (_cache, tool) = scripted_yarn(
         &project.root,
         indoc! {r#"
-            if grep -q '"first": "^1.1.0"' package.json; then land first 1.0.0 1.1.0; fi
-            if grep -q '"second": "^1.1.0"' package.json; then
-              land second 1.0.0 1.1.0
+            if [ "$2" = first ]; then move first 1.0.0 1.1.0; fi
+            if [ "$2" = second ]; then
+              move second 1.0.0 1.1.0
               sed -e '/^"pinned@/,/^$/s|version "1.0.0"|version "1.1.0"|' \
                   -e 's|/pinned-1.0.0.tgz|/pinned-1.1.0.tgz|' \
                 yarn.lock > yarn.next && mv yarn.next yarn.lock
@@ -834,7 +939,8 @@ async fn yarn_protects_an_exact_self_alias_pin() -> eyre::Result<()> {
     };
 
     let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
-    let report = tool.apply(&mutation).await?;
+    let landing = ScriptedLanding { cmd: &tool.cmd };
+    let report = tool.apply_with_runner(&mutation, &landing).await?;
 
     // The first candidate leaves the self-alias's copy alone and stays applied.
     assert_eq!(
@@ -902,12 +1008,12 @@ async fn yarn_keeps_an_earlier_authorized_rewrite_protected() -> eyre::Result<()
     let (_cache, tool) = scripted_yarn(
         &project.root,
         indoc! {r#"
-            if grep -q '"own": "^1.1.0"' package.json; then
+            if [ "$2" = own ]; then
               move own 1.0.0 1.1.0
               sed -e "s|^own@1.0.0, own@^1.0.0:|own@1.1.0, own@^1.1.0:|" yarn.lock > yarn.next \
                 && mv yarn.next yarn.lock
             fi
-            if grep -q '"second": "^1.1.0"' package.json; then
+            if [ "$2" = second ]; then
               land second 1.0.0 1.1.0
               move own 1.1.0 1.2.0
             fi
@@ -923,7 +1029,8 @@ async fn yarn_keeps_an_earlier_authorized_rewrite_protected() -> eyre::Result<()
     };
 
     let mutation = PreparedMutation::prepare(&tool, &project, &plan).await?;
-    let report = tool.apply(&mutation).await?;
+    let landing = ScriptedLanding { cmd: &tool.cmd };
+    let report = tool.apply_with_runner(&mutation, &landing).await?;
 
     // The rewrite lands under the descriptors it rewrote.
     assert_eq!(

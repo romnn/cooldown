@@ -992,12 +992,17 @@ fn same_name_constraints_split_as_yarn_classic_reads_them() {
     }
 }
 
-/// The tokenizer swallows a blank line after a newline as Yarn's does, and reads `true`, `false`,
-/// and digits as plain values.
+/// The tokenizer swallows a blank line after a newline as Yarn's does, still counting it among the
+/// lines each token starts on, and reads `true`, `false`, and digits as plain values.
 #[test]
 fn the_tokenizer_follows_yarns_cases() {
+    let lexed = tokenize("a:\n\n  b true\n");
     assert_eq!(
-        tokenize("a:\n\n  b true\n"),
+        lexed.as_ref().map(|lexed| &lexed.lines),
+        Some(&vec![0, 0, 0, 2, 2, 2, 2, 3])
+    );
+    assert_eq!(
+        lexed.map(|lexed| lexed.tokens),
         Some(vec![
             Token::Text("a".to_string()),
             Token::Colon,
@@ -1010,12 +1015,12 @@ fn the_tokenizer_follows_yarns_cases() {
         ])
     );
     assert_eq!(
-        tokenize(r#""a\"b" 12"#),
+        tokenize(r#""a\"b" 12"#).map(|lexed| lexed.tokens),
         Some(vec![
             Token::Text("a\"b".to_string()),
             Token::Number,
             Token::Eof
         ])
     );
-    assert_eq!(tokenize("@scope/pkg@1:"), None);
+    assert!(tokenize("@scope/pkg@1:").is_none());
 }

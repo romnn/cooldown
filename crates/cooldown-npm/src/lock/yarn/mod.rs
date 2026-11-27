@@ -27,8 +27,10 @@ use crate::manifest::workspaces::{FieldSpecifier, WorkspaceManifests};
 use crate::version::is_exact_npm_specifier;
 use graph::RegistryReference;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::RangeInclusive;
 
 pub(super) mod graph;
+pub(crate) mod seed;
 
 /// The deepest indentation level the lock reader descends to.
 ///
@@ -498,6 +500,24 @@ impl BindingEvidence<'_> {
     }
 }
 
+/// The selector Yarn Classic requests for member `member`'s install declarations of `name`
+/// ([`effective_selector`]), or `None` when the member declares no install field of it or one
+/// holds no string.
+pub(crate) fn classic_selector<'a>(
+    workspace: &'a WorkspaceManifests,
+    member: &str,
+    name: &str,
+) -> Option<&'a str> {
+    let (_, manifest) = workspace.members().find(|(path, _)| *path == member)?;
+    let install: Vec<&FieldSpecifier> = manifest
+        .declarations
+        .get(name)?
+        .iter()
+        .filter(|declaration| declaration.field != "peerDependencies")
+        .collect();
+    effective_selector(&install)
+}
+
 /// The constraint an install declaration of `dependency` as `specifier` puts on the dependency
 /// itself: the specifier, or the range inside a registry-protocol reference to `dependency`'s own
 /// name (`npm:chalk@1.2.3` for `chalk`).
@@ -654,7 +674,7 @@ impl ClassicLock {
     fn read(content: &str) -> Option<Self> {
         let items = read_items(content)?;
         let mut descriptors: HashMap<String, Option<LockedEntry>> = HashMap::new();
-        for Item { keys, value } in items {
+        for Item { keys, value, .. } in items {
             let entry = match value {
                 Value::Object(fields) => Some(locked_entry(&fields)),
                 Value::Text(_) | Value::Other => None,
@@ -687,9 +707,10 @@ fn read_items(content: &str) -> Option<Vec<Item>> {
     if content.contains("<<<<<<<") && content.contains("=======") && content.contains(">>>>>>>") {
         return None;
     }
-    let tokens = tokenize(&content)?;
+    let Tokens { tokens, lines } = tokenize(&content)?;
     Parser {
         tokens,
+        lines,
         position: 0,
     }
     .parse_object(0)
@@ -703,7 +724,7 @@ fn locked_entry(fields: &[Item]) -> LockedEntry {
         resolved: Field::Absent,
         name: Field::Absent,
     };
-    for Item { keys, value } in fields {
+    for Item { keys, value, .. } in fields {
         let text = match value {
             Value::Text(text) => Field::Text(text.clone()),
             Value::Object(_) | Value::Other => Field::Malformed,
@@ -744,8 +765,10 @@ static END: Token = Token::Eof;
 /// The cases run in Yarn's order: a newline (one or two characters swallowed, as Yarn's `chop`
 /// does), a comment, a space, a quoted string, digits, `true`, `false`, `:`, `,`, and an unquoted
 /// run starting with a letter, `/`, `.`, or `-` that ends at `:`, a space, a newline, or `,`.
-fn tokenize(input: &str) -> Option<Vec<Token>> {
+fn tokenize(input: &str) -> Option<Tokens> {
     let mut tokens = Vec::new();
+    let mut lines = Vec::new();
+    let mut line = 0;
     let mut rest = input;
     let mut after_newline = false;
     while let Some(first) = rest.chars().next() {
@@ -817,10 +840,19 @@ fn tokenize(input: &str) -> Option<Vec<Token>> {
             _ => return None,
         };
         after_newline = first == '\n' || (first == '\r' && second == Some('\n'));
+        lines.resize(tokens.len(), line);
+        line += rest.get(..consumed)?.matches('\n').count();
         rest = rest.get(consumed..)?;
     }
     tokens.push(Token::Eof);
-    Some(tokens)
+    lines.push(line);
+    Some(Tokens { tokens, lines })
+}
+
+/// The tokens of a lock, with the zero-based line each starts on.
+struct Tokens {
+    tokens: Vec<Token>,
+    lines: Vec<usize>,
 }
 
 /// The byte length of the quoted string `rest` starts with, through its closing quote, or all of
@@ -848,6 +880,9 @@ fn quoted_length(rest: &str) -> usize {
 struct Item {
     keys: Vec<String>,
     value: Value,
+    /// The zero-based lines the item spans, from its key line through its value's last line, in
+    /// the lock without its byte-order mark.
+    lines: RangeInclusive<usize>,
 }
 
 /// The value of an [`Item`].
@@ -863,12 +898,19 @@ enum Value {
 /// A port of Yarn's recursive-descent lockfile parser over the tokens of [`tokenize`].
 struct Parser {
     tokens: Vec<Token>,
+    /// The line each token starts on.
+    lines: Vec<usize>,
     position: usize,
 }
 
 impl Parser {
     fn current(&self) -> &Token {
         self.tokens.get(self.position).unwrap_or(&END)
+    }
+
+    /// The line the token at `position` starts on.
+    fn line(&self, position: usize) -> usize {
+        self.lines.get(position).copied().unwrap_or_default()
     }
 
     fn advance(&mut self) {
@@ -903,6 +945,7 @@ impl Parser {
                 }
                 Token::Eof => break,
                 Token::Text(key) => {
+                    let first = self.line(self.position);
                     let mut keys = vec![key.clone()];
                     self.advance();
                     while *self.current() == Token::Comma {
@@ -928,6 +971,7 @@ impl Parser {
                             items.push(Item {
                                 keys,
                                 value: Value::Object(object),
+                                lines: first..=self.line(self.position.saturating_sub(1)),
                             });
                             if indent > 0 && !matches!(self.current(), Token::Indent(_)) {
                                 break;
@@ -936,7 +980,8 @@ impl Parser {
                         }
                         _ => return None,
                     };
-                    items.push(Item { keys, value });
+                    let lines = first..=self.line(self.position);
+                    items.push(Item { keys, value, lines });
                     self.advance();
                 }
                 Token::Number | Token::Boolean | Token::Colon | Token::Comma => return None,

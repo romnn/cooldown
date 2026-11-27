@@ -17,6 +17,8 @@
 //! A mutation starts only from a lock Yarn proves current, so a landing never carries along a
 //! change the manifests made before it, and `sync` writes the project's native age gate
 //! ([`age_gate`]).
+//! A Classic project's `upgrade` and `fix` land each candidate exactly the same way on Linux, in
+//! a copy, by seeding the lock's selectors with Yarn's writes confined ([`classic`]).
 //!
 //! `check` verifies a Berry lock with Yarn itself, in a copy of the project ([`verify`]), and
 //! confirms afterwards that none of the inputs it verified changed while the dependencies were
@@ -25,6 +27,7 @@
 //! the public registry for the package ([`routing`]).
 
 mod age_gate;
+mod classic;
 mod executable;
 mod mutate;
 mod prune;
@@ -102,6 +105,25 @@ impl LockFormat {
     }
 }
 
+/// Confirms the lock at `root` is still of the `judged` format.
+///
+/// # Errors
+///
+/// Returns [`CoreError::LockConflict`] when it is not, leaving it as it is, and
+/// [`CoreError::Filesystem`] when it cannot be read.
+fn confirm_format(root: &Utf8Path, judged: LockFormat) -> Result<()> {
+    let live = LockFormat::on_disk(root)?;
+    if live != judged {
+        return Err(CoreError::LockConflict(format!(
+            "yarn.lock changed from a {judged} to a {live} lockfile before cooldown ran Yarn, so \
+             it was left as it is; re-run once the lock has settled",
+            judged = judged.describe(),
+            live = live.describe()
+        )));
+    }
+    Ok(())
+}
+
 /// The `yarn` driver every Yarn run of the adapter goes through: `cmd` with Corepack's auto-pin
 /// disabled.
 ///
@@ -118,6 +140,9 @@ fn yarn_driver(cmd: NodeCmd) -> NodeCmd {
 /// A Classic lock records no workspace member, so the members come from the root `workspaces`
 /// field and each member's direct dependencies are attributed through the lock entry its own
 /// manifest selector names, which protects its exact manifest pins like npm's (see [`Yarn`]).
+/// On Linux, `upgrade` and `fix` land each candidate exactly by seeding the selectors its members
+/// request, with Yarn's writes confined, and elsewhere hold it; `--build` runs Yarn's frozen
+/// install.
 ///
 /// A Berry lock records its workspaces, so each member's direct dependencies are attributed
 /// through the lock's own record of the member, joined to the member's manifest, and read through
@@ -139,6 +164,9 @@ pub struct YarnTool {
     verify_bases: Vec<Utf8PathBuf>,
     /// The Yarn environment a test verifies under, in place of this process's.
     yarn_environment: Option<YarnEnvironment>,
+    /// Whether a test's Classic landing can confine Yarn's writes, in place of this kernel's
+    /// answer.
+    confinement: Option<std::result::Result<(), String>>,
     /// The digest of the inputs each project root's Berry lock was verified current against,
     /// until [`ToolRead::confirm_verified_inputs`] checks it.
     verified: tokio::sync::Mutex<HashMap<Utf8PathBuf, verify::InputDigest>>,
@@ -168,6 +196,7 @@ impl YarnTool {
             driver: yarn_driver(NodeCmd::new(Yarn::BIN)),
             verify_bases,
             yarn_environment: None,
+            confinement: None,
             verified: tokio::sync::Mutex::new(HashMap::new()),
             routing: tokio::sync::Mutex::new(HashMap::new()),
         }
@@ -216,6 +245,26 @@ impl YarnTool {
             verify_bases: bases,
             ..self
         }
+    }
+
+    /// Lands Classic candidates as if Yarn's writes could be confined only when `confinement`
+    /// says so, so a test reaches the hold every unsupported system takes.
+    #[cfg(all(test, unix))]
+    fn with_confinement(self, confinement: std::result::Result<(), String>) -> Self {
+        YarnTool {
+            confinement: Some(confinement),
+            ..self
+        }
+    }
+
+    /// Why a Classic landing holds every candidate before Yarn runs, or `None` when it lands them
+    /// ([`classic::declined`]).
+    fn classic_declined(&self) -> Option<String> {
+        let confinement = self
+            .confinement
+            .clone()
+            .unwrap_or_else(classic::confinement);
+        classic::declined(&self.yarn_environment(), confinement)
     }
 
     /// The environment Yarn reads its configuration from.
@@ -316,23 +365,23 @@ impl YarnTool {
         // The probe's own refusal waits for that check, because a caller restores the captured
         // lock after a refusal but never after a conflict, and restoring would put the judged
         // Classic lock back over the Berry one.
-        let live = LockFormat::on_disk(root)?;
-        if live != judged {
-            return Err(CoreError::LockConflict(format!(
-                "yarn.lock changed from a {judged} to a {live} lockfile before cooldown ran Yarn, \
-                 so it was left as it is; re-run once the lock has settled",
-                judged = judged.describe(),
-                live = live.describe()
-            )));
-        }
+        confirm_format(root, judged)?;
         probed
     }
 
     /// The backend that may apply `mutation`, judged on the lock its journal captured.
+    ///
+    /// No Yarn runs in the project for a Classic lock, whose landing asks the version itself, in
+    /// its confined copy with `yarnPath` ignored ([`classic`]), so a repository's launcher never
+    /// runs unconfined.
     async fn applying_backend(&self, mutation: &PreparedMutation) -> Result<Admitted> {
         let (project, _, journal) = mutation.parts_for(self)?;
-        self.admitted_backend(&project.root, LockFormat::captured(journal))
-            .await
+        let judged = LockFormat::captured(journal);
+        if judged == LockFormat::Classic {
+            confirm_format(&project.root, judged)?;
+            return executable::ensure_classic_declared(&project.root).map(|()| Admitted::Classic);
+        }
+        self.admitted_backend(&project.root, judged).await
     }
 
     /// Applies `mutation` to a Berry project that Yarn `version` runs, landing each candidate by
@@ -362,6 +411,18 @@ impl YarnTool {
             settings,
         };
         self.berry.apply_with_runner(mutation, &landing).await
+    }
+
+    /// Applies `mutation` to a Classic project, landing each candidate by selector seeding
+    /// ([`classic`]).
+    async fn apply_classic(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
+        let landing = classic::Landing::new(
+            &self.driver,
+            self.verify_context(),
+            self.classic_declined(),
+            mutation.source_root(),
+        );
+        self.classic.apply_with_runner(mutation, &landing).await
     }
 
     /// Verifies that `project`'s Berry lock is current, the state a mutation must start from, and
@@ -408,13 +469,8 @@ enum Admitted {
 impl ToolRead for YarnTool {
     fn evidence(&self, project: &Project) -> Result<cooldown_core::trace::Evidence> {
         let mut evidence = self.classic.evidence(project)?;
-        match verify::evidence_paths(project, &self.verify_context()) {
-            Ok(paths) => evidence.inputs.extend(paths.into_iter().map(|path| {
-                cooldown_core::trace::EvidenceInput {
-                    path,
-                    role: cooldown_core::trace::InputRole::ResolverInput,
-                }
-            })),
+        match verify::evidence_inputs(project, &self.verify_context()) {
+            Ok(inputs) => evidence.inputs.extend(inputs),
             Err(err) => evidence.limitations.push(err.to_string()),
         }
         evidence
@@ -437,11 +493,10 @@ impl ToolRead for YarnTool {
         Ok(evidence)
     }
 
+    /// None: `yarn --version` in a project runs whatever Yarn its `yarnPath` names, which a
+    /// Classic landing runs only confined, so the trace asks no Yarn for its version.
     fn version_command(&self) -> Option<cooldown_core::trace::ToolVersionCommand> {
-        Some(cooldown_core::trace::ToolVersionCommand {
-            program: self.driver.program().to_string(),
-            arguments: vec!["--version".into()],
-        })
+        None
     }
 
     fn id(&self) -> ToolId {
@@ -617,14 +672,18 @@ impl ToolWrite for YarnTool {
         self.classic.target_fallback()
     }
 
-    /// A preview of a Berry mutation runs in a copy that must hold what Yarn reads, so every file a
-    /// verification copies is a root: each `file:` folder's files, which Yarn archives into the
-    /// lock, and the rc files above the project among them.
+    /// A preview of a mutation lands in a copy that must hold what Yarn reads, so every file a
+    /// landing copies is a root, each `file:` folder's files among them, and so is every rc file
+    /// above the project that a landing reads in place.
+    ///
+    /// A Classic landing that holds every candidate copies nothing, so its preview names nothing.
     fn external_resolve_roots(&self, project: &Project) -> Result<Vec<Utf8PathBuf>> {
-        match LockFormat::on_disk(&project.root) {
-            Ok(LockFormat::Berry) => Ok(verify::copied_sources(project, &self.verify_context())),
-            _ => self.classic.external_resolve_roots(project),
+        if LockFormat::on_disk(&project.root)? == LockFormat::Classic
+            && self.classic_declined().is_some()
+        {
+            return Ok(Vec::new());
         }
+        verify::copied_sources(project, &self.verify_context())
     }
 
     /// A Berry mutation with changes to land starts only from a lock Yarn verifies current
@@ -659,7 +718,7 @@ impl ToolWrite for YarnTool {
 
     async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
         match self.applying_backend(mutation).await? {
-            Admitted::Classic => self.classic.apply(mutation).await,
+            Admitted::Classic => self.apply_classic(mutation).await,
             Admitted::Berry(version) => self.apply_berry(mutation, &version).await,
         }
     }
@@ -667,12 +726,10 @@ impl ToolWrite for YarnTool {
     async fn apply_with_observer(
         &self,
         mutation: &PreparedMutation,
-        observer: &dyn ApplyObserver,
+        _observer: &dyn ApplyObserver,
     ) -> Result<ApplyAttempt> {
         let report = match self.applying_backend(mutation).await {
-            Ok(Admitted::Classic) => {
-                return self.classic.apply_with_observer(mutation, observer).await;
-            }
+            Ok(Admitted::Classic) => self.apply_classic(mutation).await,
             Ok(Admitted::Berry(version)) => self.apply_berry(mutation, &version).await,
             // A refused apply wrote nothing, and it reports like any failed apply, with the
             // postimage the caller restores from.

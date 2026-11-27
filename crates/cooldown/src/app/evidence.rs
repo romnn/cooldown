@@ -1,6 +1,6 @@
 use camino::Utf8Path;
 use cooldown_core::trace::{
-    ArtifactOutcome, ArtifactSource, Content, Event, Evidence, SnapshotPhase,
+    ArtifactOutcome, ArtifactSource, Content, Event, Evidence, InputRole, SnapshotPhase,
 };
 use cooldown_core::{Project, ToolRead};
 use std::io::Read as _;
@@ -49,7 +49,10 @@ impl Session {
         }
         .emit();
         for input in &self.evidence.inputs {
-            capture_file(snapshot, &input.path, input.role);
+            match input.role {
+                InputRole::Credentials => summarize_file(&input.path, input.role),
+                _ => capture_file(snapshot, &input.path, input.role),
+            }
         }
         Event::SnapshotFinished { snapshot }.emit();
     }
@@ -61,7 +64,19 @@ impl Drop for Session {
     }
 }
 
-fn capture_file(snapshot: u64, path: &Utf8Path, role: cooldown_core::trace::InputRole) {
+/// Records the length and digest of the input at `path`, which may hold credentials, when it can
+/// be read, and never its bytes.
+fn summarize_file(path: &Utf8Path, role: InputRole) {
+    if let Ok(bytes) = std::fs::read(path) {
+        let source = ArtifactSource::File {
+            path: path.as_str(),
+            role,
+        };
+        cooldown_core::trace::summarized_artifact(source, &bytes);
+    }
+}
+
+fn capture_file(snapshot: u64, path: &Utf8Path, role: InputRole) {
     let artifact = cooldown_core::trace::operation_id();
     let declared = std::fs::metadata(path);
     Event::ArtifactStarted {

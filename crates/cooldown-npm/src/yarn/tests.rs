@@ -391,8 +391,10 @@ mod mutation {
         Ok(())
     }
 
-    /// A Classic lock the project's `yarn` would run as Yarn Berry, here through a `yarnPath`, is
-    /// refused after asking only its version, naming the version and the redirect.
+    /// A Classic lock the project's `yarn` would build as Yarn Berry, here through a `yarnPath`,
+    /// is refused after asking only its version, naming the version and the redirect.
+    ///
+    /// A landing asks no Yarn in the project, only its own confined one (`classic`).
     #[tokio::test]
     async fn a_berry_yarn_is_refused_beside_a_classic_lock() -> eyre::Result<()> {
         let fixture = &yarn_fixtures::PINNED_MEMBERS;
@@ -405,19 +407,14 @@ mod mutation {
         let (_cache, tool) = tool()?;
         let tool = tool.with_driver(script.as_str());
 
-        let mutation = PreparedMutation::prepare(&tool, &project, &chalk_plan()).await?;
-        let applied = system_message(tool.apply(&mutation).await)?;
-        let built = system_message(tool.build(&project).await)?;
+        let message = system_message(tool.build(&project).await)?;
 
-        for message in [&applied, &built] {
-            assert!(
-                message.contains("runs Yarn 4.18.1")
-                    && message
-                        .contains("`yarnPath: .yarn/releases/yarn-4.18.1.cjs` in .yarnrc.yml"),
-                "{message}"
-            );
-        }
-        assert_eq!(yarn_invocations(&project.root), ["--version", "--version"]);
+        assert!(
+            message.contains("runs Yarn 4.18.1")
+                && message.contains("`yarnPath: .yarn/releases/yarn-4.18.1.cjs` in .yarnrc.yml"),
+            "{message}"
+        );
+        assert_eq!(yarn_invocations(&project.root), ["--version"]);
         assert_eq!(
             std::fs::read_to_string(project.root.join("yarn.lock"))?,
             fixture.lock
@@ -426,7 +423,7 @@ mod mutation {
     }
 
     /// A Classic lock under a Classic `yarn` runs as before: the executable check asks for the
-    /// version, then the Classic backend installs.
+    /// version, then the Classic backend's frozen install builds it.
     #[tokio::test]
     async fn a_classic_yarn_runs_a_classic_lock() -> eyre::Result<()> {
         let TempProject { _guard, project } = classic_project(&yarn_fixtures::PINNED_MEMBERS)?;
@@ -437,13 +434,16 @@ mod mutation {
         let report = tool.build(&project).await?;
 
         assert!(report.ok, "{report:?}");
-        assert_eq!(yarn_invocations(&project.root), ["--version", "install"]);
+        assert_eq!(
+            yarn_invocations(&project.root),
+            ["--version", "install --frozen-lockfile"]
+        );
         Ok(())
     }
 
-    /// A lock that turns Berry while Yarn's version is probed is never handed to the Classic
-    /// backend: the apply and the build stop with a lock conflict before any write, leaving the
-    /// replacement in place.
+    /// A lock that turns Berry after the apply was prepared, or while `--build` probes Yarn's
+    /// version, is never handed to the Classic backend: either stops with a lock conflict before
+    /// any write, leaving the replacement in place.
     #[tokio::test]
     async fn a_lock_that_turns_berry_under_the_probe_is_a_conflict() -> eyre::Result<()> {
         let fixture = &yarn_fixtures::PINNED_MEMBERS;
@@ -461,6 +461,7 @@ mod mutation {
         let tool = tool.with_driver(script.as_str());
 
         let mutation = PreparedMutation::prepare(&tool, &project, &chalk_plan()).await?;
+        std::fs::copy(&replacement, &lock)?;
         let applied = tool.apply(&mutation).await;
         let Err(CoreError::LockConflict(message)) = applied else {
             eyre::bail!("expected a lock conflict, got {applied:?}");
@@ -469,20 +470,19 @@ mod mutation {
             message.contains("changed from a Yarn Classic (v1) to a Yarn Berry (v2+) lockfile"),
             "{message}"
         );
-        // Only the probe ran, and the Berry lock that replaced the judged one stays.
-        assert_eq!(yarn_invocations(&project.root), ["--version"]);
+        assert_eq!(yarn_invocations(&project.root), Vec::<String>::new());
         assert_eq!(std::fs::read_to_string(&lock)?, EVERY_SOURCE.lock);
-        assert_eq!(std::fs::read(&project.manifest)?, manifest);
 
-        // `--build` judges the lock it reads first the same way.
         std::fs::write(&lock, fixture.lock)?;
         let built = tool.build(&project).await;
         assert!(
             matches!(built, Err(CoreError::LockConflict(_))),
             "{built:?}"
         );
-        assert_eq!(yarn_invocations(&project.root), ["--version", "--version"]);
+        // Only the probe ran, and the Berry lock that replaced the judged one stays.
+        assert_eq!(yarn_invocations(&project.root), ["--version"]);
         assert_eq!(std::fs::read_to_string(&lock)?, EVERY_SOURCE.lock);
+        assert_eq!(std::fs::read(&project.manifest)?, manifest);
         Ok(())
     }
 
@@ -491,10 +491,6 @@ mod mutation {
     /// Classic lock over the Berry one, which a conflict never does.
     #[tokio::test]
     async fn a_lock_that_turns_berry_under_a_failing_probe_is_a_conflict() -> eyre::Result<()> {
-        /// An observer that ignores every notification.
-        struct Silent;
-        impl cooldown_core::ApplyObserver for Silent {}
-
         for (version, then) in [("4.18.1", ":"), ("1.22.22", "exit 1")] {
             let fixture = &yarn_fixtures::PINNED_MEMBERS;
             let TempProject { _guard, project } = classic_project(fixture)?;
@@ -509,26 +505,13 @@ mod mutation {
             let (_cache, tool) = tool()?;
             let tool = tool.with_driver(script.as_str());
 
-            let mutation = PreparedMutation::prepare(&tool, &project, &chalk_plan()).await?;
-            let attempt = tool.apply_with_observer(&mutation, &Silent).await?;
-            match attempt.into_outcome_for(&mutation)? {
-                cooldown_core::ApplyAttemptOutcome::Finished { report, .. } => assert!(
-                    matches!(report, Err(CoreError::LockConflict(_))),
-                    "probe {version} then {then:?}: {report:?}"
-                ),
-                other @ cooldown_core::ApplyAttemptOutcome::PendingRecovery { .. } => {
-                    eyre::bail!("expected a finished attempt, got {other:?}");
-                }
-            }
-            assert_eq!(yarn_invocations(&project.root), ["--version"]);
-            assert_eq!(std::fs::read_to_string(&lock)?, EVERY_SOURCE.lock);
-
-            std::fs::write(&lock, fixture.lock)?;
             let built = tool.build(&project).await;
+
             assert!(
                 matches!(built, Err(CoreError::LockConflict(_))),
                 "probe {version} then {then:?}: {built:?}"
             );
+            assert_eq!(yarn_invocations(&project.root), ["--version"]);
             assert_eq!(std::fs::read_to_string(&lock)?, EVERY_SOURCE.lock);
         }
         Ok(())

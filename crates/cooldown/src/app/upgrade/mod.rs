@@ -161,7 +161,8 @@ impl UpgradeCtx<'_> {
                 cooldown_core::PreparedMutation::prepare(self.writer, &self.pctx.project, plan)
                     .await?
             }
-        };
+        }
+        .with_source_root(self.source_root);
         let journal = prepared.journal();
         let unleased = match &self.access {
             ProjectExecution::Source => journal

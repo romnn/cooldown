@@ -161,6 +161,7 @@ fn selectors_decode_as_yarn_decodes_them() {
                  package,
                  aliased,
                  registry,
+                 ..
              }| (package, aliased, registry),
         )
     };

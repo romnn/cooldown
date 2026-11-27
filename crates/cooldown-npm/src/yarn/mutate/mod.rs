@@ -604,7 +604,7 @@ fn declared_ranges(root: &Utf8Path, change: &Change) -> Result<Declared> {
 
 /// Every manifest of a copy with the bytes it was copied with, which the copy's manifests are
 /// restored to after each install.
-struct Manifests {
+pub(super) struct Manifests {
     files: Vec<CopiedFile>,
 }
 
@@ -616,7 +616,7 @@ struct CopiedFile {
 
 impl Manifests {
     /// Every `package.json` below `copy_root`, which holds only the inputs a copy stages.
-    fn take(copy_root: &Utf8Path) -> Result<Self> {
+    pub(super) fn take(copy_root: &Utf8Path) -> Result<Self> {
         let mut files = Vec::new();
         let mut directories = vec![copy_root.to_path_buf()];
         while let Some(directory) = directories.pop() {
@@ -640,7 +640,7 @@ impl Manifests {
     }
 
     /// Writes every manifest's copied bytes back.
-    fn restore(&self) -> Result<()> {
+    pub(super) fn restore(&self) -> Result<()> {
         for CopiedFile { path, bytes } in &self.files {
             write(path, bytes)?;
         }
@@ -655,7 +655,7 @@ impl Manifests {
 ///
 /// Returns [`CoreError::Filesystem`] or [`CoreError::Parse`] when a manifest cannot be read or
 /// written, and [`CoreError::System`] when a declaration cannot be rewritten in place.
-fn pin_in_copy(copy_root: &Utf8Path, change: &Change) -> Result<()> {
+pub(super) fn pin_in_copy(copy_root: &Utf8Path, change: &Change) -> Result<()> {
     let name = change.package.name.as_str();
     let to = change.to.as_str();
     for rel in manifest::manifest_rels(&change.members) {
@@ -699,11 +699,11 @@ fn manifest_document(path: &Utf8Path) -> Result<serde_json::Value> {
 }
 
 /// The text of the file at `path`.
-fn read(path: &Utf8Path) -> Result<String> {
+pub(super) fn read(path: &Utf8Path) -> Result<String> {
     std::fs::read_to_string(path).map_err(|err| filesystem(path, &err))
 }
 
-fn write(path: &Utf8Path, bytes: &[u8]) -> Result<()> {
+pub(super) fn write(path: &Utf8Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(path, bytes).map_err(|err| filesystem(path, &err))
 }
 

@@ -224,8 +224,9 @@ writes the native age gate, `npmMinimalAgeGate` and `npmPreapprovedPackages`, in
 `.yarnrc.yml`; a Yarn Classic project has no native age gate.
 
 Before running Yarn on a Classic lock, cooldown checks that the Yarn the project declares
-(`packageManager`) and the one `yarn --version` reports there, through `yarnPath` or Corepack, are
-Yarn 1, and otherwise refuses rather than let a Berry Yarn migrate the lock. It runs Yarn with
+(`packageManager`) is Yarn 1, and so is the one `yarn --version` reports: for `--build`, in the
+project, through `yarnPath` or Corepack; for a landing, only in its confined copy, with `yarnPath`
+ignored. Otherwise it refuses rather than let a Berry Yarn migrate the lock. It runs Yarn with
 Corepack's auto-pin off (`COREPACK_ENABLE_AUTO_PIN=0`), so the check never writes a
 `packageManager` field into the root `package.json`.
 

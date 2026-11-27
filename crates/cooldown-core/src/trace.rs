@@ -130,6 +130,9 @@ pub enum InputRole {
     Configuration,
     /// A local reference, patch, executable or other resolver input.
     ResolverInput,
+    /// Native configuration that may hold registry credentials, such as an `.npmrc`, which a
+    /// trace records by length and digest alone.
+    Credentials,
 }
 
 /// One exact native input, declared by the adapter that reads it.
