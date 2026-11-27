@@ -264,6 +264,9 @@ fn berry_inventory_matches_yarns_own_registry_releases() -> eyre::Result<()> {
 /// first install would migrate the lock: `upgrade` refuses, naming the executable or the
 /// declaration, and the Classic lock stays byte for byte.
 ///
+/// Only a Linux landing asks the executable, inside its confined copy; elsewhere the landing holds
+/// the row before any Yarn runs, so only the declaration is refused there.
+///
 /// The lock is a hand-written Classic entry for the one dependency, enough for cooldown to plan
 /// a change against it.
 #[test]
@@ -306,6 +309,20 @@ fn a_berry_yarn_never_migrates_a_classic_lock() -> eyre::Result<()> {
 
         let upgrade = cooldown(&fixture, &["upgrade", "--major"])?;
 
+        if !declares_berry && !cfg!(target_os = "linux") {
+            assert_eq!(upgrade.code, Some(0), "{:#}", upgrade.envelope);
+            let held = upgrade
+                .envelope
+                .pointer("/items/0/skipped/message")
+                .and_then(serde_json::Value::as_str);
+            assert!(
+                held.is_some_and(|message| message.contains("Linux Landlock")),
+                "{:#}",
+                upgrade.envelope
+            );
+            assert_eq!(fixture.read_bytes("yarn.lock"), classic.as_bytes());
+            continue;
+        }
         assert_eq!(upgrade.code, Some(4), "{:#}", upgrade.envelope);
         let expected = if declares_berry {
             format!("\"packageManager\": \"yarn@{YARN}\"")

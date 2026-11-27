@@ -55,9 +55,8 @@ const FREEZE: &str = "2020-11-01";
 /// The release of `chalk` that [`FREEZE`] matures `^4.0.0` to.
 const CHALK_TARGET: &str = "4.1.0";
 
-/// The cache home every Yarn Classic process a test starts, cooldown's included, is pointed at
-/// through `XDG_CACHE_HOME`, so Yarn's default cache folder, the one a landing lets Yarn write,
-/// is the fixture's own.
+/// The cache home cooldown is pointed at through `XDG_CACHE_HOME`, so Yarn's default cache folder
+/// on Linux, the one a landing lets Yarn write, is the fixture's own, the one [`yarn`] caches in.
 fn cache_home(fixture: &Fixture) -> eyre::Result<String> {
     let home = fixture.yarn_cache_home();
     home.to_str()
@@ -66,10 +65,17 @@ fn cache_home(fixture: &Fixture) -> eyre::Result<String> {
 }
 
 /// Runs Yarn Classic with `args` at the fixture root and requires it to succeed.
+///
+/// It caches in the folder Yarn Classic defaults to below the cache home on Linux, named through
+/// `YARN_CACHE_FOLDER`, since on Windows Yarn Classic ignores `XDG_CACHE_HOME` for a shared
+/// cache that would lock [`locked_behind`]'s ranges at whatever release other runs cached.
 fn yarn(fixture: &Fixture, args: &[&str]) -> eyre::Result<CapturedOutput> {
-    let home = cache_home(fixture)?;
+    let cache = fixture.yarn_cache_home().join("yarn");
+    let cache = cache
+        .to_str()
+        .ok_or_else(|| eyre::eyre!("the cache folder {} is not UTF-8", cache.display()))?;
     fixture
-        .run_tool(YARN_CLASSIC, args, &[("XDG_CACHE_HOME", &home)])
+        .run_tool(YARN_CLASSIC, args, &[("YARN_CACHE_FOLDER", cache)])
         .require_success()
 }
 
