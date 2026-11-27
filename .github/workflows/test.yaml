@@ -54,7 +54,8 @@ jobs:
 
   integration:
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    # Gradle starts a fresh JVM for every run, so its suite alone takes about 15 minutes on Windows.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -66,7 +67,7 @@ jobs:
           install: false
           cache: true
           env: false
-      - run: mise install task aqua:nextest-rs/nextest/cargo-nextest uv go node npm:pnpm yarn deno bun python pypi:poetry ruby erlang elixir java maven
+      - run: mise install task aqua:nextest-rs/nextest/cargo-nextest uv go node npm:pnpm yarn deno bun python pypi:poetry ruby erlang elixir java maven gradle
       - name: Resolve Rust toolchain from rust-toolchain.toml
         id: rust
         shell: bash

@@ -18,10 +18,12 @@ use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use cooldown_core::{CoreError, MemberRef, Result};
 
 use super::pom::{self, Declared, ParentRef, Pom, Text};
+use crate::registry::CENTRAL_URL;
+use crate::tree::slash_path;
 
-/// The repository Maven's super POM declares, the one source cooldown judges releases by.
+/// The id of the repository Maven's super POM declares, the one source cooldown judges releases
+/// by.
 const CENTRAL_ID: &str = "central";
-const CENTRAL_URL: &str = "https://repo.maven.apache.org/maven2";
 
 /// How deeply one property may refer to another before cooldown stops following.
 const INTERPOLATION_DEPTH: usize = 16;
@@ -884,19 +886,6 @@ fn normalize(path: &Utf8Path) -> Option<Utf8PathBuf> {
         }
     }
     Some(normalized)
-}
-
-/// `path` spelled with `/` on every platform, `.` when empty.
-pub(crate) fn slash_path(path: &Utf8Path) -> String {
-    let parts: Vec<&str> = path
-        .components()
-        .map(|component| component.as_str())
-        .collect();
-    if parts.is_empty() {
-        ".".to_owned()
-    } else {
-        parts.join("/")
-    }
 }
 
 #[cfg(test)]

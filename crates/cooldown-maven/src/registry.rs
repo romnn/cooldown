@@ -14,6 +14,10 @@ const DEFAULT_BASE: &str = "https://search.maven.org";
 /// The registry name used to tag Maven-sourced [`PackageId`]s.
 pub const MAVEN_CENTRAL: &str = "maven-central";
 
+/// The repository that serves the artifacts this registry describes, the one source cooldown
+/// judges releases by.
+pub(crate) const CENTRAL_URL: &str = "https://repo.maven.apache.org/maven2";
+
 /// A client for [Maven Central], implementing [`PackageRegistry`].
 ///
 /// HTTP is shared and cached via [`SharedHttp`]; publish times pass through the store's monotonic

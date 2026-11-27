@@ -368,6 +368,16 @@ cooldown cannot tell which profiles Maven activates, so it plans nothing from a 
 repository other than Maven Central, in a profile or not, and no dependency a profile declares too.
 It never reads a build plugin's dependencies.
 `--build` runs `mvn -B -ntp -DskipTests package`.
+Gradle's `upgrade`, `fix` and `--build` run the `gradlew` (`gradlew.bat` on Windows) beside the
+nearest `settings.gradle` or `settings.gradle.kts`, and `gradle` only when the build ships none.
+`upgrade` and `fix` relock the project in a scratch copy of that whole build, with your Gradle
+home, init scripts and credentials, and publish only the project's `gradle.lockfile`.
+They never edit a build script, so `fix` holds a target below the version `build.gradle`
+declares.
+They refuse a project that resolves from a repository other than Maven Central, a mirror included,
+that turns on `org.gradle.mirror.maven.settings` or locks leniently.
+cooldown finds the project by its directory, as the settings place it.
+`--build` runs that project's `assemble` alone, without the projects below it.
 
 When `PATH` leads to a [mise](https://mise.jdx.dev) shim, every command first runs mise, which picks
 the tool and its environment for the command's directory.

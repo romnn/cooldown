@@ -25,6 +25,11 @@
   copy, and rewrite only the version text that owns them.** Properties, `dependencyManagement` and
   reactor modules are read as Maven reads them; plugin dependencies, comments and version ranges are
   no longer planned, and `--build` now runs `mvn package`.
+- **Gradle `upgrade` and `fix` land exactly the planned versions, relocked in a scratch copy of the
+  build, and publish only `gradle.lockfile`.** They run the build's `gradlew`, or `gradle`
+  (`COOLDOWN_GRADLE`) when it ships none, hold a `fix` target below the version `build.gradle`
+  declares, and refuse a project that resolves from a repository other than Maven Central or
+  locks leniently; `--build` now runs the project's own `assemble`.
 
 ## v0.0.33
 

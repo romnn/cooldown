@@ -17,7 +17,8 @@ use cooldown_adapter_util::Driver;
 use cooldown_core::{CoreError, Result, failure_detail};
 use serde::Deserialize;
 
-use super::reactor::{self, slash_path};
+use super::reactor;
+use crate::tree::{files_below, slash_path, utf8};
 
 /// The goal that collects each project's dependency graph, at a pinned release so the verdict
 /// never drifts.
@@ -36,6 +37,10 @@ const EFFECTIVE_SETTINGS: &str =
 
 /// The directories a copy leaves out: version control metadata, and Maven's build output.
 const UNSTAGED: [&str; 5] = [".git", ".hg", ".svn", ".jj", "target"];
+
+fn unstaged(dir: &Utf8Path) -> bool {
+    dir.file_name().is_some_and(|name| UNSTAGED.contains(&name))
+}
 
 /// A scratch copy of a project, deleted when dropped.
 pub(crate) struct Scratch {
@@ -225,7 +230,7 @@ impl Scratch {
         };
         let roster = effective_models(&report("effective-pom")?)?;
         let mut trees = Vec::new();
-        for path in files_below(&base)? {
+        for path in files_below(&base, &unstaged)? {
             let Some(pom) = path.as_str().strip_suffix(&tree_suffix) else {
                 continue;
             };
@@ -422,11 +427,6 @@ fn write_file(path: &Utf8Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn utf8(path: &std::path::Path) -> Result<Utf8PathBuf> {
-    Utf8PathBuf::from_path_buf(path.to_path_buf())
-        .map_err(|path| CoreError::PathEncoding(format!("{} is not valid UTF-8", path.display())))
-}
-
 /// Every file a Maven build started in `root` can read from the project's side, by absolute
 /// path: the project's own files, its local parents `external` outside it, and a `.mvn`
 /// directory the launcher finds above it.
@@ -434,62 +434,13 @@ fn utf8(path: &std::path::Path) -> Result<Utf8PathBuf> {
 /// Both the copy an apply verifies in and the copy a preview runs in hold exactly these, so
 /// Maven activates the same profiles and builds the same projects in each as in the project.
 pub(crate) fn sources(root: &Utf8Path, external: &[&Utf8Path]) -> Result<Vec<Utf8PathBuf>> {
-    let mut sources = files_below(root)?;
+    let mut sources = files_below(root, &unstaged)?;
     sources.extend(external.iter().map(|path| (*path).to_owned()));
     if let Some(config) = reactor::maven_config_dir(root).filter(|config| !config.starts_with(root))
     {
-        sources.extend(files_below(&config)?);
+        sources.extend(files_below(&config, &unstaged)?);
     }
     Ok(sources)
-}
-
-/// Every file below `dir`, a symbolic link to one included, leaving out [`UNSTAGED`]
-/// directories.
-///
-/// # Errors
-///
-/// Returns [`CoreError::System`] for a symbolic link to a directory, which could loop, or lead
-/// Maven's reports out of the copy into the project, and a filesystem error when a directory
-/// cannot be read.
-fn files_below(dir: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
-    let mut files = Vec::new();
-    let mut pending = vec![dir.to_owned()];
-    while let Some(current) = pending.pop() {
-        for entry in current.read_dir_utf8()? {
-            let entry = entry?;
-            let kind = entry.file_type()?;
-            if kind.is_file() {
-                files.push(entry.into_path());
-                continue;
-            }
-            if UNSTAGED.contains(&entry.file_name()) {
-                continue;
-            }
-            let path = entry.into_path();
-            if kind.is_dir() {
-                pending.push(path);
-            } else if kind.is_symlink() {
-                match std::fs::metadata(&path) {
-                    Ok(target) if target.is_dir() => {
-                        let rel = path.strip_prefix(dir).unwrap_or(Utf8Path::new(""));
-                        return Err(CoreError::System(format!(
-                            "{} is a symbolic link to a directory, which cooldown does not \
-                             follow into the copy it verifies the project in",
-                            slash_path(rel)
-                        )));
-                    }
-                    Ok(target) if target.is_file() => files.push(path),
-                    // A link to nothing is no file to Maven either.
-                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                        return Err(error.into());
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    files.sort();
-    Ok(files)
 }
 
 #[cfg(test)]
