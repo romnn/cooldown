@@ -129,9 +129,15 @@ fn build_gradle(seed: Seed) -> String {
 /// Gradle keeps its project cache in the private Gradle home instead of a `.gradle/` beside the
 /// build, so the fixture's own Gradle runs leave the project tree alone, and every file a test
 /// finds there is one cooldown wrote.
+///
+/// The cache is spelled by its long, canonical path: Windows hands out the temp dir by its short
+/// `RUNNER~1` spelling, under which Gradle cannot delete the lock it has just taken.
 fn gradle(fixture: &Fixture, args: &[&str]) -> CapturedOutput {
     let cache = fixture.gradle_user_home().join("project-cache");
+    std::fs::create_dir_all(&cache).expect("create the project cache");
+    let cache = std::fs::canonicalize(&cache).expect("canonicalize the project cache");
     let cache = cache.to_str().expect("a UTF-8 temp dir");
+    let cache = cache.strip_prefix(r"\\?\").unwrap_or(cache);
     let mut full = vec!["-q", "--project-cache-dir", cache];
     full.extend_from_slice(args);
     fixture.run_tool("gradle", &full, &[]).expect_success()
