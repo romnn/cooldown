@@ -118,6 +118,8 @@ enum Horizon {
 /// dependencies into, and any `settings.xml` it reads, are never the user's, and a private Gradle
 /// user home, so the caches Gradle resolves into, and any `gradle.properties` or init script it
 /// reads, are never the user's either.
+/// It also owns a private pixi home and cache, so the repodata, packages and PyPI metadata pixi
+/// caches and any global environment or config it keeps never land in the user's home.
 /// It also owns a cache home, which a Yarn Classic suite hands Yarn Classic and cooldown (see
 /// [`Fixture::yarn_cache_home`]).
 /// A fixture built with [`Fixture::pnpm`] also starts its cache seeded from a [`PnpmPool`] of the
@@ -126,7 +128,7 @@ pub struct Fixture {
     dir: tempfile::TempDir,
     /// The fixture's private pnpm cache and store, its private Poetry cache, its private Bundler
     /// home and gem install path, its private Mix and Hex homes, its private Maven and Gradle user
-    /// homes, and the cache home of a Yarn Classic suite.
+    /// homes, its private pixi home and cache, and the cache home of a Yarn Classic suite.
     ///
     /// It is a sibling of the project tree rather than inside it, so cooldown's project discovery
     /// never walks into the cache or the store.
@@ -304,8 +306,13 @@ impl Fixture {
     /// Gradle leaves a daemon running for hours after each build, one per user home, so every
     /// fixture would leave one behind; `GRADLE_OPTS` turns the daemon off, and replacing an
     /// inherited value also drops any `-Dgradle.user.home` that would move the home elsewhere.
+    /// pixi keeps its global environments and config under `PIXI_HOME` (otherwise `~/.pixi`), and
+    /// its repodata, package and uv caches under `PIXI_CACHE_DIR` (otherwise `~/.cache/rattler`),
+    /// which it requires to be absolute.
+    /// `PIXI_NO_CONFIG` keeps it from reading the system and user config files `PIXI_HOME` does
+    /// not move, such as `~/.config/pixi/config.toml`, which could set a mirror or a cutoff.
     /// The variables are inert for every other tool, so each fixture sets them whatever it drives.
-    fn tool_env(&self) -> [(&'static str, OsString); 13] {
+    fn tool_env(&self) -> [(&'static str, OsString); 16] {
         let home = self.tool_home.path();
         let mut maven_opts = OsString::from("-Duser.home=");
         maven_opts.push(home.join("maven"));
@@ -323,6 +330,9 @@ impl Fixture {
             ("MAVEN_SKIP_RC", "1".into()),
             ("GRADLE_USER_HOME", self.gradle_user_home().into()),
             ("GRADLE_OPTS", "-Dorg.gradle.daemon=false".into()),
+            ("PIXI_HOME", home.join("pixi").into()),
+            ("PIXI_CACHE_DIR", home.join("pixi-cache").into()),
+            ("PIXI_NO_CONFIG", "1".into()),
         ]
     }
 

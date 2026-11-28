@@ -18,7 +18,7 @@ use cooldown_core::{CoreError, Result, failure_detail};
 use serde::Deserialize;
 
 use super::reactor;
-use crate::tree::{files_below, slash_path, utf8};
+use cooldown_adapter_util::tree::{files_below, slash_path, utf8};
 
 /// The goal that collects each project's dependency graph, at a pinned release so the verdict
 /// never drifts.

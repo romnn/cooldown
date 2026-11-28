@@ -33,6 +33,7 @@ elixir = "1.20.1-otp-29"
 java = "26.0.1"
 maven = "3.9.16"
 gradle = "9.9.2"
+"github:prefix-dev/pixi" = "0.85.0"
 
 # Supported ecosystems whose real-tool integration tests are still to be written (#186); CI does
 # not install them yet.

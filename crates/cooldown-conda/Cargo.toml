@@ -22,7 +22,12 @@ serde_json.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 camino.workspace = true
+serde-saphyr.workspace = true
+tempfile.workspace = true
+toml_edit.workspace = true
+humantime.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
+indoc.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }

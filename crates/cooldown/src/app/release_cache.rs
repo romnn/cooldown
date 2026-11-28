@@ -39,7 +39,8 @@
 
 use async_trait::async_trait;
 use cooldown_core::{
-    CandidateScope, Dependency, FetchContext, PackageId, Release, ReleaseFetcher, Result, Version,
+    ArtifactId, CandidateScope, Dependency, FetchContext, PackageId, Release, ReleaseFetcher,
+    Result, Version,
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -124,24 +125,29 @@ where
 /// Identity of a candidate-release resolution. `package` is the full [`PackageId`] — it carries the
 /// `tool` and `registry` alongside the name, so `foo` on npm and `foo` on JSR (or two registries of
 /// one tool) never share an entry. `current` is the version the dep sits at (candidate annotations
-/// are relative to it) and `scope` is the major scope. `project` is `Some(root)` only for a
-/// project-scoped fetcher (see [`project_scope`]), so a project-dependent adapter's answer is never
-/// shared across projects while a global registry adapter's `None` is shared across the whole run.
+/// are relative to it) and `scope` is the major scope. `artifacts` are the locked artifacts the
+/// dep sits at, which an artifact-aware fetcher reads the current release's age from, so a
+/// same-version rebuild the lock takes during a run is not served the age of the build it
+/// replaced. `project` is `Some(root)` only for a project-scoped fetcher (see [`project_scope`]),
+/// so a project-dependent adapter's answer is never shared across projects while a global registry
+/// adapter's `None` is shared across the whole run.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CandidateKey {
     package: PackageId,
     current: Version,
+    artifacts: Vec<ArtifactId>,
     scope: CandidateScope,
     project: Option<String>,
 }
 
 /// Identity of a locked-release resolution: the full [`PackageId`], the locked `version`, and the
-/// same `project` discriminator as [`CandidateKey`] — uv reads a locked version's publish time from
-/// the asking project's own lock, so its locked releases are project-scoped.
+/// same `artifacts` and `project` discriminators as [`CandidateKey`] — uv reads a locked version's
+/// publish time from the asking project's own lock, so its locked releases are project-scoped.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct LockedKey {
     package: PackageId,
     version: Version,
+    artifacts: Vec<ArtifactId>,
     project: Option<String>,
 }
 
@@ -217,6 +223,7 @@ impl ReleaseResolver for ReleaseCache {
         let key = CandidateKey {
             package: dep.package.clone(),
             current: dep.current.clone(),
+            artifacts: dep.artifacts.clone(),
             scope,
             project: project_scope(fetcher, fetch),
         };
@@ -228,6 +235,7 @@ impl ReleaseResolver for ReleaseCache {
             let key = LockedKey {
                 package: dep.package.clone(),
                 version: dep.current.clone(),
+                artifacts: dep.artifacts.clone(),
                 project: project_scope(fetcher, fetch),
             };
             self.locked.seed(key, locked);
@@ -245,6 +253,7 @@ impl ReleaseResolver for ReleaseCache {
         let key = LockedKey {
             package: dep.package.clone(),
             version: dep.current.clone(),
+            artifacts: dep.artifacts.clone(),
             project: project_scope(fetcher, fetch),
         };
         self.locked
@@ -594,6 +603,33 @@ mod tests {
         resolve_in(&cache, &fetcher, &test_project("/b")).await;
         // A global registry fetcher resolves once and shares across every project in the run.
         assert_eq!(fetcher.calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// A dep the lock rebuilt at the same version sits at other artifacts, so it is resolved
+    /// again rather than served the age of the build it replaced.
+    #[tokio::test]
+    async fn a_rebuild_at_the_same_version_is_resolved_again() {
+        let cache = ReleaseCache::new();
+        let fetcher = CountingFetcher {
+            calls: AtomicU64::new(0),
+            project_scoped: false,
+        };
+        let project = test_project("/a");
+        let fetch = FetchContext {
+            project: &project,
+            artifacts: ArtifactScope::Environment,
+            batch: None,
+        };
+        for build in ["sha256:aa", "sha256:bb"] {
+            let dep = Dependency {
+                artifacts: vec![ArtifactId(build.to_owned())],
+                ..test_dep()
+            };
+            let _ = cache
+                .candidate_releases(&fetcher, &dep, &fetch, CandidateScope::CurrentMajorOnly)
+                .await;
+        }
+        assert_eq!(fetcher.calls.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

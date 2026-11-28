@@ -379,6 +379,28 @@ They refuse a project that resolves from a repository other than Maven Central, 
 that turns on `org.gradle.mirror.maven.settings` or locks leniently.
 cooldown finds the project by its directory, as the settings place it.
 `--build` runs that project's `assemble` alone, without the projects below it.
+pixi's `upgrade` and `fix` run one `pixi lock` per batch in a scratch copy of the manifest, the
+lock, `.pixi/config.toml` and the files directly in each relative `find-links` directory, and
+publish only `pixi.lock`.
+The copy's manifest pins each conda target with one top-level `[constraints]` entry, narrows a
+PyPI target's top-level requirement (`[pypi-dependencies]`, or `[project]` dependencies in a
+`pyproject.toml`) to it, and sets `exclude-newer` to cooldown's cutoff; each young build the lock
+already holds of a package no target moves is exempted by its archive.
+The new lock must bind every target where the old one bound it, at exactly the target, and every
+build it newly selects must have been uploaded by its own cutoff: the window that admitted a
+target, or the one cooldown's policy gives the package; pixi must then find the lock current for
+your own manifest, its `exclude-newer` included.
+They never edit the manifest, so they hold a target the lock binds at more than one version, one
+whose top-level constraint has alternatives or comes from the workspace, a PyPI package only a
+feature or target declares or one from another index, and a batch whose lock binds a source
+package or local path, whose two young builds of one package pixi cannot both exempt, or whose
+`find-links` directory is absolute, missing, or a link or holds one; a range the manifest declares
+is pixi's to judge.
+A conda package's age is the upload of the newest build the lock holds, unknown when one of them
+records none; a PyPI package's is the newest upload of its version's files.
+The workspace's `exclude-newer` and `pypi-exclude-newer` are read as native cooldown windows, a span
+in pixi's units such as `1month`; one cooldown cannot read is ignored with a warning.
+`--build` runs `pixi install --locked --all`.
 
 When `PATH` leads to a [mise](https://mise.jdx.dev) shim, every command first runs mise, which picks
 the tool and its environment for the command's directory.
@@ -437,7 +459,7 @@ in Cargo's spelling (`"14 days"`); it bounds what Cargo can resolve but is not r
 
 ## Several ecosystems at once
 
-In a polyglot repository every detected ecosystem runs in its own lane, and the lanes run concurrently: while `cargo` waits on crates.io, `uv` is already resolving against PyPI, whether they live in different directories or share one. A lane runs its own projects one after another, since concurrent invocations of one package manager block on that manager's own cache lock. Only ecosystems that rewrite the same manifest take turns under `upgrade`, `fix`, or `--lock`: uv and poetry both own `pyproject.toml`, and every npm-family tool owns `package.json`, so two of them at one root, or one nested in the other's workspace, run in turn (`--dry-run` mutates a throwaway copy, so it reads side by side too). Each adapter declares the file its lease guards: pixi is detected by `pixi.lock` but rewrites `pixi.toml`, or the `pyproject.toml` hosting its tables, and takes turns with uv and poetry in the latter case. `--build` steps run one at a time across ecosystems, since every ecosystem installs into the environment shared at a root (`node_modules`, `.venv`); so do the upgrades of tools whose native command installs as it pins (`poetry add`, `conda install`, `swift package update`), and `outdated`'s preview of such an update, which runs the same command on a copy. `--jobs <N>` caps how many ecosystems run at once; `--jobs 1` runs them one after another. The reports, their order, and the exit code are the same as a sequential run's. The interactive progress display shows one block per live ecosystem, and the plain transcript names the tool and project on every per-project line.
+In a polyglot repository every detected ecosystem runs in its own lane, and the lanes run concurrently: while `cargo` waits on crates.io, `uv` is already resolving against PyPI, whether they live in different directories or share one. A lane runs its own projects one after another, since concurrent invocations of one package manager block on that manager's own cache lock. Only ecosystems that rewrite the same manifest take turns under `upgrade`, `fix`, or `--lock`: uv and poetry both own `pyproject.toml`, and every npm-family tool owns `package.json`, so two of them at one root, or one nested in the other's workspace, run in turn (`--dry-run` mutates a throwaway copy, so it reads side by side too). `--build` steps run one at a time across ecosystems, since every ecosystem installs into the environment shared at a root (`node_modules`, `.venv`); so do the upgrades of tools whose native command installs as it pins (`poetry add`, `conda install`, `swift package update`), and `outdated`'s preview of such an update, which runs the same command on a copy. `--jobs <N>` caps how many ecosystems run at once; `--jobs 1` runs them one after another. The reports, their order, and the exit code are the same as a sequential run's. The interactive progress display shows one block per live ecosystem, and the plain transcript names the tool and project on every per-project line.
 
 ## Scoping to a subset
 

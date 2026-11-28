@@ -249,6 +249,29 @@ checksum = "sha256:6920b6f493f0c13a28e32522ccb7efffcc57c8849d887366b19c599dc2238
 url = "https://github.com/est31/cargo-udeps/releases/download/v0.1.61/cargo-udeps-v0.1.61-x86_64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/est31/cargo-udeps/releases/assets/407804338"
 
+[[tools."github:prefix-dev/pixi"]]
+version = "0.85.0"
+backend = "github:prefix-dev/pixi"
+specifiers = ["0.85.0"]
+
+[tools."github:prefix-dev/pixi"."platforms.linux-x64"]
+checksum = "sha256:e3c34f16cb634d5f20ffd4aa60a2844b3cacbdb16b0566c2dfe1d89619f13cab"
+url = "https://github.com/prefix-dev/pixi/releases/download/v0.85.0/pixi-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/prefix-dev/pixi/releases/assets/791242994"
+provenance = "github-attestations"
+
+[tools."github:prefix-dev/pixi"."platforms.macos-arm64"]
+checksum = "sha256:99f893da09dda63ec038d4476f01c8f735b276781c6862bdd4415b9e944f4675"
+url = "https://github.com/prefix-dev/pixi/releases/download/v0.85.0/pixi-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/prefix-dev/pixi/releases/assets/791242393"
+provenance = "github-attestations"
+
+[tools."github:prefix-dev/pixi"."platforms.windows-x64"]
+checksum = "sha256:a34af155965345ed9a6f123125bc3b482973956bcbbe0a2451798a4ba72d307b"
+url = "https://github.com/prefix-dev/pixi/releases/download/v0.85.0/pixi-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/prefix-dev/pixi/releases/assets/791242922"
+provenance = "github-attestations"
+
 [[tools."github:romnn/bumpversion"]]
 version = "0.0.14"
 backend = "github:romnn/bumpversion"

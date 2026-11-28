@@ -6,7 +6,7 @@
 /// Only the name is located; extras, specifier, and marker are kept verbatim so a caller can
 /// print exactly what the author wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Requirement<'a> {
+pub struct Requirement<'a> {
     /// The package name as written, not PEP 503 normalized.
     pub name: &'a str,
     /// The bracketed extras without the brackets (`torch` for `safetensors[torch]`).
@@ -27,7 +27,8 @@ impl Requirement<'_> {
 }
 
 /// Splits a PEP 508 requirement, or `None` when no package name leads it.
-pub(crate) fn parse(requirement: &str) -> Option<Requirement<'_>> {
+#[must_use]
+pub fn parse(requirement: &str) -> Option<Requirement<'_>> {
     let (head, marker) = match requirement.split_once(';') {
         Some((head, marker)) => (head, Some(marker.trim())),
         None => (requirement, None),

@@ -13,10 +13,10 @@ use std::hash::Hasher as _;
 
 use crate::lock;
 use crate::registry::{CENTRAL_URL, MAVEN_CENTRAL, MavenCentral};
-use crate::tree::{files_below, slash_path, utf8};
 use crate::version;
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
+use cooldown_adapter_util::tree::{files_below, slash_path, utf8};
 use cooldown_adapter_util::{Driver, single_lock_journal, verify_current_unknown};
 use cooldown_core::{
     ApplyAttempt, ApplyObserver, ApplyReport, CandidateScope, Capabilities, Change, CoreError,

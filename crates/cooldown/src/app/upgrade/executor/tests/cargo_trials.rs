@@ -685,6 +685,8 @@ impl ToolWrite for FakeCargo {
         // Which search each batch asked for, apart from `trials` so their expectations stay put.
         let search = if plan.fast { "fast" } else { "exhaustive" };
         log_batch(&project.root.join("searches"), search, plan)?;
+        // The cutoff each target was admitted under, apart for the same reason.
+        log_batch(&project.root.join("cutoffs"), &admitted(plan), plan)?;
         self.fail_as_scripted(project, plan, &versions)?;
         let mut skipped = Vec::new();
         let mut applied = Vec::new();
@@ -784,6 +786,21 @@ impl ToolWrite for FakeCargo {
             detail: String::new(),
         })
     }
+}
+
+/// The cutoff each target of `plan` was admitted under, as `name@to<=cutoff`.
+fn admitted(plan: &Plan) -> String {
+    let cutoffs: Vec<String> = plan
+        .target_cutoffs
+        .iter()
+        .map(|admitted| {
+            format!(
+                "{}@{}<={:?}",
+                admitted.package.name, admitted.to, admitted.cutoff
+            )
+        })
+        .collect();
+    cutoffs.join(",")
 }
 
 /// Appends `label` and the batch's targets as one line to the log at `path`.
@@ -1127,6 +1144,28 @@ async fn a_dry_run_gives_every_batch_the_starting_lock() -> eyre::Result<()> {
     assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
     assert_eq!(rows(&outcome), [row("parent", "1.0.0", "1.1.0", None)]);
     assert_eq!(std::fs::read(project.root.join("Cargo.lock"))?, before);
+    Ok(())
+}
+
+/// Each batch hands the adapter the cutoff that admitted each of its targets: the built-in seven
+/// days before the run, here.
+#[tokio::test]
+async fn a_batch_carries_the_cutoff_that_admitted_each_target() -> eyre::Result<()> {
+    let CargoFixture {
+        directory: _directory,
+        workspace,
+        project,
+    } = fixture(Resolver::ExactFrom(2), 1, false)?;
+
+    let outcome = workspace.upgrade(&RunOpts::default()).await;
+
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    let cutoffs = std::fs::read_to_string(project.root.join("cutoffs"))?;
+    assert_eq!(
+        cutoffs.lines().next(),
+        Some("parent@1.1.0<=Some(2026-06-10T00:00:00Z):parent@1.1.0"),
+        "{cutoffs}"
+    );
     Ok(())
 }
 

@@ -13,7 +13,7 @@ pub mod lock;
 mod manifest;
 mod native;
 pub mod pypi;
-mod requirement;
+pub mod requirement;
 pub mod tool;
 pub mod uvcmd;
 pub mod version;
