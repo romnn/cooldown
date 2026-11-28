@@ -235,7 +235,9 @@ impl Manifest {
         let mut paths = Vec::new();
         for link in &self.links {
             match link {
-                Link::Path(path) if !Utf8Path::new(path).is_absolute() => paths.push(path.as_str()),
+                // A rooted path such as `/opt/wheels` has no drive on Windows, so `is_absolute`
+                // calls it relative, yet it still names a directory outside the project.
+                Link::Path(path) if !Utf8Path::new(path).has_root() => paths.push(path.as_str()),
                 Link::Url(url) if !url.starts_with("file:") => {}
                 Link::Path(local) | Link::Url(local) => {
                     return Err(format!(
