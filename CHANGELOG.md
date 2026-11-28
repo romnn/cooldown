@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **pixi `upgrade` and `fix` land exactly the planned versions, adopt no build uploaded after its
+  cutoff, and change only `pixi.lock`.** A target that cannot be pinned from the top-level tables is
+  held, `outdated` and `--dry-run` now work on pixi projects, and the workspace's `exclude-newer` is
+  honoured.
 - **On Linux, Yarn Classic `upgrade` and `fix` land exactly the planned versions, resolved in a
   scratch copy whose writes Landlock confines, and change only `yarn.lock` for a move within the
   declared range.** Elsewhere they hold Yarn Classic rows as `not_eligible`, and `--build` now runs

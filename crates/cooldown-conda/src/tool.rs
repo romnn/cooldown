@@ -1,12 +1,11 @@
-//! The generic conda-world [`Tool`](cooldown_core::Tool),
-//! parameterised by a [`CondaLayout`] (conda-lock or pixi).
-//! Both lockfiles pin a mix of conda-channel and PyPI packages, so — like the
+//! The conda-lock [`Tool`](cooldown_core::Tool).
+//! The lockfile pins a mix of conda-channel and PyPI packages, so — like the
 //! Deno adapter — this tool carries two registry clients and dispatches each
 //! dependency's publish-time lookup to the one named on its [`PackageId`].
 //! Versions use the PEP 440 model reused from [`cooldown_uv`] (a close
 //! approximation of conda's own ordering for the common `X.Y.Z` shapes).
 
-use crate::lock::{self, CondaDep};
+use crate::lock;
 use crate::registry::{CONDA, Conda};
 use async_trait::async_trait;
 use camino::Utf8Path;
@@ -14,7 +13,6 @@ use cooldown_adapter_util::{
     Driver, RegistryVersionClassifier, build_registry_releases, skipped_on_apply_error,
     verify_current_unknown,
 };
-use cooldown_core::fs::ManifestFamily;
 use cooldown_core::{
     ApplyReport, CandidateScope, Capabilities, DepScope, Dependency, FetchContext,
     LockVerifyReport, NativePolicyLayer, PackageId, PackageRegistry, Plan, PreparedMutation,
@@ -26,145 +24,36 @@ use cooldown_registry::SharedHttp;
 use cooldown_uv::PyPi;
 use cooldown_uv::pypi::PYPI;
 use cooldown_uv::version;
-use std::collections::{HashMap, HashSet};
-use std::marker::PhantomData;
+use std::collections::HashSet;
 
-/// The per-tool knobs the generic adapter needs: identity, the lockfile it reads, the driver
-/// binary, how to parse the lock, and how to re-pin a dependency.
-pub trait CondaLayout: Send + Sync + 'static {
-    /// The tool's canonical [`ToolId`] (`conda` or `pixi`).
-    const ID: ToolId;
-    /// The lockfile detected as the project marker.
-    const LOCKFILE: &'static str;
-    /// The driver binary, shelled out to for apply/build.
-    const BIN: &'static str;
+/// The [`ToolId`] for the conda-lock adapter (`"conda"`).
+const CONDA_ID: ToolId = ToolId("conda");
 
-    /// Parses the lock into its resolved conda/PyPI dependency list.
-    fn parse(content: &str) -> Vec<CondaDep>;
+/// The lock conda-lock writes, which is the project marker and the resolved graph.
+const LOCKFILE: &str = "conda-lock.yml";
 
-    /// The graph ceiling candidates (`name` → every exact version a requirer pins it to) for each
-    /// conda package some requirer caps — `pixi.lock` `depends:`/`constrains:` or `conda-lock.yml`
-    /// `dependencies:`.
-    fn graph_ceilings(content: &str) -> HashMap<String, Vec<String>>;
-
-    /// The package names declared in the project's *source* manifest (`environment.yml` /
-    /// `pixi.toml`), so the resolved lock can be split direct vs. transitive — the lock itself does
-    /// not say. `None` when no manifest is found, so the caller treats every locked package as direct.
-    fn direct_names(root: &Utf8Path) -> Option<HashSet<String>>;
-
-    /// The driver args that re-pin `name` to `version`.
-    fn upgrade_args(name: &str, version: &str) -> Vec<String>;
-
-    /// The driver args for the opt-in `--build` step.
-    fn build_args() -> Vec<String>;
-
-    /// The family of the file the driver rewrites at `root`, which the project lease guards.
-    ///
-    /// conda-lock's driver rewrites no file at the root (`conda install` writes the active
-    /// prefix), so the default names the recorded lock as a stable key of the layout's own; a
-    /// layout whose driver rewrites a source manifest overrides this to name that file.
-    #[must_use]
-    fn lease_family(_root: &Utf8Path) -> ManifestFamily {
-        ManifestFamily::named(Self::LOCKFILE)
-    }
-}
-
-/// conda-lock: `conda-lock.yml`, driven by `conda`.
-pub struct CondaLock;
-/// pixi: `pixi.lock`, driven by `pixi`.
-pub struct Pixi;
-
-impl CondaLayout for CondaLock {
-    const ID: ToolId = ToolId("conda");
-    const LOCKFILE: &'static str = "conda-lock.yml";
-    const BIN: &'static str = "conda";
-
-    fn parse(content: &str) -> Vec<CondaDep> {
-        lock::parse_conda_lock(content)
-    }
-
-    fn graph_ceilings(content: &str) -> HashMap<String, Vec<String>> {
-        lock::conda_lock_ceilings(content)
-    }
-
-    fn direct_names(root: &Utf8Path) -> Option<HashSet<String>> {
-        let content = std::fs::read_to_string(root.join("environment.yml"))
-            .or_else(|_| std::fs::read_to_string(root.join("environment.yaml")))
-            .ok()?;
-        Some(lock::environment_yml_direct(&content))
-    }
-
-    fn upgrade_args(name: &str, version: &str) -> Vec<String> {
-        vec!["install".into(), "-y".into(), format!("{name}={version}")]
-    }
-
-    fn build_args() -> Vec<String> {
-        vec!["list".into()]
-    }
-}
-
-impl CondaLayout for Pixi {
-    const ID: ToolId = ToolId("pixi");
-    const LOCKFILE: &'static str = "pixi.lock";
-    const BIN: &'static str = "pixi";
-
-    fn parse(content: &str) -> Vec<CondaDep> {
-        lock::parse_pixi_lock(content)
-    }
-
-    fn graph_ceilings(content: &str) -> HashMap<String, Vec<String>> {
-        lock::pixi_lock_ceilings(content)
-    }
-
-    fn direct_names(root: &Utf8Path) -> Option<HashSet<String>> {
-        let content = std::fs::read_to_string(root.join("pixi.toml")).ok()?;
-        Some(lock::pixi_toml_direct(&content))
-    }
-
-    fn upgrade_args(name: &str, version: &str) -> Vec<String> {
-        vec!["add".into(), format!("{name}=={version}")]
-    }
-
-    fn build_args() -> Vec<String> {
-        vec!["install".into()]
-    }
-
-    /// `pixi add` rewrites the manifest it finds: `pixi.toml`, or otherwise the `pyproject.toml`
-    /// hosting a `[tool.pixi]` table, which is uv's and poetry's file too.
-    fn lease_family(root: &Utf8Path) -> ManifestFamily {
-        if root.join("pixi.toml").is_file() {
-            ManifestFamily::named("pixi.toml")
-        } else {
-            ManifestFamily::named("pyproject.toml")
-        }
-    }
-}
-
-/// The conda-world implementation of the [`Tool`](cooldown_core::Tool)
-/// port, generic over a [`CondaLayout`].
-pub struct CondaEnvTool<L> {
+/// The conda-lock implementation of the [`Tool`](cooldown_core::Tool) port.
+pub struct CondaTool {
     conda: Conda,
     pypi: PyPi,
     driver: Driver,
-    _layout: PhantomData<fn() -> L>,
 }
 
-impl<L: CondaLayout> CondaEnvTool<L> {
+impl CondaTool {
     /// Creates the adapter from the conda and PyPI registry clients.
     #[must_use]
     pub fn new(conda: Conda, pypi: PyPi) -> Self {
-        CondaEnvTool {
+        CondaTool {
             conda,
             pypi,
-            driver: Driver::new(L::BIN),
-            _layout: PhantomData,
+            driver: Driver::new("conda"),
         }
     }
 
     /// Creates the adapter from a shared HTTP client, building both registry clients.
     #[must_use]
     pub fn from_http(http: SharedHttp) -> Self {
-        CondaEnvTool::new(Conda::new(http.clone()), PyPi::new(http))
+        CondaTool::new(Conda::new(http.clone()), PyPi::new(http))
     }
 
     async fn raw_releases(&self, dep: &Dependency) -> Result<Vec<RawRelease>> {
@@ -176,7 +65,17 @@ impl<L: CondaLayout> CondaEnvTool<L> {
     }
 }
 
-fn classify_quality(v: &str) -> ReleaseQuality {
+/// The package names the project's source manifest (`environment.yml`) declares, so the resolved
+/// lock can be split direct vs. transitive — the lock itself does not say.
+/// `None` when no manifest is found, so the caller treats every locked package as direct.
+fn direct_names(root: &Utf8Path) -> Option<HashSet<String>> {
+    let content = std::fs::read_to_string(root.join("environment.yml"))
+        .or_else(|_| std::fs::read_to_string(root.join("environment.yaml")))
+        .ok()?;
+    Some(lock::environment_yml_direct(&content))
+}
+
+pub(crate) fn classify_quality(v: &str) -> ReleaseQuality {
     if version::is_prerelease(v) {
         ReleaseQuality::Prerelease
     } else {
@@ -184,7 +83,7 @@ fn classify_quality(v: &str) -> ReleaseQuality {
     }
 }
 
-fn build_releases(current: &str, raw: Vec<RawRelease>) -> Vec<Release> {
+pub(crate) fn build_releases(current: &str, raw: Vec<RawRelease>) -> Vec<Release> {
     build_registry_releases(
         current,
         raw,
@@ -200,7 +99,7 @@ fn build_releases(current: &str, raw: Vec<RawRelease>) -> Vec<Release> {
 }
 
 #[async_trait]
-impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
+impl ToolRead for CondaTool {
     fn version_command(&self) -> Option<cooldown_core::trace::ToolVersionCommand> {
         Some(cooldown_core::trace::ToolVersionCommand {
             program: self.driver.program().to_string(),
@@ -212,7 +111,7 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
         use cooldown_core::trace::GraphCoverage;
         let mut evidence = cooldown_adapter_util::evidence::native(
             project,
-            L::LOCKFILE,
+            LOCKFILE,
             GraphCoverage::Inventory {
                 reason: "native lock retains its original platform-specific package evidence"
                     .into(),
@@ -220,7 +119,6 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
             &[
                 "environment.yml",
                 "environment.yaml",
-                "pixi.toml",
                 "pyproject.toml",
                 ".condarc",
             ],
@@ -228,13 +126,13 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
         cooldown_adapter_util::evidence::ancestors(&mut evidence, &project.root, &[]);
         cooldown_adapter_util::evidence::environment(
             &mut evidence,
-            &["CONDARC", "CONDA_PREFIX", "CONDA_SUBDIR", "PIXI_HOME"],
+            &["CONDARC", "CONDA_PREFIX", "CONDA_SUBDIR"],
         );
         Ok(evidence)
     }
 
     fn id(&self) -> ToolId {
-        L::ID
+        CONDA_ID
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -252,15 +150,11 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
 
     fn project_marker(&self) -> cooldown_core::ProjectMarker {
         ProjectMarker {
-            marker: L::LOCKFILE,
-            manifest: L::LOCKFILE,
+            marker: LOCKFILE,
+            manifest: LOCKFILE,
             alternate_manifests: &[],
             workspace_root: false,
         }
-    }
-
-    fn lease_family(&self, project: &Project) -> ManifestFamily {
-        L::lease_family(&project.root)
     }
 
     fn classify_update_kind(&self, from: &str, to: &str) -> Option<UpdateKind> {
@@ -269,14 +163,14 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
 
     async fn dependencies(&self, project: &Project, scope: DepScope) -> Result<Vec<Dependency>> {
         // conda-world locks do not mark direct vs. transitive, so cross-reference the source manifest
-        // (`environment.yml` / `pixi.toml`): a package named there is direct, the rest transitive. The
+        // (`environment.yml`): a package named there is direct, the rest transitive. The
         // split lets `--major` rewrite direct deps across a major while leaving transitives capped.
         // When no manifest is found, fall back to treating every resolved package as direct.
-        let content = std::fs::read_to_string(project.root.join(L::LOCKFILE))?;
-        let direct = L::direct_names(&project.root).filter(|names| !names.is_empty());
-        let ceilings = L::graph_ceilings(&content);
+        let content = std::fs::read_to_string(project.root.join(LOCKFILE))?;
+        let direct = direct_names(&project.root).filter(|names| !names.is_empty());
+        let ceilings = lock::conda_lock_ceilings(&content);
         let mut deps = Vec::new();
-        for entry in L::parse(&content) {
+        for entry in lock::parse_conda_lock(&content) {
             let normalized = lock::normalize_name(&entry.name);
             let is_direct = direct
                 .as_ref()
@@ -284,7 +178,7 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
             if scope == DepScope::Direct && !is_direct {
                 continue;
             }
-            // A requirer's exact `depends:`/`constrains:` spec caps this package at its resolved
+            // A requirer's exact `dependencies:` spec caps this package at its resolved
             // version: the ceiling is honored only when some pin equals it, so a fuzzy prefix spec
             // holds only when resolution landed exactly on it. The match is by string equality, not
             // `version::compare`: conda versions are routinely not PEP 440 (calver `2022g`, R-style
@@ -300,7 +194,7 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
                 .map(|_| Version::new(entry.version.clone()));
             let registry = if entry.conda { CONDA } else { PYPI };
             deps.push(Dependency {
-                package: PackageId::new(L::ID, entry.name, Some(registry.to_string())),
+                package: PackageId::new(CONDA_ID, entry.name, Some(registry.to_string())),
                 // No advisory-database ecosystem maps conda channels (see `capabilities`), so
                 // no package carries an advisory identity.
                 advisory_identity: None,
@@ -324,12 +218,12 @@ impl<L: CondaLayout> ToolRead for CondaEnvTool<L> {
     }
 
     async fn verify_lock_current(&self, _project: &Project) -> Result<LockVerifyReport> {
-        Ok(verify_current_unknown(L::LOCKFILE))
+        Ok(verify_current_unknown(LOCKFILE))
     }
 }
 
 #[async_trait]
-impl<L: CondaLayout> ReleaseFetcher for CondaEnvTool<L> {
+impl ReleaseFetcher for CondaTool {
     async fn releases(
         &self,
         dep: &Dependency,
@@ -366,12 +260,12 @@ impl<L: CondaLayout> ReleaseFetcher for CondaEnvTool<L> {
 }
 
 #[async_trait]
-impl<L: CondaLayout> ToolWrite for CondaEnvTool<L> {
+impl ToolWrite for CondaTool {
     fn mutation_tool(&self) -> ToolId {
-        L::ID
+        CONDA_ID
     }
 
-    // `conda install` writes the active prefix and `pixi add` installs into `.pixi/envs`.
+    // `conda install` writes the active prefix.
     fn mutation_installs(&self) -> bool {
         true
     }
@@ -381,14 +275,18 @@ impl<L: CondaLayout> ToolWrite for CondaEnvTool<L> {
         project: &Project,
         _plan: &Plan,
     ) -> Result<ProjectMutationJournal> {
-        ProjectMutationJournal::capture(&project.root, [Utf8Path::new(L::LOCKFILE)])
+        ProjectMutationJournal::capture(&project.root, [Utf8Path::new(LOCKFILE)])
     }
 
     async fn apply(&self, mutation: &PreparedMutation) -> Result<ApplyReport> {
         let (project, plan, _) = mutation.parts_for(self)?;
         let mut report = ApplyReport::default();
         for change in &plan.changes {
-            let args = L::upgrade_args(&change.package.name, change.to.as_str());
+            let args = [
+                "install".to_owned(),
+                "-y".to_owned(),
+                format!("{}={}", change.package.name, change.to),
+            ];
             match self.driver.run(&project.root, &args).await {
                 Ok(()) => report.applied.push(change.clone()),
                 Err(e) => report.skipped.push(skipped_on_apply_error(change, e)?),
@@ -399,7 +297,7 @@ impl<L: CondaLayout> ToolWrite for CondaEnvTool<L> {
 
     async fn build(&self, project: &Project) -> Result<VerifyReport> {
         self.driver
-            .verify(&project.root, &L::build_args(), "build succeeded")
+            .verify(&project.root, &["list".to_owned()], "build succeeded")
             .await
     }
 }
@@ -407,45 +305,14 @@ impl<L: CondaLayout> ToolWrite for CondaEnvTool<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use camino::Utf8PathBuf;
 
-    /// A pixi project's lease names the file `pixi add` rewrites, so a pyproject-hosted pixi
-    /// project takes turns with uv and poetry at the root, while conda-lock keeps its own lease.
-    /// The assertions go through the port, so dropping the layout override would fail them.
+    /// conda's apply installs into the active prefix, so it takes the environment turn.
     #[test]
-    fn the_lease_family_is_the_rewritten_manifest() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).expect("UTF-8 path");
+    fn the_conda_apply_installs() {
         let cache = tempfile::tempdir().expect("cache");
         let http =
             SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http");
-        let pixi = CondaEnvTool::<Pixi>::from_http(http.clone());
-        let conda = CondaEnvTool::<CondaLock>::from_http(http);
-        let project = |lock: &str| Project {
-            root: root.clone(),
-            kind: ToolId("pixi"),
-            manifest: root.join(lock),
-            exclude_newer: None,
-            exclude_newer_package: std::collections::BTreeMap::new(),
-            generated_members: cooldown_core::GeneratedMembers::undeclared(),
-        };
-
-        assert_eq!(
-            pixi.lease_family(&project("pixi.lock")),
-            ManifestFamily::named("pyproject.toml")
-        );
-        std::fs::write(root.join("pixi.toml"), "[project]\n").expect("write pixi.toml");
-        assert_eq!(
-            pixi.lease_family(&project("pixi.lock")),
-            ManifestFamily::named("pixi.toml")
-        );
-        assert_eq!(
-            conda.lease_family(&project("conda-lock.yml")),
-            ManifestFamily::named("conda-lock.yml")
-        );
-        // Both applies install, so both take the environment turn.
-        assert!(pixi.mutation_installs());
-        assert!(conda.mutation_installs());
+        assert!(CondaTool::from_http(http).mutation_installs());
     }
 
     #[test]
@@ -454,50 +321,8 @@ mod tests {
         let http =
             SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http");
         assert_eq!(
-            CondaEnvTool::<CondaLock>::from_http(http.clone())
-                .capabilities()
-                .advisory_ecosystem,
+            CondaTool::from_http(http).capabilities().advisory_ecosystem,
             None
         );
-        assert_eq!(
-            CondaEnvTool::<Pixi>::from_http(http)
-                .capabilities()
-                .advisory_ecosystem,
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn pixi_routes_conda_and_pypi_registries() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
-        std::fs::write(
-            root.join("pixi.lock"),
-            "version: 6\npackages:\n- conda: https://conda.anaconda.org/conda-forge/linux-64/numpy-1.24.0-py311h_0.conda\n- pypi: https://files.pythonhosted.org/x/requests-2.28.0-py3-none-any.whl\n  name: requests\n  version: 2.28.0\n",
-        )
-        .expect("lock");
-        let project = Project {
-            root: root.clone(),
-            kind: Pixi::ID,
-            manifest: root.join("pixi.lock"),
-            exclude_newer: None,
-            exclude_newer_package: std::collections::BTreeMap::new(),
-            generated_members: cooldown_core::GeneratedMembers::undeclared(),
-        };
-        let cache = tempfile::tempdir().expect("cache");
-        let tool = CondaEnvTool::<Pixi>::from_http(
-            SharedHttp::new(cache.path(), cooldown_registry::HttpOptions::default()).expect("http"),
-        );
-
-        let mut deps = tool
-            .dependencies(&project, DepScope::Graph)
-            .await
-            .expect("deps");
-        deps.sort_by(|a, b| a.package.name.cmp(&b.package.name));
-        assert_eq!(deps.len(), 2);
-        assert_eq!(deps[0].package.name, "numpy");
-        assert_eq!(deps[0].package.registry.as_deref(), Some(CONDA));
-        assert_eq!(deps[1].package.name, "requests");
-        assert_eq!(deps[1].package.registry.as_deref(), Some(PYPI));
     }
 }

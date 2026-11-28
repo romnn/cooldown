@@ -12,7 +12,7 @@ use cooldown_core::{CoreError, Result};
 /// Returns [`CoreError::System`] for a symbolic link to a directory, which could loop, or lead
 /// the tool's writes out of the copy into the project, and a filesystem error when a directory
 /// cannot be read.
-pub(crate) fn files_below(
+pub fn files_below(
     dir: &Utf8Path,
     skipped: &dyn Fn(&Utf8Path) -> bool,
 ) -> Result<Vec<Utf8PathBuf>> {
@@ -57,7 +57,8 @@ pub(crate) fn files_below(
 }
 
 /// `path` spelled with `/` on every platform, `.` when empty.
-pub(crate) fn slash_path(path: &Utf8Path) -> String {
+#[must_use]
+pub fn slash_path(path: &Utf8Path) -> String {
     let parts: Vec<&str> = path
         .components()
         .map(|component| component.as_str())
@@ -69,7 +70,12 @@ pub(crate) fn slash_path(path: &Utf8Path) -> String {
     }
 }
 
-pub(crate) fn utf8(path: &std::path::Path) -> Result<Utf8PathBuf> {
+/// `path` as a UTF-8 path.
+///
+/// # Errors
+///
+/// Returns [`CoreError::PathEncoding`] when `path` is not valid UTF-8.
+pub fn utf8(path: &std::path::Path) -> Result<Utf8PathBuf> {
     Utf8PathBuf::from_path_buf(path.to_path_buf())
         .map_err(|path| CoreError::PathEncoding(format!("{} is not valid UTF-8", path.display())))
 }

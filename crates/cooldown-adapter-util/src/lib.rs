@@ -4,6 +4,7 @@
 mod driver;
 pub mod evidence;
 mod scratch;
+pub mod tree;
 pub use driver::{Driver, program_on_path, resolve_program, supervised_output};
 pub use scratch::{canonical_path, outside_project};
 

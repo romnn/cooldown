@@ -12,9 +12,10 @@ use self::batch::{
 use self::outcome::Provenance;
 pub(crate) use self::outcome::{CopyOutcome, PlannedCopy};
 use self::planning::{
-    EffectiveHold, candidate_scope, crosses_line, current_line_target, dep_resolve_ctx,
-    effective_hold, fix_change, is_downgrade, line_leaving_nodes, lower_adoptable_targets,
-    plan_baseline_violations, sort_planned_changes, upgrade_resolve_ctx, upgrade_view,
+    EffectiveHold, admitting_cutoff, candidate_scope, crosses_line, current_line_target,
+    dep_resolve_ctx, effective_hold, fix_change, is_downgrade, line_leaving_nodes,
+    lower_adoptable_targets, plan_baseline_violations, sort_planned_changes, upgrade_resolve_ctx,
+    upgrade_view,
 };
 pub(crate) use self::planning::{Judged, target_package_for, upgrade_verdict};
 use self::report::{
@@ -492,6 +493,13 @@ pub(super) struct ProjectUpgradeExecutor<'a, 'b> {
     /// converge on the same target while an advisory affects only one copy's current version,
     /// and only that copy's row is security-relevant.
     security_by_change: HashMap<ChangeKey, crate::app::SecurityInfo>,
+    /// The cutoff each planned change's target was admitted under, parked beside the plan for the
+    /// same reason as [`security_by_change`](Self::security_by_change) and handed to the adapter
+    /// as [`Plan::target_cutoffs`].
+    cutoff_by_change: HashMap<ChangeKey, Option<jiff::Timestamp>>,
+    /// The policy every batch hands the adapter for what a resolve moves beyond its targets, built
+    /// once for the project's execution.
+    pin_policy: std::sync::Arc<cooldown_core::PinPolicy>,
     /// The alternative targets of each planned change, in retry order, as the writer's
     /// [`TargetFallback`] selects them.
     ///
@@ -620,6 +628,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
         mode: PlanMode,
         acc: &'a mut UpgradeAccum,
     ) -> Self {
+        let pin_policy = std::sync::Arc::new(cooldown_core::PinPolicy {
+            layers: ctx.pctx.policy.layers.clone(),
+            tool: ctx.pctx.tool,
+            project: ctx.pctx.rel_path.clone(),
+        });
         ProjectUpgradeExecutor {
             ws,
             project_label: ctx.pctx.rel_path.to_string(),
@@ -635,6 +648,8 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             excluded_members: Vec::new(),
             batch_item_offsets: Vec::new(),
             security_by_change: HashMap::new(),
+            cutoff_by_change: HashMap::new(),
+            pin_policy,
             fallback_changes: HashMap::new(),
             pin_security: HashMap::new(),
             pin_affected: HashMap::new(),
@@ -2149,6 +2164,7 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                     .collect()
             }
         };
+        let now = self.ws.now();
         let alternatives = candidates
             .into_iter()
             .map(|candidate| {
@@ -2163,6 +2179,10 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                         crate::app::workspace::security_info(relevance, &alternative.to),
                     );
                 }
+                self.cutoff_by_change.insert(
+                    ChangeKey::of(&alternative),
+                    admitting_cutoff(&candidate.window, now),
+                );
                 alternative
             })
             .collect();
@@ -2630,6 +2650,12 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 self.security_by_change
                     .insert(ChangeKey::of(&change), security);
             }
+            if let Some(candidate) = chosen {
+                self.cutoff_by_change.insert(
+                    ChangeKey::of(&change),
+                    admitting_cutoff(&candidate.window, self.ws.now()),
+                );
+            }
             self.remember_upgrade_fallbacks(&change, releases, verdict);
             self.trace_tried(&change, dep, copy);
             planned.push(change);
@@ -3039,6 +3065,11 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
                 .and_then(|release| release.kind_from_current)
                 .unwrap_or(UpdateKind::Minor);
             let change = fix_change(&releases, &dep, target, kind);
+            // A fix target is judged against the window the pin itself failed.
+            self.cutoff_by_change.insert(
+                ChangeKey::of(&change),
+                admitting_cutoff(&fix.current.window, self.ws.now()),
+            );
             if let Some(note) = reintroduces_advisory_warning(
                 &dep,
                 &releases,
@@ -3605,6 +3636,19 @@ impl<'a, 'b> ProjectUpgradeExecutor<'a, 'b> {
             ),
             edge_policy: self.ctx.pctx.edge_policy,
             baseline_violations: plan_baseline_violations(&state.baseline_violations),
+            target_cutoffs: changes
+                .iter()
+                .filter_map(|change| {
+                    let cutoff = self.cutoff_by_change.get(&ChangeKey::of(change))?;
+                    Some(cooldown_core::TargetCutoff {
+                        package: change.package.clone(),
+                        from: change.from.clone(),
+                        to: change.to.clone(),
+                        cutoff: *cutoff,
+                    })
+                })
+                .collect(),
+            pin_policy: Some(std::sync::Arc::clone(&self.pin_policy)),
             excluded_members: self.excluded_members.clone(),
             single_copy: cooldown_core::SingleCopyPolicy {
                 names: self.ctx.pctx.single_copy.iter().cloned().collect(),

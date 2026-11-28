@@ -942,6 +942,54 @@ impl EdgeRebind {
     }
 }
 
+/// The cutoff the planner admitted one planned change's target under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetCutoff {
+    /// The complete package identity, including its registry or source.
+    pub package: PackageId,
+    /// The version the change moves from.
+    pub from: Version,
+    /// The target the window admitted.
+    pub to: Version,
+    /// The newest publish instant the target's window admits, or `None` when an `allow` rule
+    /// exempts the package from every window.
+    pub cutoff: Option<jiff::Timestamp>,
+}
+
+/// The policy that judges the packages a resolve moves beyond its targets, resolved for each as
+/// `check` resolves a locked pin's window.
+#[derive(Debug, Clone)]
+pub struct PinPolicy {
+    /// The project's policy layers, low to high authority.
+    pub layers: Vec<crate::policy::PolicyLayer>,
+    /// The tool whose packages the policy judges.
+    pub tool: ToolId,
+    /// The project path that project selectors match.
+    pub project: Utf8PathBuf,
+}
+
+impl PinPolicy {
+    /// The newest publish instant a locked version of `package` from `registry` may have at
+    /// `now`, or `None` when an `allow` rule exempts the package from every window.
+    #[must_use]
+    pub fn cutoff(
+        &self,
+        package: &str,
+        registry: Option<&str>,
+        now: jiff::Timestamp,
+    ) -> Option<jiff::Timestamp> {
+        let query = crate::policy::ResolveQuery {
+            tool: self.tool,
+            package,
+            registry,
+            project: &self.project,
+            kind: crate::policy::ResolveKind::CurrentPin,
+        };
+        let window = crate::policy::resolve(&self.layers, &query, now).window;
+        (!window.exempt).then(|| window.cutoff(now))
+    }
+}
+
 /// A resolved package version already rejected by the active policy before an apply trial begins.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BaselineViolation {
@@ -1041,6 +1089,21 @@ pub struct Plan {
     /// Adapters may authorize these exact starting versions while resolving a repair, but must not
     /// treat the set as permission for newly selected versions to bypass the policy.
     pub baseline_violations: Vec<BaselineViolation>,
+    /// The cutoff each change's target was admitted under, by the package, registry and update
+    /// kind windows that judged it.
+    ///
+    /// An adapter whose resolver applies a publish-time cutoff of its own lets each target
+    /// through at its own cutoff rather than at the project's default.
+    /// A change without an entry was admitted under the project's own windows
+    /// ([`Project::exclude_newer`] and [`Project::exclude_newer_package`]).
+    pub target_cutoffs: Vec<TargetCutoff>,
+    /// The policy that judges what the resolve moves beyond the changes' targets, when the caller
+    /// resolved one.
+    ///
+    /// An adapter that must establish the cutoff of such a move holds the batch without it.
+    /// It sits behind an [`Arc`](std::sync::Arc), so every batch of a project shares one and a
+    /// plan stays small in the futures that carry it.
+    pub pin_policy: Option<std::sync::Arc<PinPolicy>>,
     /// The workspace members the run's `exclude-folders`/`exclude-packages` policy dropped from
     /// every dependency's attribution — outside the request, not merely unattributed.
     ///

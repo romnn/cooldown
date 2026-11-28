@@ -109,10 +109,7 @@ pub trait ToolRead: Send + Sync {
     /// different families run side by side.
     /// The lane planner and every lease site read the family from here alone, so an adapter
     /// whose recorded manifest is not the file it rewrites overrides this to name the rewritten
-    /// file: pixi is detected by `pixi.lock` but rewrites `pixi.toml`, or the `pyproject.toml`
-    /// that hosts its tables and that uv and poetry rewrite too.
-    /// The family is a method rather than marker data because pixi's depends on which manifest
-    /// exists at the root.
+    /// file.
     /// A tool that rewrites either of two spellings (deno's `deno.json` or `deno.jsonc`) keeps
     /// one family for both, since the family is a lease key rather than a path.
     fn lease_family(&self, _project: &Project) -> ManifestFamily {
@@ -1610,6 +1607,9 @@ impl ResolveInputs {
         // conda
         "environment.yml",
         "environment.yaml",
+        // pixi
+        "pixi.toml",
+        "pixi.lock",
     ];
 
     /// Resolver config paths that live below otherwise-pruned dot directories or have generic names.
@@ -1619,6 +1619,7 @@ impl ResolveInputs {
         ".swiftpm/configuration/registries.json",
         ".yarn/releases",
         ".yarn/plugins",
+        ".pixi/config.toml",
     ];
 
     /// The declaration-only default: every known manifest/lock/config basename, no source files.

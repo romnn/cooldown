@@ -19,7 +19,7 @@ use cooldown_core::{CoreError, MemberRef, Result};
 
 use super::pom::{self, Declared, ParentRef, Pom, Text};
 use crate::registry::CENTRAL_URL;
-use crate::tree::slash_path;
+use cooldown_adapter_util::tree::slash_path;
 
 /// The id of the repository Maven's super POM declares, the one source cooldown judges releases
 /// by.

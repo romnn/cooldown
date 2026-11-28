@@ -3,9 +3,10 @@ use crate::app::advisories::{ClassifiedAdvisories, ProjectAdvisories};
 use crate::app::{ProjectCtx, RunOpts, TransitiveGate, Workspace};
 use cooldown_core::{
     BaselineViolation, Candidate, Change, DepScope, Dependency, GraphHoldEdge, GraphHoldKind,
-    MajorKey, PackageId, Release, ResolveContext, RewriteMode, Status, ToolRead, UpdateKind,
-    Verdict, Version, evaluate_advised,
+    MajorKey, PackageId, Release, ResolveContext, ResolvedWindow, RewriteMode, Status, ToolRead,
+    UpdateKind, Verdict, Version, evaluate_advised,
 };
+use jiff::Timestamp;
 use std::borrow::Cow;
 use std::collections::HashSet;
 
@@ -385,6 +386,12 @@ pub(super) fn effective_hold(
         discounted,
         compliant_holder,
     }
+}
+
+/// The newest publish instant `window` admits at `now`, or `None` when an `allow` rule exempts
+/// the package from every window.
+pub(super) fn admitting_cutoff(window: &ResolvedWindow, now: Timestamp) -> Option<Timestamp> {
+    (!window.exempt).then(|| window.cutoff(now))
 }
 
 /// Builds a `fix` change that matures one dependency back to its selected target.
